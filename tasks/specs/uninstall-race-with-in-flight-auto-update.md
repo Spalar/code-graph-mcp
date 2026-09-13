@@ -1,6 +1,6 @@
 ---
 status: draft
-revision: 1
+revision: 2
 ---
 
 # Uninstall races an in-flight auto-update and leaves the cache behind
@@ -96,15 +96,63 @@ A short-TTL tombstone as a sibling of the cache directory, e.g.
    directory) and needs no timing. Arm 1 needs a seam — inject the tombstone
    check, or drive `downloadBinary` directly — rather than a sleep race.
 
+## SETTLED — `doctor` cannot be the first move
+
+> "Should `doctor` report an orphan `CACHE_DIR` with no plugin and no npm
+> install, and offer to reclaim it? That closes the residual case (another live
+> session's updater) without any cross-process protocol, and may be the better
+> first move."
+
+Measured 2026-09-13. The answer is no, and not on cost grounds — **in the exact
+state the question names, `doctor` cannot run at all.**
+
+`doctor` is not implemented in the Rust binary. `main.rs:387` intercepts
+`--help` (so the read-only form stays side-effect-free) and otherwise forwards to
+`run_node_script("doctor.js")`, whose three candidates (`main.rs:896-947`) are
+`$_FIND_BINARY_ROOT/claude-plugin/scripts/`,
+`exe_dir/../../claude-plugin/scripts/` and `exe_dir/../claude-plugin/scripts/`.
+All three resolve inside the plugin — or inside the npm package, which ships
+`claude-plugin/` through `package.json`'s `files` list. `_FIND_BINARY_ROOT` is
+set only by `bin/cli.js`, the npm wrapper. Remove the plugin and the npm install
+and every candidate is gone; the 42 MB binary left standing in the cache is the
+one thing that survives, and it cannot reach its own JS.
+
+Reproduced in a `HOME`-isolated sandbox containing nothing but the residue —
+the same 42,847,128 B binary this defect leaves behind, copied from a machine
+where the race had just fired:
+
+```
+$ env -i PATH=/usr/bin:/bin HOME=<SB>/home \
+    <SB>/home/.cache/code-graph/bin/code-graph-mcp doctor --check-only
+doctor.js not found. Looked in:
+  <SB>/home/.cache/code-graph/bin/../../claude-plugin/scripts/doctor.js
+  <SB>/home/.cache/code-graph/bin/../claude-plugin/scripts/doctor.js
+```
+
+**What this rules in.** Nothing on an orphaned machine can self-report. Only code
+that runs *while the plugin still exists* can act, which puts prevention — the
+tombstone above, or an equivalent — back as the primary mechanism rather than a
+fallback to a cheaper detector.
+
+**What stays reachable, and it is not `doctor`.** `readManifest()` has exactly
+two callers, `install` (`lifecycle.js:1326`) and `update` (`:1675`), and both run
+at the moment a plugin exists again. Neither validates the manifest against
+reality — `install` reads it only for its own statusline-claim config. So a fresh
+install that finds a manifest describing a plugin root which is no longer there
+is the one detection point with code available to act. That reaches the residual
+case the tombstone deliberately excludes (another live session's updater), just
+later rather than never, and it is independent of whichever prevention lands.
+
 ## Open questions
 
-- Should `doctor` report an orphan `CACHE_DIR` with no plugin and no npm install,
-  and offer to reclaim it? That closes the residual case (another live session's
-  updater) without any cross-process protocol, and may be the better first move.
 - Is `statusline-registry.json` returning a second, separate ordering problem, or
   purely collateral of the same re-creation? Not investigated.
 
 # Change log
 
+- r2 (2026-09-13) — the `doctor` open question settled by reproduction: not
+  reachable, because `doctor` forwards to a `doctor.js` that leaves with the
+  plugin. Prevention promoted back to primary; `install`-side manifest
+  validation recorded as the reachable detector.
 - r1 (2026-09-13) — filed from the full-lifecycle QA pass. Both arms measured;
   the install-lock approach prototyped and refuted before filing.
