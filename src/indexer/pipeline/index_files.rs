@@ -2342,6 +2342,13 @@ pub(super) fn index_files(
     // identity, and a no-diff incremental should not rewrite the row. Deleted
     // files need no handling here — the set is intersected with `files` on read.
     //
+    // The guard is reader-equivalent, not row-equivalent: a delete-only run
+    // skips the write, so the stored row can still name a path that is gone.
+    // The reader is unaffected — `parse_error_files` intersects with `files` —
+    // and the next run that parses anything prunes it, since the merge reads
+    // through that same intersection. So the row is bounded by "files that ever
+    // errored since the last parsing run", not "files currently erroring".
+    //
     // Warn, do not `?`. The read side is already defensive on purpose
     // (`health.rs` and `management.rs` both `.unwrap_or_default()` — a status
     // poll must not fail over bookkeeping), and the write side using `?` was the

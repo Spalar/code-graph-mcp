@@ -552,7 +552,15 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// files were read, identified, and had their nodes purged — the old verdict
     /// is spent. A file whose READ failed is the one that must stay out: no
     /// identity was established, so it re-diffs next run and self-heals.
+    ///
+    /// Read and write run inside one savepoint. They are otherwise separate
+    /// autocommit statements, and two indexers can be live at once: the index
+    /// `flock` is taken only by CLI `rebuild-index` / `reindex`, not by the MCP
+    /// server's startup and background indexing or by CLI `incremental-index`.
+    /// Interleaved read/read/write/write loses one run's verdict (pre-ship
+    /// review, code-read — reachable rather than observed).
     pub fn record_parse_error_files(&self, examined: &[String], errored: &[String]) -> Result<()> {
+        let tx = self.savepoint("record_parse_errors")?;
         let previous = self.parse_error_files()?;
         let reexamined: std::collections::HashSet<&str> =
             examined.iter().map(String::as_str).collect();
@@ -567,14 +575,16 @@ If you see this repeatedly, another code-graph server of a different version is 
             crate::storage::queries::delete_meta(
                 self.conn(),
                 crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
-            )
+            )?;
         } else {
             crate::storage::queries::set_meta(
                 self.conn(),
                 crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
                 &serde_json::to_string(&kept)?,
-            )
+            )?;
         }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Check if an error indicates SQLite database corruption.

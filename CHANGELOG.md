@@ -52,11 +52,25 @@ repaired file loses it on the run that re-parses it; a deleted file drops out
 because the set is intersected with `files` on read, so removal needs no
 bookkeeping of its own.
 
-No `SCHEMA_VERSION` bump: the value is a `meta` row, that table is v7, and an
-absent key reads as "nothing known to be degraded" — the correct answer for every
-index built before this key existed. No `INDEX_VERSION` bump either: nothing
-about what gets extracted changed, only whether the run's own finding is written
-down.
+No `SCHEMA_VERSION` bump: the value is a `meta` row and that table is v7. No
+`INDEX_VERSION` bump either: nothing about what gets extracted changed, only
+whether the run's own finding is written down.
+
+**What that costs, stated rather than glossed.** An absent key reads as "nothing
+known to be degraded", and for an index built before this release the honest
+answer is "unknown" — which these surfaces render as healthy. An incremental run
+only re-parses files that changed, so a broken file nobody edits is never
+revisited and the gap does not close on its own: **existing indexes report
+nothing here until their next full `reindex`**. The alternative was bumping
+`INDEX_VERSION` to force every user to rebuild for an observability field, which
+is the worse trade by a wide margin. An earlier draft of this paragraph called
+the absent key "the correct answer"; it is the available one.
+
+**To pin back:** `npm i -g @sdsrs/code-graph@0.150.0`, or `cargo install
+code-graph-mcp --version 0.150.0`; plugin users can set the version in the
+marketplace entry. Nothing written by this release needs removing first — the
+`meta` row is ignored by older binaries, and the teardown tombstone it reads is
+unchanged from 0.149.0.
 
 ### `doctor` put an uninstall back
 

@@ -156,6 +156,19 @@ test('classifyHealthReport surfaces a damaged parse, and stays silent on a clean
   assert.deepEqual(clean, [],
     'health-check omits the field on a clean index; inventing a row from its absence would warn on every healthy repo');
 
+  // The guard is `!== undefined`, not truthiness, and until this case existed a
+  // mutation to truthiness SURVIVED: the test fed 2 and 12 and never 0, so the
+  // distinction the guard and its comment both make a point of was unpinned
+  // (pre-ship review, mutation-verified). A literal 0 is unreachable from
+  // today's producer — `health.rs` only emits the field inside
+  // `if !parse_error_files.is_empty()` — so this pins the contract rather than
+  // an observed shape, and it is the contract that a future producer will read.
+  const zero = classifyHealthReport({ ...base, files_with_parse_errors: 0, parse_error_files: [] })
+    .filter(r => r.name === 'Parse');
+  assert.equal(zero.length, 1,
+    'an explicit 0 is a REPORTED clean parse, not an absent field: the row must still appear');
+  assert.equal(zero[0].advisory, true);
+
   const degraded = classifyHealthReport({
     ...base, files_with_parse_errors: 2, parse_error_files: ['src/a.rs', 'src/b.rs'],
   }).filter(r => r.name === 'Parse');

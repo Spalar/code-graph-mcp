@@ -181,7 +181,13 @@ function classifyHealthReport(hc) {
   // clean ones at query time — the symbols that survived are real, the ones that
   // did not are simply absent — so a thin result reads as "the code is thin".
   // Additive and absent on a clean index, which is why this is `!== undefined`
-  // rather than a truthiness test that would also swallow a legitimate 0.
+  // rather than a truthiness test that would also swallow a reported 0.
+  //
+  // Today's producer cannot send 0 — `health.rs` emits both fields only inside
+  // `if !parse_error_files.is_empty()` — so the distinction is a contract for
+  // the next producer, not an observed shape. Said plainly because the comment
+  // used to imply 0 arrives in practice, and because the test that pins it had
+  // to be added after a mutation to truthiness survived.
   //
   // No `fixId`, and `advisory: true`. The repair is editing the source, which
   // is the user's to do — and on this very repository the cause is a pinned

@@ -335,7 +335,12 @@ function writeCacheEntry(binPath) {
   // findBinary() after a complete uninstall brought `~/.cache/code-graph/` back.
   //
   // Skipping costs a re-probe on the next call, not a wrong answer: the caller
-  // already has the resolved path, and this only memoizes it.
+  // already has the resolved path, and this only memoizes it. Measured, so the
+  // trade is on the record rather than asserted: `findBinary()` runs ~5 ms warm
+  // (4-5 ms, n=5) against ~84 ms with the memo suppressed (71-93 ms, n=5) on a
+  // box where the binary resolves through a global npm install — roughly +79 ms
+  // per cold hook process, bounded by the tombstone's 5-minute TTL (pre-ship
+  // review).
   if (uninstallTombstoneActive()) return;
   try {
     fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });

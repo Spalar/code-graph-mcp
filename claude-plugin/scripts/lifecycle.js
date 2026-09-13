@@ -1340,7 +1340,15 @@ function install({ reclaimStatusline = false, clearTombstone = false } = {}) {
   // So only the two genuinely user-initiated entry points pass true: the
   // `lifecycle.js install` CLI and doctor's repair pass. Everything automatic —
   // session-init's install reporting, healthCheck's repair — leaves it standing
-  // and lets the TTL expire it. The cost is that a reinstall inside the window
+  // and lets the TTL expire it.
+  //
+  // Doctor's half is now vestigial, and saying so beats leaving a reader to
+  // work it out: `teardownRepairGuard` returns before both of doctor's
+  // `install({ clearTombstone: true })` sites, so doctor can only ever clear a
+  // tombstone that has already expired — at which point there is nothing to
+  // clear. Kept rather than removed because a concurrent teardown can still
+  // write one between the guard check and the install, and because the flag is
+  // the honest statement of intent for that call site. The cost is that a reinstall inside the window
   // may skip one update check, which the spec already accepts; the install
   // itself supplies the binary.
   if (clearTombstone) clearUninstallTombstone();

@@ -155,12 +155,36 @@ fn a_deleted_file_stops_counting_against_the_index() {
     f.write("src/clean_a.rs", CLEAN_A);
     assert_eq!(f.full(), 1, "precondition");
 
-    fs::remove_file(f.project.path().join("src/broken.rs")).unwrap();
-    f.incremental();
+    // Two arms, because the end-to-end one cannot say WHICH mechanism cleared
+    // it. The docs credit the read-side intersection with `files` specifically —
+    // "whatever removes the row removes the claim with it" — and an incremental
+    // run also does its own bookkeeping, so a single arm proves only that the
+    // pair of them together works (pre-ship review, reviewer-flagged).
+
+    // Arm 1, the mechanism on its own: drop the `files` row directly and read,
+    // with NO index run in between. Nothing but the intersection can be acting.
+    f.db.conn()
+        .execute("DELETE FROM files WHERE path = ?1", ["src/broken.rs"])
+        .unwrap();
     assert!(
         f.recorded().is_empty(),
-        "the offending file is gone; a verdict naming it is stale, got {:?}",
+        "the stored row still names it; only the read-side intersection with `files` \
+         can drop it here, and that is the claim the doc makes, got {:?}",
         f.recorded()
+    );
+
+    // Arm 2, the realistic path: the file leaves the tree and an ordinary run
+    // notices. Same answer, reached the way a user reaches it.
+    let g = fixture();
+    g.write("src/broken.rs", BROKEN);
+    g.write("src/clean_a.rs", CLEAN_A);
+    assert_eq!(g.full(), 1, "precondition");
+    fs::remove_file(g.project.path().join("src/broken.rs")).unwrap();
+    g.incremental();
+    assert!(
+        g.recorded().is_empty(),
+        "the offending file is gone; a verdict naming it is stale, got {:?}",
+        g.recorded()
     );
 }
 
