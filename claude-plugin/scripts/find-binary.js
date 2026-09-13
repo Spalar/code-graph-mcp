@@ -7,6 +7,9 @@ const os = require('os');
 const { readBinaryVersion, compareVersions } = require('./version-utils');
 const { npmInvocation } = require('./npm-exec');
 const { hidden } = require('./proc-opts');
+// Only the teardown predicate, and cache-paths.js is deliberately tiny and
+// builtin-only for exactly this kind of hook-path consumer.
+const { uninstallTombstoneActive } = require('./cache-paths');
 
 const PLATFORM = os.platform();
 const ARCH = os.arch();
@@ -318,6 +321,17 @@ function readCacheEntry() {
 }
 
 function writeCacheEntry(binPath) {
+  // A teardown is in flight, and `path.dirname(CACHE_FILE)` IS the directory it
+  // just reclaimed — so the mkdir below re-creates it to hold a resolution
+  // nobody will read. auto-update.js guards its three writers the same way;
+  // this one was missed because it reaches CACHE_DIR through its own
+  // `os.homedir()` join instead of cache-paths.js, and it is the most-called of
+  // the four (every cold binary resolution on every hook). Measured: one
+  // findBinary() after a complete uninstall brought `~/.cache/code-graph/` back.
+  //
+  // Skipping costs a re-probe on the next call, not a wrong answer: the caller
+  // already has the resolved path, and this only memoizes it.
+  if (uninstallTombstoneActive()) return;
   try {
     fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
     fs.writeFileSync(

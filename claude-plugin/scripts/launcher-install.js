@@ -109,6 +109,25 @@ function installBinaryInBackground({
   lockPath = null,
 }) {
   let lock = null;
+  // DELIBERATELY outside the teardown tombstone, unlike every other writer that
+  // can re-create CACHE_DIR. `acquireLock` mkdirs the lock file's parent, which
+  // IS CACHE_DIR, so a teardown landing here gets the directory back — and the
+  // install that follows brings the ~41 MB binary with it. auto-update.js gates
+  // its three writers on `uninstallTombstoneActive()` and find-binary.js's
+  // cold-cache memo now does too; this one does not, and must not:
+  //
+  // The tombstone cannot tell a teardown from a REINSTALL. `/plugin install`
+  // reaches `install()` through session-init, which by design does NOT pass
+  // `clearTombstone` (a record any concurrent session may erase protects
+  // nobody — see the comment on lifecycle.js's install()). So right after a
+  // legitimate reinstall the tombstone is still standing AND the cache was
+  // emptied by the teardown that preceded it — exactly the state where this
+  // path is the only thing that puts a binary back. Gating it would hand the
+  // user a 0-tool stub for the rest of the TTL as the reward for reinstalling.
+  //
+  // The cost of staying ungated is bounded and smaller: a teardown that races
+  // an MCP relaunch gets CACHE_DIR back. Not a crash either way — the
+  // missing-binary path already answers the handshake with `serveEmptyMcpStub`.
   if (lockPath) {
     lock = acquireLock(lockPath);
     if (!lock) {

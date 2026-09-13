@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION`, the
+schema, every flag and every exit code are unchanged. Two behaviour changes, both
+confined to the five minutes after a teardown: `doctor` no longer re-installs
+what `uninstall` just removed, and resolving the binary no longer re-creates the
+cache directory. Outside that window nothing behaves differently — with no
+teardown tombstone standing, both paths are byte-for-byte what they were.
+
+### `doctor` put an uninstall back
+
+v0.149.0 added a teardown tombstone so an in-flight auto-update could not
+re-create `~/.cache/code-graph` under a teardown. It gated the three writers in
+`auto-update.js`. It did not gate `doctor` — and `doctor` repairs by default
+(`--check-only` opts out), which makes it the natural way to check that an
+uninstall worked.
+
+Measured on a clean teardown, then one `doctor` with no flags: all six hook
+entries back in `settings.json`, the cache directory re-created holding
+`binary-path` + `install-manifest.json` + `statusline-registry.json`, and the
+tombstone deleted. Both plugin layouts, dev and marketplace.
+
+The tombstone deletion is the sharp end rather than the residue. A two-arm probe:
+with the tombstone standing the updater refused and left no directory behind;
+after `doctor` had cleared it the identical call walked into the binary-download
+arm. The diagnostic re-opened the race the previous release closed.
+
+`relicRepairGuard()` could not have caught it. It asks whether this copy is the
+*active* install and returns false the moment `activeInstallPath()` is null —
+exactly the post-uninstall state. The new `teardownRepairGuard()` sits beside it
+on the same two settings-writing arms and asks the other question, printing why
+it declined and the one command that undoes it.
+
+Bounded by the tombstone's own TTL, deliberately: past the window a torn-down
+install is indistinguishable from one installed but never set up, and that IS a
+repair case. A stale, future-stamped or corrupt tombstone all fail OPEN, so the
+guard cannot become a permanent kill switch — the same four arms the tombstone
+itself is verified on.
+
+### Resolving the binary re-created the cache it had just lost
+
+`find-binary.js` writes `~/.cache/code-graph/binary-path` on every cold
+resolution, and reaches the directory through its own `os.homedir()` join rather
+than `cache-paths.js` — the exact anti-pattern that file's header comment
+complains about, and why the tombstone work did not see it. It is also the
+most-called of the four writers: every cold resolution, on every hook. One
+`findBinary()` after a complete uninstall brought the directory back.
+
+It now consults the same predicate. Skipping costs one re-probe on the next call,
+never a wrong answer: the caller already holds the resolved path and this only
+memoizes it.
+
+**Still ungated, on purpose:** `launcher-install.js`. Its `acquireLock` mkdirs
+CACHE_DIR too, but the tombstone cannot tell a teardown from a reinstall —
+`/plugin install` leaves the tombstone standing by design — and this is the one
+path that puts a binary back afterwards. Gating it would trade a narrow residue
+window for a 0-tool MCP stub as the reward for reinstalling. The reasoning is now
+recorded at the call site so it is not "fixed" later by symmetry.
+
 ## 0.150.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` is

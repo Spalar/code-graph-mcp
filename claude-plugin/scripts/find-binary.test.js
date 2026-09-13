@@ -520,7 +520,12 @@ function buildDetachedPlugin(t) {
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
   const scripts = path.join(sandbox, 'plugin', 'scripts');
   fs.mkdirSync(scripts, { recursive: true });
-  for (const f of ['find-binary.js', 'version-utils.js', 'npm-exec.js', 'proc-opts.js']) {
+  // find-binary.js's intra-package requires, hand-listed: a missing one fails as
+  // MODULE_NOT_FOUND from inside the spawned child, which reads as "the resolver
+  // found nothing" rather than "this fixture is incomplete". `cache-paths.js`
+  // joined the list when the cold-cache write started consulting the teardown
+  // tombstone.
+  for (const f of ['find-binary.js', 'version-utils.js', 'npm-exec.js', 'proc-opts.js', 'cache-paths.js']) {
     fs.copyFileSync(path.join(__dirname, f), path.join(scripts, f));
   }
   const home = path.join(sandbox, 'home');

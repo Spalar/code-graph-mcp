@@ -10,7 +10,7 @@ const {
   settingsPath, surveyHookCoverage,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');
-const { UPDATE_STATE_FILE } = require('./cache-paths');
+const { UPDATE_STATE_FILE, uninstallTombstoneActive } = require('./cache-paths');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 const { hidden } = require('./proc-opts');
 const { MAX_UPDATE_ATTEMPTS, GLOBAL_PKG_HEAL_MAX_ATTEMPTS, isBinaryHealExhausted, readState } = require('./auto-update');
@@ -662,6 +662,34 @@ function formatReport(results, { checkOnly = false } = {}) {
  * Returns true (and prints redirection) when this copy must NOT write config.
  * `relic` is injectable for tests.
  */
+/**
+ * Second gate on the same two settings-writing arms: is this the state a
+ * teardown just produced, rather than damage?
+ *
+ * `doctor` repairs by default and is the natural way to check an uninstall
+ * worked. Reproduced: a clean teardown, then one `doctor` with no flags, and
+ * all six hook entries were back in settings.json and the teardown tombstone
+ * was gone — re-opening the 41 MB auto-update race the tombstone closes, since
+ * `install({ clearTombstone: true })` erases the one marker the three gates in
+ * auto-update.js read.
+ *
+ * `relicRepairGuard` cannot cover this: it asks whether THIS copy is the active
+ * install, and returns false the moment `activeInstallPath()` is null — exactly
+ * the post-uninstall state.
+ *
+ * Bounded by the tombstone's own TTL, and deliberately: past the window a
+ * torn-down install is indistinguishable from one that was installed but never
+ * set up, which IS a repair case. `torndown` is injectable for tests.
+ */
+function teardownRepairGuard({ log = console.log, torndown = undefined } = {}) {
+  const isTorndown = torndown !== undefined ? torndown : uninstallTombstoneActive();
+  if (!isTorndown) return false;
+  log('  ⚠ A teardown ran moments ago — skipping settings repair.');
+  log('     Missing hooks ARE the uninstalled state here, not damage to repair.');
+  log(`     If that was not intended: node "${path.join(__dirname, 'lifecycle.js')}" install`);
+  return true;
+}
+
 function relicRepairGuard({ log = console.log, relic = undefined } = {}) {
   const { isStaleRelicContext, activeInstallPath } = require('./lifecycle');
   const isRelic = relic !== undefined ? relic : isStaleRelicContext();
@@ -1133,6 +1161,7 @@ function runRepairs(results, {
       case 'hooks-invalid': {
         console.log('\n  Repairing hooks...');
         if (relicRepairGuard()) break;
+        if (teardownRepairGuard()) break;
         const { install, scanForBrokenPaths } = require('./lifecycle');
         const installResult = install({ clearTombstone: true });
         // Diagnosis already ran install()+re-scan and the paths were STILL
@@ -1172,6 +1201,7 @@ function runRepairs(results, {
       case 'missing-hooks-in-settings': {
         console.log('\n  Registering code-graph hooks in settings.json...');
         if (relicRepairGuard()) break;
+        if (teardownRepairGuard()) break;
         const { install } = require('./lifecycle');
         const r = install({ clearTombstone: true });
         if (r.hooksRegistered) {
@@ -1289,7 +1319,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason, autoUpdateLastError, silentFailureReason };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, teardownRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason, autoUpdateLastError, silentFailureReason };
 
 // Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
 // doctor …`. It exists as one function because the first version of this guard

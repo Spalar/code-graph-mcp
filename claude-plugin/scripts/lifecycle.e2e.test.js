@@ -1172,3 +1172,94 @@ test('the CLI install path is one of the two that asks for the clear', (t) => {
   assert.equal(fs.existsSync(tombstone), false,
     '`lifecycle.js install` is user intent; the TTL is the backstop for everything else');
 });
+
+// ── The teardown window binds doctor's repair pass too ──
+//
+// `doctor` is the natural way to check an uninstall worked, and it repairs by
+// default (`--check-only` opts out). Reproduced before the guard existed: a
+// clean teardown, then one `doctor` with no flags, and all six hook entries
+// were back in settings.json, the cache dir was re-created holding
+// binary-path + install-manifest.json + statusline-registry.json, and the
+// tombstone was gone — so the next in-flight updater walked straight into the
+// 41 MB arm that tombstone exists to close.
+
+test('doctor does not re-register hooks while a teardown tombstone stands', (t) => {
+  const homeDir = mkHome(t);
+  const doctorCli = path.join(__dirname, 'doctor.js');
+  const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
+  const settings = path.join(homeDir, '.claude', 'settings.json');
+
+  // The repair arm only, not the whole diagnosis: `runRepairs` takes the issue
+  // list, so this exercises the real install() against a real settings.json
+  // without spawning the binary for a health-check it does not need.
+  const repair = (fixId) => JSON.parse(execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    const { runRepairs } = require(${JSON.stringify(doctorCli)});
+    const fixed = runRepairs([{ name: 'Hook coverage', status: 'warn',
+                               fixId: ${JSON.stringify(fixId)} }]);
+    console.log('@@' + JSON.stringify({ fixed }));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot })
+    .toString().split('@@').pop().trim());
+
+  // BOTH settings-writing arms, not just the one the reproduction happened to
+  // raise. They are separate `case`s that each call install(), so guarding one
+  // and testing one leaves the other free to lose its guard silently.
+  for (const fixId of ['missing-hooks-in-settings', 'hooks-invalid']) {
+    writeJson(settings, {});
+    fs.mkdirSync(path.dirname(tombstone), { recursive: true });
+    fs.writeFileSync(tombstone, JSON.stringify({ at: new Date().toISOString() }));
+
+    const guarded = repair(fixId);
+    assert.equal(guarded.fixed, 0, `${fixId}: the uninstalled state is not an issue doctor gets to "fix"`);
+    assert.deepEqual(Object.keys(readJson(settings).hooks || {}), [],
+      `${fixId}: the hook entries the teardown removed must stay removed`);
+    assert.equal(fs.existsSync(tombstone), true,
+      `${fixId}: the marker survives — clearing it re-opens the race the teardown closed`);
+  }
+
+  // Control. Without it "0 fixed / no hooks" also describes a repair arm that
+  // never ran at all in this sandbox, which is the same green a guard wired to
+  // nothing would print.
+  fs.rmSync(tombstone, { force: true });
+  writeJson(settings, {});
+  const control = repair('missing-hooks-in-settings');
+  assert.equal(control.fixed, 1, 'control: with no teardown in flight doctor still repairs');
+  assert.ok(Object.keys(readJson(settings).hooks || {}).length > 0,
+    'control: the same call really does write hook entries — the guard is what stopped it above');
+});
+
+test('a binary lookup does not re-create the cache dir a teardown just removed', (t) => {
+  // `find-binary` writes `~/.cache/code-graph/binary-path` on every cold
+  // resolution and reaches CACHE_DIR through its own `os.homedir()` join rather
+  // than cache-paths.js — so it was the one hot-path writer the three
+  // auto-update gates did not cover. Measured: one findBinary() after a
+  // complete teardown brought the directory back.
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
+  const findBinaryCli = path.join(__dirname, 'find-binary.js');
+
+  const lookup = () => JSON.parse(execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    const fs = require('fs');
+    const found = require(${JSON.stringify(findBinaryCli)}).findBinary();
+    console.log('@@' + JSON.stringify({ found: !!found,
+      cacheDir: fs.existsSync(${JSON.stringify(cacheDir)}) }));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot })
+    .toString().split('@@').pop().trim());
+
+  fs.mkdirSync(path.dirname(tombstone), { recursive: true });
+  fs.writeFileSync(tombstone, JSON.stringify({ at: new Date().toISOString() }));
+
+  const guarded = lookup();
+  assert.equal(guarded.found, true, 'precondition: there IS a binary to resolve, so the write path is live');
+  assert.equal(guarded.cacheDir, false,
+    'resolving a binary must not rebuild the directory the teardown just reclaimed');
+
+  fs.rmSync(tombstone, { force: true });
+  const control = lookup();
+  assert.equal(control.cacheDir, true,
+    'control: with no teardown standing the same lookup DOES cache — the guard is what stopped it');
+});
