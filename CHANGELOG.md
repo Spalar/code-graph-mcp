@@ -114,10 +114,15 @@ memoizes it.
 
 **Still ungated, on purpose:** `launcher-install.js`. Its `acquireLock` mkdirs
 CACHE_DIR too, but the tombstone cannot tell a teardown from a reinstall —
-`/plugin install` leaves the tombstone standing by design — and this is the one
-path that puts a binary back afterwards. Gating it would trade a narrow residue
-window for a 0-tool MCP stub as the reward for reinstalling. The reasoning is now
-recorded at the call site so it is not "fixed" later by symmetry.
+`/plugin install` leaves the tombstone standing by design — and its npm arm is
+the one path that puts a binary back afterwards. The residue that buys is 47
+bytes (`install.lock`), measured with a tombstone standing; the npm arm installs
+into the npm global prefix, not CACHE_DIR. Pre-ship review corrected both halves
+of the original reasoning here, which had asserted ~41 MB without measuring and
+had overlooked that the GitHub fallback arm is already gated — so on a machine
+where `npm install -g` fails, a reinstall inside the window already gets nothing.
+The corrected reasoning is recorded at the call site so it is not "fixed" later
+by symmetry.
 
 ## 0.150.0
 

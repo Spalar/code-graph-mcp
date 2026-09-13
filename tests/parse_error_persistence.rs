@@ -14,9 +14,15 @@
 //! describes the changed files alone, so one clean incremental after a full
 //! index that found eight bad files would store `0` — "healthy", one edit to an
 //! unrelated file later. The stored value is therefore the set of offending
-//! paths, updated as `(stored - parsed_this_run) + errored_this_run`, which is
-//! the same rule for both run kinds: a full index parses everything, so the
-//! subtraction empties the set and the result is exactly what this run saw.
+//! paths, updated as `(stored - examined_this_run) + errored_this_run`, one rule
+//! for both run kinds.
+//!
+//! EXAMINED, not parsed. An earlier version of this file said "a full index
+//! parses everything, so the subtraction empties the set", and pre-ship review
+//! showed that false: a full index parses everything it CAN, and a file set
+//! aside as oversize / non-UTF-8 / unparseable kept its verdict through every
+//! subsequent full rebuild. `a_file_the_run_examined_but_skipped_loses_its_verdict_too`
+//! is the test for it.
 //!
 //! `incremental_run_over_other_files_keeps_the_verdict` is the test that
 //! separates the set from the count — it is green for a count too, but only
@@ -154,6 +160,53 @@ fn a_deleted_file_stops_counting_against_the_index() {
     assert!(
         f.recorded().is_empty(),
         "the offending file is gone; a verdict naming it is stale, got {:?}",
+        f.recorded()
+    );
+}
+
+#[test]
+fn a_file_the_run_examined_but_skipped_loses_its_verdict_too() {
+    // Pre-ship review, reviewer-reproduced. The fold's stated invariant — "a full
+    // index parses everything, so the subtraction empties the set" — was false: a
+    // full index parses everything it CAN. `pre_parse_batch` has three outcomes
+    // and the drain read only `parsed`, so a file that errored and then became
+    // unparseable-but-known (oversize here; non-UTF-8 and outright parse failure
+    // take the same exit) kept its verdict through any number of FULL rebuilds.
+    //
+    // That is worse than a stale count: `health-check` names a file as damaged
+    // when it is syntactically fine, and the remedy it implies — re-index —
+    // provably does not clear it.
+    //
+    // `Skipped` means the bytes were read and identified and the file's nodes
+    // were purged, so the old verdict is spent. `Nothing` (read failure, unknown
+    // language) stays excluded: no identity was established, the file re-diffs
+    // next run, and dropping a verdict on that basis would be guessing.
+    let f = fixture();
+    f.write("src/broken.rs", BROKEN);
+    assert_eq!(f.full(), 1, "precondition");
+    assert_eq!(
+        f.recorded(),
+        vec!["src/broken.rs".to_string()],
+        "precondition"
+    );
+
+    // Repaired AND pushed past CODE_GRAPH_MAX_FILE_SIZE, so this run reads it,
+    // identifies it, and skips it rather than parsing it.
+    let mut grown = String::from(CLEAN_A);
+    while grown.len() <= 1024 * 1024 {
+        grown.push_str("// pad pad pad pad pad pad pad pad pad pad pad pad pad\n");
+    }
+    f.write("src/broken.rs", &grown);
+    assert_eq!(
+        f.full(),
+        0,
+        "precondition: the rebuild parsed nothing broken"
+    );
+    assert!(
+        f.recorded().is_empty(),
+        "a FULL rebuild must not keep a verdict about a file it re-examined; the \
+         file is valid now and re-indexing is the remedy health-check implies, \
+         got {:?}",
         f.recorded()
     );
 }

@@ -2132,14 +2132,31 @@ pub(super) fn index_files(
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
         let pre_parsed = pre_parse_batch(batch, root, hashes, &counters);
 
-        // Drained here, before Phase 1b consumes `pre_parsed.parsed`. Skipped
-        // files are deliberately absent: nothing re-examined them this run, so
-        // whatever the index already believed about them stands.
+        // Drained here, before Phase 1b consumes the batch.
+        //
+        // `skipped` counts as EXAMINED, and leaving it out was a real hole: a
+        // full index parses everything it CAN, not everything. A file that
+        // errored and then became unparseable-but-known — repaired and grown
+        // past `max_file_size`, turned non-UTF-8, or failing the grammar
+        // outright — lands in `Skipped`, and its stale verdict survived any
+        // number of FULL rebuilds. `health-check` then named a syntactically
+        // valid file as damaged and the remedy it implies, re-indexing, provably
+        // did not clear it (pre-ship review, reviewer-reproduced).
+        //
+        // The bytes were read, the identity is known, and Phase 1b purges the
+        // file's nodes — so the old verdict is spent whichever way the file was
+        // set aside. `PreParseOutcome::Nothing` (read failure, unknown language)
+        // stays out for the opposite reason: no identity was established, the
+        // file re-diffs on the next run, and dropping a verdict on that basis
+        // would be guessing rather than observing.
         for p in &pre_parsed.parsed {
             parsed_paths.push(p.rel_path.clone());
             if p.has_parse_errors {
                 parse_error_paths.push(p.rel_path.clone());
             }
+        }
+        for s in &pre_parsed.skipped {
+            parsed_paths.push(s.rel_path.clone());
         }
 
         // The paths this batch purges WITHOUT reinserting anything. They have to
@@ -2324,8 +2341,19 @@ pub(super) fn index_files(
     // gone. Skipped when this run parsed nothing: the merge would then be the
     // identity, and a no-diff incremental should not rewrite the row. Deleted
     // files need no handling here — the set is intersected with `files` on read.
+    //
+    // Warn, do not `?`. The read side is already defensive on purpose
+    // (`health.rs` and `management.rs` both `.unwrap_or_default()` — a status
+    // poll must not fail over bookkeeping), and the write side using `?` was the
+    // asymmetry: the statement above has just CLEARED the in-flight marker, so a
+    // failure here (SQLITE_BUSY past the timeout, SQLITE_FULL) returned Err with
+    // the escalation evidence already gone, skipping Phase 3 — context strings,
+    // embeddings, the pending-call sweep — and nothing would re-trigger it.
+    // Losing an observability row is the smaller loss by far (pre-ship review).
     if !parsed_paths.is_empty() {
-        db.record_parse_error_files(&parsed_paths, &parse_error_paths)?;
+        if let Err(e) = db.record_parse_error_files(&parsed_paths, &parse_error_paths) {
+            tracing::warn!("could not record which files parsed with errors: {e}");
+        }
     }
 
     // Finalizing heartbeat: every phase below is a full-graph pass with no

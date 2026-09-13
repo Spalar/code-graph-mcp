@@ -110,24 +110,35 @@ function installBinaryInBackground({
 }) {
   let lock = null;
   // DELIBERATELY outside the teardown tombstone, unlike every other writer that
-  // can re-create CACHE_DIR. `acquireLock` mkdirs the lock file's parent, which
-  // IS CACHE_DIR, so a teardown landing here gets the directory back — and the
-  // install that follows brings the ~41 MB binary with it. auto-update.js gates
-  // its three writers on `uninstallTombstoneActive()` and find-binary.js's
-  // cold-cache memo now does too; this one does not, and must not:
+  // can re-create CACHE_DIR (auto-update.js gates its three; find-binary.js's
+  // cold-cache memo is gated too). The reason, corrected twice by pre-ship
+  // review — the first version of this comment got both the cost and the
+  // benefit wrong:
   //
-  // The tombstone cannot tell a teardown from a REINSTALL. `/plugin install`
-  // reaches `install()` through session-init, which by design does NOT pass
-  // `clearTombstone` (a record any concurrent session may erase protects
-  // nobody — see the comment on lifecycle.js's install()). So right after a
-  // legitimate reinstall the tombstone is still standing AND the cache was
-  // emptied by the teardown that preceded it — exactly the state where this
-  // path is the only thing that puts a binary back. Gating it would hand the
-  // user a 0-tool stub for the rest of the TTL as the reward for reinstalling.
+  // COST, measured rather than assumed. `acquireLock` mkdirs the lock file's
+  // parent, which IS CACHE_DIR, so a teardown landing here does get the
+  // directory back. What lands in it is `install.lock` — **47 bytes**, measured
+  // with a tombstone standing in a sandbox HOME. Not the ~41 MB an earlier
+  // version of this comment claimed: the npm arm below installs into the npm
+  // global prefix, not CACHE_DIR.
   //
-  // The cost of staying ungated is bounded and smaller: a teardown that races
-  // an MCP relaunch gets CACHE_DIR back. Not a crash either way — the
-  // missing-binary path already answers the handshake with `serveEmptyMcpStub`.
+  // BENEFIT, and it is narrower than it looks. The tombstone cannot tell a
+  // teardown from a REINSTALL: `/plugin install` reaches `install()` through
+  // session-init, which by design does not pass `clearTombstone` (a record any
+  // concurrent session may erase protects nobody — see lifecycle.js's
+  // install()). So right after a legitimate reinstall the tombstone still
+  // stands and the cache is empty, and this path is what puts a binary back.
+  // But only its FIRST arm is: the GitHub fallback below spawns auto-update
+  // with --install-missing, and `downloadBinary` opens with its own
+  // `tombstoneActive()` check, so on a machine where `npm install -g` fails —
+  // offline registry, npm absent, EACCES on the global prefix, precisely why
+  // that fallback exists — the reinstall already gets nothing for the rest of
+  // the TTL. Gating here would extend that to the npm arm as well, which is the
+  // arm that currently works.
+  //
+  // So: 47 bytes of residue against the one reinstall path that survives the
+  // window. Not a crash either way — the missing-binary path already answers
+  // the handshake with `serveEmptyMcpStub`.
   if (lockPath) {
     lock = acquireLock(lockPath);
     if (!lock) {

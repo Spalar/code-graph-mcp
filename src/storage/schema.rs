@@ -19,8 +19,16 @@ pub const META_KEY_INDEX_RUN_IN_FLIGHT: &str = "index_run_in_flight";
 /// count it observed describes those files alone: one clean edit after a full
 /// index that found eight bad files would store `0` and the index would report
 /// itself healthy while still serving symbols from a damaged parse. The set is
-/// updated as `(stored - parsed_this_run) + errored_this_run`, one rule for both
-/// run kinds — a full index parses everything, so the subtraction empties it.
+/// updated as `(stored - examined_this_run) + errored_this_run`, one rule for
+/// both run kinds.
+///
+/// EXAMINED, not parsed — an earlier version of this comment said "a full index
+/// parses everything, so the subtraction empties it", and that is false: a full
+/// index parses everything it CAN. A file set aside as oversize, non-UTF-8, or
+/// unparseable is read and identified and has its nodes purged, so it counts as
+/// examined; leaving it out kept a stale verdict alive through any number of
+/// full rebuilds. A file whose read failed outright stays excluded — no identity
+/// was established, and it re-diffs next run.
 ///
 /// No SCHEMA_VERSION bump: the `meta` table is v7 and an absent key reads as
 /// "nothing known to be degraded", which is the correct answer for every index

@@ -538,22 +538,27 @@ If you see this repeatedly, another code-graph server of a different version is 
     }
 
     /// Fold one run's verdict into the stored set:
-    /// `(stored - parsed_this_run) + errored_this_run`.
+    /// `(stored - examined_this_run) + errored_this_run`.
     ///
     /// The subtraction is what makes an incremental run safe. Only a file this
-    /// run actually PARSED can have changed its verdict; one it never opened
-    /// keeps whatever was known about it. A full index parses everything, so the
-    /// subtraction empties the set and the result is exactly this run's finding
-    /// — no separate full-vs-incremental branch, and no way for the two to drift.
+    /// run re-examined can have changed its verdict; one it never opened keeps
+    /// whatever was known about it. One rule for both run kinds — no separate
+    /// full-vs-incremental branch, and no way for the two to drift.
     ///
-    /// Files skipped for size / encoding / read failure are deliberately NOT in
-    /// `parsed`: nothing re-examined them, so their verdict stands.
-    pub fn record_parse_error_files(&self, parsed: &[String], errored: &[String]) -> Result<()> {
+    /// `examined` is wider than "parsed", and the difference was a real defect:
+    /// a full index parses everything it CAN, so a file set aside as oversize,
+    /// non-UTF-8 or unparseable never entered the subtraction and kept a stale
+    /// "damaged parse" verdict through every subsequent full rebuild. Those
+    /// files were read, identified, and had their nodes purged — the old verdict
+    /// is spent. A file whose READ failed is the one that must stay out: no
+    /// identity was established, so it re-diffs next run and self-heals.
+    pub fn record_parse_error_files(&self, examined: &[String], errored: &[String]) -> Result<()> {
         let previous = self.parse_error_files()?;
-        let reparsed: std::collections::HashSet<&str> = parsed.iter().map(String::as_str).collect();
+        let reexamined: std::collections::HashSet<&str> =
+            examined.iter().map(String::as_str).collect();
         let mut kept: Vec<String> = previous
             .into_iter()
-            .filter(|p| !reparsed.contains(p.as_str()))
+            .filter(|p| !reexamined.contains(p.as_str()))
             .collect();
         kept.extend(errored.iter().cloned());
         kept.sort();
