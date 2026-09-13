@@ -427,6 +427,7 @@ skill does is also runnable by hand.
 - **Rust has no `inherits` edges** — the language has no class inheritance, so `impl Trait for Type` is recorded as `implements` and an `inherits`-filtered query returns empty for Rust.
 - **Kotlin/Swift interface conformance** is recorded as `inherits` (both use a single `: Type` grammar for base classes and protocols/interfaces), so `implements`-filtered queries return empty for these two languages.
 - **Cross-file dead-code detection** may false-positive a type whose only cross-file reference sits beyond the 4096-byte stored-content cap per node (documented accepted limitation, v0.97.1).
+- **Rust: borrowing a binding named `raw`** (`&raw`, `&raw[..]`, `&raw.field`) is misread by the pinned `tree-sitter-rust` 0.23 grammar as the start of the `&raw const` / `&raw mut` pointer operator, so the enclosing expression can be dropped from the index. `&mut raw`, `&self.raw` and the genuine `&raw const x` operator all parse correctly. The index reports the damage rather than hiding it, but only while indexing: a run prints `Syntax errors in <file> — symbols may be incomplete` per file plus an `N file(s) parsed with syntax errors` total. Nothing replays that afterwards — `health-check` and `doctor` both report a degraded index as healthy, so re-run the index to see the list. Workaround: rename the binding. Measured on this repo: 8 of 161 Rust files trip the warning (the total says 9 — a Markdown file trips the same counter for an unrelated reason), and one symbol is lost, `cmd_affected`. Recovery is usually partial rather than total: across a fixture covering every trigger shape, the surrounding functions and their call edges survived.
 
 ## Team-shared graph snapshot
 
@@ -446,8 +447,13 @@ npx -y -p @sdsrs/code-graph code-graph-mcp snapshot inspect ./code-graph-snapsho
 ```
 
 After setup, the auto-fetch is **opt-in per consumer**: an untrusted repo could
-otherwise seed a misleading graph, so an unconfigured clone prints a hint and
-skips the install. Enable it with one of the trust signals below. These live in
+otherwise seed a misleading graph, so an unconfigured clone silently skips the
+install — the explanation is logged at `debug` level (`RUST_LOG=debug`) rather
+than warned, because deciding whether this repo even publishes a snapshot would
+require the network call the gate is declining to make, and an unconditional
+warning would fire on every repository. A committed `[snapshot] url` override is
+louder: that one does warn, because the file is already asking for something.
+Enable the auto-fetch with one of the trust signals below. These live in
 the *environment* (never in `.code-graph.toml`) so a committed/PR-injected config
 file cannot set them.
 

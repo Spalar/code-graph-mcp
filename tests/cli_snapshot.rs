@@ -40,6 +40,127 @@ fn init_git_repo() -> TempDir {
     dir
 }
 
+/// The `[snapshot] url` trust gate, exercised through the real binary.
+///
+/// # Why this is not covered by the unit tests
+///
+/// `resolve_snapshot_source_impl` takes `url_trusted` as a PARAMETER, and every
+/// unit test passes it directly. The env read lives in the thin public wrapper
+/// `resolve_snapshot_source`, which no test reaches — so renaming the variable,
+/// inverting the comparison, or reading `SNAPSHOT_TRUST_ORIGIN` here by
+/// copy-paste would leave the whole suite green while the gate that blocks
+/// malicious-repo snapshot injection silently stopped opening (or worse, stopped
+/// closing). Subprocesses, not `set_var`: the env is process-global and the rest
+/// of the suite runs in parallel.
+///
+/// Case B is the non-vacuity anchor. Without a case that is ALLOWED through,
+/// "everything was refused" is equally consistent with a gate that works and a
+/// gate wired to a variable nobody sets. Port 1 is reserved, so the trusted
+/// fetch fails on connection-refused immediately and offline.
+#[test]
+fn cli_snapshot_url_override_honors_only_its_own_env_signal() {
+    let repo = init_git_repo();
+    std::fs::write(
+        repo.path().join(".code-graph.toml"),
+        "[snapshot]\nurl = \"https://127.0.0.1:1/attacker.db.zst\"\n",
+    )
+    .unwrap();
+
+    const REFUSAL: &str = "CODE_GRAPH_SNAPSHOT_TRUST_URL=1 in your environment to trust it";
+    const ATTEMPTED: &str = "Snapshot install failed";
+    let pin = "a".repeat(64);
+
+    /// label, the one trust signal this case sets (if any), and whether the
+    /// committed url override is expected to be honored.
+    type Case<'a> = (&'a str, Option<(&'a str, &'a str)>, bool);
+
+    let cases: [Case; 6] = [
+        ("no signal", None, false),
+        (
+            "TRUST_URL=1",
+            Some(("CODE_GRAPH_SNAPSHOT_TRUST_URL", "1")),
+            true,
+        ),
+        (
+            "TRUST_ORIGIN=1 must not unlock a url override",
+            Some(("CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN", "1")),
+            false,
+        ),
+        (
+            "PIN must not unlock a url override",
+            Some(("CODE_GRAPH_SNAPSHOT_PIN", pin.as_str())),
+            false,
+        ),
+        (
+            "TRUST_URL=0",
+            Some(("CODE_GRAPH_SNAPSHOT_TRUST_URL", "0")),
+            false,
+        ),
+        (
+            "TRUST_URL=true is not the literal 1",
+            Some(("CODE_GRAPH_SNAPSHOT_TRUST_URL", "true")),
+            false,
+        ),
+    ];
+
+    for (label, signal, honored) in cases {
+        let _ = std::fs::remove_dir_all(repo.path().join(".code-graph"));
+        let mut cmd = Command::new(cli_bin());
+        cmd.args(["reindex", "--from-snapshot"])
+            .current_dir(repo.path())
+            .env("CODE_GRAPH_DISABLE_MODEL_DOWNLOAD", "1")
+            // Pinned, not left to the ambient env (same reason cli_e2e.rs pins
+            // it): the refusal this test matches on is a `tracing::warn!`, and
+            // `EnvFilter::try_from_default_env()` lets a shell or CI exporting
+            // `RUST_LOG=error` swallow it. The five refuse-cases would then fail
+            // claiming the gate had been BYPASSED while their own captured
+            // output says "No snapshot source resolved" — sending whoever hits
+            // it to debug a security gate that is working.
+            .env("RUST_LOG", "warn")
+            // Never inherit the developer's own trust signals, and keep the
+            // connection-refused outcome independent of an ambient proxy.
+            .env_remove("CODE_GRAPH_SNAPSHOT_TRUST_URL")
+            .env_remove("CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN")
+            .env_remove("CODE_GRAPH_SNAPSHOT_PIN")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy");
+        if let Some((k, v)) = signal {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        if honored {
+            assert!(
+                !text.contains(REFUSAL),
+                "[{label}] override was refused despite its own trust signal — \
+                 the env read in resolve_snapshot_source is not wired.\n{text}"
+            );
+            assert!(
+                text.contains(ATTEMPTED),
+                "[{label}] expected the trusted url to be fetched (and fail on \
+                 connection-refused); without this the other cases prove nothing.\n{text}"
+            );
+        } else {
+            assert!(
+                text.contains(REFUSAL),
+                "[{label}] a committed url override was honored without \
+                 CODE_GRAPH_SNAPSHOT_TRUST_URL=1.\n{text}"
+            );
+            assert!(
+                !text.contains(ATTEMPTED),
+                "[{label}] the untrusted url was contacted.\n{text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn cli_snapshot_create_then_inspect_round_trip() {
     let repo = init_git_repo();

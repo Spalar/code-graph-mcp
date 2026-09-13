@@ -123,7 +123,9 @@ impl McpServer {
         type NotSearched = Option<&'static str>;
         let retrieve = |fetch: i64| -> Result<(Fused, Fused, bool, NotSearched)> {
             let fts_result = queries::fts5_search(self.db.conn(), query, fetch)?;
-            let or_fallback = fts_result.or_fallback;
+            // Both widening arms feed one flag; `FtsResult::is_widened_match`
+            // carries the rationale and the two surface consequences.
+            let or_fallback = fts_result.is_widened_match();
             let fts_not_searched = fts_result.empty_reason;
             // Carry raw BM25 scores for score blending in RRF fusion.
             let fts_search: Fused = fts_result
@@ -1185,6 +1187,69 @@ mod tests {
         let server = McpServer::new_test_with_project(project.path());
         crate::indexer::pipeline::run_full_index(&server.db, project.path(), None, None).unwrap();
         server
+    }
+
+    /// A CJK substring rescue must reach the response carrying the widened-match
+    /// penalty.
+    ///
+    /// `FtsResult::is_widened_match()` is read at exactly one place, and the
+    /// unit test beside it pins the truth table rather than the use — replacing
+    /// the call with `fts_result.or_fallback` leaves the whole suite green while
+    /// every rescued CJK query silently ships full confidence.
+    ///
+    /// `match_confidence` itself is only emitted when a vector channel exists,
+    /// and this harness hard-codes `embedding_model: None`, so it is asserted
+    /// through `relevance`, which carries it on every build:
+    ///
+    ///   relevance = score/max_rrf * query_quality * match_confidence * 100
+    ///              * name_boost * size_dampening
+    ///
+    /// Both queries resolve the SAME single node, so score/max_rrf is 1.0,
+    /// name_boost and size_dampening are identical, and both are one token
+    /// longer than two bytes so query_quality is 0.7 for each. Everything
+    /// cancels except the factor under test, leaving the ratio at exactly
+    /// `CONF_OR_FALLBACK_PENALTY`. Under the mutation it is 1.0.
+    #[test]
+    fn test_cjk_rescue_takes_the_widened_match_penalty() {
+        let project = tempfile::TempDir::new().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // `gateway` is its own FTS token; 订单 sits INSIDE the unspaced run
+        // 创建订单并扣减库存, so only the substring scan can reach it.
+        std::fs::write(
+            src.join("handler.py"),
+            "def handler(req):\n    \"\"\"gateway 创建订单并扣减库存\"\"\"\n    return req\n",
+        )
+        .unwrap();
+        let server = indexed_server(&project);
+
+        let top_relevance = |q: &str| -> f64 {
+            let out = server
+                .tool_semantic_search(&json!({"query": q, "top_k": 5, "skip_indexing": true}))
+                .unwrap();
+            let results = out["results"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                results.len(),
+                1,
+                "fixture must resolve exactly one node for {q:?}, else the ratio \
+                 below compares different rows: {out}"
+            );
+            assert_eq!(results[0]["name"].as_str(), Some("handler"), "{out}");
+            results[0]["relevance"].as_f64().unwrap()
+        };
+
+        let direct = top_relevance("gateway");
+        let rescued = top_relevance("订单");
+        assert!(direct > 0.0, "control: the direct hit must score");
+
+        let ratio = rescued / direct;
+        let expected = crate::domain::CONF_OR_FALLBACK_PENALTY;
+        assert!(
+            (ratio - expected).abs() < 0.02,
+            "a rescued CJK query must ship the widened-match penalty: \
+             rescued {rescued} / direct {direct} = {ratio}, expected {expected} \
+             (1.0 means the call site stopped reading is_widened_match)"
+        );
     }
 
     /// The always-on `<module>`/`<external>`/test filter must not silently eat

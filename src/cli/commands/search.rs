@@ -449,6 +449,16 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         eprintln!("[code-graph] Note: AND match insufficient, showing OR results (broader match).");
     }
 
+    // Same placement and reason as the note above: the consumer reading a bare
+    // JSON array cannot tell substring hits from tokenized ones, and these are
+    // ranked without BM25 — identifier hits first, then shortest body — so the
+    // ordering is weaker evidence than a normal search's.
+    if fts_result.cjk_substring_fallback {
+        eprintln!(
+            "[code-graph] Note: no tokenized match — showing substring matches (the index tokenizer stores an unspaced CJK phrase as one token, so a word inside it is only reachable by substring)."
+        );
+    }
+
     // Same placement and the same reason as the OR-fallback note above: a SHORT
     // result array is byte-identical to a complete one, so the consumer that
     // cannot infer the shortfall from stdout is exactly the one reading `--json`.

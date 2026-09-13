@@ -18,6 +18,9 @@ pub struct FtsResult {
     pub bm25_scores: Vec<f64>,
     /// True if AND mode failed and OR fallback was used (weaker match).
     pub or_fallback: bool,
+    /// True when these rows came from the CJK substring scan rather than from
+    /// FTS5 MATCH. Surfaces are expected to label them as a widened match.
+    pub cjk_substring_fallback: bool,
     /// Why the result set is empty, when the reason is the QUERY rather than the
     /// index. `None` means the search really ran and found nothing.
     ///
@@ -30,6 +33,31 @@ pub struct FtsResult {
     pub empty_reason: Option<&'static str>,
 }
 
+impl FtsResult {
+    /// Whether these rows are a WIDENED match — the precise query found nothing
+    /// and the net was cast wider — as opposed to a direct hit.
+    ///
+    /// Both arms qualify for the same reason, so confidence scoring treats them
+    /// alike rather than inventing a second constant: an OR fallback dropped the
+    /// AND requirement, and a CJK substring rescue dropped tokenization.
+    ///
+    /// This flag drives exactly one thing: the widened-match confidence penalty
+    /// (`CONF_OR_FALLBACK_PENALTY`). Scope it no wider when reading the call
+    /// site — the "no text anchor" warning next to it keys on
+    /// `fts_search.is_empty()` and never reads this flag, so it stops firing for
+    /// a rescued CJK query because the scan returned ROWS, with or without the
+    /// flag existing.
+    ///
+    /// The penalty IS observable: `match_confidence` is a response field and it
+    /// multiplies every result's `relevance`, so a CJK rescue that lost this flag
+    /// would ship `1.0` where it owes `0.6`.
+    /// `mcp::server::tools::search` pins that end-to-end; the truth table below
+    /// alone would leave the call site free to revert.
+    pub fn is_widened_match(&self) -> bool {
+        self.or_fallback || self.cjk_substring_fallback
+    }
+}
+
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<FtsResult> {
     fts5_search_impl(conn, query, limit, true)
 }
@@ -40,7 +68,224 @@ pub fn fts5_search_with_tests(conn: &Connection, query: &str, limit: i64) -> Res
     fts5_search_impl(conn, query, limit, false)
 }
 
+/// What counts as part of a term when splitting a raw query.
+///
+/// One definition, two readers: the MATCH preprocessing below and the substring
+/// rescue in `cjk_substring_scan`. They must agree on where a term ends or the
+/// rescue would scan for a string the MATCH path never looked up — the two
+/// splitters drifting apart is exactly the class of bug that makes a filter
+/// silently stop matching valid indexed nodes.
+fn is_term_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Scripts written without spaces between words.
+///
+/// `unicode61` (the tokenizer `nodes_fts` declares) classes every one of these
+/// code points as alphanumeric, so a whole phrase with no interior punctuation
+/// becomes ONE token: `创建订单并扣减库存` is a single term. FTS5 matches tokens
+/// and prefixes, never substrings, so `订单` — a real word sitting in the middle
+/// of that token — can not be reached by MATCH at all. The text is indexed and
+/// stored, and still answers "no results".
+///
+/// Covered, each with a fixture in this module's tests: CJK Unified Ideographs
+/// and Extensions A-F, compatibility ideographs, full-width AND half-width kana,
+/// precomposed Hangul syllables. NOT covered: Hangul compatibility Jamo, and
+/// Thai/Lao/Khmer — they share the property, no fixture exercises them, so they
+/// are left out rather than claimed.
+fn is_unsegmented_script(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF     // Hiragana + Katakana
+        | 0x3400..=0x4DBF   // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF   // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF   // Hangul syllables
+        | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
+        | 0xFF66..=0xFF9D   // Half-width katakana (common in legacy JP source)
+        | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+        | 0x2A700..=0x2EBEF // CJK Unified Ideographs Extensions C-F
+    )
+}
+
+/// How many distinct unsegmented-script terms the substring scan will AND.
+///
+/// Not a tuning knob — a correctness bound. `clauses.join(" AND ")` builds a
+/// left-deep AND tree whose depth is the term count, and SQLite refuses to
+/// prepare a statement past `SQLITE_MAX_EXPR_DEPTH` (1000), so pasting a
+/// punctuated CJK document into `search` turned a query that used to answer
+/// "no results" into a hard error on the CLI and a JSON-RPC error over MCP.
+/// Anything past a handful of AND-ed words matches nothing anyway, so the
+/// over-long query keeps the pre-rescue contract — an honest empty — rather
+/// than paying for a scan that cannot succeed.
+const CJK_SCAN_MAX_TERMS: usize = 32;
+
+/// The ranking terms after the identifier-hit CASE: densest body, then id.
+///
+/// A const so the final tiebreak is inspectable. Pinning it behaviourally would
+/// need two rows agreeing on every preceding term, and SQLite's order without a
+/// tiebreak is stable-but-unspecified — such a fixture passes with the tiebreak
+/// deleted, which is the vacuous shape
+/// `test_fuzzy_fallback_pool_is_deterministically_bounded` already works around
+/// for the fuzzy pool. Same workaround, same reason.
+const CJK_SCAN_ORDER_TAIL: &str = ", LENGTH(COALESCE(n.code_content, '')), n.id";
+
 fn fts5_search_impl(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    exclude_tests: bool,
+) -> Result<FtsResult> {
+    let matched = fts5_search_match(conn, query, limit, exclude_tests)?;
+    // Only a search that RAN and found nothing is worth widening. `empty_reason`
+    // means no SQL ever executed (every term was dropped in preprocessing), and
+    // a substring scan for a query the tokenizer rejected would answer a
+    // question the user was already told was unanswerable.
+    if !matched.nodes.is_empty() || matched.empty_reason.is_some() {
+        return Ok(matched);
+    }
+    cjk_substring_scan(conn, query, limit, exclude_tests)
+}
+
+/// Substring rescue for unsegmented-script queries that MATCH could not reach.
+///
+/// Scoped three ways so it cannot become a general fuzzy-match: it runs only
+/// after MATCH returned zero rows, only over the terms that actually contain
+/// unsegmented-script characters (an ASCII term in a mixed query stays on MATCH
+/// semantics — substring-matching Latin text would turn every typo into a
+/// flood), and it AND-joins those terms, mirroring the AND-first strategy above.
+///
+/// # The scope is WHOLE-RESULT-empty, which leaves a real gap
+///
+/// A mixed query whose Latin half matches anything never reaches here, so the
+/// CJK word in `search "payment 订单"` stays exactly as unreachable as before
+/// this function existed: the AND fails, the OR fallback matches `payment`, the
+/// result is non-empty, and the caller returns. The user sees rows and gets no
+/// signal that half the query went unanswered. Widening the trigger to "no
+/// returned row matched any CJK term" would fix it but has to union two ranked
+/// sets, so it is deliberately out of scope here and documented in the README
+/// rather than half-done. `test_mixed_query_leaves_the_cjk_term_unreachable`
+/// pins the current behaviour so the gap cannot close by accident and go
+/// unnoticed.
+///
+/// Rows carry no BM25 score: there is none. The `0.0` tells `weighted_rrf_fusion`
+/// no raw score is available, so these rank by RRF position alone rather than by
+/// a number invented for them.
+fn cjk_substring_scan(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    exclude_tests: bool,
+) -> Result<FtsResult> {
+    let empty = |()| FtsResult {
+        nodes: vec![],
+        bm25_scores: vec![],
+        or_fallback: false,
+        cjk_substring_fallback: false,
+        empty_reason: None,
+    };
+
+    // Each MAXIMAL RUN of unsegmented-script characters is its own term. Filtering
+    // the non-CJK characters out of a token instead would glue the run on either
+    // side of them together and scan for a string nobody typed: `订x单` would look
+    // for `%订单%` and match a document containing neither `订x单` nor `订 单`.
+    let mut cjk_terms: Vec<String> = Vec::new();
+    let mut run = String::new();
+    for c in query.chars() {
+        if is_unsegmented_script(c) {
+            run.push(c);
+        } else if !run.is_empty() {
+            cjk_terms.push(std::mem::take(&mut run));
+        }
+    }
+    if !run.is_empty() {
+        cjk_terms.push(run);
+    }
+    cjk_terms.sort_unstable(); // deterministic ?1..?N binding
+    cjk_terms.dedup();
+    if cjk_terms.is_empty() {
+        return Ok(empty(()));
+    }
+    // Past the bound the AND tree cannot be prepared at all — see
+    // `CJK_SCAN_MAX_TERMS`. Answer the pre-rescue empty rather than an error.
+    if cjk_terms.len() > CJK_SCAN_MAX_TERMS {
+        return Ok(empty(()));
+    }
+
+    // The columns `nodes_fts` indexes that can hold prose. `n.name` is scanned
+    // first in the ORDER BY below so an identifier hit outranks a body hit.
+    const TEXT_COLS: [&str; 5] = [
+        "n.name",
+        "n.qualified_name",
+        "n.code_content",
+        "n.context_string",
+        "n.doc_comment",
+    ];
+
+    let mut params: Vec<String> = Vec::with_capacity(cjk_terms.len());
+    let mut clauses: Vec<String> = Vec::with_capacity(cjk_terms.len());
+    let mut name_hit_ors: Vec<String> = Vec::with_capacity(cjk_terms.len() * 2);
+    for (i, term) in cjk_terms.iter().enumerate() {
+        // `escape_like` cannot currently fire: none of `%`, `_` or `\` is inside
+        // any range `is_unsegmented_script` accepts, so every term is already
+        // literal. It stays as the invariant that keeps `ESCAPE '\'` honest if
+        // that predicate is ever widened — not as a guard anything exercises.
+        params.push(format!("%{}%", escape_like(term)));
+        let idx = i + 1;
+        let ors: Vec<String> = TEXT_COLS
+            .iter()
+            .map(|col| format!("{} LIKE ?{} ESCAPE '\\'", col, idx))
+            .collect();
+        clauses.push(format!("({})", ors.join(" OR ")));
+        name_hit_ors.push(format!("n.name LIKE ?{} ESCAPE '\\'", idx));
+        name_hit_ors.push(format!("n.qualified_name LIKE ?{} ESCAPE '\\'", idx));
+    }
+    let test_filter = if exclude_tests {
+        " AND n.is_test = 0"
+    } else {
+        ""
+    };
+    // An unordered LIMIT picks an arbitrary subset (the invariant
+    // `test_fuzzy_fallback_pool_is_deterministically_bounded` pins for the fuzzy
+    // pool). Rank: identifier hits first, then the densest match — a short body
+    // containing the term is a stronger signal than a long one — then id, so the
+    // order is total and the same query always answers the same way.
+    //
+    // The CASE spans EVERY term, not just `?1`. Hard-coding `?1` ranked on
+    // whichever term happened to sort first in UTF-8 order, so for `订单 库存`
+    // a node named `订单处理器` lost to an unrelated short body while
+    // `库存处理器` won — "identifier hits first" held for one arbitrary half of
+    // the query.
+    let name_hit = format!("CASE WHEN {} THEN 0 ELSE 1 END", name_hit_ors.join(" OR "));
+    let sql = format!(
+        "SELECT {} FROM nodes n WHERE {}{} ORDER BY {}{} LIMIT ?{}",
+        NODE_SELECT_ALIASED,
+        clauses.join(" AND "),
+        test_filter,
+        name_hit,
+        CJK_SCAN_ORDER_TAIL,
+        cjk_terms.len() + 1
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::ToSql)
+        .collect::<Vec<_>>();
+    bound.push(&limit);
+    let rows = stmt.query_map(bound.as_slice(), map_node_row)?;
+    let nodes: Vec<NodeResult> = rows.collect::<Result<Vec<_>, _>>()?;
+    if nodes.is_empty() {
+        return Ok(empty(()));
+    }
+    Ok(FtsResult {
+        bm25_scores: vec![0.0; nodes.len()],
+        nodes,
+        or_fallback: false,
+        cjk_substring_fallback: true,
+        empty_reason: None,
+    })
+}
+
+fn fts5_search_match(
     conn: &Connection,
     query: &str,
     limit: i64,
@@ -59,7 +304,6 @@ fn fts5_search_impl(
     // hard zero, and the empty response blamed the user's spelling (audit
     // 2026-08-16 P1-6). `_` stays a term character so snake_case identifiers
     // survive as one token.
-    let is_term_char = |c: char| c.is_alphanumeric() || c == '_';
     let raw_terms: Vec<&str> = query
         .split(|c: char| !is_term_char(c))
         .filter(|w| !w.is_empty())
@@ -107,6 +351,7 @@ fn fts5_search_impl(
             nodes: vec![],
             bm25_scores: vec![],
             or_fallback: false,
+            cjk_substring_fallback: false,
             empty_reason: if !had_input {
                 Some("the query has no searchable characters")
             } else if all_stop_words {
@@ -159,6 +404,7 @@ fn fts5_search_impl(
                 nodes,
                 bm25_scores,
                 or_fallback: false,
+                cjk_substring_fallback: false,
                 empty_reason: None,
             });
         }
@@ -237,6 +483,7 @@ fn fts5_search_impl(
                             // co-occur never reaches this branch — it returns from
                             // the AND above with the penalty correctly absent.
                             or_fallback: true,
+                            cjk_substring_fallback: false,
                             empty_reason: None,
                         });
                     }
@@ -245,6 +492,7 @@ fn fts5_search_impl(
                     nodes: vec![],
                     bm25_scores: vec![],
                     or_fallback: false,
+                    cjk_substring_fallback: false,
                     empty_reason: None,
                 });
             }
@@ -267,6 +515,7 @@ fn fts5_search_impl(
                             nodes: vec![],
                             bm25_scores: vec![],
                             or_fallback: false,
+                            cjk_substring_fallback: false,
                             empty_reason: None,
                         });
                     }
@@ -285,6 +534,7 @@ fn fts5_search_impl(
         nodes,
         bm25_scores,
         or_fallback: terms.len() > 1,
+        cjk_substring_fallback: false,
         empty_reason: None,
     })
 }
@@ -1176,6 +1426,585 @@ mod tests {
             "multi-word query keeps OR-fallback"
         );
         assert!(result.or_fallback, "expected or_fallback flag to be true");
+    }
+
+    /// Seeds one node whose text carries a long unsegmented CJK run.
+    ///
+    /// `unicode61` classifies every CJK ideograph as alphanumeric, so a run with
+    /// no interior punctuation becomes ONE token. That makes the words inside it
+    /// unreachable by MATCH, which is what the substring fallback exists to fix.
+    fn cjk_fixture() -> (crate::storage::db::Database, tempfile::TempDir) {
+        let (db, tmp) = test_db();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "order.py".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
+        insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "create_order".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "def create_order(uid):\n    pass".into(),
+                signature: None,
+                doc_comment: Some("创建订单并扣减库存".into()),
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "charge_card".into(),
+                qualified_name: None,
+                start_line: 7,
+                end_line: 9,
+                code_content: "def charge_card(token):\n    pass".into(),
+                signature: None,
+                doc_comment: Some("payment gateway wrapper".into()),
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        (db, tmp)
+    }
+
+    /// The defect: `订单` is INSIDE the stored run `创建订单并扣减库存`, so MATCH
+    /// cannot reach it. Before the fallback this returned zero rows and the CLI
+    /// told the user the term does not exist.
+    #[test]
+    fn test_cjk_substring_query_finds_node() {
+        let (db, _tmp) = cjk_fixture();
+
+        // Precondition, not decoration: if MATCH ever starts segmenting CJK this
+        // test would pass for a reason that has nothing to do with the fallback.
+        let via_match = fts5_search(db.conn(), "创建订单并扣减库存", 10).unwrap();
+        assert_eq!(
+            via_match.nodes.len(),
+            1,
+            "whole-run query must match via FTS5 — fixture or tokenizer changed"
+        );
+        assert!(
+            !via_match.cjk_substring_fallback,
+            "whole-run query is a real MATCH hit, the fallback must not fire"
+        );
+
+        let result = fts5_search(db.conn(), "订单", 10).unwrap();
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "a CJK word inside an unsegmented run must be reachable"
+        );
+        assert_eq!(result.nodes[0].name, "create_order");
+        assert!(
+            result.cjk_substring_fallback,
+            "this hit came from the substring scan and must say so"
+        );
+    }
+
+    /// The fallback is scoped to CJK. An ASCII miss must stay an honest empty —
+    /// otherwise every typo turns into a substring flood.
+    #[test]
+    fn test_ascii_miss_does_not_trigger_substring_fallback() {
+        let (db, _tmp) = cjk_fixture();
+
+        let result = fts5_search(db.conn(), "gatewa", 10).unwrap();
+        assert!(
+            result.nodes.is_empty(),
+            "ASCII substring of an indexed word must NOT be found by the CJK fallback"
+        );
+        assert!(!result.cjk_substring_fallback);
+    }
+
+    /// A CJK query that MATCH already answers must not pay for the scan, and a
+    /// CJK query matching nothing at all must stay empty rather than return rows.
+    #[test]
+    fn test_cjk_fallback_only_fires_on_empty_and_only_for_cjk() {
+        let (db, _tmp) = cjk_fixture();
+
+        let miss = fts5_search(db.conn(), "无关词条", 10).unwrap();
+        assert!(miss.nodes.is_empty(), "genuine CJK miss stays empty");
+
+        // ASCII query that MATCH answers: fallback flag stays clear.
+        let ascii = fts5_search(db.conn(), "payment gateway", 10).unwrap();
+        assert!(!ascii.nodes.is_empty(), "ASCII search still works");
+        assert!(!ascii.cjk_substring_fallback);
+    }
+
+    /// Both widening arms must read as widened, and a direct hit must not.
+    ///
+    /// This pins the truth table only. It does NOT pin the call site: replacing
+    /// `fts_result.is_widened_match()` with `fts_result.or_fallback` leaves this
+    /// test green, so `test_cjk_rescue_takes_the_widened_match_penalty` in
+    /// `mcp::server::tools::search` is the one that kills that mutation.
+    #[test]
+    fn test_widened_match_covers_both_arms() {
+        let mk = |or_fb: bool, cjk: bool| FtsResult {
+            nodes: vec![],
+            bm25_scores: vec![],
+            or_fallback: or_fb,
+            cjk_substring_fallback: cjk,
+            empty_reason: None,
+        };
+        assert!(
+            !mk(false, false).is_widened_match(),
+            "direct hit is not widened"
+        );
+        assert!(mk(true, false).is_widened_match(), "OR fallback is widened");
+        assert!(
+            mk(false, true).is_widened_match(),
+            "CJK substring rescue is widened — dropping this re-fires the no-anchor warning"
+        );
+        assert!(mk(true, true).is_widened_match());
+    }
+
+    /// The substring scan has no BM25 to rank by, so its ORDER BY is the only
+    /// thing deciding which rows survive `LIMIT`. Fixture: three nodes all
+    /// containing 库存, distinguishable only by where and how long.
+    #[test]
+    fn test_cjk_substring_ranking_is_identifier_then_shortest() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "w.py".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
+        let add = |name: &str, body: &str, doc: Option<&str>| {
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: body.into(),
+                    signature: None,
+                    doc_comment: doc.map(String::from),
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
+        };
+        // The identifier-hit node carries the LONGEST body on purpose. With a
+        // short one, `LENGTH(code_content)` alone reproduces the expected order
+        // and the identifier leg can be neutralised (`THEN 0 ELSE 1` ->
+        // `THEN 1 ELSE 1`) with the whole suite still green — a fixture that
+        // agrees with both legs pins neither. Here the two legs DISAGREE, so
+        // only the identifier leg can produce this order.
+        add("short_body", "y = 2  # 扣减库存", None);
+        add(
+            "mid_body",
+            &format!("x = 1  # 扣减库存\n{}", "pad\n".repeat(50)),
+            None,
+        );
+        add(
+            "库存校验",
+            &format!("z = 3\n{}", "pad\n".repeat(200)),
+            Some("与查询词无关的说明"),
+        );
+
+        let r = fts5_search(db.conn(), "库存", 10).unwrap();
+        assert!(
+            r.cjk_substring_fallback,
+            "must come from the substring scan"
+        );
+        let order: Vec<&str> = r.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["库存校验", "short_body", "mid_body"],
+            "identifier hit first even with the longest body, then shortest body"
+        );
+    }
+
+    /// The scan's LIMIT decides which rows survive, so its ORDER BY must end in
+    /// a total tiebreak — same one-directional invariant, and the same reason,
+    /// as `test_fuzzy_fallback_pool_is_deterministically_bounded`.
+    #[test]
+    fn test_cjk_scan_order_ends_in_a_total_tiebreak() {
+        assert!(
+            CJK_SCAN_ORDER_TAIL.trim_end().ends_with("n.id"),
+            "without a unique final term the LIMIT keeps an arbitrary subset of \
+             rows that tie on every preceding term: {CJK_SCAN_ORDER_TAIL}"
+        );
+        assert!(
+            CJK_SCAN_ORDER_TAIL.contains("LENGTH(COALESCE(n.code_content"),
+            "the density leg must precede the tiebreak"
+        );
+    }
+
+    /// The identifier-hit rank must span EVERY term, not `?1` alone.
+    ///
+    /// `?1` is whichever term sorts first in UTF-8 order, so hard-coding it made
+    /// the rank depend on an ordering the user cannot see: for `订单 库存`,
+    /// 库 (U+5E93) precedes 订 (U+8BA2), and a node named `订单处理器` lost to an
+    /// unrelated short body.
+    #[test]
+    fn test_cjk_identifier_rank_spans_every_term() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "m.py".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
+        let add = |name: &str, body: &str| {
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: body.into(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
+        };
+        // The run is UNSPACED: spelling it `订单 库存` would make each half its
+        // own FTS token, MATCH would answer directly and the scan would never
+        // run. Every node carries the same run, so the AND matches all three and
+        // only the identifier leg can separate them; `helper` is the shortest.
+        const RUN: &str = "创建订单并扣减库存";
+        add("helper", &format!("a = 1  # {RUN}"));
+        add(
+            "订单处理器",
+            &format!("b = 2  # {RUN}\n{}", "pad\n".repeat(100)),
+        );
+        add(
+            "库存处理器",
+            &format!("c = 3  # {RUN}\n{}", "pad\n".repeat(200)),
+        );
+
+        let r = fts5_search(db.conn(), "订单 库存", 10).unwrap();
+        assert!(r.cjk_substring_fallback);
+        let order: Vec<&str> = r.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["订单处理器", "库存处理器", "helper"],
+            "both identifier hits outrank the shortest non-identifier body"
+        );
+    }
+
+    /// The scan AND-joins its terms. Flipping the join to OR turns the rescue
+    /// into the broad flood the module doc promises it is not, and every other
+    /// CJK test uses a single term, so nothing else would notice.
+    #[test]
+    fn test_cjk_multi_term_requires_all_terms() {
+        let (db, _tmp) = cjk_fixture();
+        // 订单 is in create_order's doc; 网关 is in no node at all.
+        let both = fts5_search(db.conn(), "订单 网关", 10).unwrap();
+        assert!(
+            both.nodes.is_empty(),
+            "AND semantics: a term present in no node must empty the result"
+        );
+        // Control: the surviving term alone still resolves, so the emptiness
+        // above is the AND and not a broken scan.
+        let one = fts5_search(db.conn(), "订单", 10).unwrap();
+        assert_eq!(one.nodes.len(), 1);
+    }
+
+    /// A query past `CJK_SCAN_MAX_TERMS` used to be `Err(Expression tree is too
+    /// large)` from SQLite rather than an empty result — a hard CLI exit and a
+    /// JSON-RPC error for pasting a punctuated CJK document into `search`.
+    #[test]
+    fn test_cjk_scan_term_cap_answers_empty_not_error() {
+        let (db, _tmp) = cjk_fixture();
+        let many: String = (0..(CJK_SCAN_MAX_TERMS + 1))
+            .map(|i| char::from_u32(0x4E00 + i as u32).unwrap())
+            .map(|c| format!("{} ", c))
+            .collect();
+        let r = fts5_search(db.conn(), &many, 10).expect("over-cap query must not error");
+        assert!(r.nodes.is_empty());
+        assert!(!r.cjk_substring_fallback);
+
+        // A pathological count SQLite definitely refuses to prepare.
+        let huge: String = (0..2000)
+            .map(|i| char::from_u32(0x4E00 + i as u32).unwrap())
+            .map(|c| format!("{} ", c))
+            .collect();
+        assert!(fts5_search(db.conn(), &huge, 10).is_ok());
+    }
+
+    /// Each maximal RUN of unsegmented script is its own term, AND-ed like any
+    /// other pair — NOT concatenated across whatever separates them.
+    ///
+    /// The fixture discriminates the two readings. `create_order`'s doc is
+    /// 创建订单并扣减库存, which contains 订单 and 库存 but never the contiguous
+    /// string 订单库存. Concatenating would search `%订单库存%` and find nothing;
+    /// splitting searches `%订单%` AND `%库存%` and finds the node. So this query
+    /// resolves under the correct reading and is empty under the wrong one,
+    /// which is the opposite of what a same-result fixture would prove.
+    #[test]
+    fn test_cjk_runs_are_not_glued_across_separators() {
+        let (db, _tmp) = cjk_fixture();
+
+        let split = fts5_search(db.conn(), "订单x库存", 10).unwrap();
+        assert_eq!(
+            split.nodes.len(),
+            1,
+            "two runs must be ANDed, not concatenated into 订单库存"
+        );
+        assert_eq!(split.nodes[0].name, "create_order");
+        assert!(split.cjk_substring_fallback);
+
+        // Control: the concatenation really is absent from the corpus, so the
+        // assertion above distinguishes the readings instead of passing for free.
+        assert!(
+            fts5_search(db.conn(), "订单库存", 10)
+                .unwrap()
+                .nodes
+                .is_empty(),
+            "the glued string must match nothing, else this test proves nothing"
+        );
+    }
+
+    /// The scan must not surface test symbols, matching the MATCH path's filter.
+    #[test]
+    fn test_cjk_scan_excludes_test_nodes() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "t.py".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
+        insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "test_helper".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: "pass".into(),
+                signature: None,
+                doc_comment: Some("校验库存是否充足".into()),
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            fts5_search(db.conn(), "库存", 10).unwrap().nodes.is_empty(),
+            "a test-only node must not be rescued into ordinary results"
+        );
+        // Control: the same node IS reachable when tests are included, so the
+        // emptiness above is the filter and not a scan that found nothing.
+        let with_tests = fts5_search_with_tests(db.conn(), "库存", 10).unwrap();
+        assert_eq!(with_tests.nodes.len(), 1);
+        assert!(with_tests.cjk_substring_fallback);
+    }
+
+    /// All five prose columns are scanned. Dropping one narrows the rescue
+    /// silently; no other fixture puts CJK in `context_string` or
+    /// `qualified_name`.
+    #[test]
+    fn test_cjk_scan_covers_every_text_column() {
+        /// label, and where in the record to put the CJK run
+        type ColCase = (&'static str, fn(&mut NodeRecord));
+        let cols: [ColCase; 5] = [
+            ("name", |n| n.name = "库存校验".into()),
+            ("qualified_name", |n| {
+                n.qualified_name = Some("mod::库存校验".into())
+            }),
+            ("code_content", |n| n.code_content = "x = '库存校验'".into()),
+            ("context_string", |n| {
+                n.context_string = Some("库存校验".into())
+            }),
+            ("doc_comment", |n| n.doc_comment = Some("库存校验".into())),
+        ];
+        for (label, place) in cols {
+            let (db, _tmp) = test_db();
+            let fid = upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: "c.py".into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 1,
+                    language: Some("python".into()),
+                },
+            )
+            .unwrap();
+            let mut rec = NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "plain".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: "pass".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            };
+            place(&mut rec);
+            insert_node(db.conn(), &rec).unwrap();
+            let r = fts5_search(db.conn(), "库存", 10).unwrap();
+            assert_eq!(r.nodes.len(), 1, "column {label} must be scanned");
+        }
+    }
+
+    /// Every script the `is_unsegmented_script` doc claims must actually resolve
+    /// a needle inside a run — the comment is otherwise an unchecked promise.
+    #[test]
+    fn test_cjk_scan_covers_every_claimed_script() {
+        // (label, stored run, needle inside it)
+        let cases: [(&str, &str, &str); 5] = [
+            ("CJK Unified", "创建订单并扣减库存", "订单"),
+            ("kana (full-width)", "ちゅうもんをさくせいする", "もん"),
+            ("kana (half-width)", "ﾁｭｳﾓﾝｻｸｾｲ", "ﾓﾝ"),
+            ("Hangul syllables", "주문생성처리", "주문"),
+            ("Ext B", "\u{20000}\u{20001}\u{20002}", "\u{20001}"),
+        ];
+        for (label, stored, needle) in cases {
+            let (db, _tmp) = test_db();
+            let fid = upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: "s.py".into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 1,
+                    language: Some("python".into()),
+                },
+            )
+            .unwrap();
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: "f".into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: "pass".into(),
+                    signature: None,
+                    doc_comment: Some(stored.into()),
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
+            let r = fts5_search(db.conn(), needle, 10).unwrap();
+            assert_eq!(
+                r.nodes.len(),
+                1,
+                "{label}: needle inside a run must resolve"
+            );
+            assert!(r.cjk_substring_fallback, "{label}");
+        }
+    }
+
+    /// The documented limit of the rescue's scope, pinned so it cannot change
+    /// silently in either direction.
+    ///
+    /// `payment` matches `charge_card` through the OR fallback, so the whole
+    /// result is non-empty and the scan never runs — `create_order`, whose doc
+    /// contains 订单, stays unreachable and the user gets rows with no signal
+    /// that half the query went unanswered.
+    #[test]
+    fn test_mixed_query_leaves_the_cjk_term_unreachable() {
+        let (db, _tmp) = cjk_fixture();
+
+        let pure = fts5_search(db.conn(), "订单", 10).unwrap();
+        assert_eq!(pure.nodes[0].name, "create_order", "control: rescue works");
+
+        let mixed = fts5_search(db.conn(), "payment 订单", 10).unwrap();
+        let names: Vec<&str> = mixed.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            !names.contains(&"create_order"),
+            "documented gap: a non-empty Latin half suppresses the rescue"
+        );
+        assert!(
+            !mixed.cjk_substring_fallback,
+            "the scan must not have run at all"
+        );
+        assert!(mixed.or_fallback, "the rows came from the OR widening");
+    }
+
+    /// A single CJK character is a word, so it stays searchable — the 2-character
+    /// minimum on the MATCH side comes from what the TOKENIZER stores, and the
+    /// substring scan has no tokenizer. Pinned because the asymmetry with Latin
+    /// (`search a` is refused) looks like an oversight and is not one: refusing
+    /// single-character CJK would drop `search 猫` finding `猫咪管理`.
+    #[test]
+    fn test_single_cjk_character_still_searches() {
+        let (db, _tmp) = cjk_fixture();
+        let r = fts5_search(db.conn(), "订", 10).unwrap();
+        assert_eq!(r.nodes.len(), 1, "one CJK char must still reach the scan");
+        assert_eq!(r.nodes[0].name, "create_order");
+        assert!(r.cjk_substring_fallback);
+        assert!(
+            r.empty_reason.is_none(),
+            "must not be refused as 'shorter than the 2-character minimum'"
+        );
+
+        // The Latin side keeps its refusal — same query length, opposite answer.
+        let latin = fts5_search(db.conn(), "a", 10).unwrap();
+        assert!(latin.nodes.is_empty());
+        assert!(
+            latin.empty_reason.is_some(),
+            "single Latin char stays refused"
+        );
     }
 
     #[test]
