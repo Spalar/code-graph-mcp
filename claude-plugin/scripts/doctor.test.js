@@ -187,6 +187,71 @@ test('classifyHealthReport surfaces a damaged parse, and stays silent on a clean
   assert.match(capped[0].detail, /and 11 more/, `got: ${capped[0].detail}`);
 });
 
+test('no classifyHealthReport row can gate the exit code without offering a repair', () => {
+  // The CLASS, not the instance — and the reason it needs its own test is worth
+  // stating, because `every doctor row is repairable or explicitly advisory`
+  // below asserts the SAME invariant and did not stop B1 from shipping.
+  //
+  // That guard builds its rows from a real `runDiagnostics({checkOnly: true})`,
+  // which is the right instinct and gives it one payload: whatever the machine
+  // running the test happens to have. It redirects HOME, but not cwd, so its
+  // health-check reads THIS REPOSITORY'S index. At 6469b42 that index had no
+  // `parse_error_files` key yet — the feature was minutes old and nothing had
+  // re-indexed — so no `Parse` row existed for it to judge, and the full suite
+  // was green. The incremental-index hook populated the key later and the guard
+  // silently gained sight: the same mutation is red today and was green then.
+  // A CI runner with a clean index is blind to it too.
+  //
+  // So: that guard covers every row the local index can produce, this one covers
+  // every row the classifier can produce. Neither subsumes the other, and the
+  // failure mode of the first is that it looks like it already did.
+  //
+  // The invariant: `runDoctor` computes `blocking = issues.filter(r =>
+  // !r.advisory)` and `runDoctorCli` returns 1 when any survive. A row with no
+  // `fixId` has no repair — `runRepairs` cannot count it fixed — so if it is
+  // also not `advisory`, it pins the exit code at 1 for as long as the condition
+  // lasts, with nothing the user can run to clear it. That is a permanently
+  // failing `doctor && …` and a permanently red self-heal, from a row whose
+  // whole job is to inform.
+  //
+  // Every payload shape this classifier branches on, so a new row cannot be
+  // added on a branch nobody exercises.
+  const { classifyHealthReport } = require('./doctor');
+  const payloads = {
+    'no-index': { reason: 'no_index' },
+    corrupt: { reason: 'corrupt', integrity: { quick_check: 'malformed' } },
+    'schema-mismatch': { schema_version: 9, nodes: 5, edges: 2, files: 3, issue: 'schema version mismatch' },
+    'empty-index': { schema_version: 10, nodes: 0, edges: 0, files: 0 },
+    healthy: { schema_version: 10, nodes: 5, edges: 2, files: 3, index_age: '1s ago' },
+    degraded: {
+      schema_version: 10, nodes: 5, edges: 2, files: 3, index_age: '1s ago',
+      files_with_parse_errors: 2, parse_error_files: ['src/a.rs', 'src/b.rs'],
+    },
+    'fts5-only': {
+      schema_version: 10, nodes: 5, edges: 2, files: 3,
+      model_available: true, embedding_progress: '0/9', embedding_status: 'pending',
+      search_mode: 'fts_only',
+    },
+  };
+
+  const offenders = [];
+  for (const [name, hc] of Object.entries(payloads)) {
+    for (const row of classifyHealthReport(hc)) {
+      if (row.status !== 'warn' && row.status !== 'error') continue;
+      if (!row.fixId && !row.advisory) offenders.push(`${name}: ${row.name} — ${row.detail}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    'each row here gates doctor\'s exit code while offering no way to clear it; mark it ' +
+    `advisory: true, or give it a fixId runRepairs can act on:\n  ${offenders.join('\n  ')}`);
+
+  // The guard is only worth something if it can fail. Same predicate, run over a
+  // row of the shape it forbids.
+  const planted = [{ name: 'Planted', status: 'warn', detail: 'no fixId, not advisory' }]
+    .filter(r => !r.fixId && !r.advisory);
+  assert.equal(planted.length, 1, 'control: the predicate does flag the shape it is written to flag');
+});
+
 test('the Parse row is advisory, so a grammar bug cannot pin doctor at exit 1', () => {
   // Pre-ship review, reviewer-reproduced. The row shipped as a plain `warn`
   // with no fixId: `runDoctor` counts `issues.filter(r => !r.advisory)` and
