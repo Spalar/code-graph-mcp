@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.149.0
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` is
+unchanged, the schema, every flag and every exit code stay as they are. What
+changes is what `uninstall` leaves behind, and it only shows up if you tear the
+plugin down within the first seconds of a session.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.148.0`, or `cargo install
+code-graph-mcp --version 0.148.0`; plugin users can set the version in the
+marketplace entry. Pinning back restores the 41 MB residue described below.
+
+### A teardown no longer loses the race to an in-flight auto-update
+
+`uninstall` deletes `~/.cache/code-graph`, and an `auto-update` spawned by a
+Claude Code SessionStart re-created it seconds later. Two arms were measured,
+distinguished by where the teardown lands relative to `downloadBinary`'s
+`mkdirSync`: land before it and the whole chain proceeds on a re-created tree,
+finishing with a freshly downloaded 42,847,128 B binary plus three JSON files —
+41 MB, 2 of 2 runs. Land after curl has written its tmp and `update-state.json`
+comes back alone, 1 of 1.
+
+The coordination record is a 33-byte tombstone at
+`~/.cache/code-graph.uninstalled` — a **sibling** of the cache directory, holding
+a timestamp, expiring after five minutes. Three writers check it: `downloadBinary`
+before its mkdir, `promoteVerifiedBinary` before its rename, and `saveState`,
+which is where the second arm's residue was actually written.
+
+Taking `install.lock` instead — the token the updater already respects — was
+prototyped for this and refuted: the lock lives at `CACHE_DIR/install.lock`, the
+sweep deletes `CACHE_DIR`, so the lock goes with the directory and the updater
+acquires freely seconds later. A mutual-exclusion token stored inside the
+resource being destroyed cannot guard that destruction.
+
+The TTL is what keeps this from becoming a kill switch, so every shape we cannot
+trust fails OPEN: absent, empty, truncated, no timestamp, unparseable timestamp
+— and a timestamp in the future, which would otherwise suppress updates for as
+long as the skew. A tombstone plus an 8h clock rollback used to mean 8h05m of
+suppression, not 5m.
+
+**Two things this does not cover, stated plainly.** A concurrent Claude Code
+session that still has the plugin loaded will re-create the cache — that session
+is not being torn down, and the tombstone does not reach across to it. And while
+a tombstone stands the updater cannot persist its rate-limit backoff or its
+last-check time, because that file lives inside the directory being reclaimed;
+for those five minutes a rate-limited updater retries every invocation instead of
+backing off.
+
+### Not covered
+
+The teardown still leaves the 33-byte tombstone behind, and for a user who never
+reinstalls nothing will ever remove it — the same unreachability that makes
+`doctor` unable to report an orphaned cache, since `doctor` forwards to a
+`doctor.js` that leaves with the plugin. That is 33 bytes against the 42 MB it
+prevents.
+
 ## 0.148.0
 
 **Upgrading: two skills appear that were never there before, and a first
