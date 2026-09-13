@@ -3941,11 +3941,17 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
 // the basename in a second module is the day the two spellings can drift, and
 // for this one a drift means the updater checks a tombstone the teardown never
 // writes.
-const CACHE_FILE_NAMES: [&str; 4] = [
+const CACHE_FILE_NAMES: [&str; 5] = [
     "update-state.json",
     "install-manifest.json",
     "install.lock",
     "code-graph.uninstalled",
+    // Added after the teardown-gate work: `find-binary.js` spelled this one
+    // itself, through its own `os.homedir()` join, and so was the writer the
+    // tombstone audit did not see. It re-created the whole cache directory on
+    // the first cold resolution after an uninstall. The name was outside this
+    // list, so the guard that exists to stop exactly that could not fire.
+    "binary-path",
 ];
 
 /// Which of [`CACHE_FILE_NAMES`] appear in `src` as a PATH LITERAL.

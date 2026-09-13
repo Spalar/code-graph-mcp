@@ -7,13 +7,18 @@ const os = require('os');
 const { readBinaryVersion, compareVersions } = require('./version-utils');
 const { npmInvocation } = require('./npm-exec');
 const { hidden } = require('./proc-opts');
-// Only the teardown predicate, and cache-paths.js is deliberately tiny and
-// builtin-only for exactly this kind of hook-path consumer.
-const { uninstallTombstoneActive } = require('./cache-paths');
+// The teardown predicate and this module's own cache path. cache-paths.js is
+// deliberately tiny and builtin-only for exactly this kind of hook-path
+// consumer, so the import costs nothing measurable.
+const { uninstallTombstoneActive, BINARY_PATH_FILE } = require('./cache-paths');
 
 const PLATFORM = os.platform();
 const ARCH = os.arch();
-const CACHE_FILE = path.join(os.homedir(), '.cache', 'code-graph', 'binary-path');
+// Still exported under this name — several modules and tests import
+// `CACHE_FILE` from here — but no longer spelled here. `cache-paths.js` owns
+// every `~/.cache/code-graph` file name, so an audit of who writes into that
+// directory can be done from one file instead of by grep.
+const CACHE_FILE = BINARY_PATH_FILE;
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
 // PATH lookup bound (NEW-07). 2 s matches the sibling `npm root -g` probe; the
 // floor is what a budget-exhausted hook still gives it, because a `which` that

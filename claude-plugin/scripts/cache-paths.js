@@ -33,6 +33,17 @@ const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
 const INSTALL_LOCK_FILE = path.join(CACHE_DIR, 'install.lock');
 
 /**
+ * Where `find-binary.js` memoizes the resolved binary.
+ *
+ * It lived in find-binary.js, built from its own `os.homedir()` join — the JS-05
+ * shape this file's header describes, and the reason the teardown-gate audit
+ * missed it: the module that re-created the whole cache directory on the first
+ * cold resolution after an uninstall was not reachable from here, so an
+ * enumeration of cache writers done from this file came up one short.
+ */
+const BINARY_PATH_FILE = path.join(CACHE_DIR, 'binary-path');
+
+/**
  * Teardown tombstone — a SIBLING of CACHE_DIR, deliberately not a file inside
  * it.
  *
@@ -120,6 +131,7 @@ module.exports = {
   UPDATE_STATE_FILE,
   MANIFEST_FILE,
   INSTALL_LOCK_FILE,
+  BINARY_PATH_FILE,
   UNINSTALL_TOMBSTONE_FILE,
   UNINSTALL_TOMBSTONE_TTL_MS,
   writeUninstallTombstone,
