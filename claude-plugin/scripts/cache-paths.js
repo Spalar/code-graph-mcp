@@ -91,7 +91,17 @@ function uninstallTombstoneActive({
     return false;
   }
   if (!Number.isFinite(at)) return false;
-  return now - at < ttlMs;
+  // `age >= 0` is not redundant with the upper bound: a NEGATIVE age — a
+  // timestamp in the future — is always less than the TTL, so a bare
+  // `age < ttlMs` would treat a tombstone stamped a year ahead as active for a
+  // year, and a legitimate one plus an 8h clock rollback (NTP correction, VM
+  // restore, RTC drift) as active for 8h05m. That is the never-expiring
+  // kill switch this design's TTL exists to prevent, in bounded form, and it is
+  // reachable without any corruption because the file carries OUR OWN
+  // Date.now(). A future stamp means the clock moved, not that a teardown is in
+  // flight, so it fails open like every other shape we cannot trust.
+  const age = now - at;
+  return age >= 0 && age < ttlMs;
 }
 
 /** Drop the tombstone. The TTL is the backstop; an install clears it eagerly so

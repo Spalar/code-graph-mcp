@@ -1,6 +1,6 @@
 ---
 status: draft
-revision: 2
+revision: 3
 ---
 
 # Uninstall races an in-flight auto-update and leaves the cache behind
@@ -134,14 +134,26 @@ that runs *while the plugin still exists* can act, which puts prevention — the
 tombstone above, or an equivalent — back as the primary mechanism rather than a
 fallback to a cheaper detector.
 
-**What stays reachable, and it is not `doctor`.** `readManifest()` has exactly
-two callers, `install` (`lifecycle.js:1326`) and `update` (`:1675`), and both run
-at the moment a plugin exists again. Neither validates the manifest against
-reality — `install` reads it only for its own statusline-claim config. So a fresh
-install that finds a manifest describing a plugin root which is no longer there
-is the one detection point with code available to act. That reaches the residual
-case the tombstone deliberately excludes (another live session's updater), just
-later rather than never, and it is independent of whichever prevention lands.
+**What stays reachable, and it is not `doctor`.** `readManifest()` runs at the
+moment a plugin exists again, and none of its callers validates the manifest
+against reality — `install` reads it only for its own statusline-claim config.
+So a fresh install that finds a manifest describing a plugin root which is no
+longer there is the one detection point with code available to act. That reaches
+the residual case prevention deliberately excludes (another live session's
+updater), just later rather than never.
+
+r3 correction: an earlier revision of this section said `readManifest()` "has
+exactly two callers, `install` (`lifecycle.js:1326`) and `update` (`:1675`)".
+There are six non-test call sites — those two plus `session-init.js:290`,
+`auto-update.js:1013`, `:1302` and `:1603`. The grep behind the claim was scoped
+to `lifecycle.js` and the two line numbers are 15c502f's, which is what made a
+partial answer look like a complete one. The conclusion survives but is weaker
+than stated, and the omission matters: `session-init.js:290` is the caller that
+fires FIRST after a teardown, and it is the same path that made an
+unconditional tombstone clear in `install()` unsafe (a concurrent session's
+SessionStart erased the tombstone 3 s after it was written). Whatever
+manifest-validation lands has to reckon with that caller, not just the two
+named here.
 
 ## Open questions
 
@@ -150,6 +162,9 @@ later rather than never, and it is independent of whichever prevention lands.
 
 # Change log
 
+- r3 (2026-09-13) — pre-ship review of the implementation: the readManifest()
+  caller count above was wrong (six, not two), and the omitted caller is the one
+  that made an unconditional tombstone clear unsafe. Correction inlined above.
 - r2 (2026-09-13) — the `doctor` open question settled by reproduction: not
   reachable, because `doctor` forwards to a `doctor.js` that leaves with the
   plugin. Prevention promoted back to primary; `install`-side manifest

@@ -1134,7 +1134,7 @@ function runRepairs(results, {
         console.log('\n  Repairing hooks...');
         if (relicRepairGuard()) break;
         const { install, scanForBrokenPaths } = require('./lifecycle');
-        const installResult = install();
+        const installResult = install({ clearTombstone: true });
         // Diagnosis already ran install()+re-scan and the paths were STILL
         // broken (that `repaired:false` is what raised hooks-invalid). Verify
         // this second attempt actually cleared them before counting it fixed \u2014
@@ -1173,7 +1173,7 @@ function runRepairs(results, {
         console.log('\n  Registering code-graph hooks in settings.json...');
         if (relicRepairGuard()) break;
         const { install } = require('./lifecycle');
-        const r = install();
+        const r = install({ clearTombstone: true });
         if (r.hooksRegistered) {
           console.log('  \u2705 settings.json updated — restart Claude Code to apply');
           fixed++;

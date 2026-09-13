@@ -179,6 +179,19 @@ function saveState(state, { tombstoneActive = uninstallTombstoneActive, write = 
   //
   // The check sits inside saveState rather than at its eight call sites: one
   // gate cannot drift out of step with seven others.
+  //
+  // It costs more than the file, and the cost is worth stating: this is also
+  // where the updater's anti-hammer memory lives. `fetchLatestRelease` records
+  // a GitHub 403 as `saveState({ ...state, rateLimited: true })` and
+  // `shouldCheck` reads it back to hold off; `lastCheck` drives the 6h/30min
+  // throttles the same way. While a tombstone stands, neither persists —
+  // measured, a rate-limited updater comes back with `rateLimited: null`,
+  // `lastCheck` unset and `shouldCheck` true, so it re-hits api.github.com on
+  // every invocation instead of backing off. Bounded by the TTL to five
+  // minutes, on a machine whose plugin was just torn down. No call site NEEDS
+  // the write — the state file lives inside the directory being reclaimed, so
+  // persisting it would mean re-creating exactly what this guard exists to
+  // prevent — but a reader should not have to discover the throttle loss.
   if (tombstoneActive()) return;
   try {
     // The marker is an in-memory signal, never a persisted field: several call

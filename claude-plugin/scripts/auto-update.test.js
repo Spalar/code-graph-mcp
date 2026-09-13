@@ -2570,6 +2570,19 @@ function tombstonePath(t) {
   return path.join(mkDir(t, 'code-graph-tombstone-'), 'code-graph.uninstalled');
 }
 
+test('tombstone: the TTL itself is bounded — absolute ceiling, not derived from the constant', () => {
+  // The TTL is this design's ONLY safety property: it is what stops a tombstone
+  // from becoming a permanent kill switch on auto-update. Every other assertion
+  // in this file computes its fixture FROM `UNINSTALL_TOMBSTONE_TTL_MS`, so all
+  // of them stay green at any value of it — pre-ship review changed it to 50
+  // minutes and both suites passed. An absolute number is the only shape that
+  // can fail.
+  assert.ok(UNINSTALL_TOMBSTONE_TTL_MS <= 10 * 60 * 1000,
+    `the tombstone TTL must stay under 10 minutes; it is ${UNINSTALL_TOMBSTONE_TTL_MS} ms`);
+  assert.ok(UNINSTALL_TOMBSTONE_TTL_MS >= 30 * 1000,
+    `and long enough to outlast a teardown; it is ${UNINSTALL_TOMBSTONE_TTL_MS} ms`);
+});
+
 test('tombstone: younger than the TTL is active, older is not — injected clock, no sleep', (t) => {
   const file = tombstonePath(t);
   const t0 = 1_700_000_000_000;
@@ -2577,11 +2590,39 @@ test('tombstone: younger than the TTL is active, older is not — injected clock
 
   assert.equal(uninstallTombstoneActive({ file, now: t0 + 1_000 }), true,
     'a teardown one second ago is still in flight');
-  // Both sides of the boundary, so an off-by-a-whole-TTL comparison cannot pass.
+  // Both sides of the boundary, and the boundary itself, so neither an
+  // off-by-a-whole-TTL comparison nor `<` -> `<=` can pass.
   assert.equal(uninstallTombstoneActive({ file, now: t0 + UNINSTALL_TOMBSTONE_TTL_MS - 1 }), true,
     'just inside the TTL');
+  assert.equal(uninstallTombstoneActive({ file, now: t0 + UNINSTALL_TOMBSTONE_TTL_MS }), false,
+    'exactly the TTL is already expired — the bound is half-open');
   assert.equal(uninstallTombstoneActive({ file, now: t0 + UNINSTALL_TOMBSTONE_TTL_MS + 1 }), false,
     'just outside the TTL — a stale tombstone must suppress nothing');
+});
+
+test('tombstone: a future timestamp or a backwards clock does NOT extend suppression', (t) => {
+  // `age < ttlMs` alone is true for every NEGATIVE age, so a stamp an hour or a
+  // year ahead would suppress auto-update for an hour or a year, and a
+  // legitimate tombstone plus an 8h clock rollback (NTP correction, VM restore,
+  // RTC drift) for 8h05m. That is the never-expiring kill switch the TTL exists
+  // to prevent, and it needs no corruption to reach: the file carries our own
+  // Date.now(), so it is enough for the clock to move afterwards.
+  const file = tombstonePath(t);
+  const t0 = 1_700_000_000_000;
+
+  writeUninstallTombstone({ file, now: t0 + 60 * 60 * 1000 });
+  assert.equal(uninstallTombstoneActive({ file, now: t0 }), false, 'stamped one hour ahead');
+
+  writeUninstallTombstone({ file, now: t0 + 365 * 24 * 60 * 60 * 1000 });
+  assert.equal(uninstallTombstoneActive({ file, now: t0 }), false, 'stamped one year ahead');
+
+  writeUninstallTombstone({ file, now: t0 });
+  assert.equal(uninstallTombstoneActive({ file, now: t0 - 8 * 60 * 60 * 1000 }), false,
+    'a real teardown, then the clock rolls back 8h — must not suppress for 8h05m');
+  // Control: the same tombstone at a sane clock is still active, so the guard
+  // above cannot be passing by rejecting everything.
+  assert.equal(uninstallTombstoneActive({ file, now: t0 + 1_000 }), true,
+    'control: unchanged clock, one second later, still in flight');
 });
 
 test('tombstone: absent or unparseable is NOT active (fail-open)', (t) => {

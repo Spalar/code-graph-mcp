@@ -1324,12 +1324,26 @@ function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
 
 // --- Install (idempotent) ---
 
-function install({ reclaimStatusline = false } = {}) {
-  // An install is the end of any teardown, so the tombstone stops applying now
-  // rather than when its TTL runs out. Without this, reinstalling inside the
-  // 5-minute window would silently skip the first update check — harmless but
-  // confusing, and the eager clear costs one unlink.
-  clearUninstallTombstone();
+function install({ reclaimStatusline = false, clearTombstone = false } = {}) {
+  // Clearing the teardown tombstone is OPT-IN, and defaults to off, because
+  // "an install is happening" does not mean "the user asked to reinstall".
+  //
+  // The first version cleared unconditionally, on the reasoning that an install
+  // ends any teardown. Pre-ship review reproduced the hole: after a genuine
+  // uninstall, a DIFFERENT still-live session's SessionStart finds no manifest
+  // (install-manifest.json went with CACHE_DIR) and no inactive-plugin markers
+  // (the composite and the statusline registry went with it too), so it falls
+  // through to `installReporting()` -> install() and cleared the tombstone 3 s
+  // after it was written — then spawned its own updater fourteen lines later.
+  // A global record that any concurrent session may erase protects nobody.
+  //
+  // So only the two genuinely user-initiated entry points pass true: the
+  // `lifecycle.js install` CLI and doctor's repair pass. Everything automatic —
+  // session-init's install reporting, healthCheck's repair — leaves it standing
+  // and lets the TTL expire it. The cost is that a reinstall inside the window
+  // may skip one update check, which the spec already accepts; the install
+  // itself supplies the binary.
+  if (clearTombstone) clearUninstallTombstone();
 
   const version = getPluginVersion();
   const manifest = readManifest();
@@ -2027,20 +2041,34 @@ const POST_TEARDOWN_UI_NOTE = [
   '`/plugin uninstall code-graph-mcp` there to sync its UI.',
 ];
 
-function removeCacheResidue() {
+function removeCacheResidue({ sweep = null } = {}) {
   // Announce the teardown BEFORE the delete, outside the directory being
-  // deleted. A SessionStart-spawned `auto-update` that is mid-flight will
-  // otherwise re-create CACHE_DIR under us — measured at 42,847,128 B of fresh
-  // binary plus three JSON files, 2 of 2 runs, when the teardown wins the race
-  // to `downloadBinary`'s mkdir.
+  // deleted. A mid-flight `auto-update` in ANOTHER process will otherwise
+  // re-create CACHE_DIR under us — measured at 42,847,128 B of fresh binary
+  // plus three JSON files, 2 of 2 runs, when the teardown wins the race to
+  // `downloadBinary`'s mkdir.
   //
-  // All three callers of this function are genuine-uninstall paths —
-  // `uninstall()`, `cleanupDisabledStatusline()` under `isPluginUninstalled`,
-  // and `runSessionInit()` under `if (uninstalled)` — so the tombstone belongs
-  // here rather than in each of them: one site, three callers, and no way for a
-  // future fourth caller to forget it. `runSessionInit`'s is the path that
-  // actually races, since it runs from the same SessionStart that spawns the
-  // updater.
+  // The racing updater is always a different process. An earlier version of
+  // this comment said `runSessionInit`'s teardown "runs from the same
+  // SessionStart that spawns the updater"; it does not — that branch returns at
+  // session-init.js:718 with `autoUpdateLaunched: false`, before
+  // `launchBackgroundAutoUpdate`. SessionStart is still the racing surface,
+  // just from a concurrent session rather than this one (pre-ship review).
+  //
+  // All three callers are genuine-uninstall paths — `uninstall()`,
+  // `cleanupDisabledStatusline()` under `isPluginUninstalled`, and
+  // `runSessionInit()` under `if (uninstalled)` — so the tombstone belongs here
+  // rather than in each of them: one site, three callers, and no way for a
+  // fourth to forget it. Verified against five sandbox states (explicit
+  // disable, genuine uninstall, healthy, unreadable registry, missing
+  // registry): only the genuine uninstall writes one.
+  //
+  // BEFORE, not after: written after the sweep there is a window in which an
+  // updater sees nothing and can mkdir mid-delete, and the sweep's own
+  // `catch { return false; }` would skip the write entirely on a failed delete.
+  // `sweep` exists so a test can observe the tombstone at the moment the delete
+  // is attempted — the ordering is the property, and asserting only that the
+  // file exists on return passes with the two lines swapped.
   //
   // Best-effort by design: if this write fails, the delete below still runs and
   // we are no worse off than before the tombstone existed.
@@ -2073,7 +2101,8 @@ function removeCacheResidue() {
     }
   } catch { /* POSIX-only helper or an unreadable path — nothing to preserve */ }
   try {
-    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
+    if (sweep) sweep(CACHE_DIR);
+    else fs.rmSync(CACHE_DIR, { recursive: true, force: true });
   } catch { return false; }
   if (registryPath && registry) {
     try {
@@ -2116,8 +2145,11 @@ module.exports = {
 if (require.main === module) {
   const cmd = process.argv[2];
   if (cmd === 'install') {
-    // Explicit CLI install = user intent: reset any statusline stand-down and re-claim.
-    const r = install({ reclaimStatusline: true });
+    // Explicit CLI install = user intent: reset any statusline stand-down and
+    // re-claim, and drop a teardown tombstone if one is standing. This and
+    // doctor's repair pass are the only two callers that pass clearTombstone —
+    // see the comment on install() for why an automatic install must not.
+    const r = install({ reclaimStatusline: true, clearTombstone: true });
     // Refusing to touch an unusable settings.json means NOTHING was installed —
     // no hooks, no statusline, no manifest stamp. Printing "Installed" and
     // exiting 0 there would make `lifecycle.js install && …` chains read the

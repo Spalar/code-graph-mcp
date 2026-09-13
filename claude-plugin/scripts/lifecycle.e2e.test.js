@@ -1094,7 +1094,74 @@ test('an in-flight updater started before the teardown finds the tombstone activ
   assert.equal(seen.after, true, 'after the teardown the updater refuses to re-create the cache');
 });
 
-test('install() clears the tombstone, so a reinstall does not skip its first update check', (t) => {
+test('the tombstone is on disk BEFORE the sweep runs, not merely after it returns', (t) => {
+  // The ordering is the property, and asserting only that the file exists on
+  // return passes with the two lines swapped — pre-ship review moved the write
+  // to after `fs.rmSync` and both suites stayed green. Written after the sweep
+  // there is a window where an in-flight updater sees nothing and can mkdir
+  // mid-delete, and the sweep's own `catch { return false; }` would skip the
+  // write entirely on a failed delete.
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cacheDir, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'bin', 'code-graph-mcp'), 'x');
+
+  const out = execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    const fs = require('fs');
+    const tombstone = ${JSON.stringify(path.join(homeDir, '.cache', 'code-graph.uninstalled'))};
+    let seenAtSweep = null;
+    require(${JSON.stringify(lifecycleCli)}).removeCacheResidue({
+      sweep: (dir) => {
+        seenAtSweep = fs.existsSync(tombstone);
+        fs.rmSync(dir, { recursive: true, force: true });
+      },
+    });
+    console.log(JSON.stringify({ seenAtSweep, afterwards: fs.existsSync(tombstone) }));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString();
+
+  const seen = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(seen.seenAtSweep, true,
+    'the updater must be able to see the tombstone at the moment the delete is attempted');
+  assert.equal(seen.afterwards, true, 'and it survives the delete, being a sibling');
+  assert.equal(fs.existsSync(cacheDir), false, 'control: the sweep really ran');
+});
+
+test('install() leaves a tombstone alone by default, and clears it only when asked', (t) => {
+  // Clearing on EVERY install is the hole pre-ship review reproduced: after a
+  // genuine uninstall, a different still-live session's SessionStart finds no
+  // manifest and no inactive-plugin markers, falls through to
+  // installReporting() -> install(), and erased the tombstone 3 s after it was
+  // written — then spawned its own updater. A record any concurrent session may
+  // erase protects nobody, so the clear is opt-in and only the two
+  // user-initiated entry points ask for it.
+  const homeDir = mkHome(t);
+  const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
+  const write = () => {
+    fs.mkdirSync(path.dirname(tombstone), { recursive: true });
+    fs.writeFileSync(tombstone, JSON.stringify({ at: new Date().toISOString() }));
+  };
+
+  write();
+  execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    require(${JSON.stringify(lifecycleCli)}).install();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot });
+  assert.equal(fs.existsSync(tombstone), true,
+    'an automatic install must NOT un-suppress another session’s teardown');
+
+  execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    require(${JSON.stringify(lifecycleCli)}).install({ clearTombstone: true });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot });
+  assert.equal(fs.existsSync(tombstone), false,
+    'an explicit install asks for the clear, so a reinstall does not skip its first update check');
+});
+
+test('the CLI install path is one of the two that asks for the clear', (t) => {
   const homeDir = mkHome(t);
   const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
   fs.mkdirSync(path.dirname(tombstone), { recursive: true });
@@ -1103,5 +1170,5 @@ test('install() clears the tombstone, so a reinstall does not skip its first upd
   runScript(homeDir, lifecycleCli, ['install']);
 
   assert.equal(fs.existsSync(tombstone), false,
-    'an install ends the teardown; the TTL is the backstop, not the only way out');
+    '`lifecycle.js install` is user intent; the TTL is the backstop for everything else');
 });
