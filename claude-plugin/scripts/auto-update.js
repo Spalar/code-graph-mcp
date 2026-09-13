@@ -53,7 +53,10 @@ function commandExists(cmd, { exec = execFileSync, timeoutMs = PATH_PROBE_TIMEOU
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
-const { UPDATE_STATE_FILE: STATE_FILE, MANIFEST_FILE, INSTALL_LOCK_FILE } = require('./cache-paths');
+const {
+  UPDATE_STATE_FILE: STATE_FILE, MANIFEST_FILE, INSTALL_LOCK_FILE,
+  uninstallTombstoneActive,
+} = require('./cache-paths');
 const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h — steady-state re-check
 const UP_TO_DATE_RECHECK_MS = 30 * 60 * 1000;        // 30min — re-verify an "up to date" result (release-race guard)
@@ -166,14 +169,24 @@ function readState() {
 // The unlink/cleanup `catch {}`s elsewhere in this file stay silent on purpose:
 // a failed cleanup costs a stale temp file, not a broken invariant.
 let stateWriteWarned = false;
-function saveState(state) {
+function saveState(state, { tombstoneActive = uninstallTombstoneActive, write = writeJsonAtomic } = {}) {
+  // A teardown deleted CACHE_DIR; writeJsonAtomic would re-create it to hold
+  // this file. Measured: in the arm where the teardown lands after curl has
+  // written its tmp, `update-state.json` was the ONE thing that came back, and
+  // it came back through here — noteUpdateFailure records the ENOENT the
+  // teardown caused, and the recording re-creates the directory. Guarding only
+  // the two download sites leaves this path open, so the arm keeps failing.
+  //
+  // The check sits inside saveState rather than at its eight call sites: one
+  // gate cannot drift out of step with seven others.
+  if (tombstoneActive()) return;
   try {
     // The marker is an in-memory signal, never a persisted field: several call
     // sites do `saveState({ ...readState(), ... })`, and a persisted
     // `stateUnreadable` would park the updater permanently.
     const { stateUnreadable, ...clean } = state || {};
     void stateUnreadable;
-    writeJsonAtomic(STATE_FILE, clean);
+    write(STATE_FILE, clean);
   } catch (e) {
     if (!stateWriteWarned) {
       stateWriteWarned = true;
@@ -583,7 +596,11 @@ function cachedBinaryStaleVsState(state, { binaryPath = cachedBinaryPath(), read
  * `needsUpdate` is injectable for tests only; production always uses the real
  * predicate. Returning false on a skip is accurate: nothing was updated.
  */
-async function downloadBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate } = {}) {
+async function downloadBinary(latest, {
+  needsUpdate = cachedBinaryNeedsUpdate,
+  tombstoneActive = uninstallTombstoneActive,
+  mkdir = fs.mkdirSync,
+} = {}) {
   if (!latest || !latest.binaryUrl) return false;
   if (!needsUpdate(latest)) return false; // already at latest.version — no fetch
   if (!commandExists('curl')) {
@@ -595,8 +612,15 @@ async function downloadBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate } 
   const binaryDst = cachedBinaryPath();
   const binaryTmp = binaryDst + '.tmp.' + process.pid;
 
+  // The 41 MB arm. A teardown that lands before this mkdir gets the whole
+  // chain proceeding on a re-created tree, and it finishes by writing a fresh
+  // 42 MB binary into a directory the user just reclaimed. Checked here rather
+  // than at the top of the function so the guard sits adjacent to the write it
+  // protects.
+  if (tombstoneActive()) return false;
+
   try {
-    fs.mkdirSync(BINARY_CACHE_DIR, { recursive: true });
+    mkdir(BINARY_CACHE_DIR, { recursive: true });
     // `-f` (fail on HTTP >= 400), same as the sidecar fetch below. Without it
     // curl writes GitHub's 404/503 HTML body to binaryTmp and exits 0, so the
     // error page travelled on as a candidate binary and was only caught two
@@ -655,7 +679,8 @@ function sha256File(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
-function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSha256) {
+function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSha256,
+  { tombstoneActive = uninstallTombstoneActive } = {}) {
   try {
     // Size floor: every published binary is tens of MB, so anything under 1 MB
     // is a truncated transfer or an error page. It used to return false without
@@ -713,6 +738,13 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
         `${expectedVersion ? `, expected v${expectedVersion}` : ''} — not installing it.`)}`);
       return false;
     }
+
+    // The other arm: the teardown landed after curl wrote the tmp, so the
+    // download is verified and ready and the destination directory is gone.
+    // Refusing HERE rather than earlier is deliberate — the `finally` below
+    // owns binaryTmp and unlinks it, so bailing at the last step costs one
+    // wasted download and leaves nothing on disk.
+    if (tombstoneActive()) return false;
 
     fs.renameSync(binaryTmp, binaryDst);
     clearBinaryCache();
@@ -1529,6 +1561,7 @@ module.exports = {
   shouldHealGlobalsOnThrottle, inactiveNodeGlobalRelics,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,
   noteUpdateFailure, takeUpdateFailure,
+  saveState,
 };
 
 // CLI: node auto-update.js [check|status] [--silent] [--install-missing]

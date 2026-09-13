@@ -3934,7 +3934,19 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
 }
 
 /// The `~/.cache/code-graph` file names that must have exactly one spelling.
-const CACHE_FILE_NAMES: [&str; 3] = ["update-state.json", "install-manifest.json", "install.lock"];
+// `code-graph.uninstalled` is the teardown tombstone and the only one of these
+// that is NOT inside CACHE_DIR — it is a sibling on purpose, because a token
+// stored in the directory being deleted cannot guard that deletion. It is in
+// this list for the same reason as the other three: the day someone hardcodes
+// the basename in a second module is the day the two spellings can drift, and
+// for this one a drift means the updater checks a tombstone the teardown never
+// writes.
+const CACHE_FILE_NAMES: [&str; 4] = [
+    "update-state.json",
+    "install-manifest.json",
+    "install.lock",
+    "code-graph.uninstalled",
+];
 
 /// Which of [`CACHE_FILE_NAMES`] appear in `src` as a PATH LITERAL.
 ///

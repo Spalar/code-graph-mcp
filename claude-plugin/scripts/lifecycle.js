@@ -20,7 +20,10 @@ const MARKETPLACE_NAME = 'code-graph-mcp';
 // the first version of this comment claimed `MANIFEST_FILE` was exported from
 // here: `CACHE_DIR` and `INSTALL_LOCK_FILE` are exported and still are;
 // `MANIFEST_FILE` is module-private and always was, so nothing importable moved.
-const { CACHE_DIR, MANIFEST_FILE, INSTALL_LOCK_FILE } = require('./cache-paths');
+const {
+  CACHE_DIR, MANIFEST_FILE, INSTALL_LOCK_FILE,
+  writeUninstallTombstone, clearUninstallTombstone,
+} = require('./cache-paths');
 // Bound for the `ps` fallback in getActiveCmdlines (pre-ship review 2026-09-06).
 // 2 s matches the other hook-path probes; the floor is what a budget-exhausted
 // hook still gives it, since an empty list degrades to recency-only.
@@ -1322,6 +1325,12 @@ function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
 // --- Install (idempotent) ---
 
 function install({ reclaimStatusline = false } = {}) {
+  // An install is the end of any teardown, so the tombstone stops applying now
+  // rather than when its TTL runs out. Without this, reinstalling inside the
+  // 5-minute window would silently skip the first update check — harmless but
+  // confusing, and the eager clear costs one unlink.
+  clearUninstallTombstone();
+
   const version = getPluginVersion();
   const manifest = readManifest();
   // Probe FIRST, and pay the backup only on the write path (audit 2026-08-29
@@ -2019,6 +2028,24 @@ const POST_TEARDOWN_UI_NOTE = [
 ];
 
 function removeCacheResidue() {
+  // Announce the teardown BEFORE the delete, outside the directory being
+  // deleted. A SessionStart-spawned `auto-update` that is mid-flight will
+  // otherwise re-create CACHE_DIR under us — measured at 42,847,128 B of fresh
+  // binary plus three JSON files, 2 of 2 runs, when the teardown wins the race
+  // to `downloadBinary`'s mkdir.
+  //
+  // All three callers of this function are genuine-uninstall paths —
+  // `uninstall()`, `cleanupDisabledStatusline()` under `isPluginUninstalled`,
+  // and `runSessionInit()` under `if (uninstalled)` — so the tombstone belongs
+  // here rather than in each of them: one site, three callers, and no way for a
+  // future fourth caller to forget it. `runSessionInit`'s is the path that
+  // actually races, since it runs from the same SessionStart that spawns the
+  // updater.
+  //
+  // Best-effort by design: if this write fails, the delete below still runs and
+  // we are no worse off than before the tombstone existed.
+  writeUninstallTombstone();
+
   // Path comes from adopt.js rather than a second spelling of the basename —
   // a literal here would silently stop matching the day adopt.js renames it,
   // and the failure mode is exactly the data loss this guard exists to stop.

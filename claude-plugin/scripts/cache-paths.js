@@ -19,6 +19,7 @@
 // file — it already does `require('./lifecycle')`, so its copy of the three path
 // segments bought nothing. An earlier version of this comment claimed both
 // modules needed the split (pre-ship review 2026-09-07).
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
@@ -31,9 +32,87 @@ const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
 /** Inter-process install lock (see install-lock.js). */
 const INSTALL_LOCK_FILE = path.join(CACHE_DIR, 'install.lock');
 
+/**
+ * Teardown tombstone — a SIBLING of CACHE_DIR, deliberately not a file inside
+ * it.
+ *
+ * A teardown that runs while a SessionStart-spawned `auto-update` is in flight
+ * used to get CACHE_DIR re-created under it: measured at 42,847,128 B of fresh
+ * binary plus three JSON files, 2 of 2 runs, in the arm where the teardown
+ * beats the download.
+ *
+ * INSTALL_LOCK_FILE above is the token the updater already respects, and taking
+ * it here was prototyped for exactly this job and REFUTED: it lives at
+ * CACHE_DIR/install.lock, `removeCacheResidue()` deletes CACHE_DIR, so the lock
+ * goes with the directory and the updater acquires freely seconds later. A
+ * mutual-exclusion token stored inside the resource being destroyed cannot
+ * guard that destruction — which is why this one is a sibling.
+ */
+const UNINSTALL_TOMBSTONE_FILE = path.join(os.homedir(), '.cache', 'code-graph.uninstalled');
+
+/**
+ * How long a tombstone suppresses writes. Longer than any teardown, shorter
+ * than any interval over which a stale one could matter: a reinstall inside the
+ * window merely skips one update check, and the install itself supplies the
+ * binary. The TTL is what keeps this from becoming a permanent kill switch —
+ * a tombstone that never expired would disable auto-update for the life of the
+ * machine, a worse failure than the residue it prevents.
+ */
+const UNINSTALL_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
+
+/** Record that a teardown is in flight. Best-effort: a cache we cannot write
+ *  to is one the updater's own writes will fail against too. */
+function writeUninstallTombstone({ file = UNINSTALL_TOMBSTONE_FILE, now = Date.now() } = {}) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ at: new Date(now).toISOString() }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Is a teardown in flight right now?
+ *
+ * Fail-OPEN on every unreadable shape — absent, unparseable, no timestamp. The
+ * alternative is a corrupt file that can never expire, and the spec rates a
+ * permanently suppressed updater worse than the 41 MB this exists to stop.
+ */
+function uninstallTombstoneActive({
+  file = UNINSTALL_TOMBSTONE_FILE,
+  now = Date.now(),
+  ttlMs = UNINSTALL_TOMBSTONE_TTL_MS,
+} = {}) {
+  let at;
+  try {
+    at = Date.parse(JSON.parse(fs.readFileSync(file, 'utf8')).at);
+  } catch {
+    return false;
+  }
+  if (!Number.isFinite(at)) return false;
+  return now - at < ttlMs;
+}
+
+/** Drop the tombstone. The TTL is the backstop; an install clears it eagerly so
+ *  a reinstall inside the window does not skip its first update check. */
+function clearUninstallTombstone({ file = UNINSTALL_TOMBSTONE_FILE } = {}) {
+  try {
+    fs.rmSync(file, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 module.exports = {
   CACHE_DIR,
   UPDATE_STATE_FILE,
   MANIFEST_FILE,
   INSTALL_LOCK_FILE,
+  UNINSTALL_TOMBSTONE_FILE,
+  UNINSTALL_TOMBSTONE_TTL_MS,
+  writeUninstallTombstone,
+  uninstallTombstoneActive,
+  clearUninstallTombstone,
 };

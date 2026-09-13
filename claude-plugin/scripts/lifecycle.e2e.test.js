@@ -1031,3 +1031,77 @@ test('uninstall removes the shared tmp dir', (t) => {
   assert.equal(fs.existsSync(cgTmp), false,
     'uninstall must reclaim the tmp dir, including entries the age-based prune would keep');
 });
+
+// ── Uninstall tombstone survives the teardown that writes it ──
+//
+// Spec: tasks/specs/uninstall-race-with-in-flight-auto-update.md.
+
+test('the teardown leaves a tombstone that OUTLIVES the directory it just deleted', (t) => {
+  // This is the whole design, and the property the refuted approach failed.
+  // Taking INSTALL_LOCK_FILE was prototyped for this job: the lock WAS acquired
+  // and 41 MB still came back, 2 of 2 runs, because the lock is
+  // CACHE_DIR/install.lock and the sweep below deletes CACHE_DIR. A
+  // mutual-exclusion token stored inside the resource being destroyed cannot
+  // guard that destruction — so this asserts the tombstone is somewhere the
+  // sweep cannot reach.
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
+  fs.mkdirSync(path.join(cacheDir, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'bin', 'code-graph-mcp'), 'x'.repeat(1024));
+  writeJson(path.join(cacheDir, 'adopted-projects.json'), []);
+  // The refuted token, planted so its fate is recorded next to the tombstone's.
+  fs.writeFileSync(path.join(cacheDir, 'install.lock'), '1');
+
+  execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    require(${JSON.stringify(lifecycleCli)}).removeCacheResidue();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot });
+
+  assert.equal(fs.existsSync(cacheDir), false, 'the cache directory is reclaimed');
+  assert.equal(fs.existsSync(path.join(cacheDir, 'install.lock')), false,
+    'control: a token INSIDE the directory goes with it — this is why the lock cannot do this job');
+  assert.equal(fs.existsSync(tombstone), true,
+    'the tombstone is a sibling, so it is still standing when the in-flight updater checks it');
+
+  const at = Date.parse(readJson(tombstone).at);
+  assert.ok(Number.isFinite(at), `tombstone carries a parseable timestamp, got ${JSON.stringify(readJson(tombstone))}`);
+  assert.ok(Math.abs(Date.now() - at) < 60_000, 'stamped now, not at some inherited time');
+});
+
+test('an in-flight updater started before the teardown finds the tombstone active', (t) => {
+  // The integration statement, without a timing race: the updater reads the
+  // tombstone through the same code path it will use in production, in a HOME
+  // where the teardown has already run.
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cacheDir, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'bin', 'code-graph-mcp'), 'x'.repeat(1024));
+
+  const out = execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    const before = require(${JSON.stringify(path.join(__dirname, 'cache-paths.js'))}).uninstallTombstoneActive();
+    require(${JSON.stringify(lifecycleCli)}).removeCacheResidue();
+    const after = require(${JSON.stringify(path.join(__dirname, 'cache-paths.js'))}).uninstallTombstoneActive();
+    console.log(JSON.stringify({ before, after }));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString();
+
+  const seen = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(seen.before, false,
+    'control: with no teardown in flight the updater is unaffected — the guard must be inert by default');
+  assert.equal(seen.after, true, 'after the teardown the updater refuses to re-create the cache');
+});
+
+test('install() clears the tombstone, so a reinstall does not skip its first update check', (t) => {
+  const homeDir = mkHome(t);
+  const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
+  fs.mkdirSync(path.dirname(tombstone), { recursive: true });
+  fs.writeFileSync(tombstone, JSON.stringify({ at: new Date().toISOString() }));
+
+  runScript(homeDir, lifecycleCli, ['install']);
+
+  assert.equal(fs.existsSync(tombstone), false,
+    'an install ends the teardown; the TTL is the backstop, not the only way out');
+});

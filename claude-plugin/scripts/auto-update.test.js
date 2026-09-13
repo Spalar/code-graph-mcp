@@ -2543,3 +2543,154 @@ test('a synchronously-thrown request does not hold the process open', (t) => {
     `process must exit once the promise rejects, not linger on the watchdog timer (took ${elapsed}ms)`,
   );
 });
+
+// ── Uninstall tombstone ────────────────────────────────────
+//
+// Spec: tasks/specs/uninstall-race-with-in-flight-auto-update.md. A teardown
+// that lands while a SessionStart-spawned updater is in flight used to get
+// CACHE_DIR re-created under it — a fresh 42,847,128 B binary plus three JSON
+// files, 41 MB, 2 of 2 runs, in the arm where the teardown beats the download.
+//
+// The coordination record has to live OUTSIDE CACHE_DIR. Taking
+// INSTALL_LOCK_FILE was prototyped for this job and REFUTED: the lock is
+// CACHE_DIR/install.lock, removeCacheResidue() deletes CACHE_DIR, so the lock
+// goes with it and the updater acquires freely seconds later. A
+// mutual-exclusion token stored inside the resource being destroyed cannot
+// guard that destruction.
+
+const {
+  UNINSTALL_TOMBSTONE_TTL_MS,
+  uninstallTombstoneActive,
+  writeUninstallTombstone,
+  clearUninstallTombstone,
+} = require('./cache-paths');
+const { saveState } = require('./auto-update');
+
+function tombstonePath(t) {
+  return path.join(mkDir(t, 'code-graph-tombstone-'), 'code-graph.uninstalled');
+}
+
+test('tombstone: younger than the TTL is active, older is not — injected clock, no sleep', (t) => {
+  const file = tombstonePath(t);
+  const t0 = 1_700_000_000_000;
+  writeUninstallTombstone({ file, now: t0 });
+
+  assert.equal(uninstallTombstoneActive({ file, now: t0 + 1_000 }), true,
+    'a teardown one second ago is still in flight');
+  // Both sides of the boundary, so an off-by-a-whole-TTL comparison cannot pass.
+  assert.equal(uninstallTombstoneActive({ file, now: t0 + UNINSTALL_TOMBSTONE_TTL_MS - 1 }), true,
+    'just inside the TTL');
+  assert.equal(uninstallTombstoneActive({ file, now: t0 + UNINSTALL_TOMBSTONE_TTL_MS + 1 }), false,
+    'just outside the TTL — a stale tombstone must suppress nothing');
+});
+
+test('tombstone: absent or unparseable is NOT active (fail-open)', (t) => {
+  const file = tombstonePath(t);
+  const now = 1_700_000_000_000;
+
+  assert.equal(uninstallTombstoneActive({ file, now }), false, 'absent');
+
+  fs.writeFileSync(file, 'not json at all');
+  assert.equal(uninstallTombstoneActive({ file, now }), false,
+    'fail OPEN: a tombstone that can never expire would disable auto-update for the life of the ' +
+    'machine, which the spec rates a worse failure than the 41 MB it prevents');
+
+  fs.writeFileSync(file, JSON.stringify({ at: 'not a timestamp' }));
+  assert.equal(uninstallTombstoneActive({ file, now }), false, 'unparseable timestamp');
+});
+
+test('tombstone: clearUninstallTombstone removes it, and is a no-op when absent', (t) => {
+  const file = tombstonePath(t);
+  const t0 = 1_700_000_000_000;
+  writeUninstallTombstone({ file, now: t0 });
+  assert.equal(fs.existsSync(file), true, 'precondition: written');
+
+  clearUninstallTombstone({ file });
+  assert.equal(fs.existsSync(file), false);
+  clearUninstallTombstone({ file }); // must not throw
+});
+
+test('arm 1: downloadBinary does not re-create the cache dir while a tombstone stands', async (t) => {
+  // The 41 MB arm. The teardown lands BEFORE downloadBinary's
+  // `fs.mkdirSync(BINARY_CACHE_DIR)`, so the whole chain proceeds on a
+  // re-created tree and finishes writing a fresh binary into it.
+  let mkdirCalls = 0;
+  let tombstoneChecks = 0;
+  const mkdir = () => { mkdirCalls++; };
+  const latest = { version: '9.9.9', binaryUrl: 'https://example.invalid/code-graph-mcp' };
+
+  const suppressed = await downloadBinary(latest, {
+    needsUpdate: () => true,
+    tombstoneActive: () => { tombstoneChecks++; return true; },
+    mkdir,
+  });
+  assert.equal(suppressed, false, 'a teardown in flight means no download this cycle');
+  // Written first WITHOUT this assertion, and it passed against the unfixed
+  // tree: the host is unreachable, so curl failed, downloadBinary returned
+  // false, and the mkdir counter stayed 0 for a reason that had nothing to do
+  // with a tombstone. The guard has to be observed, not inferred from an
+  // outcome that several paths produce.
+  assert.equal(tombstoneChecks, 1, 'the guard must actually be consulted');
+  assert.equal(mkdirCalls, 0, 'the cache directory must not come back');
+});
+
+test('arm 1 control: with no tombstone, downloadBinary still creates the cache dir', async (t) => {
+  // The other half of the pair. Without this, a guard that always answered
+  // "0 mkdir calls" would pass the test above and have broken every update.
+  let mkdirCalls = 0;
+  const mkdir = () => { mkdirCalls++; throw new Error('stop after the mkdir'); };
+  const latest = { version: '9.9.9', binaryUrl: 'https://example.invalid/code-graph-mcp' };
+
+  const result = await downloadBinary(latest, {
+    needsUpdate: () => true,
+    tombstoneActive: () => false,
+    mkdir,
+  });
+  assert.equal(result, false, 'the injected throw ends the attempt');
+  assert.equal(mkdirCalls, 1, 'no tombstone: behaviour is unchanged, the directory is created');
+});
+
+test('arm 2: promoteVerifiedBinary refuses the rename while a tombstone stands, and drops its tmp', (t) => {
+  // The teardown lands after curl has written the tmp file. Today the tmp is
+  // unlinked with the directory and statSync throws ENOENT; with the cache dir
+  // back, the rename would re-populate it instead.
+  const dir = mkDir(t, 'code-graph-bin-');
+  const tmp = path.join(dir, 'code-graph-mcp.tmp');
+  const dst = path.join(dir, 'code-graph-mcp');
+  writeFakeBinary(tmp, '1.2.3');
+
+  assert.equal(
+    promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp), { tombstoneActive: () => true }),
+    false,
+  );
+  assert.equal(fs.existsSync(dst), false, 'nothing promoted into a directory being torn down');
+  assert.equal(fs.existsSync(tmp), false, 'the finally block still owns the tmp file');
+});
+
+test('arm 2 control: with no tombstone, promoteVerifiedBinary still promotes', (t) => {
+  const dir = mkDir(t, 'code-graph-bin-');
+  const tmp = path.join(dir, 'code-graph-mcp.tmp');
+  const dst = path.join(dir, 'code-graph-mcp');
+  writeFakeBinary(tmp, '1.2.3');
+
+  assert.equal(
+    promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp), { tombstoneActive: () => false }),
+    true,
+  );
+  assert.equal(fs.existsSync(dst), true);
+});
+
+test('arm 2 residue: saveState does not re-create CACHE_DIR while a tombstone stands', (t) => {
+  // Measured: in the arm where the teardown beats the rename, the surviving
+  // residue was `update-state.json` — written by noteUpdateFailure -> saveState
+  // AFTER the directory had been deleted. Guarding only the two download sites
+  // leaves this one, so the arm would still fail its success criterion.
+  let writes = 0;
+  const write = () => { writes++; };
+
+  saveState({ installedVersion: '1.2.3' }, { tombstoneActive: () => true, write });
+  assert.equal(writes, 0, 'no state file, and therefore no CACHE_DIR, during a teardown');
+
+  saveState({ installedVersion: '1.2.3' }, { tombstoneActive: () => false, write });
+  assert.equal(writes, 1, 'control: without a tombstone the state is written as before');
+});
