@@ -22,7 +22,7 @@ const MARKETPLACE_NAME = 'code-graph-mcp';
 // `MANIFEST_FILE` is module-private and always was, so nothing importable moved.
 const {
   CACHE_DIR, MANIFEST_FILE, INSTALL_LOCK_FILE,
-  writeUninstallTombstone, clearUninstallTombstone,
+  writeUninstallTombstone, clearUninstallTombstone, uninstallTombstoneActive,
 } = require('./cache-paths');
 // Bound for the `ps` fallback in getActiveCmdlines (pre-ship review 2026-09-06).
 // 2 s matches the other hook-path probes; the floor is what a budget-exhausted
@@ -1959,11 +1959,36 @@ function scanForBrokenPaths() {
   return issues;
 }
 
-function healthCheck() {
+function healthCheck({ torndown = uninstallTombstoneActive } = {}) {
   const issues = scanForBrokenPaths();
 
   if (issues.length === 0) {
     return { healthy: true, issues, repaired: false };
+  }
+
+  // A teardown just ran: these broken paths ARE the uninstall, and the
+  // auto-repair below is an install().
+  //
+  // This is the second door to the same room. `doctor`'s two settings-writing
+  // repair arms are guarded, but `runDiagnostics` reaches HERE first on the
+  // default (repairing) path, and this call site sits in front of neither
+  // guard. Reproduced: sandbox HOME, plugin installed, all six hook commands
+  // repointed at a nonexistent dir, fresh tombstone standing, one `node
+  // doctor.js` — `Hooks ✅ 6 issue(s) auto-repaired`, settings.json back from
+  // six broken paths to zero, and doctor's own guard never printed. Guarding
+  // the repair arms while leaving the diagnosis free to install is a fix that
+  // only looks like one (pre-ship review, reviewer-reproduced).
+  //
+  // Placed in healthCheck rather than at doctor's call site so `lifecycle.js
+  // health` is covered by the same gate: both are "scan and auto-repair"
+  // entry points, and one of the two remembering is how this reappears.
+  //
+  // Honest return: `healthy: false` with `repaired: false` is exactly what the
+  // caller should render — the paths really are broken, and nothing fixed
+  // them. `skippedForTeardown` lets a caller say WHY instead of implying the
+  // repair was attempted and failed.
+  if (torndown()) {
+    return { healthy: false, issues, repaired: false, skippedForTeardown: true };
   }
 
   // Attempt auto-repair, then re-scan to confirm the issues actually went

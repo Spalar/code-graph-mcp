@@ -174,6 +174,25 @@ test('classifyHealthReport surfaces a damaged parse, and stays silent on a clean
   assert.match(capped[0].detail, /and 11 more/, `got: ${capped[0].detail}`);
 });
 
+test('the Parse row is advisory, so a grammar bug cannot pin doctor at exit 1', () => {
+  // Pre-ship review, reviewer-reproduced. The row shipped as a plain `warn`
+  // with no fixId: `runDoctor` counts `issues.filter(r => !r.advisory)` and
+  // `runDoctorCli` exits 1 when that is non-empty, so one unfixable file pinned
+  // the exit code at 1 permanently — including under --check-only, and
+  // including on this repository, where the README documents 8 of 161 Rust
+  // files tripping a pinned tree-sitter grammar bug with no user remedy.
+  //
+  // Measured, same HOME and project, one variable: add a file with unbalanced
+  // delimiters and reindex → exit 0 → 1; remove it and reindex → back to 0.
+  const { classifyHealthReport } = require('./doctor');
+  const row = classifyHealthReport({
+    schema_version: 10, nodes: 5, edges: 2, files: 3,
+    files_with_parse_errors: 1, parse_error_files: ['src/a.rs'],
+  }).find(r => r.name === 'Parse');
+  assert.equal(row.advisory, true,
+    'a warning whose repair is "edit source you may not control" must not gate the exit code');
+});
+
 // ── classifyEmbeddings (vector-availability — warns on silent FTS5-only) ──
 
 test('classifyEmbeddings WARNS when embed-capable but nothing embedded (vector inactive)', () => {

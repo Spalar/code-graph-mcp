@@ -3,13 +3,23 @@
 ## Unreleased
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71), the
-schema (v10), every flag and every exit code are unchanged. Two behaviour changes
-are confined to the five minutes after a teardown: `doctor` no longer re-installs
-what `uninstall` just removed, and resolving the binary no longer re-creates the
-cache directory. Outside that window both paths are byte-for-byte what they were.
-The third change is additive: a degraded index now says so on every status
-surface, and on a clean index those fields are absent, so existing responses are
-unchanged.
+schema (v10) and every flag are unchanged. Two behaviour changes are confined to
+the five minutes after a teardown: `doctor` no longer re-installs what
+`uninstall` just removed, and resolving the binary no longer re-creates the cache
+directory. Outside that window both paths are byte-for-byte what they were. The
+third change is additive: a degraded index now says so on every status surface,
+and on a clean index those fields are absent, so existing responses are unchanged.
+
+**One exit code does move, and only inside that window.** When `doctor` declines
+to repair because a teardown tombstone is standing, the issue stays unresolved
+and `doctor` exits 1 — the same shape `relicRepairGuard` has always had when it
+declines. `health-check` is unaffected and still exits 0. The new `Parse` row is
+deliberately **advisory**, so a degraded index never gates the exit code: its
+cause can be a grammar bug with no user remedy, and an earlier draft of this
+release pinned `doctor` at exit 1 permanently on any repository holding one such
+file — including this one. Caught in pre-ship review, with the matched control
+(add one file with unbalanced delimiters and reindex → exit 0 → 1; remove it →
+back to 0).
 
 ### A degraded index reported itself healthy
 
@@ -71,6 +81,17 @@ arm. The diagnostic re-opened the race the previous release closed.
 exactly the post-uninstall state. The new `teardownRepairGuard()` sits beside it
 on the same two settings-writing arms and asks the other question, printing why
 it declined and the one command that undoes it.
+
+Guarding those two arms was not enough, and pre-ship review found the door beside
+them: `runDiagnostics` reaches `healthCheck()` first on the default path, and
+`healthCheck()` calls `install()` whenever `scanForBrokenPaths()` is non-empty —
+in front of neither guard. Reproduced with the plugin installed, all six hook
+commands repointed at a nonexistent directory and a fresh tombstone standing: one
+`node doctor.js` printed `Hooks ✅ 6 issue(s) auto-repaired` and took
+`settings.json` from six broken paths back to zero, while the guard on the repair
+arms never printed. The gate now lives inside `healthCheck()` itself, so the
+`lifecycle.js health` CLI is covered by the same one — a second entry point
+remembering to check is how this class of hole reappears.
 
 Bounded by the tombstone's own TTL, deliberately: past the window a torn-down
 install is indistinguishable from one installed but never set up, and that IS a

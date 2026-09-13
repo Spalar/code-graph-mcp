@@ -183,14 +183,24 @@ function classifyHealthReport(hc) {
   // Additive and absent on a clean index, which is why this is `!== undefined`
   // rather than a truthiness test that would also swallow a legitimate 0.
   //
-  // No `fixId`: the repair is editing the source, which is the user's to do.
-  // `formatReport` already branches on `fixable.length === 0`, so a warn with no
-  // fix is counted as an issue without claiming doctor will fix it.
+  // No `fixId`, and `advisory: true`. The repair is editing the source, which
+  // is the user's to do — and on this very repository the cause is a pinned
+  // tree-sitter grammar bug the README documents as unfixed, so for 8 of 161
+  // Rust files there is no user action at all.
+  //
+  // The advisory flag is the load-bearing half. `runDoctor` counts
+  // `issues.filter(r => !r.advisory)` and `runDoctorCli` exits 1 when that is
+  // non-empty, so a plain warn with no fixId pins the exit code at 1 forever on
+  // any repo holding one bad file — including under `--check-only`, and
+  // including this one. Measured: same HOME, same project, add one file with
+  // unbalanced delimiters and reindex → exit 0 → 1; remove it and reindex →
+  // back to 0. The `Embeddings` row above carries the same flag for the same
+  // reason.
   if (hc.files_with_parse_errors !== undefined) {
     const named = Array.isArray(hc.parse_error_files) ? hc.parse_error_files : [];
     const more = hc.files_with_parse_errors - named.length;
     rows.push({
-      name: 'Parse', status: 'warn',
+      name: 'Parse', status: 'warn', advisory: true,
       detail: `${hc.files_with_parse_errors} file(s) indexed over a damaged parse — `
         + `symbols may be missing: ${named.join(', ')}${more > 0 ? `, and ${more} more` : ''}`,
     });
@@ -444,6 +454,21 @@ function runDiagnostics({ checkOnly = false } = {}) {
     : healthCheck();
   if (hookResult.healthy) {
     results.push({ name: 'Hooks', status: 'ok', detail: 'all paths valid' });
+  } else if (hookResult.skippedForTeardown) {
+    // healthCheck() declined the repair half because a teardown tombstone is
+    // standing. Advisory, and with no fixId, for the same reason
+    // `teardownRepairGuard` gives on the two arms below: these broken paths are
+    // the uninstall, not damage. Without `advisory` this would exit 1 for the
+    // life of the tombstone.
+    results.push({
+      name: 'Hooks',
+      status: 'warn',
+      advisory: true,
+      detail:
+        `${hookResult.issues.length} stale path(s) — NOT repaired: a teardown ran moments ago, ` +
+        `so these are the uninstalled state. If that was not intended: ` +
+        `node "${path.join(__dirname, 'lifecycle.js')}" install`,
+    });
   } else if (hookResult.repaired && hookResult.rebuiltFrom) {
     // The repair WORKED, but it worked by replacing an unusable settings.json
     // with a freshly built one — the user's model / env / permissions / own

@@ -1229,6 +1229,84 @@ test('doctor does not re-register hooks while a teardown tombstone stands', (t) 
     'control: the same call really does write hook entries — the guard is what stopped it above');
 });
 
+test('the DIAGNOSIS half of doctor cannot re-install during a teardown either', (t) => {
+  // Pre-ship review caught this: guarding the two `runRepairs` arms left the
+  // door beside them open. `runDiagnostics` calls `healthCheck()` on the
+  // default path, and `healthCheck()` calls `install()` whenever
+  // `scanForBrokenPaths()` is non-empty — in front of neither guard.
+  //
+  // Reproduced before the fix: plugin installed, all six hook commands
+  // repointed at a nonexistent dir, fresh tombstone, one `node doctor.js` →
+  // "Hooks ✅ 6 issue(s) auto-repaired", settings.json back from six broken
+  // paths to zero, and teardownRepairGuard never printed.
+  const homeDir = mkHome(t);
+  const settings = path.join(homeDir, '.claude', 'settings.json');
+  const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
+  runScript(homeDir, lifecycleCli, ['install']);
+
+  // Break every hook path, so the auto-repair half has something to do.
+  // `replaceAll`, not `replace`: each command names the script TWICE
+  // (`if [ -f "P" ]; then node "P"`), and a first-occurrence-only swap leaves
+  // the one the scanner reads intact — the fixture then produces nothing and
+  // every assertion below passes vacuously. Found exactly that way.
+  const broken = readJson(settings);
+  for (const matchers of Object.values(broken.hooks || {})) {
+    for (const m of matchers) {
+      for (const h of m.hooks || []) {
+        h.command = h.command.replaceAll(pluginRoot, '/nonexistent/gone/claude-plugin');
+      }
+    }
+  }
+  writeJson(settings, broken);
+
+  // The precondition asserts the SCANNER's verdict, not a string count in the
+  // file. Those are different questions, and the string count is the one that
+  // can be true while the condition under test is absent.
+  const brokenCount = JSON.parse(execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    console.log(require(${JSON.stringify(lifecycleCli)}).scanForBrokenPaths().length);
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString().trim());
+  assert.ok(brokenCount > 0,
+    'precondition: scanForBrokenPaths must actually see broken paths, or healthCheck short-circuits as healthy and proves nothing');
+
+  fs.mkdirSync(path.dirname(tombstone), { recursive: true });
+  fs.writeFileSync(tombstone, JSON.stringify({ at: new Date().toISOString() }));
+
+  const out = execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    console.log(JSON.stringify(require(${JSON.stringify(lifecycleCli)}).healthCheck()));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString();
+  const result = JSON.parse(out.trim().split('\n').pop());
+
+  const seen = JSON.stringify({ ...result, issues: (result.issues || []).length });
+  assert.equal(result.repaired, false, `the repair half must not run during a teardown: ${seen}`);
+  assert.equal(result.skippedForTeardown, true,
+    `and must say why, not imply the repair failed: ${seen}`);
+  const stillBroken = () => JSON.parse(execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    console.log(require(${JSON.stringify(lifecycleCli)}).scanForBrokenPaths().length);
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString().trim());
+  assert.equal(stillBroken(), brokenCount,
+    `settings.json must be untouched: ${brokenCount} broken path(s) before, ${stillBroken()} after`);
+
+  // Control: same call, same broken settings, no tombstone — the repair DOES
+  // run. Without this arm "nothing was repaired" is equally consistent with a
+  // healthCheck that never had anything to repair in this sandbox.
+  fs.rmSync(tombstone, { force: true });
+  const out2 = execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
+    console.log(JSON.stringify(require(${JSON.stringify(lifecycleCli)}).healthCheck()));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString();
+  const control = JSON.parse(out2.trim().split('\n').pop());
+  assert.equal(control.skippedForTeardown, undefined, 'control: no teardown standing');
+  assert.equal(stillBroken(), 0,
+    'control: the same call really does re-anchor the paths — the tombstone is what stopped it above');
+});
+
 test('a binary lookup does not re-create the cache dir a teardown just removed', (t) => {
   // `find-binary` writes `~/.cache/code-graph/binary-path` on every cold
   // resolution and reaches CACHE_DIR through its own `os.homedir()` join rather
