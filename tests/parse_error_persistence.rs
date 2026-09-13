@@ -186,6 +186,43 @@ fn a_deleted_file_stops_counting_against_the_index() {
         "the offending file is gone; a verdict naming it is stale, got {:?}",
         g.recorded()
     );
+
+    // Arm 3: the stored ROW, not only what the reader makes of it.
+    //
+    // Arms 1 and 2 are blind to this by construction. `record_parse_error_files`
+    // opens with `let previous = self.parse_error_files()?` — the INTERSECTED
+    // read — and that is the only thing that prunes dead paths out of the row.
+    // Turn that line into a raw `get_meta` some day and both arms above stay
+    // green while the row accumulates dead paths forever (pre-ship review,
+    // reviewer-named; the mutation is verified red against this arm).
+    //
+    // The run has to PARSE something. A delete-only run skips the write
+    // entirely (`if !parsed_paths.is_empty()`), so the row keeps the dead path
+    // and that is deliberate — reader-equivalent, not row-equivalent. A first
+    // draft of this arm asserted the row after a delete-only run and failed on
+    // correct code, which is the test contradicting a documented decision rather
+    // than finding a defect. Touching a second file is what makes the write run.
+    let h = fixture();
+    h.write("src/broken.rs", BROKEN);
+    h.write("src/clean_a.rs", CLEAN_A);
+    assert_eq!(h.full(), 1, "precondition");
+    fs::remove_file(h.project.path().join("src/broken.rs")).unwrap();
+    h.write("src/clean_a.rs", CLEAN_B); // gives the run parse work to do
+    h.incremental();
+
+    let raw: Option<String> =
+        h.db.conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                ["parse_error_files"],
+                |r| r.get(0),
+            )
+            .ok();
+    assert!(
+        !raw.as_deref().unwrap_or("").contains("src/broken.rs"),
+        "a run that did parse work must prune the departed file OUT OF THE ROW, \
+         not merely hide it behind the reader's intersection — got {raw:?}"
+    );
 }
 
 #[test]

@@ -513,6 +513,22 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// observability; a corrupt bookkeeping row must not make `health-check`
     /// fail, and "nothing known to be degraded" is what every index built before
     /// this key existed also says.
+    ///
+    /// # Cost, measured rather than bounded by assertion
+    ///
+    /// One `SELECT 1 FROM files WHERE path = ?1` per stored path, so O(n) round
+    /// trips — served by the `files.path` UNIQUE index, and NOT on the per-query
+    /// hot path: the only readers are `cmd_health_check_opts` and
+    /// `tool_get_index_status`. Measured in pre-ship review: 2000 all-erroring
+    /// files give a 44,001-byte row read in 5.9 ms cold / 5.5 ms warm (≈22 B and
+    /// ≈3 µs per path); this repository's own index gives 10 files and a
+    /// 283-byte row. Linear extrapolation to 10k degraded files is ~480 KB and
+    /// ~30 ms, orders of magnitude inside SQLite's TEXT limit.
+    ///
+    /// Deliberately not a test. A timing assertion is flaky in CI, and a
+    /// row-size assertion derived from `PARSE_ERROR_FILES_SHOWN` or from the
+    /// fixture would stay green at every value of the constant it claims to
+    /// guard — the vacuous shape this repo has been bitten by before.
     pub fn parse_error_files(&self) -> Result<Vec<String>> {
         let raw = match crate::storage::queries::get_meta(
             self.conn(),
