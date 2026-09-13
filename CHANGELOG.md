@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.151.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71), the
 schema (v10) and every flag are unchanged. Two behaviour changes are confined to
