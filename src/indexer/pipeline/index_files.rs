@@ -236,6 +236,13 @@ struct FilePreParsed {
     hash: String,
     last_modified: i64,
     parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+    /// This file's tree carried ERROR node(s). Travels beside the `parse_errors`
+    /// counter rather than replacing it: the counter is this run's total, this
+    /// flag is which file, and only the second can be folded into the index's
+    /// durable set (`META_KEY_PARSE_ERROR_FILES`). Carried on the outcome
+    /// instead of collected through a shared Mutex because the batch's outcomes
+    /// are already drained by a sequential loop, so the paths cost no locking.
+    has_parse_errors: bool,
 }
 
 // Heavyweight per-file data used during Phase 1+2, dropped after each batch.
@@ -514,7 +521,8 @@ fn pre_parse_batch(
             // nodes and still returning a tree, so parse "succeeds" but symbol
             // extraction below runs over a damaged parse and can silently drop
             // symbols. Surface it: warn once per file and count the pass total.
-            if tree.root_node().has_error() {
+            let has_parse_errors = tree.root_node().has_error();
+            if has_parse_errors {
                 tracing::warn!(
                     "Syntax errors in {} — symbols may be incomplete (parsed with tree-sitter error recovery)",
                     rel_path
@@ -532,6 +540,7 @@ fn pre_parse_batch(
                 hash,
                 last_modified,
                 parsed_nodes,
+                has_parse_errors,
             }))
         })
         .collect();
@@ -2104,6 +2113,14 @@ pub(super) fn index_files(
     // Process files in batches — each batch does Phase 1 + Phase 2.
     // Bounded by bytes as well as by count: see [`BATCH_MAX_BYTES`] for why a
     // 500-file cap alone let one batch reach 500 MiB of source.
+    // Which files this run PARSED, and the subset whose tree carried ERROR
+    // nodes. Both are needed to fold this run into the index's durable
+    // degraded-file set: the second is the finding, the first is the authority
+    // to overwrite — a file this run never opened keeps its previous verdict.
+    // See `Database::record_parse_error_files`.
+    let mut parsed_paths: Vec<String> = Vec::new();
+    let mut parse_error_paths: Vec<String> = Vec::new();
+
     let plan = plan_batches(&files, root, BATCH_SIZE, BATCH_MAX_BYTES);
     let multi_batch = plan.len() > 1;
     let mut batch_start = 0usize;
@@ -2114,6 +2131,16 @@ pub(super) fn index_files(
 
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
         let pre_parsed = pre_parse_batch(batch, root, hashes, &counters);
+
+        // Drained here, before Phase 1b consumes `pre_parsed.parsed`. Skipped
+        // files are deliberately absent: nothing re-examined them this run, so
+        // whatever the index already believed about them stands.
+        for p in &pre_parsed.parsed {
+            parsed_paths.push(p.rel_path.clone());
+            if p.has_parse_errors {
+                parse_error_paths.push(p.rel_path.clone());
+            }
+        }
 
         // The paths this batch purges WITHOUT reinserting anything. They have to
         // join `batch_file_paths` below, which is the set that both excludes a
@@ -2290,6 +2317,15 @@ pub(super) fn index_files(
             db.conn(),
             crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
         )?;
+    }
+
+    // Fold this run's parse verdicts into the index's durable set, so a reader
+    // can report a degraded index after the process that warned about it is
+    // gone. Skipped when this run parsed nothing: the merge would then be the
+    // identity, and a no-diff incremental should not rewrite the row. Deleted
+    // files need no handling here — the set is intersected with `files` on read.
+    if !parsed_paths.is_empty() {
+        db.record_parse_error_files(&parsed_paths, &parse_error_paths)?;
     }
 
     // Finalizing heartbeat: every phase below is a full-graph pass with no

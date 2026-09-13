@@ -501,6 +501,77 @@ If you see this repeatedly, another code-graph server of a different version is 
         self.index_version_stale
     }
 
+    /// Files currently believed to have parsed with tree-sitter ERROR nodes, so
+    /// a reader can report a degraded index long after the run that built it.
+    ///
+    /// Intersected with `files` on the way out rather than pruned on write: a
+    /// path that left the repository is no longer a verdict about anything, and
+    /// doing it here means deletion needs no bookkeeping on the index side —
+    /// whatever removes the row removes the claim with it.
+    ///
+    /// An unreadable or malformed value reads as EMPTY, not as an error. This is
+    /// observability; a corrupt bookkeeping row must not make `health-check`
+    /// fail, and "nothing known to be degraded" is what every index built before
+    /// this key existed also says.
+    pub fn parse_error_files(&self) -> Result<Vec<String>> {
+        let raw = match crate::storage::queries::get_meta(
+            self.conn(),
+            crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
+        )? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        let stored: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+        if stored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut live = Vec::new();
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
+        for path in stored {
+            if stmt.exists([&path])? {
+                live.push(path);
+            }
+        }
+        Ok(live)
+    }
+
+    /// Fold one run's verdict into the stored set:
+    /// `(stored - parsed_this_run) + errored_this_run`.
+    ///
+    /// The subtraction is what makes an incremental run safe. Only a file this
+    /// run actually PARSED can have changed its verdict; one it never opened
+    /// keeps whatever was known about it. A full index parses everything, so the
+    /// subtraction empties the set and the result is exactly this run's finding
+    /// — no separate full-vs-incremental branch, and no way for the two to drift.
+    ///
+    /// Files skipped for size / encoding / read failure are deliberately NOT in
+    /// `parsed`: nothing re-examined them, so their verdict stands.
+    pub fn record_parse_error_files(&self, parsed: &[String], errored: &[String]) -> Result<()> {
+        let previous = self.parse_error_files()?;
+        let reparsed: std::collections::HashSet<&str> = parsed.iter().map(String::as_str).collect();
+        let mut kept: Vec<String> = previous
+            .into_iter()
+            .filter(|p| !reparsed.contains(p.as_str()))
+            .collect();
+        kept.extend(errored.iter().cloned());
+        kept.sort();
+        kept.dedup();
+        if kept.is_empty() {
+            crate::storage::queries::delete_meta(
+                self.conn(),
+                crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
+            )
+        } else {
+            crate::storage::queries::set_meta(
+                self.conn(),
+                crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
+                &serde_json::to_string(&kept)?,
+            )
+        }
+    }
+
     /// Check if an error indicates SQLite database corruption.
     /// Used to decide whether to auto-delete and rebuild the index cache.
     fn is_corruption_error(e: &anyhow::Error) -> bool {

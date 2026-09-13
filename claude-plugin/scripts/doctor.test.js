@@ -146,6 +146,34 @@ test('relicRepairGuard blocks settings repair from a relic copy and redirects', 
   assert.equal(relicRepairGuard({ relic: false, log: () => {} }), false);
 });
 
+// ── Parse-degradation row (v0.151.0 — a damaged parse is invisible at query time) ──
+
+test('classifyHealthReport surfaces a damaged parse, and stays silent on a clean index', () => {
+  const { classifyHealthReport } = require('./doctor');
+  const base = { schema_version: 10, nodes: 5, edges: 2, files: 3, index_age: '1s ago' };
+
+  const clean = classifyHealthReport(base).filter(r => r.name === 'Parse');
+  assert.deepEqual(clean, [],
+    'health-check omits the field on a clean index; inventing a row from its absence would warn on every healthy repo');
+
+  const degraded = classifyHealthReport({
+    ...base, files_with_parse_errors: 2, parse_error_files: ['src/a.rs', 'src/b.rs'],
+  }).filter(r => r.name === 'Parse');
+  assert.equal(degraded.length, 1);
+  assert.equal(degraded[0].status, 'warn', 'the index is usable but not complete');
+  assert.match(degraded[0].detail, /2 file\(s\)/);
+  assert.match(degraded[0].detail, /src\/a\.rs, src\/b\.rs/, 'name them — "2 files" is not actionable');
+  assert.equal(degraded[0].fixId, undefined,
+    'fixing syntax errors is the user\'s job; a fixId would make doctor claim a repair it cannot perform');
+
+  // The count is uncapped and the list is not, so the row must account for the
+  // difference rather than silently under-report.
+  const capped = classifyHealthReport({
+    ...base, files_with_parse_errors: 12, parse_error_files: ['src/a.rs'],
+  }).filter(r => r.name === 'Parse');
+  assert.match(capped[0].detail, /and 11 more/, `got: ${capped[0].detail}`);
+});
+
 // ── classifyEmbeddings (vector-availability — warns on silent FTS5-only) ──
 
 test('classifyEmbeddings WARNS when embed-capable but nothing embedded (vector inactive)', () => {

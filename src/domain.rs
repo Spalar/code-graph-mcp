@@ -25,6 +25,15 @@ pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
 /// flow. Kept in sync with the literal in claude-plugin/scripts/recommendation-log.js.
 pub const NO_METRICS_SENTINEL: &str = ".no-metrics";
 
+/// How many degraded file paths a status surface names before it stops.
+///
+/// Shared by `health-check` and the MCP `get_index_status` so the two cannot
+/// disagree about how much of the same list they show. The COUNT beside it is
+/// never capped: a repository where a grammar fails on hundreds of files is
+/// exactly the one whose status must not become a hundred-line dump, but
+/// understating the total to keep the output short would defeat the field.
+pub const PARSE_ERROR_FILES_SHOWN: usize = 10;
+
 // -- MCP tool surface --
 /// Tools surfaced in `tools/list` (the live surface MCP clients see). Single
 /// source of truth so `stats` can flag legacy/folded tool names recorded in

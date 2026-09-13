@@ -148,13 +148,27 @@ impl McpServer {
             // stderr summary and `--json` both carry it); the MCP surface had no
             // way to say it, so an agent could not tell that a thin result set
             // came from a broken file rather than from the code really being
-            // thin. Zero stays silent, like every counter around it —
-            // `last_index_stats` is per-process, so a server that started
-            // against a fresh index holds zeros it never earned.
-            if stats.files_with_parse_errors > 0 {
+            // thin. Empty stays silent, like every counter around it.
+            //
+            // Read from the INDEX, not from `last_index_stats`. That counter is
+            // per-process: a server that started against an already-fresh index
+            // did no work and holds zeros it never earned, so this surface could
+            // disclose the damage only to the one process that happened to cause
+            // it. The index now carries the offending paths itself
+            // (`META_KEY_PARSE_ERROR_FILES`) — the same answer the run would have
+            // given, and it survives the run.
+            let parse_error_files = self.db.parse_error_files().unwrap_or_default();
+            if !parse_error_files.is_empty() {
                 obj.insert(
                     "files_with_parse_errors".into(),
-                    json!(stats.files_with_parse_errors),
+                    json!(parse_error_files.len()),
+                );
+                obj.insert(
+                    "parse_error_files".into(),
+                    json!(parse_error_files
+                        .iter()
+                        .take(crate::domain::PARSE_ERROR_FILES_SHOWN)
+                        .collect::<Vec<_>>()),
                 );
             }
             obj.insert(

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::domain::PARSE_ERROR_FILES_SHOWN;
+
 // Internal notes — `//` (not `///`) so clap leaves them out of `--help`: --json and
 // --format coexist for back-compat (--json is shorthand for `--format json` and wins
 // when both are given); resolved_format() below collapses them into the single `&str`
@@ -306,6 +308,8 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
     // an older INDEX_VERSION, the data is intact but a rebuild is owed. Report it
     // rather than (as before) silently wiping it on this status poll.
     let index_version_stale = ctx.db.index_version_stale();
+    // Observability only: a read that fails must not fail the status poll.
+    let parse_error_files = ctx.db.parse_error_files().unwrap_or_default();
     let conn = ctx.db.conn();
     let status = queries::get_index_status(conn, false)?;
 
@@ -466,6 +470,23 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 "index_version_stale": index_version_stale.is_some(),
                 "integrity": integrity.to_json(),
             });
+            // Additive, and absent on a clean index so this adds nothing to the
+            // common response. A degraded index used to be indistinguishable
+            // from a healthy one here: tree-sitter recovers from syntax errors
+            // and still yields a tree, so the file is indexed over a damaged
+            // parse and the run's per-file warning is the only trace — gone the
+            // moment the process exits.
+            //
+            // The list is capped; the count is not. Truncating the count to keep
+            // the response small would understate the damage, which is the one
+            // thing this field exists not to do.
+            if !parse_error_files.is_empty() {
+                json["files_with_parse_errors"] = serde_json::json!(parse_error_files.len());
+                json["parse_error_files"] = serde_json::json!(parse_error_files
+                    .iter()
+                    .take(PARSE_ERROR_FILES_SHOWN)
+                    .collect::<Vec<_>>());
+            }
             // Additive field: absent when no download was ever recorded, which
             // is itself the "never attempted" diagnosis.
             if let Some(ref s) = model_download {
@@ -617,6 +638,27 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                          rebuild — run: code-graph-mcp reindex",
                         old,
                         crate::domain::INDEX_VERSION
+                    );
+                }
+                // Same reason the STALE line above exists: usable, but not
+                // everything the user thinks it is, and until now only the
+                // indexing run's own stderr ever said so.
+                if !parse_error_files.is_empty() {
+                    let shown: Vec<&str> = parse_error_files
+                        .iter()
+                        .take(PARSE_ERROR_FILES_SHOWN)
+                        .map(String::as_str)
+                        .collect();
+                    let more = parse_error_files.len().saturating_sub(shown.len());
+                    println!(
+                        "Parse: {} file(s) indexed over a damaged parse — symbols may be missing: {}{}",
+                        parse_error_files.len(),
+                        shown.join(", "),
+                        if more > 0 {
+                            format!(", and {} more", more)
+                        } else {
+                            String::new()
+                        }
                     );
                 }
                 print_resolution();

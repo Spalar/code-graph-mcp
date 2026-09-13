@@ -5091,10 +5091,8 @@ app.post('/api/login', handleLogin);
         let server = McpServer::new_test();
 
         // Zero must stay SILENT, matching the `skipped_files` idiom right above
-        // it: `last_index_stats` reflects the last index run IN THIS PROCESS, so
-        // a server that started against an already-fresh index did no work and
-        // holds zeros. Emitting `0` there would assert "no parse errors" on
-        // evidence that says nothing at all.
+        // it. Emitting `0` would assert "no parse errors" on an index that may
+        // simply never have been asked.
         let resp = server
             .handle_message(&tool_call_json("get_index_status", json!({})))
             .unwrap();
@@ -5104,18 +5102,45 @@ app.post('/api/login', handleLogin);
             "a run with no parse errors must not claim a count: {clean:?}"
         );
 
-        server
-            .last_index_stats
-            .lock()
-            .unwrap()
-            .files_with_parse_errors = 3;
-        let resp = server
+        // The disclosure has to survive the process that caused it. This used to
+        // read `last_index_stats`, which is per-process, so it was asserted by
+        // POKING that field — a shape that passes whether or not the index can
+        // answer the question for anyone else. Two servers over one project:
+        // the first does the indexing, the second is every later session.
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("broken.ts"),
+            "function b( { const x = ;\nfunction c() {}\n",
+        )
+        .unwrap();
+        let indexer = McpServer::new_test_with_project(project_dir.path());
+        indexer
+            .handle_message(&tool_call_json("rebuild_index", json!({"confirm": true})))
+            .unwrap();
+
+        let later_session = McpServer::new_test_with_project(project_dir.path());
+        assert_eq!(
+            later_session
+                .last_index_stats
+                .lock()
+                .unwrap()
+                .files_with_parse_errors,
+            0,
+            "precondition: this server did no indexing, so the old per-process \
+             counter holds nothing — the answer below can only come from the index"
+        );
+        let resp = later_session
             .handle_message(&tool_call_json("get_index_status", json!({})))
             .unwrap();
         let degraded = parse_tool_result(&resp);
         assert_eq!(
-            degraded["files_with_parse_errors"], 3,
+            degraded["files_with_parse_errors"], 1,
             "salvaged-but-incomplete files must be disclosed: {degraded:?}"
+        );
+        assert_eq!(
+            degraded["parse_error_files"],
+            json!(["broken.ts"]),
+            "and named, or the caller cannot tell WHICH results are thin: {degraded:?}"
         );
     }
 

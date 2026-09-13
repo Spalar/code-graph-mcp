@@ -12,6 +12,22 @@ pub const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
 /// built before this key existed.
 pub const META_KEY_INDEX_RUN_IN_FLIGHT: &str = "index_run_in_flight";
 
+/// JSON array of the file paths whose tree carried tree-sitter ERROR node(s) on
+/// the run that last parsed them — the index's own record that it is degraded.
+///
+/// A COUNT cannot live here. An incremental run parses only what changed, so the
+/// count it observed describes those files alone: one clean edit after a full
+/// index that found eight bad files would store `0` and the index would report
+/// itself healthy while still serving symbols from a damaged parse. The set is
+/// updated as `(stored - parsed_this_run) + errored_this_run`, one rule for both
+/// run kinds — a full index parses everything, so the subtraction empties it.
+///
+/// No SCHEMA_VERSION bump: the `meta` table is v7 and an absent key reads as
+/// "nothing known to be degraded", which is the correct answer for every index
+/// built before this key existed (same argument as
+/// [`META_KEY_INDEX_RUN_IN_FLIGHT`] above).
+pub const META_KEY_PARSE_ERROR_FILES: &str = "parse_error_files";
+
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
 const FTS5_TRIGGERS: &str = "

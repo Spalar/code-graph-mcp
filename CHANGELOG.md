@@ -2,12 +2,51 @@
 
 ## Unreleased
 
-**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION`, the
-schema, every flag and every exit code are unchanged. Two behaviour changes, both
-confined to the five minutes after a teardown: `doctor` no longer re-installs
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71), the
+schema (v10), every flag and every exit code are unchanged. Two behaviour changes
+are confined to the five minutes after a teardown: `doctor` no longer re-installs
 what `uninstall` just removed, and resolving the binary no longer re-creates the
-cache directory. Outside that window nothing behaves differently — with no
-teardown tombstone standing, both paths are byte-for-byte what they were.
+cache directory. Outside that window both paths are byte-for-byte what they were.
+The third change is additive: a degraded index now says so on every status
+surface, and on a clean index those fields are absent, so existing responses are
+unchanged.
+
+### A degraded index reported itself healthy
+
+Tree-sitter recovers from syntax errors by inserting ERROR nodes and still
+returning a tree. The file IS indexed — over a damaged parse, with whatever
+symbols did not survive simply absent, so a thin result set reads as "the code is
+thin". The indexer warned per file while it ran, and that was the only trace it
+ever left: `health-check` reported `healthy: true` with no mention, `doctor`
+agreed, `stats`' `parse_errors` is an unrelated number (session metrics from
+`usage.jsonl`), and the MCP `files_with_parse_errors` key appeared only when the
+server process had itself done the indexing, from per-process state it could not
+have earned otherwise.
+
+The index now carries the verdict: `health-check` prints
+`Parse: N file(s) indexed over a damaged parse — symbols may be missing: <paths>`
+and, under `--json`, `files_with_parse_errors` plus a capped `parse_error_files`;
+`doctor` grows a `Parse` row (a warning with no auto-fix — editing the source is
+the user's job); MCP `get_index_status` carries the same two fields, now read
+from the index rather than from memory.
+
+**What is stored is a path SET, not a count, and that is the whole design.** An
+incremental run parses only what changed, so a count written by that run
+describes those files alone: one clean edit after a full index that found eight
+bad files would store `0`, and the index would call itself healthy while still
+serving symbols from a damaged parse. The set is folded as
+`(stored - parsed_this_run) + errored_this_run`, one rule for both run kinds —
+a full index parses everything, so the subtraction empties the set and the result
+is exactly what that run saw. A file nobody re-parsed keeps its verdict; a
+repaired file loses it on the run that re-parses it; a deleted file drops out
+because the set is intersected with `files` on read, so removal needs no
+bookkeeping of its own.
+
+No `SCHEMA_VERSION` bump: the value is a `meta` row, that table is v7, and an
+absent key reads as "nothing known to be degraded" — the correct answer for every
+index built before this key existed. No `INDEX_VERSION` bump either: nothing
+about what gets extracted changed, only whether the run's own finding is written
+down.
 
 ### `doctor` put an uninstall back
 

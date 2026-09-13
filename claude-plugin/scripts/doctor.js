@@ -177,6 +177,24 @@ function classifyHealthReport(hc) {
   // degradation (model missing/not loaded) instead of false-greening it.
   rows.push(classifyEmbeddings(hc));
   rows.push(classifyIntegrity(hc));
+  // Files indexed over a tree-sitter error recovery. They look exactly like
+  // clean ones at query time — the symbols that survived are real, the ones that
+  // did not are simply absent — so a thin result reads as "the code is thin".
+  // Additive and absent on a clean index, which is why this is `!== undefined`
+  // rather than a truthiness test that would also swallow a legitimate 0.
+  //
+  // No `fixId`: the repair is editing the source, which is the user's to do.
+  // `formatReport` already branches on `fixable.length === 0`, so a warn with no
+  // fix is counted as an issue without claiming doctor will fix it.
+  if (hc.files_with_parse_errors !== undefined) {
+    const named = Array.isArray(hc.parse_error_files) ? hc.parse_error_files : [];
+    const more = hc.files_with_parse_errors - named.length;
+    rows.push({
+      name: 'Parse', status: 'warn',
+      detail: `${hc.files_with_parse_errors} file(s) indexed over a damaged parse — `
+        + `symbols may be missing: ${named.join(', ')}${more > 0 ? `, and ${more} more` : ''}`,
+    });
+  }
   return rows;
 }
 
