@@ -480,6 +480,13 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
             // The list is capped; the count is not. Truncating the count to keep
             // the response small would understate the damage, which is the one
             // thing this field exists not to do.
+            //
+            // Same KEY as `index --json`'s counter, different SCOPE, and both
+            // spellings are shipped so neither can be renamed: there it is
+            // run-scoped (what that run saw), here it is index-scoped (what the
+            // index believes about the whole tree). They agree after a full index
+            // and diverge after an incremental — which is the point of storing a
+            // set rather than a number (pre-ship review raised the collision).
             if !parse_error_files.is_empty() {
                 json["files_with_parse_errors"] = serde_json::json!(parse_error_files.len());
                 json["parse_error_files"] = serde_json::json!(parse_error_files

@@ -236,6 +236,51 @@ fn a_file_the_run_examined_but_skipped_loses_its_verdict_too() {
 }
 
 #[test]
+fn the_same_holds_for_the_other_skipped_arm_non_utf8() {
+    // `Skipped` is reached from three conditions, and the test above exercises
+    // exactly one of them (oversize). The reviewer who found the defect said so
+    // plainly — "my repro used arm 2 only, so arms 4 and 5 are now fixed but
+    // untested" — and a fix verified on one arm of three is the shape that
+    // leaves the other two to rot.
+    //
+    // This is arm 4: bytes read, identity known, `String::from_utf8` refuses.
+    //
+    // Arm 5 (`parse_tree` returns Err, i.e. the parse TIMES OUT) is deliberately
+    // not here. Its trigger is `CODE_GRAPH_PARSE_TIMEOUT_MS`, read through a
+    // process-global `OnceLock` that latches on first use, so it is only
+    // settable in a test binary that contains exactly one test — which is what
+    // `tests/parse_failure_recording.rs` is, and that file already pins arm 5's
+    // membership in `Skipped`. From the drain's point of view arms 4 and 5 are
+    // the same statement (`for s in &pre_parsed.skipped`), so pinning one arm's
+    // drain plus the other arm's membership covers the pair.
+    let f = fixture();
+    f.write("src/broken.rs", BROKEN);
+    assert_eq!(f.full(), 1, "precondition");
+    assert_eq!(
+        f.recorded(),
+        vec!["src/broken.rs".to_string()],
+        "precondition"
+    );
+
+    // Valid Rust, then a lone 0xFF — readable bytes, not UTF-8.
+    let mut bytes = CLEAN_A.as_bytes().to_vec();
+    bytes.push(0xFF);
+    fs::write(f.project.path().join("src/broken.rs"), bytes).unwrap();
+
+    assert_eq!(
+        f.full(),
+        0,
+        "precondition: the rebuild parsed nothing broken"
+    );
+    assert!(
+        f.recorded().is_empty(),
+        "a file the run read and identified but could not decode was still \
+         re-examined, so its old verdict is spent — got {:?}",
+        f.recorded()
+    );
+}
+
+#[test]
 fn a_clean_project_records_nothing() {
     // Negative control for all four above: the mechanism must be inert when
     // there is nothing to report, or "the set is non-empty" proves only that

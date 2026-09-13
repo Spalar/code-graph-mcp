@@ -40,6 +40,15 @@ and, under `--json`, `files_with_parse_errors` plus a capped `parse_error_files`
 the user's job); MCP `get_index_status` carries the same two fields, now read
 from the index rather than from memory.
 
+**One name, two scopes — worth knowing before you script against it.**
+`files_with_parse_errors` on `index --json` has always been RUN-scoped: what that
+one run saw. The same key on `health-check --json` and MCP `get_index_status` is
+INDEX-scoped: what the index currently believes about the whole tree. They agree
+after a full index and diverge after an incremental, which is the entire point of
+storing a set. The MCP field in particular changed meaning here — it used to be
+run-scoped too, and only when the reading process happened to be the one that did
+the indexing, which is the defect this release fixes.
+
 **What is stored is a path SET, not a count, and that is the whole design.** An
 incremental run parses only what changed, so a count written by that run
 describes those files alone: one clean edit after a full index that found eight
@@ -93,8 +102,10 @@ arm. The diagnostic re-opened the race the previous release closed.
 `relicRepairGuard()` could not have caught it. It asks whether this copy is the
 *active* install and returns false the moment `activeInstallPath()` is null —
 exactly the post-uninstall state. The new `teardownRepairGuard()` sits beside it
-on the same two settings-writing arms and asks the other question, printing why
-it declined and the one command that undoes it.
+on the two settings-writing repair arms and asks the other question, printing why
+it declined and the one command that undoes it — **and the gate also sits on the
+diagnosis pass that repairs before those arms are ever reached**, which is where
+the first version of this fix had its hole (below).
 
 Guarding those two arms was not enough, and pre-ship review found the door beside
 them: `runDiagnostics` reaches `healthCheck()` first on the default path, and
