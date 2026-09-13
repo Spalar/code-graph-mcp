@@ -196,12 +196,26 @@ fn a_deleted_file_stops_counting_against_the_index() {
     // green while the row accumulates dead paths forever (pre-ship review,
     // reviewer-named; the mutation is verified red against this arm).
     //
-    // The run has to PARSE something. A delete-only run skips the write
-    // entirely (`if !parsed_paths.is_empty()`), so the row keeps the dead path
-    // and that is deliberate — reader-equivalent, not row-equivalent. A first
-    // draft of this arm asserted the row after a delete-only run and failed on
-    // correct code, which is the test contradicting a documented decision rather
-    // than finding a defect. Touching a second file is what makes the write run.
+    // DELIBERATELY the delete-PLUS-PARSE shape. Do not "simplify" it back into a
+    // delete-only run — the two flavours have OPPOSITE expected values for this
+    // very assertion, and that is the whole reason this comment is long:
+    //
+    //   delete-only          -> write skipped (`if !parsed_paths.is_empty()`),
+    //                           the dead path is STILL in the row, and only the
+    //                           reader's intersection hides it. Arm 2 pins this.
+    //   delete + any parse   -> the write runs, `previous` is the intersected
+    //                           read, the `files` row is already gone (deletions
+    //                           land in Phase 0, the merge runs after the batch
+    //                           loop), so the dead path is pruned OUT of the row
+    //                           and never reaches the reader. This arm pins it.
+    //
+    // A first draft of this arm was delete-only and failed on correct code. That
+    // was the test contradicting a decision, not finding a defect. Touching a
+    // second file is what puts the run in the second flavour.
+    //
+    // (Arm 1's raw `DELETE FROM files` cascades to `nodes`/`edges` only under
+    // `PRAGMA foreign_keys = ON`. Harmless while it asserts on `files` alone —
+    // it would matter the day someone gives it a node-count assertion.)
     let h = fixture();
     h.write("src/broken.rs", BROKEN);
     h.write("src/clean_a.rs", CLEAN_A);

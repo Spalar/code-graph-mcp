@@ -2349,6 +2349,15 @@ pub(super) fn index_files(
     // through that same intersection. So the row is bounded by "files that ever
     // errored since the last parsing run", not "files currently erroring".
     //
+    // Harmless, but NOT inert, and the difference has bitten a test already: it
+    // makes the stored row's contents depend on which flavour of run last
+    // touched it, so any assertion ABOUT THE ROW must first decide which flavour
+    // it is constructing. Delete-only expects the dead path present;
+    // delete-plus-parse expects it pruned. The two are opposite, and a test that
+    // does not control the flavour either pins nothing or fails on correct code
+    // (pre-ship review; the reviewer regraded this from "harmless in practice"
+    // after seeing it happen).
+    //
     // Warn, do not `?`. The read side is already defensive on purpose
     // (`health.rs` and `management.rs` both `.unwrap_or_default()` — a status
     // poll must not fail over bookkeeping), and the write side using `?` was the
