@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.150.0
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` is
+unchanged, the schema is unchanged, every flag and exit code stays as it is. One
+class of query that used to answer "no results" now answers: a CJK, Japanese or
+Korean word sitting inside a phrase written without spaces. If your codebase is
+English-only you will see no difference at all — the new path is unreachable
+without unsegmented-script characters in the query.
+
+The one thing to know before upgrading: those rescued queries pay a full-table
+LIKE scan, ~0.35 ms per MB of indexed text plus ~0.16 µs per node, growing faster
+past ~12 MB. It fires only where the answer was already empty, so nothing that
+works today gets slower — but on a large repository a CJK search that finds
+nothing now costs tens to a few hundred milliseconds instead of ~0.1 ms.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.149.0`, or `cargo install
+code-graph-mcp --version 0.149.0`; plugin users can set the version in the
+marketplace entry. Pinning back restores the silent empty described below.
+
+### A CJK word inside an unspaced phrase was indexed but unreachable
+
+`nodes_fts` declares `tokenize='porter unicode61'`. unicode61 classes every CJK
+ideograph as alphanumeric, so a phrase with no interior punctuation becomes ONE
+token — `创建订单并扣减库存` is a single term. FTS5 matches tokens and prefixes,
+never substrings, so `订单`, a real word sitting in the middle of it, could not
+be reached by MATCH at all. The text was indexed, stored, and still answered "no
+results".
+
+What made it read as flaky rather than broken: whether a query worked came down
+to whether a comma or a colon happened to fall in the right place. `退款` found
+its function because a full-width colon split the run there; `订单`, two
+characters away in the same file, found nothing.
+
+The MATCH path is untouched — it moved byte-for-byte into `fts5_search_match`,
+and `fts5_search_impl` is now a wrapper that calls the new substring scan only
+when MATCH returned zero rows. Wrapping rather than hooking the last empty exit
+matters: MATCH has four of them, and a query split by punctuation leaves through
+a different one than a bare phrase does.
+
+The scan is scoped so it cannot become a general fuzzy match. It runs over each
+maximal run of unsegmented script and AND-joins them, so an ASCII miss stays an
+honest empty — `gatewa` still does not find `payment gateway`. Rows rank
+identifier-hit first, then densest body, then id, and carry no BM25 score
+because there is none: the `0.0` tells the fusion no raw score is available
+rather than inventing one. Over MCP they take the widened-match confidence
+penalty, which `match_confidence` carries into every result's `relevance`.
+
+Single-character CJK stays searchable. The two-character minimum on the MATCH
+side describes what the tokenizer stores, and a substring scan has no tokenizer;
+refusing it would drop `search 猫` finding `猫咪管理`.
+
+### The snapshot trust gate's env read now has a test
+
+`resolve_snapshot_source_impl` takes `url_trusted` as a parameter and every unit
+test passed it directly, so the env read in the public wrapper was untested.
+Renaming the variable, inverting the comparison, or reading
+`CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN` there by copy-paste would have left the whole
+suite green while the gate that blocks malicious-repo snapshot injection stopped
+opening — or stopped closing. Six cases now run through the real binary, with
+`RUST_LOG` pinned so a shell exporting `RUST_LOG=error` cannot swallow the
+refusal the assertions match on.
+
+### Not covered
+
+**Mixed queries.** The scan triggers on a whole-result-empty MATCH, so
+`search "payment 订单"` — where the Latin half matches something — still cannot
+reach the CJK word, and the user sees rows with no signal that half the query
+went unanswered. Closing it means unioning two ranked sets. A test pins the
+current behaviour so it cannot change silently.
+
+**Very long queries.** The AND tree is capped at 32 distinct runs. Past that the
+query answers empty rather than scanning: SQLite refuses to prepare beyond
+`SQLITE_MAX_EXPR_DEPTH`, and before the cap, pasting a punctuated CJK document
+into `search` turned an empty answer into a hard CLI exit and a JSON-RPC error.
+
+**Scripts.** CJK Unified plus Extensions A–F, compatibility ideographs,
+full-width and half-width kana, and precomposed Hangul syllables are covered and
+each has a fixture. Hangul compatibility Jamo, Thai, Lao and Khmer are not.
+
+### Rust `&raw` parse gap, documented not fixed
+
+Borrowing a binding named `raw` (`&raw`, `&raw[..]`, `&raw.field`) is read by the
+pinned `tree-sitter-rust` 0.23 grammar as the start of the `&raw const` pointer
+operator, and the enclosing expression can be dropped from the index. `&mut raw`,
+`&self.raw` and the genuine `&raw const x` all parse correctly. Measured on this
+repository: 8 of 161 Rust files trip the warning and one symbol, `cmd_affected`,
+is actually lost. Fixing it needs `tree-sitter` 0.24 → 0.25 and a re-validation
+of extraction across all 19 grammars; the upgrade was verified feasible (all 19
+load under 0.25.10) and deferred against that payoff. README carries the
+workaround: rename the binding.
+
 ## 0.149.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` is
