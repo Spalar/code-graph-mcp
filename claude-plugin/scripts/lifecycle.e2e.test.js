@@ -1318,6 +1318,20 @@ test('a binary lookup does not re-create the cache dir a teardown just removed',
   const tombstone = path.join(homeDir, '.cache', 'code-graph.uninstalled');
   const findBinaryCli = path.join(__dirname, 'find-binary.js');
 
+  // The fixture SUPPLIES the binary instead of hoping the machine has one.
+  // Shipped red: the first version relied on whatever `findBinary()` could
+  // resolve, which on this developer's box is the dev-mode `target/release`
+  // build and on a clean CI runner is nothing at all — the precondition failed
+  // with `found: false` and the whole test proved nothing about the gate it is
+  // named for. `_FIND_BINARY_ROOT` is find-binary.js's own seam
+  // (`find-binary.js:592-593` adds `<root>/bin` to the search), so this puts a
+  // resolvable binary somewhere that is NOT the cache dir under assertion.
+  const binRoot = path.join(mkHome(t), 'binroot');
+  fs.mkdirSync(path.join(binRoot, 'bin'), { recursive: true });
+  const fakeBin = path.join(binRoot, 'bin', 'code-graph-mcp');
+  fs.writeFileSync(fakeBin, '#!/bin/sh\necho "code-graph-mcp 99.9.9"\n');
+  fs.chmodSync(fakeBin, 0o755);
+
   const lookup = () => JSON.parse(execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
     process.env.USERPROFILE = ${JSON.stringify(homeDir)};
@@ -1325,8 +1339,10 @@ test('a binary lookup does not re-create the cache dir a teardown just removed',
     const found = require(${JSON.stringify(findBinaryCli)}).findBinary();
     console.log('@@' + JSON.stringify({ found: !!found,
       cacheDir: fs.existsSync(${JSON.stringify(cacheDir)}) }));
-  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot })
-    .toString().split('@@').pop().trim());
+  `], {
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, _FIND_BINARY_ROOT: binRoot },
+    cwd: repoRoot,
+  }).toString().split('@@').pop().trim());
 
   fs.mkdirSync(path.dirname(tombstone), { recursive: true });
   fs.writeFileSync(tombstone, JSON.stringify({ at: new Date().toISOString() }));
