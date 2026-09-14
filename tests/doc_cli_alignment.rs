@@ -863,3 +863,59 @@ fn readme_documents_every_env_var_the_code_reads() {
          internal/test-only block."
     );
 }
+
+/// `doctor --help` ships from TWO sources and nothing held them equal.
+///
+/// `main.rs` intercepts `doctor --help` and prints its own copy so the flag
+/// works without spawning node; `claude-plugin/scripts/doctor.js` prints the
+/// same text when the Node layer is reached directly. `main.rs`'s own comment
+/// names this drift class, and the drift is not hypothetical: correcting the
+/// `--check-only` residue sentence in both files at once still left them
+/// differing, because the two edits wrapped the same words at different
+/// columns. Wrapping is invisible in review and user-visible in output.
+///
+/// Byte equality, deliberately: a normalised comparison would pass on exactly
+/// the whitespace difference that motivated the guard.
+#[test]
+fn doctor_help_is_byte_identical_from_both_sources() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let rust = std::process::Command::new(env!("CARGO_BIN_EXE_code-graph-mcp"))
+        .args(["doctor", "--help"])
+        .current_dir(root)
+        .output()
+        .expect("the binary must run `doctor --help`");
+    assert!(
+        rust.status.success(),
+        "binary `doctor --help` failed: {}",
+        String::from_utf8_lossy(&rust.stderr)
+    );
+
+    let js = std::process::Command::new("node")
+        .args(["claude-plugin/scripts/doctor.js", "--help"])
+        .current_dir(root)
+        .output()
+        .expect("node is required to render doctor.js's help copy");
+    assert!(
+        js.status.success(),
+        "doctor.js --help failed: {}",
+        String::from_utf8_lossy(&js.stderr)
+    );
+
+    let rust_help = String::from_utf8(rust.stdout).expect("help is utf-8");
+    let js_help = String::from_utf8(js.stdout).expect("help is utf-8");
+
+    // Non-vacuity: an empty or truncated render on both sides would compare
+    // equal and prove nothing. Require the two facts the text exists to carry.
+    assert!(
+        rust_help.contains("--check-only") && rust_help.contains("~/.claude/settings.json"),
+        "the binary's help lost its own subject — guard would pass vacuously; got: {rust_help:?}"
+    );
+
+    assert_eq!(
+        rust_help, js_help,
+        "`doctor --help` differs between src/main.rs and claude-plugin/scripts/doctor.js. \
+         Edit both, and match the line wrapping — users see whichever copy their \
+         install path reaches."
+    );
+}

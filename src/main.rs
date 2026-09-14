@@ -397,9 +397,9 @@ fn main() -> Result<()> {
                      By default doctor repairs detected issues (re-registers hooks in\n\
                      ~/.claude/settings.json, fixes stale binary/model paths). Pass\n\
                      --check-only to report issues without repairing: it never writes\n\
-                     ~/.claude/settings.json. Reaching the diagnostics still resolves\n\
-                     the binary through the Node layer, which memoizes it under\n\
-                     ~/.cache/code-graph/.\n"
+                     ~/.claude/settings.json. It is not otherwise write-free — the Node\n\
+                     layer memoizes the resolved binary under ~/.cache/code-graph/, and\n\
+                     the npm checks let npm write its own logs.\n"
                 );
                 Ok(())
             } else {

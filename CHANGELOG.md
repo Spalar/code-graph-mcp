@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### The `doctor --check-only` help still read as a complete residue list
+
+Help text only. 0.153.0 replaced "without changing anything" with a sentence
+naming `~/.cache/code-graph/binary-path`, which is accurate and still reads as
+the whole set. It is not: the `Global npm packages` check shells out to npm, and
+npm writes its own debug logs under `~/.npm/_logs/` — two per invocation here,
+accumulating across runs. The help now states the contract it actually keeps
+(`~/.claude/settings.json` is never written) and says plainly that it is not
+otherwise write-free, rather than enumerating a set that a future check could
+extend again. 0.153.0's CHANGELOG entry carries the corrected measurement.
+
+Caught by the pre-ship reviewer for 0.153.0, whose report reached me in chunks
+and whose blocking list named this one after the release had published. The
+underlying miss was mine: the npm logs were in my very first measurement and I
+left them out as npm's noise, which is exactly what turned a true sentence into
+a misleading one.
+
+### The two copies of that help text are now pinned together
+
+The same reviewer noted, as a NIT, that `src/main.rs` and
+`claude-plugin/scripts/doctor.js` ship the same `doctor --help` text with nothing
+holding them equal — and the correction above proved it in one move: both files
+were edited in a single pass and the renders still differed, because the two
+edits wrapped the same words at different columns. Wrapping is invisible in a
+diff review and visible in a user's terminal.
+
+`doctor_help_is_byte_identical_from_both_sources` (`tests/doc_cli_alignment.rs`)
+runs `doctor --help` through the binary and `doctor.js --help` through node and
+compares byte for byte — not normalised, since normalising would pass on exactly
+the whitespace that motivated it. It carries a non-vacuity assertion so an empty
+render on both sides cannot compare equal and prove nothing. It lives in
+`doc_cli_alignment` because `pre-commit` runs that suite even for a JS-only
+commit, which is the change most likely to move one copy alone.
+
 ## 0.153.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71) and
@@ -66,11 +102,19 @@ implements, and the two guards over it pin what it actually implements: both
 `doctor --check-only never writes settings.json` and `--check-only still reports
 and still writes nothing` assert on `~/.claude/settings.json` and nothing else.
 Measured on a pristine `HOME`, `--check-only` leaves `~/.claude/settings.json`
-untouched — the contract holds — and creates `~/.cache/code-graph/binary-path`.
-That memo is written by `find-binary.js`, so it is the **Node** layer that writes
+byte-identical — the contract holds — and it is not otherwise write-free. The
+full residue set on a fresh `HOME`, both writes outside `~/.claude`:
+`~/.cache/code-graph/binary-path`, the resolved-binary memo, written once; and
+`~/.npm/_logs/*.log`, npm's own debug logs from the `Global npm packages` check
+shelling out to npm — two per invocation here, and they accumulate (2 after one
+run, 4 after two). Neither is `doctor`'s state and neither is bounded by this
+project, but naming only the first read as a complete list, which is the same
+overclaim in a smaller frame.
+
+The memo is written by `find-binary.js`, so it is the **Node** layer that writes
 it: `doctor` forwards to `claude-plugin/scripts/doctor.js`, while the native
 binary invoked directly does not. Measured under a fresh `HOME`: `show <symbol>`
-created no files at all; `doctor --check-only` created the memo.
+created no files at all.
 
 The memo is not the defect. Suppressing it was measured at ~5 ms warm versus
 ~71–93 ms per cold process (`writeCacheEntry`'s own note), it is already
@@ -87,10 +131,12 @@ was wrong, so the sentence is what changed — in `src/main.rs` and
   path out would change `resolve_show_nodes`'s return type and both of its call
   sites, which is more than this fix is worth on a set that is almost always one
   to five rows.
-- **Nothing pins the two copies of the `doctor` help text equal.** `src/main.rs`
-  and `claude-plugin/scripts/doctor.js` render byte-identically and are now edited
-  together twice; `main.rs`'s own comment names this drift class, and no test
-  holds them.
+- ~~Nothing pins the two copies of the `doctor` help text equal.~~ **Closed in
+  Unreleased**, after the drift happened for real on the very next edit: both
+  files were corrected in one pass and still differed, because the two edits
+  wrapped the same words at different columns.
+  `doctor_help_is_byte_identical_from_both_sources` now compares the two renders
+  byte for byte.
 - **The bash `function Foo.bar()` producer is still open**, as
   `get_nodes_with_files_by_qualified_name` documents: its node type is `function`,
   which no type predicate of either polarity separates from a real symbol. After
