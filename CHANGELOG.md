@@ -1,5 +1,107 @@
 # Changelog
 
+## 0.153.0
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71) and
+the schema (v10) are unchanged and no extraction source is touched — the extraction
+fingerprint is byte-identical. One command's resolution order changes, and it
+changes what `show` prints for one class of input: **`show <Class.method>` (no
+`--file`) now returns the definitions whose `qualified_name` is that spelling.**
+Where a markdown heading, a gtest case or a bash function is spelled the same, the
+method used to be dropped and now is not; a markdown heading that used to be the
+answer is now excluded from that result and remains reachable as
+`show <Class.method> --file <the-doc>.md`. A script parsing `show --json` for a
+dotted symbol sees a different array. To pin back: `npm i -g @sdsrs/code-graph@0.152.0`,
+or `cargo install code-graph-mcp --version 0.152.0`; plugin users can set the
+version in the marketplace entry.
+
+### `show Class.method` answered with the doc heading and the test, never the method
+
+`show` resolved a dotted symbol in the opposite order from every other command. It
+queried the literal `name` column first and consulted `qualified_name` only when
+that came back empty (`resolve_show_nodes`, the no-`--file` branch). Several
+extractors write a dotted string into the `name` column; the ones that collide with
+a real `Class.method` spelling are markdown headings, gtest `TEST(Suite, Case)` and
+bash `function Foo.bar()` — for those the first
+query was never empty and the fallback never ran. Against a C++ `class Database`
+with a `connect` method plus its own `TEST(Database, connect)`, `show
+Database.connect` returned the test case alone; add `## Database.connect` to an API
+doc and it returned the heading alone. The method was dropped with no ambiguity
+notice and no exit code — `show` renders every match instead of refusing, so the
+wrong answer looked like an answer. `show connect` returned the method, so the more
+specific query gave the worse result.
+
+`refs`, `callgraph` and `impact` were already correct here. They select through
+`resolve::selectable_qualified_definitions`, which queries
+`queries::get_nodes_with_files_by_qualified_name` and then applies a
+production-over-test partition. `show` now reaches that same query — so the
+`<module>` / `h1`..`h6` / `<external>` exclusions stay in one place instead of
+being restated — but deliberately **not** through the wrapper: the partition would
+also drop the gtest case from what `show` renders, and `show` rendered it before
+this change too. Taking it here would be a second, unrelated narrowing rather than
+restoring the method. The consequence is visible and intended: on a fixture with
+both, `show Widget.run` renders 4 nodes and `refs Widget.run` lists 3.
+
+The `--file` branch already matched `name` OR `qualified_name` in its primary
+filter and is untouched; a heading remains reachable as
+`show Widget.run --file docs/api.md`.
+
+**Why the two guards over this collision were green.** Both
+`a_gtest_case_does_not_shadow_the_method_it_tests` and
+`a_markdown_heading_does_not_shadow_the_method_it_documents` iterate
+`["refs", "callgraph", "impact"]`. Adding `"show"` to that loop would have passed
+vacuously: the loop asserts exit 0 and no `ambiguous` in the output, and a command
+that renders whatever it resolved satisfies both while answering about the wrong
+node. The assertion that holds `show` is which files come back, so each guard now
+also asserts the source file is among them.
+
+Checked: `show Widget.run --json` returned `["src/widget_test.cc"]` and
+`["docs/api.md"]` before the fix and includes `src/widget.cc` / `src/widget.py`
+after; both guards fail on the unfixed binary and pass on the fixed one.
+
+### `doctor --check-only` said "without changing anything" and wrote one file
+
+Help text only; no behaviour changes. `--check-only` promised more than it
+implements, and the two guards over it pin what it actually implements: both
+`doctor --check-only never writes settings.json` and `--check-only still reports
+and still writes nothing` assert on `~/.claude/settings.json` and nothing else.
+Measured on a pristine `HOME`, `--check-only` leaves `~/.claude/settings.json`
+untouched — the contract holds — and creates `~/.cache/code-graph/binary-path`.
+That memo is written by `find-binary.js`, so it is the **Node** layer that writes
+it: `doctor` forwards to `claude-plugin/scripts/doctor.js`, while the native
+binary invoked directly does not. Measured under a fresh `HOME`: `show <symbol>`
+created no files at all; `doctor --check-only` created the memo.
+
+The memo is not the defect. Suppressing it was measured at ~5 ms warm versus
+~71–93 ms per cold process (`writeCacheEntry`'s own note), it is already
+tombstone-guarded so a teardown in flight does not get `CACHE_DIR` re-created
+under it, and the flag's purpose is to skip the repair pass. The sentence is what
+was wrong, so the sentence is what changed — in `src/main.rs` and
+`claude-plugin/scripts/doctor.js`, which ship the same text.
+
+### Not covered
+
+- **`show` still re-queries each node's file path.** The new call uses the
+  `…with_files…` JOIN and then discards `file_path`, so `cmd_show` looks it up
+  again once per resolved node — the N+1 that JOIN exists to avoid. Carrying the
+  path out would change `resolve_show_nodes`'s return type and both of its call
+  sites, which is more than this fix is worth on a set that is almost always one
+  to five rows.
+- **Nothing pins the two copies of the `doctor` help text equal.** `src/main.rs`
+  and `claude-plugin/scripts/doctor.js` render byte-identically and are now edited
+  together twice; `main.rs`'s own comment names this drift class, and no test
+  holds them.
+- **The bash `function Foo.bar()` producer is still open**, as
+  `get_nodes_with_files_by_qualified_name` documents: its node type is `function`,
+  which no type predicate of either polarity separates from a real symbol. After
+  this change `show` returns it *alongside* the method rather than instead of it,
+  which is the improvement available without a type predicate; `refs` still
+  refuses that spelling as ambiguous.
+- **The dotted-`name` class is not closed.** Inline HTTP route handlers also carry
+  dots (`GET /api/v1.0/users#L7`); they are harmless here because their `name` and
+  `qualified_name` are equal, so they shadow nothing — but the enumeration above
+  is the set that collides, not the set that contains a dot.
+
 ## 0.152.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71) and

@@ -1392,7 +1392,10 @@ const DOCTOR_USAGE = [
   '',
   'By default doctor repairs detected issues (re-registers hooks in',
   '~/.claude/settings.json, fixes stale binary/model paths). Pass',
-  '--check-only to report issues without changing anything.',
+  '--check-only to report issues without repairing: it never writes',
+  '~/.claude/settings.json. Reaching the diagnostics still resolves',
+  'the binary through the Node layer, which memoizes it under',
+  '~/.cache/code-graph/.',
 ].join('\n');
 
 function parseDoctorArgs(args) {

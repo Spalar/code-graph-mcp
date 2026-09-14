@@ -78,6 +78,38 @@ pub(crate) fn resolve_show_nodes(
         }
         found
     } else {
+        // Exact-qualified precedence for dotted input. `show` used to invert it:
+        // it queried the literal `name` column first and consulted
+        // `qualified_name` only when THAT came back empty. Several extractors put
+        // a dotted string in the `name` column; the ones that collide with a real
+        // `Class.method` spelling are markdown headings, gtest `TEST(Suite, Case)`
+        // and bash `function Foo.bar()`. For those the first query was never empty
+        // and the fallback below never ran, so `show Widget.run` answered with the
+        // heading or the test case and dropped the method entirely. The class is
+        // not closed — see the note on `get_nodes_with_files_by_qualified_name`.
+        //
+        // The two guards over this collision only exercised refs/callgraph/impact,
+        // which refuse rather than render, so neither covered `show`.
+        //
+        // Deliberately the RAW shared query, not `resolve::selectable_qualified_definitions`
+        // (what refs/callgraph/impact select through). That wrapper adds a
+        // production-over-test partition on top of this query, which would ALSO
+        // drop the gtest case from the rendered set — a second, unrelated
+        // narrowing. `show` rendered the gtest case before this change too, so
+        // taking the partition here would go past restoring the method. What the
+        // shared query does buy is the vetted `module` / `h1`..`h6` / `<external>`
+        // exclusions, in one place rather than restated.
+        let qualified: Vec<queries::NodeResult> = if symbol.contains('.') {
+            queries::get_nodes_with_files_by_qualified_name(conn, symbol)?
+                .into_iter()
+                .map(|n| n.node)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !qualified.is_empty() {
+            return Ok(qualified);
+        }
         let mut found = queries::get_nodes_by_name(conn, symbol)?;
         // `Class.method` fallback: when no node has the exact qualified name
         // stored in DB, prefer nodes whose qualified_name matches; otherwise

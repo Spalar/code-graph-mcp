@@ -396,7 +396,10 @@ fn main() -> Result<()> {
                      USAGE:\n    code-graph-mcp doctor [--check-only]\n\n\
                      By default doctor repairs detected issues (re-registers hooks in\n\
                      ~/.claude/settings.json, fixes stale binary/model paths). Pass\n\
-                     --check-only to report issues without changing anything.\n"
+                     --check-only to report issues without repairing: it never writes\n\
+                     ~/.claude/settings.json. Reaching the diagnostics still resolves\n\
+                     the binary through the Node layer, which memoizes it under\n\
+                     ~/.cache/code-graph/.\n"
                 );
                 Ok(())
             } else {

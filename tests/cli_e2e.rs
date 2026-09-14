@@ -11821,6 +11821,37 @@ fn a_gtest_case_does_not_shadow_the_method_it_tests() {
             "{cmd}: a gtest case must not make the method it tests ambiguous: {combined}"
         );
     }
+
+    // `show` is not in the loop above because it cannot refuse: it renders every
+    // match it resolves, so "no `ambiguous` in the output" passes vacuously for
+    // it. The predicate that actually holds it is WHICH nodes come back — the
+    // method must be among them, not only the gtest case that shares its
+    // spelling.
+    let (stdout, stderr, code) = run_cli(&project, &["show", "Widget.run", "--json"]);
+    assert_eq!(code, 0, "show Widget.run: {stdout}{stderr}");
+    let shown: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let files: Vec<&str> = shown
+        .as_array()
+        .expect("show --json is an array")
+        .iter()
+        .filter_map(|n| n["file_path"].as_str())
+        .collect();
+    assert!(
+        files.contains(&"src/widget.cc"),
+        "show must return the method it was asked for, not only the gtest case \
+         sharing its spelling; got {files:?}"
+    );
+    // And the gtest case stays IN the rendered set. `show` reaches the shared
+    // query directly rather than through `selectable_qualified_definitions`,
+    // whose production-over-test partition would drop it — a narrowing `show`
+    // never had. Pinning it here so a later "make show match refs" does not take
+    // that partition silently: on this fixture `refs Widget.run` is the one that
+    // filters the test twin, and the two commands differ on purpose.
+    assert!(
+        files.contains(&"src/widget_test.cc"),
+        "show must keep rendering the gtest case beside the method — it did \
+         before this guard existed; got {files:?}"
+    );
 }
 
 #[test]
@@ -11871,4 +11902,32 @@ fn a_markdown_heading_does_not_shadow_the_method_it_documents() {
     let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(out["direct_callers"], 1, "{out}");
     assert_eq!(out["callers"][0]["name"], "drive", "{out}");
+
+    // Same gap as the gtest guard: `show` renders every match instead of
+    // refusing, so only the returned file set can hold it. Both halves matter,
+    // and asserting only the first leaves the fix under-pinned: returning the
+    // heading ALONGSIDE the method also satisfies "the method is present", and
+    // that is not what ships — `get_nodes_with_files_by_qualified_name` excludes
+    // `h1`..`h6`, so the heading is replaced, not joined. That exclusion is the
+    // whole reason `show` now agrees with `refs`/`callgraph`/`impact` and MCP
+    // `get_ast_node`, all of which reach the same query.
+    let (stdout, stderr, code) = run_cli(&project, &["show", "Widget.run", "--json"]);
+    assert_eq!(code, 0, "show Widget.run: {stdout}{stderr}");
+    let shown: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let files: Vec<&str> = shown
+        .as_array()
+        .expect("show --json is an array")
+        .iter()
+        .filter_map(|n| n["file_path"].as_str())
+        .collect();
+    assert!(
+        files.contains(&"src/widget.py"),
+        "show must return the method it was asked for, not only the doc heading \
+         documenting it; got {files:?}"
+    );
+    assert!(
+        !files.contains(&"docs/api.md"),
+        "a heading is not a definition: it must be excluded from the no---file \
+         result, not merely joined to it; got {files:?}"
+    );
 }
