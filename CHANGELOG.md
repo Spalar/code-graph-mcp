@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.156.0
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (72) and
+the schema (v10) are unchanged; the only Rust change is a comment. If you are
+coming from 0.154.0 or older, 0.155.0's one-time rebuild still applies. One hook
+behavior is corrected: a grep whose pattern holds an escaped quote (`"a\"b"`) is
+no longer misread, so the PostToolUse hook stops attaching results for a
+different pattern than the one you ran. To pin back: `npm i -g
+@sdsrs/code-graph@0.155.0`, or `cargo install code-graph-mcp --version 0.155.0`;
+plugin users can set the version in the marketplace entry.
 
 ### A grep pattern with an escaped quote no longer injects every line of the file
 
@@ -29,6 +38,21 @@ inside double quotes, which the shell removes and the rewrite kept, so
 `grep "Foo\<newline>Bar"` was rewritten to search a pattern with a backslash and
 a line break in it. The rewrite now declines that shape and the grep runs as
 typed.
+
+### Not covered
+
+- **Heredoc bodies are still read as shell.** No version parses `<<WORD` bodies,
+  so a grep written inside one can be answered as if it ran, and a quote or
+  backslash inside one can hide a real grep that follows. This release moves a
+  few such commands in both directions: over 13,019 greps from real sessions, 3
+  heredoc commands moved away from what bash runs (two lost an answer, one gained
+  a wrong one) against 30 commands that moved toward it.
+- **Bare parentheses in a basic-regex grep.** `grep 'f()'` treats `(` `)` as
+  literals; the rewritten `code-graph-mcp grep` reads them as a group, so the
+  rewrite can report more lines than grep would (3 vs 6 on one real command).
+  Present since 0.154.0 and unchanged here.
+- `$VAR` inside a double-quoted pattern is not expanded when the PostToolUse
+  hook reads it; the PreToolUse rewrite declines such commands.
 
 ## 0.155.0
 
