@@ -749,8 +749,15 @@ function splitTopLevelSegments(cmd) {
       if (c === quote) quote = null;
       continue;
     }
-    // Outside quotes: escapes the next char, kept verbatim (see firstShellClause).
-    if (c === '\\' && i + 1 < cmd.length) { cur += c + cmd[i + 1]; i++; continue; }
+    // Outside quotes: escapes the next char, kept verbatim (see firstShellClause)
+    // — except a newline, where the pair is a line continuation and the shell
+    // removes both. Keeping them left `&& \⏎ grep …` a segment that starts
+    // with `\`, which GREP_HEAD rejects (pre-ship review round 2 F1).
+    if (c === '\\' && i + 1 < cmd.length) {
+      if (cmd[i + 1] !== '\n') cur += c + cmd[i + 1];
+      i++;
+      continue;
+    }
     if (c === '"' || c === "'") { quote = c; cur += c; continue; }
     // `&&` and `||` (a single `&`/`|` is NOT a split — `|` is an output-filter
     // pipe, lone `&` is background and rare in tool calls).

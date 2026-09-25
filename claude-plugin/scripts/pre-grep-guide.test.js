@@ -771,6 +771,26 @@ test('outside-quote backslash: an escaped operator is a literal, not a boundary'
   assert.deepEqual(extractPatterns(String.raw`grep -rn \'x "FooBar" src/`), ['FooBar']);
 });
 
+test('outside-quote backslash-newline is a line continuation: both characters go', () => {
+  // Pre-ship review round 2 F1: keeping them left the segment starting with
+  // `\`, GREP_HEAD failed, and a grep continued onto its own line after `&&`
+  // lost the answer v0.155 gave it.
+  assert.deepEqual(
+    splitTopLevelSegments('cargo build --release && \\\n  grep -rn "cmd_affected" src/'),
+    ['cargo build --release', 'grep -rn "cmd_affected" src/'],
+  );
+  // Same segments as the one-line spelling of the loop.
+  assert.deepEqual(
+    splitTopLevelSegments('for f in a b; do \\\n  grep -rn "FooBar" src/; done'),
+    splitTopLevelSegments('for f in a b; do grep -rn "FooBar" src/; done'),
+  );
+  // Continuation is not a clause boundary for the other two splitters either.
+  assert.equal(firstShellClause('grep -rn "FooBar" \\\nsrc/ && echo x'), 'grep -rn "FooBar" \\\nsrc/ ');
+  assert.equal(extractUnansweredTail('grep -rn "FooBar" \\\nsrc/ && echo x'), 'echo x');
+  // A trailing lone backslash has nothing to escape and stays as typed.
+  assert.deepEqual(splitTopLevelSegments('grep -rn "FooBar" src/ \\'), ['grep -rn "FooBar" src/ \\']);
+});
+
 test('extractPatterns: each double-quote escape drops its backslash; others keep it', () => {
   assert.deepEqual(extractPatterns(String.raw`grep "a\\bFooBar" src/`), [String.raw`a\bFooBar`]);
   assert.deepEqual(extractPatterns(String.raw`grep "Foo\$Bar" src/`), ['Foo$Bar']);

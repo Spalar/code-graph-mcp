@@ -12,7 +12,8 @@ the PostToolUse hook told the model that all 2,284 lines of a file had hit a
 grep whose real output was `0`. Observed three times in one session. Quoted
 arguments are now read with the shell's rules: inside double quotes a backslash
 escapes `"` `\` `$` and a backtick, joins lines before a newline, and is literal
-before anything else; outside quotes it escapes the next character. The three
+before anything else; outside quotes it escapes the next character, and a
+backslash-newline is a line continuation there too. The three
 splitters that find where the grep's own clause ends (`firstShellClause`,
 `splitTopLevelSegments`, `extractUnansweredTail`) follow the same outside-quote
 rule now — they did not, and a reader that honored it while they did not would
