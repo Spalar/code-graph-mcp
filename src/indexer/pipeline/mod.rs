@@ -263,8 +263,20 @@ pub fn plan_file_refresh(
     }
     let abs_path = project_root.join(rel_path);
 
+    // TRELLIS FORK: the index walk never follows symlinks
+    // (WalkBuilder::follow_links(false)) and the read path
+    // (read_source_context) canonicalizes under the project root — but this
+    // query-time freshness path used to follow them. A malicious repo could
+    // ship `leak.py -> <sensitive file>` and any MCP tool call naming that
+    // file_path would index the target's contents into the graph. Treat
+    // anything that is not a regular file (symlink, FIFO, socket, directory)
+    // exactly like a missing file: drop any stale row, index nothing.
+    let not_regular_file = std::fs::symlink_metadata(&abs_path)
+        .map(|m| !m.file_type().is_file())
+        .unwrap_or(false);
+
     // Missing-file path: drop stale row so future queries don't return phantom nodes.
-    if !abs_path.is_file() {
+    if not_regular_file || !abs_path.is_file() {
         let exists_in_db: Option<i64> = db
             .conn()
             .query_row("SELECT id FROM files WHERE path = ?1", [rel_path], |row| {

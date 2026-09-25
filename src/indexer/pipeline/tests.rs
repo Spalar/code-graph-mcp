@@ -5410,3 +5410,55 @@ fn a_name_moving_across_languages_still_enters_the_drift_scope() {
          (name, language) and `helper` is no longer entering cg_scope_names: {inc:?}"
     );
 }
+
+// TRELLIS FORK: the index walk never follows symlinks (follow_links(false))
+// and the read path (read_source_context) canonicalizes under the project
+// root. The query-time freshness path must enforce the same policy, or a
+// malicious repo can ship `leak.py -> <sensitive file>` and have the target's
+// contents indexed and served back through search/ast tools by any MCP call
+// naming that file_path.
+#[test]
+fn test_plan_file_refresh_refuses_directory_at_file_path() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("pkg")).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let plan = plan_file_refresh(&db, project_dir.path(), "pkg", RefreshScope::IncludeNew)
+        .expect("plan_file_refresh should not error on a non-regular path");
+    assert_eq!(
+        plan,
+        FileRefresh::Fresh,
+        "a directory at the file path must be treated like a missing file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_freshness_never_follows_symlinks() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let secret = outside.path().join("secret.py");
+    fs::write(&secret, "API_KEY = 'hunter2'\n").unwrap();
+    std::os::unix::fs::symlink(&secret, project_dir.path().join("leak.py")).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let plan = plan_file_refresh(&db, project_dir.path(), "leak.py", RefreshScope::IncludeNew)
+        .expect("plan_file_refresh should not error on a symlinked path");
+    assert_eq!(
+        plan,
+        FileRefresh::Fresh,
+        "a symlinked file must never be scheduled for reindex"
+    );
+
+    let reindexed = ensure_file_indexed(&db, project_dir.path(), "leak.py", None)
+        .expect("ensure_file_indexed should not error on a symlinked path");
+    assert!(!reindexed, "a symlinked file must never be indexed");
+
+    let nodes = get_nodes_by_file_path(db.conn(), "leak.py").unwrap();
+    assert!(
+        nodes.is_empty(),
+        "nothing from the symlink target may land in the index: {nodes:?}"
+    );
+}

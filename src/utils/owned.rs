@@ -46,7 +46,9 @@
 //!   not a planted `index.db`. So "everything under `.code-graph/`" above
 //!   describes what this module MEDIATES — telemetry JSONL, the repo's
 //!   `.gitignore`, the index lock — not literally every write under that
-//!   directory.
+//!   directory. (TRELLIS FORK: the open itself is now mediated —
+//!   `Database::open_impl` calls [`refuse_non_regular`] on the db path before
+//!   rusqlite sees it, closing the planted-`index.db`-symlink vector.)
 //!
 //! The hardlink half is also Unix-only, and deliberately differs from the JS
 //! twin there — see [`refuse_unowned_handle`] for the reason and for what is

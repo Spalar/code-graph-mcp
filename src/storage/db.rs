@@ -92,6 +92,11 @@ impl Database {
     /// migrations or table creation happens — secondary relies entirely on
     /// the primary's bootstrap.
     pub fn open_readonly(path: &Path) -> Result<Self> {
+        // TRELLIS FORK: same planted-symlink refusal as open_impl — a
+        // secondary reader must not silently open a repo-shipped
+        // `.code-graph/index.db` link either (read-only, but the link could
+        // point at an unrelated SQLite file whose contents queries then read).
+        crate::utils::owned::refuse_non_regular(path)?;
         register_sqlite_vec();
         let conn = Connection::open_with_flags(
             path,
@@ -166,6 +171,16 @@ impl Database {
     /// verdict, and doctor's `index-corrupt` repair does the rebuild under a
     /// caller that actually rebuilds.
     fn open_impl(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
+        // TRELLIS FORK: rusqlite follows a symlink at `index.db`, so a repo
+        // shipping `.code-graph/index.db` as a link could have the link target
+        // initialized in place (serve startup on an empty victim) or deleted
+        // by the corruption recovery below (rebuild-index). Refuse anything
+        // that is not a regular file before any open or wipe — the same
+        // `refuse_non_regular` policy the owned-file module applies to every
+        // other write under `.code-graph/`. Upstream documents this gap at
+        // utils/owned.rs ("index.db does not come through this module at all")
+        // but does not mediate the open.
+        crate::utils::owned::refuse_non_regular(path)?;
         // Proactive sub-header size guard: any pre-existing main file smaller
         // than the 100-byte SQLite database header cannot be a valid database.
         // Without this, post-crash residue (0-byte main + stale .wal/.shm,
@@ -889,6 +904,45 @@ impl Drop for UncheckedSavepoint<'_> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // TRELLIS FORK: a planted non-regular file at the db path (a symlink, or
+    // even a directory) must be refused before rusqlite follows or opens it —
+    // otherwise a repo-shipped `.code-graph/index.db` link could have its
+    // target initialized in place or deleted by corruption recovery.
+    #[test]
+    fn open_refuses_non_regular_db_path() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        std::fs::create_dir(&db_path).unwrap();
+        let err = match Database::open(&db_path) {
+            Ok(_) => panic!("open must refuse a non-regular db path"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_symlinked_db_and_target_survives() {
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"sensitive").unwrap();
+        let db_path = tmp.path().join("index.db");
+        std::os::unix::fs::symlink(&victim, &db_path).unwrap();
+        let err = match Database::open(&db_path) {
+            Ok(_) => panic!("open must refuse a symlinked db path"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+        // No wipe, no SQLite init: the link target must be byte-for-byte intact.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"sensitive");
+    }
 
     #[test]
     fn test_savepoint_standalone_commit_and_rollback() {
