@@ -129,6 +129,11 @@ function firstShellClause(cmd) {
       if (c === quote) quote = null;
       continue;
     }
+    // Outside quotes a backslash escapes the next character: `\"` opens no
+    // quote and `\;` / `\|` are literal. quotedSpans reads patterns by the same
+    // rule; a splitter that disagreed let `grep \"X\" src/ && echo "Y"` hand the
+    // echo's `Y` to the pattern reader (pre-ship review F1).
+    if (c === '\\') { i++; continue; }
     if (c === '"' || c === "'") { quote = c; continue; }
     // Control operators END the grep's argument list → truncate. NOT redirects
     // (`>` `<`): `2>&1`, `>out`, and process substitution `-f <(cat pats) src/`
@@ -232,14 +237,15 @@ function extractPatterns(cmd) {
 
 /**
  * The quoted spans of a shell clause, read the way the shell reads them — the
- * same rules firstShellClause and splitTopLevelSegments already follow (lesson
- * #9656), which a span regex (`"([^"]+)"|'([^']+)'`) did not: it closed a
+ * rules firstShellClause, splitTopLevelSegments and extractUnansweredTail also
+ * follow (lesson #9656 inside quotes; pre-ship review F1 outside), which a span regex (`"([^"]+)"|'([^']+)'`) did not: it closed a
  * double-quoted argument at the first `\"`, so
  * `grep "if:\s*'\|\"if\"\|statusMessage"` yielded `\|statusMessage`, and its
  * translation `|statusMessage` matches every line (observed 2026-09-25).
  *   - `'…'` is literal to the next `'`.
- *   - `"…"`: a backslash escapes `"` `\` `$` backtick and newline (the
- *     backslash is dropped); before anything else it is literal (`"a\|b"`).
+ *   - `"…"`: a backslash escapes `"` `\` `$` and backtick (the backslash is
+ *     dropped) and, before a newline, removes both characters (a line
+ *     continuation); before anything else it is literal (`"a\|b"`).
  *   - Outside quotes a backslash escapes the next character, so `\"` opens
  *     nothing — the shell hands grep the quote character itself.
  * An unterminated quote ends the scan: what follows is not a span we can read.
@@ -256,7 +262,10 @@ function quotedSpans(s) {
     let body = '';
     let j = i + 1;
     for (; j < s.length && s[j] !== c; j++) {
-      if (c === '"' && s[j] === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) j++;
+      if (c === '"' && s[j] === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) {
+        j++;
+        if (s[j] === '\n') continue;  // backslash-newline is a line continuation: both go
+      }
       body += s[j];
     }
     if (j >= s.length) break;
@@ -646,6 +655,7 @@ function extractUnansweredTail(cmd) {
       if (c === quote) quote = null;
       continue;
     }
+    if (c === '\\') { i++; continue; }  // outside quotes: escapes the next char (see firstShellClause)
     if (c === '"' || c === "'") { quote = c; continue; }
     if (c === ';' || (c === '&' && cmd[i + 1] === '&')) {
       const tail = cmd.slice(i + (c === ';' ? 1 : 2)).trim();
@@ -739,6 +749,8 @@ function splitTopLevelSegments(cmd) {
       if (c === quote) quote = null;
       continue;
     }
+    // Outside quotes: escapes the next char, kept verbatim (see firstShellClause).
+    if (c === '\\' && i + 1 < cmd.length) { cur += c + cmd[i + 1]; i++; continue; }
     if (c === '"' || c === "'") { quote = c; cur += c; continue; }
     // `&&` and `||` (a single `&`/`|` is NOT a split — `|` is an output-filter
     // pipe, lone `&` is background and rare in tool calls).

@@ -10,15 +10,24 @@ lifecycle.js` therefore yielded the pattern `\|statusMessage`; its translation
 `|statusMessage` opens with an empty alternative, which matches every line, so
 the PostToolUse hook told the model that all 2,284 lines of a file had hit a
 grep whose real output was `0`. Observed three times in one session. Quoted
-arguments are now read with the shell's rules (a backslash escapes `"` `\` `$`
-and a backtick inside double quotes, is literal before anything else, and
-outside quotes escapes the next character) — the rules `firstShellClause` and
-`splitTopLevelSegments` already followed. The same span regex also blanked
+arguments are now read with the shell's rules: inside double quotes a backslash
+escapes `"` `\` `$` and a backtick, joins lines before a newline, and is literal
+before anything else; outside quotes it escapes the next character. The three
+splitters that find where the grep's own clause ends (`firstShellClause`,
+`splitTopLevelSegments`, `extractUnansweredTail`) follow the same outside-quote
+rule now — they did not, and a reader that honored it while they did not would
+have let `grep -rn \"X\" src/ && echo "Y"` answer a search for the echo's `Y`
+(caught in pre-ship review). `foo\|bar` and `a\;b` outside quotes are literal
+words to the shell, and now to the hook. The same span regex also blanked
 quoted text in the ag filename-search check, where `ag "some_symbol \" -g x"`
 left the `-g` inside the pattern looking like a flag and dropped a content
-search to a hint; it uses the same reader now. The PreToolUse rewrite was not
-affected: its tokenizer declines any double-quoted body holding `\"`, so those
-commands ran as typed.
+search to a hint; it uses the same reader now. The PreToolUse rewrite never saw
+the `\"` shape — its tokenizer declines any double-quoted body holding one, so
+those commands ran as typed — but it did see one other: a backslash-newline
+inside double quotes, which the shell removes and the rewrite kept, so
+`grep "Foo\<newline>Bar"` was rewritten to search a pattern with a backslash and
+a line break in it. The rewrite now declines that shape and the grep runs as
+typed.
 
 ## 0.155.0
 

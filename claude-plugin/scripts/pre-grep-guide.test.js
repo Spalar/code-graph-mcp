@@ -748,6 +748,54 @@ test('extractPatterns: a backslash-escaped quote OUTSIDE quotes opens no argumen
   assert.deepEqual(extractPatterns(String.raw`grep -rn \"FooBar\" src/`), []);
 });
 
+// Pre-ship review F1: the pattern reader and the clause splitters must share
+// ONE rule for a backslash outside quotes. When only quotedSpans honored it,
+// the splitters took `\"` as an opening quote, never saw the `&&`, and the
+// reader then found `"DoneMarker"` from the echo — so post-grep-inject
+// answered a search for the echo's argument.
+test('outside-quote backslash: the grep clause ends at && and the echo arg is never the pattern', () => {
+  const cmd = String.raw`grep -rn \"FooBar\" src/ && echo "DoneMarker"`;
+  assert.equal(firstShellClause(cmd), String.raw`grep -rn \"FooBar\" src/ `);
+  assert.deepEqual(splitTopLevelSegments(cmd), [String.raw`grep -rn \"FooBar\" src/`, 'echo "DoneMarker"']);
+  assert.equal(extractUnansweredTail(cmd), 'echo "DoneMarker"');
+  assert.deepEqual(extractPatterns(cmd), []);
+  assert.equal(pickBlockPattern(cmd), undefined);
+});
+
+test('outside-quote backslash: an escaped operator is a literal, not a boundary', () => {
+  // The shell hands grep `foo|BarBaz` and `a;b` as one word each.
+  assert.equal(firstShellClause(String.raw`grep -rn foo\|BarBaz src/`), String.raw`grep -rn foo\|BarBaz src/`);
+  assert.deepEqual(splitTopLevelSegments(String.raw`grep -rn a\;FooBar src/`), [String.raw`grep -rn a\;FooBar src/`]);
+  assert.equal(extractUnansweredTail(String.raw`grep -rn a\;FooBar src/`), null);
+  // …and an escaped quote outside quotes opens no span even when a real one follows.
+  assert.deepEqual(extractPatterns(String.raw`grep -rn \'x "FooBar" src/`), ['FooBar']);
+});
+
+test('extractPatterns: each double-quote escape drops its backslash; others keep it', () => {
+  assert.deepEqual(extractPatterns(String.raw`grep "a\\bFooBar" src/`), [String.raw`a\bFooBar`]);
+  assert.deepEqual(extractPatterns(String.raw`grep "Foo\$Bar" src/`), ['Foo$Bar']);
+  assert.deepEqual(extractPatterns('grep "Foo\\`Bar" src/'), ['Foo`Bar']);
+  assert.deepEqual(extractPatterns(String.raw`grep "Foo\wBar" src/`), [String.raw`Foo\wBar`]);
+  // Single quotes escape nothing.
+  assert.deepEqual(extractPatterns(String.raw`grep 'Foo\"Bar' src/`), [String.raw`Foo\"Bar`]);
+});
+
+test('extractPatterns: nothing after an unterminated quote is read as a span', () => {
+  // Everything past the lone `'` is inside that quote as far as the shell is
+  // concerned, so `"FooBar"` there is not an argument.
+  assert.deepEqual(extractPatterns(`grep -rn 'unterminated "FooBar" src/`), []);
+});
+
+test('extractPatterns: an empty quoted argument is not a pattern', () => {
+  assert.deepEqual(extractPatterns('grep -rn "" src/'), []);
+  assert.equal(classifyBlock('grep -rn "" src/'), null);
+});
+
+test('extractPatterns: backslash-newline inside double quotes is a line continuation', () => {
+  // Pre-ship review F4: the shell removes BOTH characters.
+  assert.deepEqual(extractPatterns('grep -rn "Foo\\\nBarBaz" src/'), ['FooBarBaz']);
+});
+
 test('classifyBlock: ag with an escaped quote in the pattern is still a content search', () => {
   // isAgFilenameSearch blanked quoted spans with the same span regex, so the
   // `-g` INSIDE this pattern survived as a bare token and demoted the search.

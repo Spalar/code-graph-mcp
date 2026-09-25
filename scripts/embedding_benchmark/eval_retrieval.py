@@ -2,8 +2,8 @@
 """Evaluate one embedding backend on the labeled query set (vector-only ranking).
 
 Usage:
-  python eval_retrieval.py --backend minilm  --field context_string \
-      --db .code-graph/index.db --queries query_set.jsonl --out results/minilm_context.json
+  python eval_retrieval.py --backend minilm  --field context_string_nodoc \
+      --db .code-graph/index.db --queries query_set.jsonl --out results/minilm_nodoc.json
   python eval_retrieval.py --backend potion  --field code_content \
       --db .code-graph/index.db --queries query_set.jsonl --out results/potion_code.json
 
