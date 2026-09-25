@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.154.0
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71) and
+the schema (v10) are unchanged; the only Rust changes are `doctor --help` text
+and a test pinning it. One default hook behavior changes: **a raw source grep
+the index can answer is now rewritten into the `code-graph-mcp grep`/`show`
+command and run, instead of being denied with the answer attached.** It is the
+same search; the tool call now succeeds instead of showing a red `Error`. The
+rewrite covers a deliberately narrow shape — a single grep with allowlisted
+flags, one pattern and at most one plain path, no pipe. Any other grep command
+is no longer intercepted and runs as typed; before, many of those (`| head`, `|
+wc -l`, `| xargs …`, a glob path) were denied. The rewritten call is
+auto-allowed (your deny/ask rules still apply to it). To keep the old deny:
+`CODE_GRAPH_NO_ANSWER_IN_DENY=1` gives the static deny with its old scope, and
+`CODE_GRAPH_NO_BLOCK_GREP=1` stops interception entirely. To pin back: `npm i -g
+@sdsrs/code-graph@0.153.0`, or `cargo install code-graph-mcp --version 0.153.0`;
+plugin users can set the version in the marketplace entry.
 
 ### An intercepted grep no longer prints a red `Error`
 
@@ -17,31 +33,73 @@ success. Verified on Claude Code 2.1.282 with a headless session: the model sent
 `grep -rn "buildRewriteContext" claude-plugin/scripts/pre-grep-guide.js`, the tool
 result was the `code-graph-mcp grep` output with `is_error: false`.
 
-- The hook still runs the answer first. That run is what tells an answerable grep
-  (rewrite) from a regex-dialect miss or a broken binary (the raw grep runs, as
-  before). A `show` rewrite re-runs only the symbols that resolved.
-- `updatedInput` is honored only with a decision, and `"ask"` would prompt on
-  every grep, so the rewrite carries `allow`. The command that runs is built from
-  the hook's own argv with every argument shell-quoted. It is never the model's
-  text: a test runs a pattern full of shell syntax through the rewrite and gets
-  it back as one argument. Claude Code re-checks deny/ask rules against the
-  rewritten input. `hook-emit.test.js` now allowlists this envelope for
-  `pre-grep-guide.js` alone.
+- The hook still runs the answer first. That run is what tells an answerable
+  grep (rewrite) from a regex-dialect miss or a broken binary (the raw grep
+  runs, as before). A `show` rewrite re-runs only the symbols that resolved.
+- **Only one narrow shape is rewritten:** `grep|rg|ag|git grep ARGS [2>&1]`,
+  where every flag is on a per-verb allowlist of ones cg honors or ignores
+  (grep: `-r -R -n -H -s -I -i -w -F -l -c -E -P`, a numeric `-A/-B/-C`,
+  `--include`; rg: `-n -H -i -w -F -l -c -s`, `-g`, `-t`), a flag's value is
+  checked like any other word, and there is exactly one pattern and at most one
+  path — the same path the answer searched, with no glob and no `..` in it.
+  (`2>/dev/null` parses, but is counted as a path, so it reaches a rewrite only
+  when no other path is named.) Everything else runs as typed, because the
+  rewrite could not reproduce it: any pipe, any other redirect,
+  `;`/`&&`/`||`/newline/`&`, a `NAME=value` or `env` prefix, `$`/backtick
+  expansion, `\` outside quotes, a glob path (bash expands it one level without
+  dotfiles; cg's `-g` is recursive), any `-e`, a pattern starting with `-`, a
+  quoted pattern the answer would take for the path, a negated `--include='!…'`,
+  and flags such as `-q -o -x -m -h`, `--json`, `--name-only`, rg's `-r -T -S -U
+  -d`, ag's `-n -G`, or ag's smart-case on an all-lowercase pattern. Four
+  pre-ship review rounds each found a shape that got past a broader gate; this
+  one is narrow on purpose, since a command left alone shows no red block
+  either.
+- A context grep (`-A5 "fn X"`) is answered with `show`, and not rewritten when
+  it asks for `-l`/`-c` or names more than three definitions; the old fallback
+  to a plain grep answer, which dropped the context, is gone. The pattern the
+  answer ran must equal the pattern the shell would pass.
+- The rewritten grep carries `-m 0`: cg caps matches at 100 per file by default.
+- The rewrite runs the binary that answered, by absolute path, so the shell
+  cannot resolve an older `code-graph-mcp` earlier on PATH.
+- Why `allow`: Claude Code 2.1.282 also honors `updatedInput` with no decision,
+  but the rewritten call would then go through the permission prompt as a
+  command the user never approved — every intercepted search would prompt a user
+  who allowlisted `grep` but not this binary. The command that runs is built
+  from the hook's own argv with every argument shell-quoted, never the model's
+  text: a test runs a pattern full of shell syntax through it and gets it back
+  as one argument. A model-set `dangerouslyDisableSandbox` is not carried over.
+  The docs state deny/ask rules are evaluated against the rewritten input.
+  `hook-emit.test.js` allowlists this envelope for `pre-grep-guide.js` alone,
+  and now matches the helper's identifier, not only its call shape.
 - The rewritten command carries `CODE_GRAPH_INTERNAL=1` on each cg call, so a
   delivered answer is not recorded as a model-initiated `use`. A shell sitting
   in a subdirectory runs it as `(cd <root> || exit 1; …)`, because the argv is
-  root-relative. The bare `code-graph-mcp` name is used only when it will
-  resolve (on PATH, or a plugin-cache install's `bin/`); otherwise the resolved
-  binary's absolute path is used.
-- The model gets one context line naming the command its output came from. If
-  its grep was piped (`| head -20`), that line says the stage was not applied.
+  root-relative; its own cwd is unchanged.
+- The model gets a short context note naming the command its output came from.
 - The funnel row stays `action:"deny"`, the event the Rust aggregator counts,
   and gains `delivery:"rewrite"`.
 - The output is no longer capped at 4000 bytes: it is the cg command's full
-  output, bounded by the Bash tool's own limit, the same as the grep it
-  replaces. Each intercepted search now runs cg twice (the hook's check and the
-  real call).
-- `CODE_GRAPH_NO_ANSWER_IN_DENY=1` still gives the static deny.
+  output, and each hit in an indexed file carries a `→ fn …` line, so it runs
+  longer than the grep's. Each intercepted search runs cg twice (the hook's
+  check and the real call).
+- `CODE_GRAPH_NO_ANSWER_IN_DENY=1` still gives the static deny, with its old
+  scope.
+
+### Not covered
+
+- A `show` rewrite is repo-wide: `grep -A3 "fn foo" src/nested/` prints `foo`'s
+  definitions wherever they are, as the deny's answer did. cg's grep skips
+  untracked dotfiles and gitignored files that `grep -r` reads, and truncates a
+  line at 512 columns. A plain-grep BRE pattern has its `\|` unescaped but its
+  bare `| + ? ( ) { }` read as regex operators. `grep` without `-r` on a
+  directory errors, while its rewrite searches recursively. `grep -rc` prints
+  `file:0` for non-matching files, and `cg -c` omits them.
+- The funnel records the rewrite as answered when the hook emits it, before
+  Claude Code runs it; a rewritten call that then fails, or that a user deny rule
+  refuses, still counts as delivered.
+- The rewrite has not been executed under Windows Git Bash; the test suite skips
+  that step on Windows, and the plugin CI job runs on Ubuntu.
+- `stats` still labels these events "answered denies".
 
 ### The `doctor --check-only` help still read as a complete residue list
 

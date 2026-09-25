@@ -827,8 +827,8 @@ function buildRewriteContext(mode, cmdShown) {
 //
 //   (grep | rg | ag | git grep) ARG… [2>&1 | 2>/dev/null]
 //
-// (`2>/dev/null` parses, but countNamedPaths counts it as a second path, so in
-// practice only a `show`-mode grep carrying it reaches a rewrite.)
+// (`2>/dev/null` parses, but countNamedPaths counts it as a path, so it
+// reaches a rewrite only when the command names no other path.)
 //
 // Every ARG is a flag from the verb's allowlist (values, where a flag takes
 // one, are checked like any other word) or a plain/quoted operand: exactly one
