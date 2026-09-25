@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.155.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 71 → 72 because the parser moved to tree-sitter 0.25 and
