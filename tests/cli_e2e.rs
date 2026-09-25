@@ -10108,6 +10108,34 @@ fn every_json_command_answers_a_miss_in_a_shape_its_consumer_can_parse() {
     );
 }
 
+// The binary under test is a cargo build output, which is exactly what a
+// dogfood checkout runs to test the tool — so a query through it must not
+// append a funnel `use` row (the recorded uses outnumbered real queries 841 to
+// 266 over 2026-09-05..25). The unit tests pin the detector and the installed-
+// copy positive control; this pins the wiring in `main`.
+#[test]
+fn a_query_through_the_dev_build_records_no_funnel_use() {
+    let project = setup_indexed_project();
+    let rec = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("recommendations.jsonl");
+    let before = std::fs::read_to_string(&rec).unwrap_or_default();
+
+    let (_, _, code) = run_cli_env(
+        &project,
+        &["show", "validateToken"],
+        &[("CODE_GRAPH_INTERNAL", "0")],
+    );
+    assert_eq!(code, 0);
+
+    let after = std::fs::read_to_string(&rec).unwrap_or_default();
+    assert!(
+        !after[before.len()..].contains("\"action\":\"use\""),
+        "a dev-build query appended a use row: {after:?}"
+    );
+}
+
 // CON-17 (audit 2026-08-29): the funnel-telemetry write rotates
 // `recommendations.jsonl`, and its "something else owns this name" warning was
 // raised through `tracing` from a call site that ran BEFORE `init_tracing` —

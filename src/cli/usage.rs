@@ -6,7 +6,12 @@ use super::*;
 /// recordRecommendation posture: best-effort, NEVER creates `.code-graph/`
 /// (zero footprint outside indexed projects). Hook-internal answer runs set
 /// `CODE_GRAPH_INTERNAL=1` and are skipped — they are deliveries, not conversions.
-pub fn record_cli_use(project_root: &Path, cmd: &str) {
+/// So are runs of a cargo build output (`exe`, normally `current_exe()`): in a
+/// dogfood checkout the dev build is run to TEST the tool, and those runs read
+/// back as adoption (2026-09-25: 841 recorded uses against 266 queries through
+/// the installed binary in the transcripts of the same 20 days). `None` skips
+/// that check.
+pub fn record_cli_use(project_root: &Path, cmd: &str, exe: Option<&Path>) {
     if std::env::var("CODE_GRAPH_INTERNAL").ok().as_deref() == Some("1") {
         return;
     }
@@ -25,21 +30,27 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
     if dir.join(NO_METRICS_SENTINEL).exists() {
         return;
     }
+    let rec_path = dir.join("recommendations.jsonl");
+    // Bounded growth: recommendations.jsonl is append-only and (unlike
+    // usage.jsonl) written per-event from both here and the JS PreToolUse hooks,
+    // so rotate before appending. Same policy/constants as usage.jsonl.
+    // Housekeeping, so it runs for a dev build too: the JS hooks keep appending
+    // either way, and the CON-17 e2e test observes the rotation through the dev
+    // build.
+    crate::utils::telemetry::rotate_jsonl_if_over(
+        &rec_path,
+        crate::utils::telemetry::JSONL_ROTATE_MAX_BYTES,
+        crate::utils::telemetry::JSONL_ROTATE_KEEP_BYTES,
+    );
+    if exe.is_some_and(is_cargo_build_output) {
+        return;
+    }
     let line = serde_json::json!({
         "ts": crate::utils::telemetry::iso8601_now(),
         "hook": "cli",
         "action": "use",
         "cmd": cmd,
     });
-    let rec_path = dir.join("recommendations.jsonl");
-    // Bounded growth: recommendations.jsonl is append-only and (unlike
-    // usage.jsonl) written per-event from both here and the JS PreToolUse hooks,
-    // so rotate before appending. Same policy/constants as usage.jsonl.
-    crate::utils::telemetry::rotate_jsonl_if_over(
-        &rec_path,
-        crate::utils::telemetry::JSONL_ROTATE_MAX_BYTES,
-        crate::utils::telemetry::JSONL_ROTATE_KEEP_BYTES,
-    );
     // `.code-graph/recommendations.jsonl` is opened by fixed name inside a
     // directory that is repo content; `append_owned` refuses to follow a
     // symlink planted there (audit 2026-08-29 SEC-02).
@@ -47,6 +58,18 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
         use std::io::Write as _;
         let _ = writeln!(f, "{}", line);
     }
+}
+
+/// True when `exe` sits in a cargo target directory: `<target>/<profile>/`,
+/// `<target>/<triple>/<profile>/`, or a `deps/` below either. Cargo marks the
+/// target root (wherever `CARGO_TARGET_DIR` puts it) with a CACHEDIR.TAG, but
+/// the tag's signature line is shared by every cachedir-aware tool, so only a
+/// tag naming cargo counts.
+pub fn is_cargo_build_output(exe: &Path) -> bool {
+    exe.ancestors().skip(2).take(3).any(|dir| {
+        std::fs::read_to_string(dir.join("CACHEDIR.TAG"))
+            .is_ok_and(|tag| tag.contains("created by cargo"))
+    })
 }
 
 /// Aggregated per-tool counts across sessions.

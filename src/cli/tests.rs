@@ -749,7 +749,7 @@ fn test_record_cli_use_rotates_recommendations_jsonl() {
     }
     assert!(std::fs::metadata(&rec).unwrap().len() > 1_048_576);
 
-    record_cli_use(root, "callgraph");
+    record_cli_use(root, "callgraph", None);
 
     let size = std::fs::metadata(&rec).unwrap().len();
     assert!(
@@ -780,7 +780,7 @@ fn test_record_cli_use_skips_when_no_metrics_sentinel_present() {
     let rec = cg.join("recommendations.jsonl");
 
     // No sentinel → the use event is recorded.
-    record_cli_use(root, "grep");
+    record_cli_use(root, "grep", None);
     let after_first = std::fs::read_to_string(&rec).unwrap();
     assert_eq!(
         after_first.lines().count(),
@@ -790,12 +790,102 @@ fn test_record_cli_use_skips_when_no_metrics_sentinel_present() {
 
     // Sentinel present → record_cli_use is a no-op; the file is byte-unchanged.
     std::fs::write(cg.join(crate::domain::NO_METRICS_SENTINEL), b"").unwrap();
-    record_cli_use(root, "callgraph");
+    record_cli_use(root, "callgraph", None);
     let after_second = std::fs::read_to_string(&rec).unwrap();
     assert_eq!(
         after_second, after_first,
         "sentinel must suppress the second use event"
     );
+}
+
+/// Lay out `<tmp>/<rel>` as an executable path, with a CACHEDIR.TAG carrying
+/// `tag` at `<tmp>/<tag_dir>` when given. Returns the exe path.
+fn fake_exe(tmp: &Path, rel: &str, tag_dir: Option<(&str, &str)>) -> std::path::PathBuf {
+    let exe = tmp.join(rel);
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, b"").unwrap();
+    if let Some((dir, tag)) = tag_dir {
+        std::fs::write(tmp.join(dir).join("CACHEDIR.TAG"), tag).unwrap();
+    }
+    exe
+}
+
+const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by cargo.\n";
+
+#[test]
+fn cargo_build_output_is_recognised_by_the_tag_cargo_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    // The three shapes cargo lays binaries out in: profile dir, cross-target
+    // profile dir, and a test harness under deps/.
+    let release = fake_exe(
+        t,
+        "a/target/release/code-graph-mcp",
+        Some(("a/target", CARGO_TAG)),
+    );
+    let cross = fake_exe(
+        t,
+        "b/tgt/x86_64-unknown-linux-gnu/release/code-graph-mcp",
+        Some(("b/tgt", CARGO_TAG)),
+    );
+    let deps = fake_exe(
+        t,
+        "c/target/debug/deps/cli-0123",
+        Some(("c/target", CARGO_TAG)),
+    );
+    assert!(is_cargo_build_output(&release));
+    assert!(is_cargo_build_output(&cross));
+    assert!(is_cargo_build_output(&deps));
+
+    // Installed copies: no tag anywhere above them.
+    let installed = fake_exe(t, "d/.cache/code-graph/bin/code-graph-mcp", None);
+    assert!(!is_cargo_build_output(&installed));
+    // The tag format is shared by every cachedir-aware tool; only cargo's counts.
+    let foreign = fake_exe(
+        t,
+        "e/cache/bin/code-graph-mcp",
+        Some((
+            "e/cache",
+            "Signature: 8a477f597d28d172789f06886806bc55\n# created by restic\n",
+        )),
+    );
+    assert!(!is_cargo_build_output(&foreign));
+}
+
+#[test]
+fn a_dev_build_does_not_record_a_use_but_an_installed_copy_does() {
+    // In a dogfood checkout the tool's own dev build is run to TEST it; those
+    // runs read back as consumer adoption (2026-09-25: 841 recorded uses vs
+    // 266 PATH-binary queries in the transcripts over the same window).
+    std::env::remove_var("CODE_GRAPH_INTERNAL");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let cg = root.join(CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&cg).unwrap();
+    let rec = cg.join("recommendations.jsonl");
+
+    let dev = fake_exe(
+        tmp.path(),
+        "target/release/code-graph-mcp",
+        Some(("target", CARGO_TAG)),
+    );
+    record_cli_use(&root, "grep", Some(&dev));
+    assert!(
+        !rec.exists() || std::fs::read_to_string(&rec).unwrap().is_empty(),
+        "a cargo build output must not record a use"
+    );
+
+    // Positive control, same process: an installed copy still records.
+    let installed = fake_exe(tmp.path(), "plugin/bin/code-graph-mcp", None);
+    record_cli_use(&root, "grep", Some(&installed));
+    let content = std::fs::read_to_string(&rec).unwrap();
+    assert_eq!(
+        content.lines().count(),
+        1,
+        "installed copy records: {content:?}"
+    );
+    assert!(content.contains("\"cmd\":\"grep\""));
 }
 
 #[test]
@@ -2649,7 +2739,7 @@ fn record_cli_use_refuses_to_append_through_a_symlink() {
     std::fs::write(&victim, "keep = 1\n").unwrap();
     std::os::unix::fs::symlink(&victim, cg.join("recommendations.jsonl")).unwrap();
 
-    record_cli_use(&root, "search");
+    record_cli_use(&root, "search", None);
 
     assert_eq!(
         std::fs::read_to_string(&victim).unwrap(),
@@ -2662,7 +2752,7 @@ fn record_cli_use_refuses_to_append_through_a_symlink() {
     let plain_root = dir.path().join("plain");
     let plain_cg = plain_root.join(crate::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&plain_cg).unwrap();
-    record_cli_use(&plain_root, "search");
+    record_cli_use(&plain_root, "search", None);
     let written = std::fs::read_to_string(plain_cg.join("recommendations.jsonl")).unwrap();
     assert!(
         written.contains("\"cmd\":\"search\""),

@@ -165,7 +165,8 @@ fn main() -> Result<()> {
     // ordering is what fixes it; no second print site is needed.
     if let Some(cmd) = subcommand.and_then(code_graph_mcp::utils::telemetry::canonical_query_cmd) {
         if let Ok(root) = code_graph_mcp::cli::resolve_project_root() {
-            code_graph_mcp::cli::record_cli_use(&root, cmd);
+            let exe = std::env::current_exe().ok();
+            code_graph_mcp::cli::record_cli_use(&root, cmd, exe.as_deref());
         }
     }
 
