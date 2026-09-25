@@ -115,14 +115,36 @@ if [ "$js_staged" -gt 0 ]; then
   # Fed by process substitution, NOT a pipe: a pipe would put the loop in a
   # subshell where `exit 1` only leaves the subshell and the hook would pass a
   # failing test.
+  js_tests=()
   while IFS= read -r t; do
+    [ -f "$t" ] && js_tests+=("$t")
+  done < <(find "$ROOT/claude-plugin/scripts" "$ROOT/scripts" -type f -name '*.test.js' | sort)
+  # Fast path: every file in ONE parallel `node --test` (measured 2026-09-25 on
+  # the CI discovery set: 13-25 s parallel vs 93 s serial). Green here is final.
+  # Red is NOT final: parallel runs share the box, and a timing assertion or the
+  # find-binary cache race can go red under contention alone — which is why CI
+  # runs serially. So a red falls through to the serial per-file loop below,
+  # which is the gate it always was: a real failure fails there too, by name.
+  # The count guard is not decoration: a bare `node --test` with no file
+  # arguments falls back to Node's OWN discovery, a different set. And
+  # `${arr[@]+…}` below, not "${arr[@]}": under `set -u` bash 3.2 (macOS's
+  # /usr/bin/env bash) calls an empty array unbound.
+  confirm_serially=true
+  if [ "${#js_tests[@]}" -gt 0 ] \
+    && "${git_clean[@]}" node --test "${js_tests[@]}" > /dev/null 2>&1; then
+    confirm_serially=false
+  elif [ "${#js_tests[@]}" -gt 0 ]; then
+    echo "  parallel run red — confirming file by file (serial)..."
+  fi
+  $confirm_serially || js_tests=()
+  for t in ${js_tests[@]+"${js_tests[@]}"}; do
     [ -f "$t" ] || continue
     if ! "${git_clean[@]}" node --test "$t" > /dev/null 2>&1; then
       echo "❌ Test failed: $(basename "$t")"
       echo "Run: node --test $t"
       exit 1
     fi
-  done < <(find "$ROOT/claude-plugin/scripts" "$ROOT/scripts" -type f -name '*.test.js' | sort)
+  done
   echo "✓ Plugin JS tests passed"
 fi
 
