@@ -109,12 +109,17 @@ function emitPreToolAllowContext(text) {
  * (the red `Error` block every intercepted grep used to print), and the model
  * reads it as one; a rewrite runs as an ordinary successful call.
  *
- * `updatedInput` is honoured only alongside a decision — `"ask"` would prompt on
- * every grep — so this carries `allow`, and the elevation is argued the same way
- * as pre-read-guide's: the command that runs is one this hook assembled from a
- * fixed argv (read-only `grep`/`show`, every argument shell-quoted), never the
- * model's text. Claude Code re-evaluates deny and ask rules against the
- * rewritten input, so a user rule denying the binary still wins.
+ * Why `allow` rather than no decision. Claude Code 2.1.282 honours
+ * `updatedInput` WITHOUT a decision too (pre-ship review reproduced it; an
+ * earlier version of this comment said otherwise). But then the rewritten call
+ * goes through the permission flow as a command the user never approved: a user
+ * who allowlisted `grep` and not this binary would be prompted on every
+ * intercepted search — worse than the red deny this replaces. `"ask"` prompts
+ * by definition. So this carries `allow`, argued the same way as
+ * pre-read-guide's: the command that runs is one this hook assembled from a
+ * fixed argv (read-only `grep`/`show`, every argument shell-quoted, the binary
+ * by absolute path), never the model's text. The docs state deny and ask rules
+ * are still evaluated against the rewritten input.
  *
  * `updatedInput` REPLACES the tool input, so the caller passes the whole object.
  * `reason` is shown to the user, not the model; `context` reaches the model.

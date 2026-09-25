@@ -48,12 +48,15 @@ const ALLOW_ELEVATION_ALLOWLIST = {
 test('only the argued hooks may use an allow envelope', () => {
   const offenders = [];
   for (const name of fs.readdirSync(__dirname)) {
-    if (!name.endsWith('.js') || name.endsWith('.test.js')) continue;
+    if (!/\.[cm]?js$/.test(name) || /\.test\.[cm]?js$/.test(name)) continue;
     if (name === 'hook-emit.js') continue; // the definition itself
     const src = fs.readFileSync(path.join(__dirname, name), 'utf8');
     for (const [helper, allowed] of Object.entries(ALLOW_ELEVATION_ALLOWLIST)) {
-      // Ignore prose: only a real call/import of the helper counts.
-      const uses = new RegExp(helper + '\\s*[(,}]').test(src.replace(/^\s*\/\/.*$/gm, ''));
+      // Ignore prose (line comments). Any use of the IDENTIFIER counts — a
+      // call-shape regex (`helper(`) let `{ emitPreToolRewrite: rw }` and
+      // `he['emitPreToolRewrite']` through while the guard stayed green
+      // (pre-ship review reproduced both).
+      const uses = new RegExp('\\b' + helper + '\\b').test(src.replace(/^\s*\/\/.*$/gm, ''));
       if (uses && !allowed.has(name)) offenders.push(name + ' → ' + helper);
     }
   }
@@ -90,7 +93,7 @@ test('no hook hand-rolls an allow decision outside hook-emit.js', () => {
 // every direct caller's `name (file)` onto one line — so editing a heavily-called
 // symbol pushed a multi-kilobyte wall into the model's context on every Edit.
 test('injected context is capped, on every envelope, with the cut announced', () => {
-  const { capContext, MAX_INJECTED_BYTES, emitPreToolContext, emitPreToolAllowContext, emitPostToolContext } =
+  const { capContext, MAX_INJECTED_BYTES, emitPreToolContext, emitPreToolAllowContext, emitPreToolRewrite, emitPostToolContext } =
     require('./hook-emit');
 
   // Under the cap: byte-identical passthrough. Without this the cap could be a
@@ -103,6 +106,7 @@ test('injected context is capped, on every envelope, with the cut announced', ()
     ['PreToolUse', emitPreToolContext],
     ['PreToolUse allow', emitPreToolAllowContext],
     ['PostToolUse', emitPostToolContext],
+    ['PreToolUse rewrite', (t) => emitPreToolRewrite({ updatedInput: { command: 'x' }, reason: 'r', context: t })],
   ]) {
     const ctx = JSON.parse(emit(huge)).hookSpecificOutput.additionalContext;
     assert.ok(

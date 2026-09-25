@@ -481,6 +481,9 @@ function extractCgFlags(cmd) {
  */
 function classifyDeny(cmd) {
   if (extractUnansweredTail(cmd)) return null;
+  // The rewrite replaces the whole command, so it must be equivalent to it —
+  // see rewritableTail. Not equivalent → the raw command runs untouched.
+  if (!rewritableTail(cmd)) return null;
   return classifyBlock(cmd);
 }
 
@@ -780,49 +783,36 @@ function buildBlockReason() {
 // advertisement (one deny once taught a 14-grep bypass prefix) and no forced
 // restatement of which hit the model will use.
 
-// The name that invokes cg in the Bash tool's shell. The bare name is what the
-// reader expects to see, but a rewrite that prints `command not found` is the
-// same red block this change exists to remove, so it is used only when it will
-// resolve: on this process's PATH, or as the launcher in a plugin-cache
-// install's `bin/`, which Claude Code puts on the Bash PATH for every enabled
-// plugin. Anything else runs the resolved binary by absolute path.
-function cgInvocation(binary, {
-  env = process.env,
-  pluginBin = path.join(__dirname, '..', 'bin', 'code-graph-mcp'),
-  exists = fs.existsSync,
-} = {}) {
-  const name = 'code-graph-mcp';
-  for (const dir of String(env.PATH || '').split(path.delimiter)) {
-    if (!dir) continue;
-    try { if (exists(path.join(dir, name))) return name; } catch { /* unreadable dir */ }
-  }
-  try {
-    if (/[\\/]\.claude[\\/]plugins[\\/]cache[\\/]/.test(pluginBin) && exists(pluginBin)) return name;
-  } catch { /* fall through to the absolute path */ }
-  return binary ? shellQuoteArg(binary) : name;
-}
-
 // The command the grep is rewritten into. One argv per cg call (several for a
 // multi-symbol `show`), each run with CODE_GRAPH_INTERNAL=1 so the CLI's `use`
 // record does not count a delivered answer as a model-initiated conversion —
 // per command, because a `;`-joined list would scope a bare prefix to the first
 // one only, and `export` would leak into the persistent shell. Paths in the argv
 // are root-relative, so a shell sitting in a subdirectory runs them from the
-// root in a subshell, leaving its own cwd alone.
-function buildRewriteCommand(argvList, { invocation = 'code-graph-mcp', root, shellCwd } = {}) {
-  const body = argvList
+// root in a subshell, leaving its own cwd alone. `filter` is an output filter
+// rebuilt by `rewritableTail` (never the model's text), piped after the lot.
+//
+// `invocation` is the binary that ANSWERED, by quoted absolute path — runMain
+// passes it. Pre-ship review of the first cut: naming it `code-graph-mcp` let
+// the Bash shell resolve a different, older copy (exit 2 on `-g`, a red error
+// again) or a non-executable match (exit 127), bypassing the version gate
+// `findBinary` exists for. The bare default is for the printed copy only.
+function buildRewriteCommand(argvList, { invocation = 'code-graph-mcp', root, shellCwd, filter } = {}) {
+  let body = argvList
     .map((args) => 'CODE_GRAPH_INTERNAL=1 ' + formatCgCommand(args, invocation))
     .join('; echo; ');
-  if (!root || !shellCwd || path.resolve(shellCwd) === path.resolve(root)) return body;
-  return '(cd ' + shellQuoteArg(root) + ' || exit 1; ' + body + ')';
+  if (root && shellCwd && path.resolve(shellCwd) !== path.resolve(root)) {
+    body = '(cd ' + shellQuoteArg(root) + ' || exit 1; ' + body + ')';
+  } else if (filter && argvList.length > 1) {
+    body = '{ ' + body + '; }';
+  }
+  return filter ? body + ' | ' + filter : body;
 }
 
 // What the model is told alongside the rewritten call's output. `cmdShown` is
 // rendered from the SAME argv the rewrite runs (no env prefix, bare name — the
-// form a reader re-runs). `droppedTail` is the part of the model's pipeline the
-// rewrite did not keep (`| head -20`): the output is the unfiltered answer, and
-// saying so is cheaper than a model puzzling over why `| wc -l` printed hits.
-function buildRewriteContext(mode, cmdShown, droppedTail) {
+// form a reader re-runs), with any kept filter.
+function buildRewriteContext(mode, cmdShown) {
   const lines = mode === 'show'
     ? ['[code-graph] Raw grep for symbol definitions on indexed source was rewritten to `code-graph-mcp show` — this call\'s output is the definitions from the AST index:',
       `$ ${cmdShown}`,
@@ -830,18 +820,75 @@ function buildRewriteContext(mode, cmdShown, droppedTail) {
     : ['[code-graph] Raw `grep` on indexed source was rewritten to its AST-aware equivalent — this call\'s output comes from:',
       `$ ${cmdShown}`,
       'Each hit shows its containing fn/module — use these results directly instead of re-running the search.'];
-  if (droppedTail) lines.push(`(Your \`${droppedTail}\` stage was not applied to this output.)`);
   return lines.join('\n');
 }
 
-// The pipeline remainder after the grep's own clause (`| head -20`), or null.
-// classifyDeny has already refused top-level `;`/`&&` tails, so what is left
-// here is a pipe or an `||` branch.
-function droppedPipelineTail(cmd) {
+// A rewrite REPLACES the whole command and reports success, so it is only
+// honest when the cg call is equivalent to everything the command would have
+// done. Pre-ship review of the first cut (HIGH): `grep -rl X src/ | xargs sed
+// -i …` became a successful `cg grep -l` and the `sed -i` never ran — under
+// the old deny the model at least knew nothing had run. The same held for
+// `| tee f`, `> out.txt`, a trailing `&`, and flags cg cannot express (`-q`
+// `-o` `-x` `-m`), which printed "success" in a shape nobody asked for.
+//
+// So the rule is an allowlist, not a denylist of known side effects:
+//   - after the grep's clause, nothing, an `||` branch (with hits it would not
+//     have run), or ONE pure line filter — `head`/`tail` with a count, or
+//     `sed -n 'A,Bp'` — which is rebuilt from its numbers and kept;
+//   - inside the clause, no redirect but `2>/dev/null` / `2>&1`, no `&`, no
+//     command substitution, no flag outside what cg honors.
+// Everything else is not rewritten: the raw command runs as typed, the way a
+// `;`/`&&` compound already does. Returns `{ filter }` (filter may be null) or
+// null when the command must run as typed.
+const PIPE_FILTERS = [
+  [/^(head|tail)$/, (m) => `${m[1]} -n 10`],
+  [/^(head|tail)\s+(?:-n\s*|--lines=|-)(\d+)$/, (m) => `${m[1]} -n ${m[2]}`],
+  [/^sed\s+-n\s+(["']?)(\d+),(\d+)p\1$/, (m) => `sed -n '${m[2]},${m[3]}p'`],
+];
+// Output-shaping flags cg has no spelling for. Short letters are grep/rg/ag
+// flags whose loss changes what the output MEANS (quiet, only-matching,
+// whole-line, max-count, byte offsets, NUL separators); rg's `-r` is REPLACE,
+// not recursive. Long forms by name.
+const UNREWRITABLE_SHORT = 'qoxmbzZ';
+const UNREWRITABLE_LONG =
+  /^--(?:quiet|silent|only-matching|line-regexp|max-count|json|null|null-data|byte-offset|replace|vimgrep|count-matches|passthru|files)(?:=|$)/;
+// Short flags that take a value: the value ends the cluster (`-g*.rs`).
+const VALUE_SHORT = 'gtefABCd';
+
+function rewritableTail(cmd) {
+  if (!cmd || typeof cmd !== 'string') return null;
   const clause = firstShellClause(cmd);
-  if (typeof cmd !== 'string' || clause === cmd) return null;
+  // Double-quoted spans still expand `$`/backticks, so the pattern the hook
+  // read is not the one the shell would pass — not ours to rewrite.
+  if (/"[^"]*[$`][^"]*"/.test(clause)) return null;
+  const bare = clause.replace(/"[^"]*"|'[^']*'/g, ' ');
+  if (/[$`]/.test(bare)) return null;
+  const unredirected = bare.replace(/(?:^|\s)2>(?:\/dev\/null|&1)(?=\s|$)/g, ' ');
+  if (/[<>&]/.test(unredirected)) return null;
+  const toks = unredirected.replace(VERB_STRIP, '').trim().split(/\s+/);
+  const isRg = RG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '');
+  for (const tok of toks) {
+    if (!tok || tok[0] !== '-' || tok === '-' || tok === '--') continue;
+    if (tok.startsWith('--')) {
+      if (UNREWRITABLE_LONG.test(tok)) return null;
+      continue;
+    }
+    for (const ch of tok.slice(1)) {
+      if (VALUE_SHORT.includes(ch)) break;
+      if (UNREWRITABLE_SHORT.includes(ch) || (isRg && ch === 'r')) return null;
+    }
+  }
   const tail = cmd.slice(clause.length).trim();
-  return tail || null;
+  if (!tail || tail.startsWith('||')) return { filter: null };
+  if (tail[0] !== '|') return null;
+  // Anchored whole-stage matches: a second `|`, a redirect or a `;` in the
+  // stage can never match, so they fall through to "run as typed".
+  const stage = tail.slice(1).trim();
+  for (const [re, build] of PIPE_FILTERS) {
+    const m = stage.match(re);
+    if (m) return { filter: build(m) };
+  }
+  return null;
 }
 
 // v0.49 — plain `grep` speaks BRE: alternation/grouping arrive escaped
@@ -1108,16 +1155,24 @@ function runMain() {
     const argvList = answeredMode === 'show'
       ? answer.symbols.map((sym) => ['show', sym])
       : [args];
+    // classifyDeny already proved the tail rewritable; this only reads its filter.
+    const { filter } = rewritableTail(cmd);
     const command = buildRewriteCommand(argvList, {
-      invocation: cgInvocation(resolveAnswerBinary({})),
+      invocation: shellQuoteArg(resolveAnswerBinary({})),
       root,
       shellCwd,
+      filter,
     });
-    const cmdShown = argvList.map((a) => formatCgCommand(a)).join('; ');
+    const cmdShown = argvList.map((a) => formatCgCommand(a)).join('; ') +
+      (filter ? ' | ' + filter : '');
+    // Not carried over: a model-set `dangerouslyDisableSandbox`. The call this
+    // hook auto-allows is its own read-only cg command, and it needs no escape
+    // from a sandbox the model's grep would have run inside.
+    const { dangerouslyDisableSandbox, ...toolInput } = input.tool_input || {};
     process.stdout.write(emitPreToolRewrite({
-      updatedInput: { ...input.tool_input, command },
+      updatedInput: { ...toolInput, command },
       reason: '[code-graph] raw grep → AST-aware equivalent',
-      context: buildRewriteContext(answeredMode, cmdShown, droppedPipelineTail(cmd)),
+      context: buildRewriteContext(answeredMode, cmdShown),
     }) + '\n');
     return;
   }
@@ -1147,10 +1202,9 @@ module.exports = {
   firstShellClause,      // v0.96 — grep's own clause (up to first top-level separator)
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
-  cgInvocation,          // rewrite — the binary name the Bash shell resolves
   buildRewriteCommand,   // rewrite — the command the grep becomes
   buildRewriteContext,   // rewrite — what the model is told about it
-  droppedPipelineTail,   // rewrite — the pipe stage the rewrite did not keep
+  rewritableTail,        // rewrite — is the cg call equivalent to the whole command
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests

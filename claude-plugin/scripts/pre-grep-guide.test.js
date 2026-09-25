@@ -49,10 +49,9 @@ const {
   countNamedPaths,
   extractDeclSymbols,
   translateBreToRg,
-  cgInvocation,
   buildRewriteCommand,
   buildRewriteContext,
-  droppedPipelineTail,
+  rewritableTail,
   extractSedReadTargets,
   extractUnansweredTail,
   extractPatterns,
@@ -1037,16 +1036,61 @@ test('buildRewriteContext: no salience restatement — the answer is the output 
   assert.match(show, /definitions from the AST index/);
 });
 
-test('buildRewriteContext: a dropped pipe stage is named, and only then', () => {
-  const cmd = cg('fts5_search', 'src/');
-  assert.doesNotMatch(buildRewriteContext('grep', cmd), /not applied/);
-  assert.match(buildRewriteContext('grep', cmd, '| wc -l'), /`\| wc -l` stage was not applied/);
+test('buildRewriteCommand: a kept filter pipes after the whole call, grouped when there are several', () => {
+  assert.equal(buildRewriteCommand([['grep', 'X', 'src']], { filter: 'head -n 20' }),
+    'CODE_GRAPH_INTERNAL=1 code-graph-mcp grep X src | head -n 20');
+  assert.equal(buildRewriteCommand([['show', 'A'], ['show', 'B']], { filter: 'head -n 5' }),
+    '{ CODE_GRAPH_INTERNAL=1 code-graph-mcp show A; echo; CODE_GRAPH_INTERNAL=1 code-graph-mcp show B; } | head -n 5',
+    'without the group the filter would apply to the last show only');
+  const root = pathTmp.join(osTmp.tmpdir(), 'r');
+  assert.equal(buildRewriteCommand([['grep', 'X', 'src']], {
+    root, shellCwd: pathTmp.join(root, 'sub'), filter: 'tail -n 3',
+  }), '(cd ' + require('./cg-answer').shellQuoteArg(root) +
+    ' || exit 1; CODE_GRAPH_INTERNAL=1 code-graph-mcp grep X src) | tail -n 3');
 });
 
-test('droppedPipelineTail: the pipe remainder, or null', () => {
-  assert.equal(droppedPipelineTail('grep -rn "Foo" src/ | head -20'), '| head -20');
-  assert.equal(droppedPipelineTail('grep -rn "Foo" src/'), null);
-  assert.equal(droppedPipelineTail('grep -rn "a|b" src/'), null, 'a quoted | is pattern text');
+test('rewritableTail: only a command the cg call is equivalent to', () => {
+  // Rewritable: nothing after, an `||` branch (with hits it would not run), or
+  // one pure line filter — rebuilt from its numbers, never the model's text.
+  assert.deepEqual(rewritableTail('grep -rn "Foo" src/'), { filter: null });
+  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ || echo none'), { filter: null });
+  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ 2>/dev/null | head -20'), { filter: 'head -n 20' });
+  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ 2>&1 | tail -n 5'), { filter: 'tail -n 5' });
+  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ | head'), { filter: 'head -n 10' });
+  assert.deepEqual(rewritableTail("grep -n \"Foo\" src/a.rs | sed -n '1,60p'"), { filter: "sed -n '1,60p'" });
+  assert.deepEqual(rewritableTail('grep -rn "a|b" src/'), { filter: null }, 'a quoted | is pattern text');
+  // Not rewritable (pre-ship review H1/L3/L6): the stage would silently not run,
+  // or the output would not mean what was asked.
+  for (const cmd of [
+    'grep -rl "Foo" src/ | xargs sed -i s/Foo/Bar/g',
+    'grep -rn "Foo" src/ | tee /tmp/out.txt',
+    'grep -rn "Foo" src/ | sort > /tmp/out.txt',
+    'grep -rn "Foo" src/ > /tmp/out.txt',
+    'grep -rn "Foo" src/ &',
+    'grep -rn "Foo" src/ | wc -l',
+    'grep -rn "Foo" src/ | head -20 | tail -5',
+    'grep -rq "Foo" src/',
+    'grep -rno "Foo" src/',
+    'grep -rnx "Foo" src/',
+    'grep -rn -m1 "Foo" src/',
+    'grep -rn --max-count=1 "Foo" src/',
+    'rg --json "Foo" src/',
+    'rg -r Bar "Foo" src/',
+    'grep -rn "$PAT" src/',
+    'grep -rn "Foo" $(cat dirs)',
+    'grep -rn "Foo" src/\nrm -rf src/',
+  ]) {
+    assert.equal(rewritableTail(cmd), null, cmd);
+  }
+  // A value-taking flag ends its cluster: `-g*.rs`'s `r`/`s` are not flags.
+  assert.deepEqual(rewritableTail("rg -g*.rs 'Foo' src/"), { filter: null });
+  assert.deepEqual(rewritableTail('grep -rnA3 "fn Foo" src/'), { filter: null });
+});
+
+test('classifyDeny: a command the rewrite cannot reproduce is not intercepted', () => {
+  assert.notEqual(classifyDeny('grep -rn "SomeSymbol" src/ | head -20'), null);
+  assert.equal(classifyDeny('grep -rl "SomeSymbol" src/ | xargs sed -i s/a/b/'), null);
+  assert.equal(classifyDeny('grep -rn "SomeSymbol" src/ > hits.txt'), null);
 });
 
 test('buildRewriteCommand: every call carries the internal marker, and a subdir shell runs from the root', () => {
@@ -1071,22 +1115,6 @@ test('buildRewriteCommand: hostile pattern text stays one quoted argument', () =
   const res = require('child_process').spawnSync('sh', ['-c', cmd.replace('CODE_GRAPH_INTERNAL=1 ', '')], { encoding: 'utf8' });
   if (res.error) return; // no POSIX sh on this runner
   assert.equal(res.stdout, 'grep\n' + hostile + '\nsrc\n');
-});
-
-test('cgInvocation: bare name only where the Bash shell will resolve it', () => {
-  const bin = '/opt/cg bin/code-graph-mcp';
-  const dirs = ['/usr/bin', '/home/u/.local/bin'].join(pathTmp.delimiter);
-  const onPath = (p) => p === pathTmp.join('/home/u/.local/bin', 'code-graph-mcp');
-  assert.equal(cgInvocation(bin, { env: { PATH: dirs }, pluginBin: '/nope', exists: onPath }),
-    'code-graph-mcp');
-  // Plugin-cache install: Claude Code puts <plugin-root>/bin on the Bash PATH.
-  const cached = '/home/u/.claude/plugins/cache/cg/cg/1.0.0/bin/code-graph-mcp';
-  assert.equal(cgInvocation(bin, { env: { PATH: '' }, pluginBin: cached, exists: (p) => p === cached }),
-    'code-graph-mcp');
-  // A repo checkout's bin/ is NOT on anyone's PATH — its existence proves nothing.
-  const repo = '/home/u/dev/cg/claude-plugin/bin/code-graph-mcp';
-  assert.equal(cgInvocation(bin, { env: { PATH: '' }, pluginBin: repo, exists: (p) => p === repo }),
-    "'/opt/cg bin/code-graph-mcp'", 'falls back to the resolved binary, shell-quoted');
 });
 
 // ── v0.50 compound-command tail: deny answers the grep, NOT the rest ─
@@ -1300,16 +1328,6 @@ function e2eFixture(stubBody) {
   return { dir, stub };
 }
 
-// PATH minus every directory holding a `code-graph-mcp`. The rewrite names the
-// binary by bare name whenever it would resolve, and a developer's shell (or
-// Claude Code's, which puts the plugin's bin/ on PATH) usually has one — so
-// without this the rewritten command would run the REAL binary, not the stub.
-function pathWithoutCg() {
-  return String(process.env.PATH || '').split(pathE2e.delimiter)
-    .filter((d) => d && !fsE2e.existsSync(pathE2e.join(d, 'code-graph-mcp')))
-    .join(pathE2e.delimiter);
-}
-
 function runHook(cmd, fixture, cwdOverride) {
   const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
     cwd: cwdOverride || fixture.dir,
@@ -1317,7 +1335,6 @@ function runHook(cmd, fixture, cwdOverride) {
     encoding: 'utf8',
     env: {
       ...process.env,
-      PATH: pathWithoutCg(),
       _CG_ANSWER_BINARY: fixture.stub,
       CODE_GRAPH_QUIET_HOOKS: '0',
       CODE_GRAPH_NO_BLOCK_GREP: '0',
@@ -1474,14 +1491,94 @@ test('e2e: the reported `grep …; sed …` shape is not denied', () => {
   }
 });
 
-test('e2e: a piped grep is still rewritten — a pipe discards no command — and the dropped stage is named', () => {
+test('e2e: `| head -20` is kept on the rewrite, rebuilt from its count', () => {
   const uniq = `StubPipe${Date.now()}`;
-  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const fixture = e2eFixture(
+    `for (let i = 0; i < 50; i++) process.stdout.write('src/foo.rs:' + i + '  hit\\n');`);
   const cmd = `grep -rn "${uniq}" src/ | head -20`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.doesNotMatch(rw.command, /head/);
-    assert.match(rw.context, /`\| head -20` stage was not applied/);
+    assert.match(rw.command, / \| head -n 20$/);
+    assert.match(rw.context, /\| head -n 20/, 'the printed command shows the filter it ran');
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.equal(ran.trim().split('\n').length, 20);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: a side-effecting pipe stage is not rewritten — the command runs as typed', () => {
+  // Pre-ship review H1: the rewrite reported success and the `sed -i` never ran.
+  const uniq = `StubSed${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs\\n');`);
+  const cmd = `grep -rl "${uniq}" src/ | xargs sed -i s/${uniq}/Bar/g`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '', `the hook must not decide for this command: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the rewrite runs the binary that answered, not whatever PATH names', () => {
+  // Pre-ship review M1: a bare `code-graph-mcp` resolved to an older copy
+  // earlier on PATH (exit 2 on `-g`) while the funnel recorded an answer.
+  const uniq = `StubAbsBin${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  RIGHT\\n');`);
+  const decoy = pathE2e.join(fixture.dir, 'decoy');
+  fsE2e.mkdirSync(decoy);
+  fsE2e.writeFileSync(pathE2e.join(decoy, 'code-graph-mcp'), '#!/bin/sh\necho WRONG\n');
+  fsE2e.chmodSync(pathE2e.join(decoy, 'code-graph-mcp'), 0o755);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
+      cwd: fixture.dir,
+      input: JSON.stringify({ tool_input: { command: cmd, description: 'search' } }),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: decoy + pathE2e.delimiter + process.env.PATH,
+        _CG_ANSWER_BINARY: fixture.stub,
+        CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_NO_BLOCK_GREP: '0', CODE_GRAPH_NO_ANSWER_IN_DENY: '0',
+      },
+    });
+    const rw = rewriteOf(res);
+    assert.ok(rw.command.includes(fixture.stub), rw.command);
+    const ran = spawnHook('bash', ['-c', rw.command], {
+      cwd: fixture.dir, encoding: 'utf8',
+      env: { ...process.env, PATH: decoy + pathE2e.delimiter + process.env.PATH },
+    });
+    if (!ran.error && process.platform !== 'win32') {
+      assert.match(ran.stdout, /RIGHT/);
+      assert.doesNotMatch(ran.stdout, /WRONG/);
+    }
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: a model-set dangerouslyDisableSandbox is not carried into the auto-allowed input', () => {
+  const uniq = `StubSbx${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
+      cwd: fixture.dir,
+      input: JSON.stringify({ tool_input: {
+        command: cmd, description: 'search', timeout: 9000, run_in_background: true,
+        dangerouslyDisableSandbox: true,
+      } }),
+      encoding: 'utf8',
+      env: {
+        ...process.env, _CG_ANSWER_BINARY: fixture.stub,
+        CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_NO_BLOCK_GREP: '0', CODE_GRAPH_NO_ANSWER_IN_DENY: '0',
+      },
+    });
+    const input = JSON.parse(res.stdout).hookSpecificOutput.updatedInput;
+    assert.equal('dangerouslyDisableSandbox' in input, false);
+    assert.equal(input.timeout, 9000, 'every other field survives the replacement');
+    assert.equal(input.run_in_background, true);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1641,6 +1738,26 @@ test('e2e: show-mode rewrite re-runs only the symbols that resolved', () => {
     assert.match(rw.context, /definitions from the AST index/);
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) assert.match(ran, new RegExp(`fn ${uniq}A  src/foo\\.rs:1-3`));
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: show-mode rewrite re-runs EVERY symbol that resolved', () => {
+  // Pre-ship review: re-running only the first resolved symbol stayed green.
+  const uniq = `StubShow2${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] !== 'show') process.exit(1);\n` +
+    `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
+  const cmd = `grep -A5 "fn ${uniq}A\\|fn ${uniq}B" src/`;
+  try {
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(` show ${uniq}A; echo; CODE_GRAPH_INTERNAL=1 \\S+ show ${uniq}B$`));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.match(ran, new RegExp(`fn ${uniq}A `));
+      assert.match(ran, new RegExp(`fn ${uniq}B `));
+    }
   } finally {
     cleanupFixture(fixture, cmd);
   }
