@@ -126,8 +126,8 @@ if [ "$js_staged" -gt 0 ]; then
   # alone — which is why CI runs serially. So a red names the files it failed
   # in (from the TAP `location:` lines) and falls through to the serial
   # per-file loop below over EVERY file, which is the gate it always was: a real
-  # failure fails there too, by name. Every file, not just the named ones — a
-  # file-level failure carries no `location:` and would otherwise go unchecked.
+  # failure fails there too, by name. Every file, not just the named ones: the
+  # names come from parsing reporter output, and a gate must not rest on a parse.
   # The count guard is not decoration: a bare `node --test` with no file
   # arguments falls back to Node's OWN discovery, a different set. And
   # `${arr[@]+…}` below, not "${arr[@]}": under `set -u` bash 3.2 (macOS's
@@ -140,7 +140,7 @@ if [ "$js_staged" -gt 0 ]; then
     else
       red=$(awk '/^not ok /{f=1; next} f && /^  location: /{s=$2; gsub(/\047/, "", s); sub(/:[0-9]+:[0-9]+$/, "", s); sub(/.*\//, "", s); print s; f=0}' "$js_log" \
         | sort -u | tr '\n' ' ')
-      echo "  parallel run red in: ${red:-<no location reported>}— confirming every file serially..."
+      echo "  parallel run red in: ${red:-<no location reported>} — confirming every file serially..."
     fi
     rm -f "${js_log:?}"
   fi

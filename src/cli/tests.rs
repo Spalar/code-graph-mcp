@@ -882,6 +882,10 @@ fn a_cargo_profile_dir_without_the_tag_still_counts_as_build_output() {
     std::fs::write(t.join("inst/bin/.cargo-lock"), b"").unwrap();
     let installed = fake_exe(t, "inst/bin/code-graph-mcp", None);
     assert!(!is_cargo_build_output(&installed));
+    // …and the other half alone is not one either, so both markers are live.
+    std::fs::create_dir_all(t.join("only-fp/bin/.fingerprint")).unwrap();
+    let only_fp = fake_exe(t, "only-fp/bin/code-graph-mcp", None);
+    assert!(!is_cargo_build_output(&only_fp));
 }
 
 #[test]
