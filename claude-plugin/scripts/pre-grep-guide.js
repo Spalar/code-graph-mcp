@@ -655,7 +655,6 @@ function countNamedPaths(cmd, patterns) {
     const tok = raw.replace(/^["']|["']$/g, '');
     if (!tok || tok.startsWith('-')) continue;     // a flag
     if (pats.has(tok)) continue;                    // the search pattern, not a path
-    if (/^\d*[<>]/.test(tok)) continue;             // a redirect (`2>/dev/null`), not a path
     if (tok.includes('/') || /\.[A-Za-z0-9]{1,6}$/.test(tok)) n++;  // dir-sep or file extension
   }
   return n;
@@ -787,29 +786,24 @@ function buildBlockReason() {
 // per command, because a `;`-joined list would scope a bare prefix to the first
 // one only, and `export` would leak into the persistent shell. Paths in the argv
 // are root-relative, so a shell sitting in a subdirectory runs them from the
-// root in a subshell, leaving its own cwd alone. `filter` is an output filter
-// rebuilt by `renderFilter` from parsed numbers (never the model's text).
+// root in a subshell, leaving its own cwd alone.
 //
 // `invocation` is the binary that ANSWERED, by quoted absolute path — runMain
 // passes it. Pre-ship review of the first cut: naming it `code-graph-mcp` let
 // the Bash shell resolve a different, older copy (exit 2 on `-g`, a red error
 // again) or a non-executable match (exit 127), bypassing the version gate
 // `findBinary` exists for. The bare default is for the printed copy only.
-function buildRewriteCommand(argvList, { invocation = 'code-graph-mcp', root, shellCwd, filter } = {}) {
-  let body = argvList
+function buildRewriteCommand(argvList, { invocation = 'code-graph-mcp', root, shellCwd } = {}) {
+  const body = argvList
     .map((args) => 'CODE_GRAPH_INTERNAL=1 ' + formatCgCommand(args, invocation))
     .join('; echo; ');
-  if (root && shellCwd && path.resolve(shellCwd) !== path.resolve(root)) {
-    body = '(cd ' + shellQuoteArg(root) + ' || exit 1; ' + body + ')';
-  } else if (filter && argvList.length > 1) {
-    body = '{ ' + body + '; }';
-  }
-  return filter ? body + ' | ' + filter : body;
+  if (!root || !shellCwd || path.resolve(shellCwd) === path.resolve(root)) return body;
+  return '(cd ' + shellQuoteArg(root) + ' || exit 1; ' + body + ')';
 }
 
 // What the model is told alongside the rewritten call's output. `cmdShown` is
 // rendered from the SAME argv the rewrite runs (no env prefix, bare name — the
-// form a reader re-runs), with any kept filter.
+// form a reader re-runs).
 function buildRewriteContext(mode, cmdShown) {
   const lines = mode === 'show'
     ? ['[code-graph] Raw grep for symbol definitions on indexed source was rewritten to `code-graph-mcp show` — this call\'s output is the definitions from the AST index:',
@@ -822,26 +816,30 @@ function buildRewriteContext(mode, cmdShown) {
 }
 
 // A rewrite REPLACES the whole command and reports success, so it is only
-// honest when the cg call does everything the command would have done. Two
-// rounds of pre-ship review each found a way past a scan that looked for known
-// hazards — `| xargs sed -i` (round 1), then a command after `|| …` on the next
-// line, and meaning-changing flags the list did not name (round 2). A denylist
-// over shell syntax does not terminate, so this is a GRAMMAR instead: the whole
-// command must parse as
+// honest when the cg call does everything the command would have done. Three
+// rounds of pre-ship review each found a way past the previous gate: a
+// side-effecting pipe stage, a command after `|| …` on the next line, flags a
+// denylist did not name, then a redirect in a flag's value slot, filters whose
+// hit count did not survive cg's output format, and globs cg reads differently
+// from the shell. So the accepted shape is deliberately NARROW — a command
+// outside it is not intercepted and runs as typed, which also shows no red
+// block; narrowing costs interception, never the user's command:
 //
-//   [NAME=value …] (grep | rg | ag | git grep) ARG… [2>&1 | 2>/dev/null] [| FILTER]
+//   (grep | rg | ag | git grep) ARG… [2>&1 | 2>/dev/null]
 //
-// where every ARG is an allowlisted flag (ALLOWED_SHORT / ALLOWED_LONG, values
-// only for the ones that take one) or a quoted/plain operand, and FILTER is one
-// `head`/`tail` with a count or `sed -n 'A,Bp'`. Anything the tokenizer does not
-// recognize — a newline, `;`, `&`, `\`, `$`, a backtick, parentheses, braces, any
-// other redirect, a second `|`, `||` — means "not ours": the command runs as
-// typed. Returns `{ filter }` (a parsed filter or null), or null.
+// Every ARG is a flag from the verb's allowlist (values, where a flag takes
+// one, are checked like any other word) or a plain/quoted operand: exactly one
+// pattern and at most one path. Not accepted: any pipe, any other redirect, a
+// NAME=value or `env` prefix (RIPGREP_CONFIG_PATH, GREP_OPTIONS, LC_ALL change
+// the search), a glob in a path or an unquoted pattern, a pattern starting with
+// `-`, and anything the tokenizer does not know — newline, `;`, `&`, `\`, `$`,
+// a backtick, parentheses, braces, `~`. Returns a plan or null.
 const WORD_CHAR = /[A-Za-z0-9_.,:@%+=/*?<>&-]/;
 function shellWords(s) {
   const words = [];
   let cur = null;
   const push = () => { if (cur) words.push(cur); cur = null; };
+  const start = (quoted) => { if (!cur) cur = { text: '', startsQuoted: quoted, anyQuoted: false, bareSpecial: false }; };
   for (let i = 0; i < s.length;) {
     const c = s[i];
     if (c === ' ' || c === '\t') { push(); i++; continue; }
@@ -855,14 +853,15 @@ function shellWords(s) {
       // it looks like. A backslash before anything else is literal (`"a\|b"`,
       // the BRE alternation models write constantly).
       if (c === '"' && (/[$`!]|\\["\\$`]/.test(body) || body.endsWith('\\'))) return null;
-      if (!cur) cur = { text: '', startsQuoted: true, bareRedirect: false };
+      start(true);
+      cur.anyQuoted = true;
       cur.text += body;
       i = j + 1;
       continue;
     }
     if (!WORD_CHAR.test(c)) return null;
-    if (!cur) cur = { text: '', startsQuoted: false, bareRedirect: false };
-    if (c === '<' || c === '>' || c === '&') cur.bareRedirect = true;
+    start(false);
+    if ('<>&*?'.includes(c)) cur.bareSpecial = true;
     cur.text += c;
     i++;
   }
@@ -872,54 +871,38 @@ function shellWords(s) {
 
 // Flags cg honors (`-i -w -F -l -c`, extractCgFlags) or that are no-ops for it
 // (recursion, line numbers, filenames, binary skipping, the regex dialect).
-// Context letters are legal only because a context grep reaches the rewrite in
-// `show` mode alone (classifyBlock), where the answer IS the body.
-const ALLOWED_SHORT = { grep: 'rRnHsIiwFlcEPABC', git: 'rnHIiwFlcEPABC', rg: 'nHiwFlcsABC', ag: 'nHiwlcsABC' };
+// Per verb, because letters differ: ag's `-n` is --norecurse and `-H` is
+// --heading, rg's `-r` is --replace. Context letters (A/B/C, a count value)
+// only reach the rewrite in `show` mode, which answers with the body.
+const ALLOWED_SHORT = { grep: 'rRnHsIiwFlcEPABC', git: 'rnHIiwFlcEPABC', rg: 'nHiwFlcsABC', ag: 'iwlcsABC' };
 const VALUE_SHORT_BY_VERB = { grep: 'ABC', git: 'ABC', rg: 'gtABC', ag: 'ABC' };
-const ALLOWED_LONG = new Set([
-  'ignore-case', 'word-regexp', 'fixed-strings', 'files-with-matches', 'count', 'recursive',
-  'line-number', 'with-filename', 'extended-regexp', 'perl-regexp', 'no-messages',
-  'color', 'colour', 'no-heading', 'include', 'glob', 'type',
-]);
+const COMMON_LONG = ['ignore-case', 'word-regexp', 'fixed-strings', 'files-with-matches', 'count', 'line-number'];
+const ALLOWED_LONG = {
+  grep: new Set([...COMMON_LONG, 'recursive', 'with-filename', 'extended-regexp', 'perl-regexp', 'no-messages', 'include']),
+  git: new Set([...COMMON_LONG, 'extended-regexp', 'perl-regexp']),
+  rg: new Set([...COMMON_LONG, 'with-filename', 'no-heading', 'glob', 'type']),
+  ag: new Set(['ignore-case', 'word-regexp', 'files-with-matches', 'count', 'case-sensitive']),
+};
 const VALUE_LONG = new Set(['include', 'glob', 'type']);
-function parseFilter(words) {
-  // Exact, anchored matches only: a second `|`, a redirect or any other word
-  // in the stage cannot match, so it falls through to "run as typed".
-  const t = words.map((w) => (w.op ? '|' : w.text));
-  if (t[0] === 'head' || t[0] === 'tail') {
-    const rest = t.slice(1).join(' ');
-    if (rest === '') return { kind: t[0], n: 10 };
-    const m = rest.match(/^(?:-n ?|--lines=|-)(\d+)$/);
-    return m ? { kind: t[0], n: Number(m[1]) } : null;
-  }
-  if (t[0] === 'sed' && t[1] === '-n' && t.length === 3) {
-    const m = t[2].match(/^(\d+),(\d+)p$/);
-    return m ? { kind: 'sed', a: Number(m[1]), b: Number(m[2]) } : null;
-  }
-  return null;
+
+// A flag's value word gets the same scrutiny as any other word: round 3 put
+// `&`/`>` in the `-A 3&` slot and dropped a command. Counts are digits; a glob
+// value is fine only quoted (unquoted, the shell would expand it first).
+function valueWordOk(w, isCount) {
+  if (!w || w.op) return false;
+  if (isCount) return !w.anyQuoted && /^\d+$/.test(w.text);
+  return !(w.bareSpecial);
 }
 
 function rewritePlan(cmd) {
   if (!cmd || typeof cmd !== 'string' || cmd.length > 1000) return null;
   const words = shellWords(cmd);
-  if (!words) return null;
-  const pipe = words.findIndex((w) => w.op);
-  const head = pipe === -1 ? words : words.slice(0, pipe);
-  let filter = null;
-  if (pipe !== -1) {
-    filter = parseFilter(words.slice(pipe + 1));
-    if (!filter) return null;
-  }
+  if (!words || words.some((w) => w.op)) return null;
   let i = 0;
-  const skipAssignments = () => {
-    while (i < head.length && !head[i].startsQuoted && /^[A-Za-z_][A-Za-z0-9_]*=[^<>&]*$/.test(head[i].text)) i++;
-  };
-  skipAssignments();
-  if (head[i] && !head[i].startsQuoted && head[i].text === 'env') { i++; skipAssignments(); }
-  let verb = head[i] && !head[i].startsQuoted ? head[i].text : '';
+  let verb = !words[0].anyQuoted ? words[0].text : '';
   if (verb === 'git') {
-    if (!head[i + 1] || head[i + 1].text !== 'grep') return null;
-    i++;
+    if (!words[1] || words[1].anyQuoted || words[1].text !== 'grep') return null;
+    i = 1;
   } else if (!['grep', 'rg', 'ag'].includes(verb)) {
     return null;
   }
@@ -928,32 +911,42 @@ function rewritePlan(cmd) {
   const valueShort = VALUE_SHORT_BY_VERB[verb];
   const operands = [];
   let caseFlag = false;
+  let context = false;
   let endOfFlags = false;
-  for (; i < head.length; i++) {
-    const w = head[i];
-    if (!w.startsQuoted && (w.text === '2>&1' || w.text === '2>/dev/null')) continue;
-    if (w.bareRedirect) return null;
+  for (; i < words.length; i++) {
+    const w = words[i];
+    if (!w.anyQuoted && (w.text === '2>&1' || w.text === '2>/dev/null')) continue;
     if (w.startsQuoted || endOfFlags || w.text[0] !== '-' || w.text === '-') {
-      operands.push(w.text);
+      operands.push(w);
       continue;
+    }
+    if (w.anyQuoted || w.bareSpecial) {
+      // Only an ATTACHED file-filter value may be quoted or carry a glob
+      // (`--include='*.rs'`, rg `-g'*.rs'`); an unquoted `<>&` is shell syntax.
+      const attachedFilter = /^--(?:include|glob|type)=/.test(w.text) || (verb === 'rg' && /^-[gt]./.test(w.text));
+      if (!attachedFilter || (!w.anyQuoted && /[<>&]/.test(w.text))) return null;
     }
     if (w.text === '--') { endOfFlags = true; continue; }
     if (w.text.startsWith('--')) {
       const eq = w.text.indexOf('=');
       const name = w.text.slice(2, eq === -1 ? undefined : eq);
-      if (!ALLOWED_LONG.has(name)) return null;
-      if (VALUE_LONG.has(name) && eq === -1) i++;  // the value is the next word
-      if (name === 'ignore-case') caseFlag = true;
+      if (!ALLOWED_LONG[verb].has(name)) return null;
+      if (VALUE_LONG.has(name) && eq === -1 && !valueWordOk(words[++i], false)) return null;
+      if (name === 'ignore-case' || name === 'case-sensitive') caseFlag = true;
       continue;
     }
     const letters = w.text.slice(1);
     for (let k = 0; k < letters.length; k++) {
       const ch = letters[k];
       if (valueShort.includes(ch)) {
+        const isCount = 'ABC'.includes(ch);
+        if (isCount) context = true;
         const attached = letters.slice(k + 1);
-        // Context counts are digits; rg's -g/-t values are anything.
-        if ('ABC'.includes(ch) ? !/^\d*$/.test(attached) : false) return null;
-        if (!attached) i++;
+        if (attached) {
+          if (isCount && !/^\d+$/.test(attached)) return null;
+        } else if (!valueWordOk(words[++i], isCount)) {
+          return null;
+        }
         break;
       }
       if (!allowed.includes(ch)) return null;
@@ -961,20 +954,35 @@ function rewritePlan(cmd) {
     }
   }
   if (operands.length === 0 || operands.length > 2) return null;
+  const [pattern, target] = operands;
+  // The pattern: unquoted glob characters would be expanded by the shell, and
+  // a leading `-` would reach cg as flags.
+  if ((!pattern.anyQuoted && pattern.bareSpecial) || pattern.text.startsWith('-')) return null;
+  // The path: bash expands a glob at one level with no dotfiles; cg's `-g`
+  // matches recursively and includes them (round 3 M5). Not reproducible.
+  if (target && (/[*?[\]{}]/.test(target.text) || target.bareSpecial)) return null;
   // ag is smart-case by default: an all-lowercase pattern matches any case,
   // and cg's search is case-sensitive, so the answer would find less.
-  if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(operands[0])) return null;
-  return { filter };
+  if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(pattern.text)) return null;
+  return { pattern: pattern.text, context };
 }
 
-// Render a parsed filter against the rewrite's output. A cg `grep` hit is TWO
-// lines (the hit, then its `→ fn …` line), so `head -20` asked for 20 hits and
-// gets `head -n 40`; `-l`/`-c` and `show` output are one line per unit.
-function renderFilter(filter, linesPerUnit) {
-  if (!filter) return null;
-  const k = linesPerUnit;
-  if (filter.kind === 'sed') return `sed -n '${(filter.a - 1) * k + 1},${filter.b * k}p'`;
-  return `${filter.kind} -n ${filter.n * k}`;
+// The plan must describe the same search classifyBlock decided on. The pattern
+// the answer ran is picked from quoted spans (pickBlockPattern); the grammar's
+// pattern operand is the one the shell passes — `"is"'Foo'` or an unquoted
+// pattern with a quoted path made them differ (round 3 L3). A context count the
+// raw-text CONTEXT_FLAG check missed (`-A"3"`) sent a context grep to grep mode,
+// which drops the context (L2). `show` answers with bodies, so a grep asking
+// for a file list or counts (`-l`/`-c`) is not its equivalent (M6).
+function rewriteMatchesBlock(plan, block, cmd, rawPattern) {
+  if (!plan || !block) return false;
+  if (plan.pattern !== rawPattern) return false;
+  if (block.mode === 'grep' && plan.context) return false;
+  if (block.mode === 'show') {
+    const f = cgFlagSet(extractCgFlags(cmd));
+    if (f.has('-l') || f.has('-c')) return false;
+  }
+  return true;
 }
 
 // v0.49 — plain `grep` speaks BRE: alternation/grouping arrive escaped
@@ -1150,7 +1158,7 @@ function runMain() {
   // typed (see rewritePlan) — decided before the answer is spent on it. The
   // opt-in static deny keeps its own, older scope.
   const plan = block && !isAnswerDisabled() ? rewritePlan(cmd) : null;
-  if (block && !isAnswerDisabled() && !plan) return;
+  if (block && !isAnswerDisabled() && !rewriteMatchesBlock(plan, block, cmd, rawGrepPattern)) return;
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the
@@ -1242,20 +1250,18 @@ function runMain() {
 
     // Re-run exactly what answered: the resolved symbols for `show`, the same
     // argv for `grep`.
+    // `-m 0`: cg caps matches at 100 per file by default and says so only on
+    // stderr; the grep being replaced has no cap (round 3 M4). Only here, not
+    // in the in-hook answer, which is a has-hits probe.
     const argvList = answeredMode === 'show'
       ? answer.symbols.map((sym) => ['show', sym])
-      : [args];
-    const cgFlagsSet = cgFlagSet(flags);
-    const filter = renderFilter(plan.filter,
-      answeredMode === 'grep' && !cgFlagsSet.has('-l') && !cgFlagsSet.has('-c') ? 2 : 1);
+      : [[...args.slice(0, 1), '-m', '0', ...args.slice(1)]];
     const command = buildRewriteCommand(argvList, {
       invocation: shellQuoteArg(resolveAnswerBinary({})),
       root,
       shellCwd,
-      filter,
     });
-    const cmdShown = argvList.map((a) => formatCgCommand(a)).join('; ') +
-      (filter ? ' | ' + filter : '');
+    const cmdShown = argvList.map((a) => formatCgCommand(a)).join('; ');
     // Not carried over: a model-set `dangerouslyDisableSandbox`. The call this
     // hook auto-allows is its own read-only cg command, and it needs no escape
     // from a sandbox the model's grep would have run inside.
@@ -1297,7 +1303,7 @@ module.exports = {
   buildRewriteContext,   // rewrite — what the model is told about it
   shellWords,            // rewrite — the tokenizer rewritePlan's grammar reads
   rewritePlan,           // rewrite — does the whole command parse as one the rewrite reproduces
-  renderFilter,          // rewrite — a kept filter, scaled to cg's lines per hit
+  rewriteMatchesBlock,   // rewrite — does that plan describe the search classifyBlock chose
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests

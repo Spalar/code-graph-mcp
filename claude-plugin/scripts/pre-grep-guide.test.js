@@ -53,7 +53,7 @@ const {
   buildRewriteContext,
   shellWords,
   rewritePlan,
-  renderFilter,
+  rewriteMatchesBlock,
   extractSedReadTargets,
   extractUnansweredTail,
   extractPatterns,
@@ -1038,78 +1038,86 @@ test('buildRewriteContext: no salience restatement — the answer is the output 
   assert.match(show, /definitions from the AST index/);
 });
 
-test('buildRewriteCommand: a kept filter pipes after the whole call, grouped when there are several', () => {
-  assert.equal(buildRewriteCommand([['grep', 'X', 'src']], { filter: 'head -n 20' }),
-    'CODE_GRAPH_INTERNAL=1 code-graph-mcp grep X src | head -n 20');
-  assert.equal(buildRewriteCommand([['show', 'A'], ['show', 'B']], { filter: 'head -n 5' }),
-    '{ CODE_GRAPH_INTERNAL=1 code-graph-mcp show A; echo; CODE_GRAPH_INTERNAL=1 code-graph-mcp show B; } | head -n 5',
-    'without the group the filter would apply to the last show only');
-  const root = pathTmp.join(osTmp.tmpdir(), 'r');
-  assert.equal(buildRewriteCommand([['grep', 'X', 'src']], {
-    root, shellCwd: pathTmp.join(root, 'sub'), filter: 'tail -n 3',
-  }), '(cd ' + require('./cg-answer').shellQuoteArg(root) +
-    ' || exit 1; CODE_GRAPH_INTERNAL=1 code-graph-mcp grep X src) | tail -n 3');
-});
 
-test('rewritePlan: only a command that parses as one the rewrite reproduces', () => {
+test('rewritePlan: only the narrow shape the rewrite reproduces', () => {
   const plan = (c) => rewritePlan(c);
-  assert.deepEqual(plan('grep -rn "Foo" src/'), { filter: null });
-  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null | head -20'), { filter: { kind: 'head', n: 20 } });
-  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1 | tail -n 5'), { filter: { kind: 'tail', n: 5 } });
-  assert.deepEqual(plan('grep -rn "Foo" src/ | head'), { filter: { kind: 'head', n: 10 } });
-  assert.deepEqual(plan("grep -n \"Foo\" src/a.rs | sed -n '1,60p'"), { filter: { kind: 'sed', a: 1, b: 60 } });
-  assert.deepEqual(plan('grep -rn "a|b" src/'), { filter: null }, 'a quoted | is pattern text');
-  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { filter: null },
+  assert.deepEqual(plan('grep -rn "Foo" src/'), { pattern: 'Foo', context: false });
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null'), { pattern: 'Foo', context: false });
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1'), { pattern: 'Foo', context: false });
+  assert.deepEqual(plan('grep -rn "a|b" src/'), { pattern: 'a|b', context: false }, 'a quoted | is pattern text');
+  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { pattern: 'describe\\|runHook', context: false },
     'a backslash before | inside double quotes is literal — the BRE shape models write');
-  assert.deepEqual(plan('env FOO=1 grep -rn "Foo" src/'), { filter: null });
+  assert.deepEqual(plan('grep -rnA3 "fn foo" src/'), { pattern: 'fn foo', context: true });
   // Flags cg honors or ignores, with their values.
   for (const cmd of ['grep -rnw "Foo" src/', 'grep -rli "Foo" src/', 'grep -rc "Foo" src/',
-    'grep -rn --include=*.rs "Foo" src/', "grep -rn --include '*.rs' \"Foo\" src/",
-    'rg -t rust "Foo" src/', 'rg -trust "Foo" src/', "rg -g '*.rs' \"Foo\" src/",
-    'grep -rnE "Foo" src/', 'grep -rnP "Foo" src/', 'grep -rnA3 "fn foo" src/', 'rg -C 5 "fn foo" src/',
-    'git grep -n "Foo" src/', 'grep -rn --color=never "Foo" src/']) {
+    'grep -rn --include=*.rs "Foo" src/', "grep -rn --include='*.rs' \"Foo\" src/",
+    "grep -rn --include '*.rs' \"Foo\" src/", 'grep -rn --include -F "Foo" src/',
+    'rg -t rust "Foo" src/', 'rg -trust "Foo" src/', "rg -g '*.rs' \"Foo\" src/", "rg -g'*.rs' \"Foo\" src/",
+    'grep -rnE "Foo" src/', 'grep -rnP "Foo" src/', 'grep -rn -A 3 "fn foo" src/', 'rg -C 5 "fn foo" src/',
+    'git grep -n "Foo" src/', 'ag "FooBar" src/', 'ag -s "foo_bar" src/', 'grep -rn "Foo"']) {
     assert.notEqual(plan(cmd), null, cmd);
   }
-  // Not rewritable: a stage, command or flag the cg call would silently drop
-  // (pre-ship review round 1 H1, round 2 H1/M1/L1/N1-N3).
+  // Not rewritable: a stage, command, redirect, flag, glob or prefix the cg
+  // call would not reproduce (pre-ship review rounds 1-3).
   for (const cmd of [
     'grep -rl "Foo" src/ | xargs sed -i s/Foo/Bar/g',
     'grep -rn "Foo" src/ | tee /tmp/out.txt',
+    'grep -rn "Foo" src/ | head -20',
+    "grep -n \"Foo\" src/a.rs | sed -n '1,60p'",
+    'grep -rn "Foo" src/ | wc -l',
     'grep -rn "Foo" src/ > /tmp/out.txt',
+    'grep -rn "Foo" src/>out.txt',
     'grep -rn "Foo" src/ >> /tmp/out.txt',
     'grep -rn "Foo" src/ &> /tmp/out.txt',
-    'grep -rn "Foo" src/ &',
-    'grep -rn "Foo" src/ | wc -l',
-    'grep -rn "Foo" src/ | head -20 | tail -5',
-    'grep -rn "Foo" src/ | head -20 2>/dev/null',
-    "grep -rn \"Foo\" src/ | sed -n '1,5p;w out'",
-    "grep -rn \"Foo\" src/ | sed -n '1,5p' | sh",
-    'grep -rn "Foo" src/ || echo none',
-    'grep -rn "Foo" src/ || echo none\ntouch created',
-    'grep -rn "Foo" src/ || true & touch created',
-    'grep -rn "Foo" src/\nrm -rf src/',
-    "grep -rn \\'Foo[ >pwned ]*' src/ '",
-    'grep -rn "a\\"b" src/',
-    'grep -rq "Foo" src/', 'grep -rno "Foo" src/', 'grep -rnx "Foo" src/', 'grep -rn -m1 "Foo" src/',
-    'grep -rh "Foo" src/', 'grep -rn --max-count=1 "Foo" src/', 'grep -rn -e "Foo" -e "baz_qux" src/',
-    'rg -e "Foo" -e "baz_qux" src/', 'rg --json "Foo" src/', 'rg -r Bar "Foo" src/', 'rg -T rust "Foo" src/',
-    "rg --iglob '*.rs' \"Foo\" src/", 'rg -d 1 "Foo" src/', 'rg --max-depth 1 "Foo" src/', 'rg -S "foo_bar" src/',
-    'rg -U "Foo" src/', 'rg -l0 "Foo" src/',
-    "ag -G '\\.py$' \"Foo\" src/", "ag --ignore '*.rs' \"Foo\" src/", 'ag "foo_bar" src/',
-    'git grep --name-only "Foo" src/', 'git grep -e "Foo" --and -e "baz" src/', 'git grep -O "Foo" src/',
-    'grep -rn "$PAT" src/', 'grep -rn "Foo" $(cat dirs)', 'grep -rn "Foo" `cat dirs`', 'grep -rn "Foo" {src,lib}/',
-    'grep -rn "Foo" ~/src/',
-    'grep -rn "Foo" src/>out.txt',
     'grep -rn "Foo" src/ 2>err.txt',
     'grep -rn "Foo" src/ 2> /dev/null',
+    'grep -rn "Foo" src/ <in.txt',
+    'grep -rn "Foo" src/ &',
+    'grep -rn "Foo" src/ || echo none',
+    'grep -rn "Foo" src/ || echo none\ntouch created',
+    'grep -rn "Foo" src/\nrm -rf src/',
+    'grep -n -A 3& src/run_me.sh "fn foo_bar"',
+    'grep -rn -A >out.txt "fn foo_bar" src/',
+    'grep -rn -A"3" "FooBar" src/',
+    "grep -rn -B'2' \"FooBar\" src/",
     'grep -rnA3q "fn foo" src/',
-    'grep "Foo" src/ lib/ tests/',
-    'grep -rn',
+    "grep -rn 2\">\"&1 \"Foo\" src/",
+    "grep -rn \\'Foo[ >pwned ]*' src/ '",
+    'grep -rn "a\\"b" src/',
+    'grep -rn "Foo" src/*.rs', 'grep -rn "Foo" "src/*.rs"', 'grep -rn Foo* src/',
+    'grep -rn -- "-Hnli" src/',
+    'FOO=1 grep -rn "Foo" src/', 'RIPGREP_CONFIG_PATH=cfg rg "Foo" src/', 'env LC_ALL=C grep -rni "Foo" src/',
+    'grep -rq "Foo" src/', 'grep -rno "Foo" src/', 'grep -rnx "Foo" src/', 'grep -rn -m1 "Foo" src/',
+    'grep -rh "Foo" src/', 'grep -rn --max-count=1 "Foo" src/', 'grep -rn -e "Foo" -e "baz_qux" src/',
+    'grep --type rust "Foo" src/', 'git grep --glob "*.rs" "Foo" src/',
+    'rg -e "Foo" -e "baz_qux" src/', 'rg --json "Foo" src/', 'rg -r Bar "Foo" src/', 'rg -T rust "Foo" src/',
+    "rg --iglob '*.rs' \"Foo\" src/", 'rg -d 1 "Foo" src/', 'rg --max-depth 1 "Foo" src/', 'rg -S "foo_bar" src/',
+    'rg -U "Foo" src/', 'rg -l0 "Foo" src/', 'rg -g *.rs "Foo" src/',
+    "ag -G '\\.py$' \"Foo\" src/", "ag --ignore '*.rs' \"Foo\" src/", 'ag "foo_bar" src/', 'ag -n "FooBar" src/',
+    'git grep --name-only "Foo" src/', 'git grep -e "Foo" --and -e "baz" src/', 'git grep -O "Foo" src/',
+    'grep -rn "$PAT" src/', 'grep -rn "Foo" $(cat dirs)', 'grep -rn "Foo" `cat dirs`', 'grep -rn "Foo" {src,lib}/',
+    'grep -rn "Foo" ~/src/', 'grep "Foo" src/ lib/', 'grep -rn',
+    'grep -rn --include=*.rs>out.txt "Foo" src/', "rg -g*.rs>out.txt 'Foo' src/",
   ]) {
     assert.equal(plan(cmd), null, cmd);
   }
-  assert.notEqual(plan('ag "FooBar" src/'), null, 'ag with an uppercase pattern is case-sensitive, like cg');
-  assert.notEqual(plan('ag -s "foo_bar" src/'), null, 'ag -s forces case-sensitive');
+});
+
+test('rewriteMatchesBlock: the plan must describe the search classifyBlock chose', () => {
+  const plan = { pattern: 'FooBar', context: false };
+  assert.equal(rewriteMatchesBlock(plan, { mode: 'grep' }, 'grep -rn "FooBar" src/', 'FooBar'), true);
+  assert.equal(rewriteMatchesBlock(null, { mode: 'grep' }, 'x', 'FooBar'), false);
+  // `"is"'FooBar'`: the shell searches `isFooBar`, the answer ran `FooBar` (round 3 L3).
+  assert.equal(rewriteMatchesBlock({ pattern: 'isFooBar', context: false }, { mode: 'grep' },
+    "grep -rn \"is\"'FooBar' src/", 'FooBar'), false);
+  // A context count the raw-text check missed would reach grep mode and lose it.
+  assert.equal(rewriteMatchesBlock({ pattern: 'FooBar', context: true }, { mode: 'grep' },
+    'grep -rn -A"3" "FooBar" src/', 'FooBar'), false);
+  // show prints bodies; a file list or counts is a different question (round 3 M6).
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', context: true }, { mode: 'show', symbols: ['foo'] },
+    'grep -rl -A3 "fn foo" src/', 'fn foo'), false);
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', context: true }, { mode: 'show', symbols: ['foo'] },
+    'grep -rn -A3 "fn foo" src/', 'fn foo'), true);
 });
 
 test('shellWords: anything but plain words, quotes and `|` is not tokenized', () => {
@@ -1119,17 +1127,12 @@ test('shellWords: anything but plain words, quotes and `|` is not tokenized', ()
   }
 });
 
-test('renderFilter: counts scale to cg lines per unit, rebuilt from numbers only', () => {
-  assert.equal(renderFilter(null, 2), null);
-  assert.equal(renderFilter({ kind: 'head', n: 20 }, 2), 'head -n 40', 'a grep hit is two lines');
-  assert.equal(renderFilter({ kind: 'tail', n: 5 }, 1), 'tail -n 5');
-  assert.equal(renderFilter({ kind: 'sed', a: 1, b: 60 }, 2), "sed -n '1,120p'");
-  assert.equal(renderFilter({ kind: 'sed', a: 3, b: 4 }, 2), "sed -n '5,8p'", 'hits 3-4 are lines 5-8');
-});
 
-test('countNamedPaths: a `2>/dev/null` redirect is not a second path', () => {
-  assert.equal(countNamedPaths('grep -rn "Foo" src/ 2>/dev/null', ['Foo']), 1);
-  assert.notEqual(classifyDeny('grep -rn "SomeSymbol" src/ 2>/dev/null | head -20'), null);
+test('countNamedPaths: unchanged — a redirect still counts, so the static deny keeps its scope', () => {
+  // Round 3 M3: skipping redirects here widened CODE_GRAPH_NO_ANSWER_IN_DENY's
+  // deny to `2>/dev/null` / `>out.txt` shapes it never covered.
+  assert.equal(countNamedPaths('grep -rn "Foo" src/ 2>/dev/null', ['Foo']), 2);
+  assert.equal(classifyDeny('grep -rn "SomeSymbol" src/ >out.txt'), null);
 });
 
 
@@ -1472,12 +1475,13 @@ test('e2e: cleanupFixture actually removes the cooldown flag the hook wrote', ()
 test('e2e: answerable grep → rewritten into the cg call that answers it + records answered:true', () => {
   const uniq = `StubHit${Date.now()}`;
   const fixture = e2eFixture(
-    `process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
+    `const a = process.argv.slice(2).filter((x, k, all) => !(x === '-m' || all[k - 1] === '-m'));\n` +
+    `process.stdout.write('src/foo.rs:7  fn ' + a[1] + '()\\n');`);
   const cmd = `grep -rn "${uniq}" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ grep ${uniq} src/$`));
-    assert.match(rw.context, new RegExp(`\\$ code-graph-mcp grep ${uniq} src/`));
+    assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ grep -m 0 ${uniq} src/$`));
+    assert.match(rw.context, new RegExp(`\\$ code-graph-mcp grep -m 0 ${uniq} src/`));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) assert.match(ran, new RegExp(`src/foo\\.rs:7  fn ${uniq}\\(\\)`));
     const recs = fsE2e.readFileSync(
@@ -1532,21 +1536,6 @@ test('e2e: the reported `grep …; sed …` shape is not denied', () => {
   }
 });
 
-test('e2e: `| head -20` is kept on the rewrite, scaled to 20 hits of two lines', () => {
-  const uniq = `StubPipe${Date.now()}`;
-  const fixture = e2eFixture(
-    `for (let i = 0; i < 50; i++) process.stdout.write('src/foo.rs:' + i + '  hit\\n  → fn f\\n');`);
-  const cmd = `grep -rn "${uniq}" src/ | head -20`;
-  try {
-    const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, / \| head -n 40$/);
-    assert.match(rw.context, /\| head -n 40/, 'the printed command shows the filter it ran');
-    const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.equal(ran.trim().split('\n').filter((l) => l.startsWith('src/')).length, 20);
-  } finally {
-    cleanupFixture(fixture, cmd);
-  }
-});
 
 test('e2e: commands the rewrite cannot reproduce get no decision — they run as typed', () => {
   // Pre-ship review: round 1 `| xargs sed -i`, round 2 a command after `|| …`
@@ -1628,6 +1617,23 @@ test('e2e: the rewrite runs the binary that answered, not whatever PATH names', 
   }
 });
 
+test('e2e: a show-answerable grep asking for a file list is not rewritten into bodies', () => {
+  // Round 3 M6: `grep -rl -A3 "fn foo"` asked for files; show prints bodies.
+  const uniq = `StubShowL${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] !== 'show') process.exit(1);\n` +
+    `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
+  const cmd = `grep -rl -A3 "fn ${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '', `must run as typed: ${res.stdout}`);
+    assert.deepEqual(readRecs(fixture).filter((r) => r.hook === 'grep'), []);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('e2e: a model-set dangerouslyDisableSandbox is not carried into the auto-allowed input', () => {
   const uniq = `StubSbx${Date.now()}`;
   const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
@@ -1666,13 +1672,13 @@ test('e2e: -l reaches the binary the rewrite runs AND the printed command', () =
   const cmd = `grep -rln "${uniq}" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` grep -l ${uniq} src/$`));
+    assert.match(rw.command, new RegExp(` grep -m 0 -l ${uniq} src/$`));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) {
-      assert.match(ran, new RegExp(`ARGV\\[grep -l ${uniq} src/\\]`),
+      assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -l ${uniq} src/\\]`),
         `the rewrite ran without -l, so it returned hits where a file list was asked for: ${ran}`);
     }
-    assert.match(rw.context, /code-graph-mcp grep -l /,
+    assert.match(rw.context, /code-graph-mcp grep -m 0 -l /,
       'the printed command must show the flag that actually runs');
   } finally {
     cleanupFixture(fixture, cmd);
@@ -1691,10 +1697,10 @@ test('e2e: -F forwards the flag AND leaves the literal pattern unescaped', (t) =
   const cmd = `grep -rF "${uniq}\\|other_symbol" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.ok(rw.command.endsWith(` grep -F '${uniq}\\|other_symbol' src/`), rw.command);
+    assert.ok(rw.command.endsWith(` grep -m 0 -F '${uniq}\\|other_symbol' src/`), rw.command);
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) {
-      assert.match(ran, new RegExp(`ARGV\\[grep -F ${uniq}\\\\\\|other_symbol src/\\]`),
+      assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -F ${uniq}\\\\\\|other_symbol src/\\]`),
         `-F must forward and must not unescape: ${ran}`);
     }
   } finally {
@@ -1712,10 +1718,10 @@ test('e2e: a `-F` sitting in a VALUE position does not trigger the literal guard
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
     // -F is --include's value here, so the BRE unescape MUST still run.
-    assert.ok(rw.command.endsWith(` grep -g -F '${uniq}|other_symbol' src/`),
+    assert.ok(rw.command.endsWith(` grep -m 0 -g -F '${uniq}|other_symbol' src/`),
       `the guard fired on a filename glob and left the pattern escaped: ${rw.command}`);
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -g -F ${uniq}\\|other_symbol src/\\]`));
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -g -F ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1766,9 +1772,9 @@ test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
   const cmd = `grep -rn "${uniq}\\|other_symbol" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.ok(rw.command.endsWith(` grep '${uniq}|other_symbol' src/`), rw.command);
+    assert.ok(rw.command.endsWith(` grep -m 0 '${uniq}|other_symbol' src/`), rw.command);
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep ${uniq}\\|other_symbol src/\\]`));
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -m 0 ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1835,19 +1841,20 @@ test('e2e: show-mode rewrite re-runs EVERY symbol that resolved', () => {
   }
 });
 
-test('e2e: a globbed path becomes scope + -g, not a silently widened scope', () => {
+test('e2e: a globbed path is not rewritten — bash expands it one level, cg\'s -g recursively', () => {
+  // Round 3 M5: `src/*.rs` became `-g '*.rs'` over all of src/, dotfiles and
+  // subdirectories included. The command runs as typed instead.
   const uniq = `StubGlob${Date.now()}`;
   const fixture = e2eFixture(ARGV_STUB);
-  const cmd = `grep -rn "${uniq}" tests/*.mjs`;
+  const cmds = [`grep -rn "${uniq}" tests/*.mjs`, `grep -rn "${uniq}" src/storage/*.rs`];
   try {
-    const rw = rewriteOf(runHook(cmd, fixture));
-    assert.ok(rw.command.endsWith(` grep ${uniq} tests -g '*.mjs'`),
-      `the rewrite searched all of tests/ instead of its .mjs files: ${rw.command}`);
-    const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep ${uniq} tests -g \\*\\.mjs\\]`));
-    assert.match(rw.context, /-g '\*\.mjs'/, 'the printed command must show the glob it honoured');
+    for (const cmd of cmds) {
+      const res = runHook(cmd, fixture);
+      assert.equal(res.status, 0);
+      assert.equal(res.stdout.trim(), '', `${cmd}: ${res.stdout}`);
+    }
   } finally {
-    cleanupFixture(fixture, cmd);
+    for (const cmd of cmds) cleanupFixture(fixture, cmd);
   }
 });
 
@@ -1858,7 +1865,7 @@ test('e2e: `git grep` identifier on src/ → rewritten to the cg call', () => {
   const cmd = `git grep -n "${uniq}" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` grep ${uniq} src/$`));
+    assert.match(rw.command, new RegExp(` grep -m 0 ${uniq} src/$`));
     assert.doesNotMatch(rw.command, /git /);
   } finally {
     cleanupFixture(fixture, cmd);
@@ -1959,9 +1966,9 @@ test('e2e: ABS-path grep under fixture root → rewrite fires, CLI argv gets rel
   const cmd = `grep -rn "${uniq}" ${realDir}/src/storage/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` grep ${uniq} src/storage/$`));
+    assert.match(rw.command, new RegExp(` grep -m 0 ${uniq} src/storage/$`));
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, /args=\["grep","StubAbs\d+","src\/storage\/"\]/);
+    if (ran !== null) assert.match(ran, /args=\["grep","-m","0","StubAbs\d+","src\/storage\/"\]/);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -2425,7 +2432,7 @@ test('e2e: subdir cwd — hook resolves root, rebases path, records at root, rew
     const ran = runRewrite(rw, sub);
     if (ran !== null) {
       assert.equal(ran.trim(),
-        `cwd=${fsE2e.realpathSync(fixture.dir)} args=grep ${uniq}|max_retries backend/app`);
+        `cwd=${fsE2e.realpathSync(fixture.dir)} args=grep -m 0 ${uniq}|max_retries backend/app`);
     }
     const recs = fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
@@ -2453,29 +2460,6 @@ test('e2e: bypassed grep is silent but recorded as action:bypass', () => {
   }
 });
 
-test('e2e: glob path arg → scope plus -g, and a literal glob still never reaches argv', () => {
-  // The literal-glob-in-argv failure this guards (rg exit 1 → answered:false) is
-  // still guarded: `src/storage/*.rs` must not appear as one path token. What
-  // changed is where the glob goes. Truncating to `src/storage` silently searched
-  // the .py and .toml files beside the .rs ones and printed a command claiming
-  // that wider scope; `-g '*.rs'` is the filter the user actually wrote.
-  const uniq = `GlobTrunc${Date.now()}`;
-  const fixture = e2eFixture(
-    `process.stdout.write('args=' + JSON.stringify(process.argv.slice(2)) + '\\n');`);
-  const cmd = `grep -rn "${uniq}" src/storage/*.rs`;
-  try {
-    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src', 'storage'), { recursive: true });
-    const rw = rewriteOf(runHook(cmd, fixture));
-    assert.ok(rw.command.endsWith(` grep ${uniq} src/storage -g '*.rs'`), rw.command);
-    const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) {
-      assert.match(ran, new RegExp(`args=\\["grep","${uniq}","src/storage","-g","\\*\\.rs"\\]`));
-      assert.doesNotMatch(ran, /"src\/storage\/\*\.rs"/, 'a literal glob must never be a path arg');
-    }
-  } finally {
-    cleanupFixture(fixture, cmd);
-  }
-});
 
 test('rebaseRelativePaths: glob token rebases when its glob-truncated dir exists', () => {
   // daagu shape: shell in backend/, command scopes a glob under it. Without
