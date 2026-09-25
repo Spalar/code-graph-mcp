@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### A grep pattern with an escaped quote no longer injects every line of the file
+
+The grep hooks read a quoted argument with a span regex that closed a
+double-quoted string at the first `\"`. `grep -c "if:\s*'\|\"if\"\|statusMessage"
+lifecycle.js` therefore yielded the pattern `\|statusMessage`; its translation
+`|statusMessage` opens with an empty alternative, which matches every line, so
+the PostToolUse hook told the model that all 2,284 lines of a file had hit a
+grep whose real output was `0`. Observed three times in one session. Quoted
+arguments are now read with the shell's rules (a backslash escapes `"` `\` `$`
+and a backtick inside double quotes, is literal before anything else, and
+outside quotes escapes the next character) — the rules `firstShellClause` and
+`splitTopLevelSegments` already followed. The same span regex also blanked
+quoted text in the ag filename-search check, where `ag "some_symbol \" -g x"`
+left the `-g` inside the pattern looking like a flag and dropped a content
+search to a hint; it uses the same reader now. The PreToolUse rewrite was not
+affected: its tokenizer declines any double-quoted body holding `\"`, so those
+commands ran as typed.
+
 ## 0.155.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

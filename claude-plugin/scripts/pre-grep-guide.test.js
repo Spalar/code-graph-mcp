@@ -712,6 +712,49 @@ test('extractPatterns: no quotes at all → empty array', () => {
   assert.deepEqual(extractPatterns('grep -rn foo src/'), []);
 });
 
+// ── Quoted spans read the way the shell reads them ───────────────────
+// A span regex (`"([^"]+)"`) ended a double-quoted argument at the first
+// `\"`, so the ESCAPED quote closed it and the rest of the pattern became a
+// second "argument". Observed live 2026-09-25: the pattern below yielded
+// `\|statusMessage`, whose translation `|statusMessage` opens with an empty
+// alternative that matches every line — post-grep-inject then told the model
+// all 2284 lines of lifecycle.js hit a grep that had returned nothing.
+
+test('extractPatterns: an escaped quote inside double quotes does not end the argument', () => {
+  const cmd = String.raw`grep -n "if:\s*'\|\"if\"\|statusMessage" claude-plugin/scripts/lifecycle.js`;
+  assert.deepEqual(extractPatterns(cmd), [String.raw`if:\s*'\|"if"\|statusMessage`]);
+});
+
+test('pickBlockPattern + translateBreToRg: the 2026-09-25 command keeps all three alternatives', () => {
+  const cmd = String.raw`grep -n "if:\s*'\|\"if\"\|statusMessage" claude-plugin/scripts/lifecycle.js`;
+  const raw = pickBlockPattern(cmd);
+  assert.equal(raw, String.raw`if:\s*'\|"if"\|statusMessage`);
+  const rg = translateBreToRg(cmd, raw);
+  assert.equal(rg, String.raw`if:\s*'|"if"|statusMessage`);
+  assert.ok(!/^\||\|\||\|$/.test(rg), `no empty alternative: ${rg}`);
+});
+
+test('extractPatterns: a single quote inside double quotes is literal', () => {
+  assert.deepEqual(extractPatterns(`grep -rn "it's fooBar" src/`), [`it's fooBar`]);
+});
+
+test('extractPatterns: a double quote inside single quotes is literal (control)', () => {
+  assert.deepEqual(extractPatterns(`grep -rn 'say "HelloWorld"' src/`), ['say "HelloWorld"']);
+});
+
+test('extractPatterns: a backslash-escaped quote OUTSIDE quotes opens no argument', () => {
+  // The shell hands grep the word `"FooBar"` — quotes included — so no quoted
+  // argument exists and the classifier must treat the pattern as unquoted.
+  assert.deepEqual(extractPatterns(String.raw`grep -rn \"FooBar\" src/`), []);
+});
+
+test('classifyBlock: ag with an escaped quote in the pattern is still a content search', () => {
+  // isAgFilenameSearch blanked quoted spans with the same span regex, so the
+  // `-g` INSIDE this pattern survived as a bare token and demoted the search.
+  const cmd = String.raw`ag "some_symbol \" -g x" src/`;
+  assert.deepEqual(classifyBlock(cmd), { mode: 'grep' });
+});
+
 test('extractPatterns: empty / non-string → empty array', () => {
   assert.deepEqual(extractPatterns(''), []);
   assert.deepEqual(extractPatterns(null), []);

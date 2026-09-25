@@ -227,8 +227,43 @@ function extractPatterns(cmd) {
   // Collect every quoted argument — first one is the pattern in standard grep
   // usage; subsequent ones (e.g. `-e "second"`) are also patterns or filter
   // expressions and worth screening too.
-  const matches = [...stripped.matchAll(/"([^"]+)"|'([^']+)'/g)];
-  return matches.map(m => m[1] !== undefined ? m[1] : m[2]);
+  return quotedSpans(stripped).map(s => s.body).filter(Boolean);
+}
+
+/**
+ * The quoted spans of a shell clause, read the way the shell reads them — the
+ * same rules firstShellClause and splitTopLevelSegments already follow (lesson
+ * #9656), which a span regex (`"([^"]+)"|'([^']+)'`) did not: it closed a
+ * double-quoted argument at the first `\"`, so
+ * `grep "if:\s*'\|\"if\"\|statusMessage"` yielded `\|statusMessage`, and its
+ * translation `|statusMessage` matches every line (observed 2026-09-25).
+ *   - `'…'` is literal to the next `'`.
+ *   - `"…"`: a backslash escapes `"` `\` `$` backtick and newline (the
+ *     backslash is dropped); before anything else it is literal (`"a\|b"`).
+ *   - Outside quotes a backslash escapes the next character, so `\"` opens
+ *     nothing — the shell hands grep the quote character itself.
+ * An unterminated quote ends the scan: what follows is not a span we can read.
+ * @returns {{start: number, end: number, body: string}[]} `end` is exclusive,
+ *   covering both quote characters.
+ */
+function quotedSpans(s) {
+  const spans = [];
+  if (typeof s !== 'string') return spans;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') { i++; continue; }
+    if (c !== '"' && c !== "'") continue;
+    let body = '';
+    let j = i + 1;
+    for (; j < s.length && s[j] !== c; j++) {
+      if (c === '"' && s[j] === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) j++;
+      body += s[j];
+    }
+    if (j >= s.length) break;
+    spans.push({ start: i, end: j + 1, body });
+    i = j;
+  }
+  return spans;
 }
 
 // Declaration anchors inside a pattern (`def cascade_failure|class TaskState`)
@@ -349,7 +384,16 @@ function isAgFilenameSearch(clause) {
   // argument can contain whitespace, so `ag "some_symbol -g x" src/` splits into
   // three tokens and the middle one looks exactly like a flag. Blanking leaves
   // an attached value's flag behind (`-g"x"` → `-g`), which is what we want.
-  const scan = clause.replace(VERB_STRIP, '').replace(/"[^"]*"|'[^']*'/g, ' ');
+  // Spans come from quotedSpans, not a span regex: `"a\" -g x"` is ONE
+  // argument, and a regex that closed it at the `\"` left `-g` bare.
+  const unverbed = clause.replace(VERB_STRIP, '');
+  let scan = '';
+  let at = 0;
+  for (const sp of quotedSpans(unverbed)) {
+    scan += unverbed.slice(at, sp.start) + ' ';
+    at = sp.end;
+  }
+  scan += unverbed.slice(at);
   for (const tok of scan.trim().split(/\s+/)) {
     if (!tok || tok[0] !== '-') continue;
     if (tok.startsWith('--')) {
