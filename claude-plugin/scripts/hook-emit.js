@@ -101,6 +101,39 @@ function emitPreToolAllowContext(text) {
 }
 
 /**
+ * PreToolUse rewrite envelope: allow + updatedInput + additionalContext.
+ *
+ * pre-grep-guide ONLY. A raw source grep the index can answer is rewritten into
+ * the `code-graph-mcp grep`/`show` command that answers it, instead of being
+ * denied with the answer in the reason. A deny is rendered as a failed tool call
+ * (the red `Error` block every intercepted grep used to print), and the model
+ * reads it as one; a rewrite runs as an ordinary successful call.
+ *
+ * `updatedInput` is honoured only alongside a decision — `"ask"` would prompt on
+ * every grep — so this carries `allow`, and the elevation is argued the same way
+ * as pre-read-guide's: the command that runs is one this hook assembled from a
+ * fixed argv (read-only `grep`/`show`, every argument shell-quoted), never the
+ * model's text. Claude Code re-evaluates deny and ask rules against the
+ * rewritten input, so a user rule denying the binary still wins.
+ *
+ * `updatedInput` REPLACES the tool input, so the caller passes the whole object.
+ * `reason` is shown to the user, not the model; `context` reaches the model.
+ * @param {{updatedInput: object, reason: string, context: string}} opts
+ * @returns {string} JSON line
+ */
+function emitPreToolRewrite({ updatedInput, reason, context }) {
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      permissionDecisionReason: reason,
+      updatedInput,
+      additionalContext: capContext(context),
+    },
+  });
+}
+
+/**
  * PostToolUse additionalContext envelope (string, no trailing newline).
  * Permission-neutral: NO permissionDecision, so the underlying Bash tool call's
  * permission flow is untouched while the answer still reaches the model.
@@ -117,6 +150,6 @@ function emitPostToolContext(text) {
 }
 
 module.exports = {
-  emitPreToolContext, emitPreToolAllowContext, emitPostToolContext,
+  emitPreToolContext, emitPreToolAllowContext, emitPreToolRewrite, emitPostToolContext,
   capContext, MAX_INJECTED_BYTES,
 };

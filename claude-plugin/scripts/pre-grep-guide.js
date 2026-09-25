@@ -14,6 +14,10 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Pr
 // ~13× more than the indexed CLI on bash-heavy days (15-day baseline: 429 raw
 // grep vs 191 functional CLI). v0.25.0 hint-only had ~0% transfer rate; v0.32.0
 // upgrades the narrowest "I'm searching for a symbol" subset to block-with-reason.
+// Since the rewrite change, an ANSWERED block no longer denies: the grep is
+// rewritten (PreToolUse `updatedInput`) into the cg command that answers it, so
+// the call succeeds instead of rendering as a red failed tool call. Only the
+// opt-in static deny (CODE_GRAPH_NO_ANSWER_IN_DENY=1) still denies.
 //
 // HINT fires when ALL conditions met (shouldHint):
 //   1. Command HEAD is grep/rg/ag (NOT piped — pipe-greps are output filters)
@@ -48,7 +52,11 @@ const fs = require('fs');
 const path = require('path');
 const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { runGrepAnswer, runShowAnswer, sanitizeSearchPath, buildGrepArgs, formatCgCommand } = require('./cg-answer');
+const {
+  runGrepAnswer, runShowAnswer, sanitizeSearchPath, buildGrepArgs, formatCgCommand, shellQuoteArg,
+  resolveAnswerBinary,
+} = require('./cg-answer');
+const { emitPreToolRewrite } = require('./hook-emit');
 
 // --- Pure logic (testable) ---
 
@@ -758,56 +766,82 @@ function buildBlockReason() {
   ].join('\n');
 }
 
-// v0.47.0 — deny WITH the answer inline. Hint-only had ~0% transfer and a bare
-// deny still asks the model to initiate a new tool call; embedding the actual
-// results removes that choice entirely.
-// v0.48 — NO escape-hatch line here: the model already has the results, and
-// advertising the bypass taught it a permanent prefix within 5 seconds (daagu
-// 2026-06-11: one deny → 14 bypassed greps). The static deny keeps a scoped
-// escape because there we give no answer.
-// `cmdShown` is rendered by the caller from the SAME argv array it handed the
-// child process (cg-answer.buildGrepArgs → formatCgCommand). It used to be
-// re-assembled here from `(pattern, searchPath)` alone, which is how a deny came
-// to print `code-graph-mcp grep "X" tests` above an answer that had actually run
-// with different arguments — the flags nobody forwarded, and a glob silently
-// widened to its parent directory.
-function buildBlockReasonWithAnswer(cmdShown, answer) {
-  const lines = [
-    '[code-graph] Raw `grep` on indexed source — denied; the AST-aware equivalent already ran for you:',
-    `$ ${cmdShown}`,
-    answer.text,
-  ];
-  if (answer.truncated) {
-    lines.push(`(truncated — run \`${cmdShown}\` yourself for the full list)`);
+// Answered interceptions are REWRITES, not denies. Until this release the hook
+// ran the cg equivalent itself and denied the grep with the output in the
+// reason. It worked — the model used the answer — but Claude Code renders every
+// deny as a failed tool call, so each intercepted search printed a red `Error`
+// block over a perfectly good result. Now the grep is replaced (PreToolUse
+// `updatedInput`) by the command whose output it would have embedded, and the
+// call runs as an ordinary success. The hook still runs the answer first: it is
+// what tells an answerable grep (rewrite) from a dialect miss or a broken binary
+// (let the raw grep run), and a rewrite must never turn into an empty result.
+//
+// v0.48/v0.63 copy rules still hold for the context line: no escape-hatch
+// advertisement (one deny once taught a 14-grep bypass prefix) and no forced
+// restatement of which hit the model will use.
+
+// The name that invokes cg in the Bash tool's shell. The bare name is what the
+// reader expects to see, but a rewrite that prints `command not found` is the
+// same red block this change exists to remove, so it is used only when it will
+// resolve: on this process's PATH, or as the launcher in a plugin-cache
+// install's `bin/`, which Claude Code puts on the Bash PATH for every enabled
+// plugin. Anything else runs the resolved binary by absolute path.
+function cgInvocation(binary, {
+  env = process.env,
+  pluginBin = path.join(__dirname, '..', 'bin', 'code-graph-mcp'),
+  exists = fs.existsSync,
+} = {}) {
+  const name = 'code-graph-mcp';
+  for (const dir of String(env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    try { if (exists(path.join(dir, name))) return name; } catch { /* unreadable dir */ }
   }
-  lines.push(
-    'Each hit shows its containing fn/module — use these results directly instead of re-running the search.',
-  );
-  // NOTE (v0.63): a forced-ack salience line was trialed here and removed. The
-  // answer is ALREADY in context, so demanding the model restate which hit it
-  // will use risks performative compliance + friction with no measured gain
-  // (deny-with-answer already satisfies in-place, 5/5 in the daagu replay). The
-  // engagement nudge is kept only where it pays — the pre-edit impact summary,
-  // a true before-you-edit reconciliation moment. Re-add here only behind an A/B.
+  try {
+    if (/[\\/]\.claude[\\/]plugins[\\/]cache[\\/]/.test(pluginBin) && exists(pluginBin)) return name;
+  } catch { /* fall through to the absolute path */ }
+  return binary ? shellQuoteArg(binary) : name;
+}
+
+// The command the grep is rewritten into. One argv per cg call (several for a
+// multi-symbol `show`), each run with CODE_GRAPH_INTERNAL=1 so the CLI's `use`
+// record does not count a delivered answer as a model-initiated conversion —
+// per command, because a `;`-joined list would scope a bare prefix to the first
+// one only, and `export` would leak into the persistent shell. Paths in the argv
+// are root-relative, so a shell sitting in a subdirectory runs them from the
+// root in a subshell, leaving its own cwd alone.
+function buildRewriteCommand(argvList, { invocation = 'code-graph-mcp', root, shellCwd } = {}) {
+  const body = argvList
+    .map((args) => 'CODE_GRAPH_INTERNAL=1 ' + formatCgCommand(args, invocation))
+    .join('; echo; ');
+  if (!root || !shellCwd || path.resolve(shellCwd) === path.resolve(root)) return body;
+  return '(cd ' + shellQuoteArg(root) + ' || exit 1; ' + body + ')';
+}
+
+// What the model is told alongside the rewritten call's output. `cmdShown` is
+// rendered from the SAME argv the rewrite runs (no env prefix, bare name — the
+// form a reader re-runs). `droppedTail` is the part of the model's pipeline the
+// rewrite did not keep (`| head -20`): the output is the unfiltered answer, and
+// saying so is cheaper than a model puzzling over why `| wc -l` printed hits.
+function buildRewriteContext(mode, cmdShown, droppedTail) {
+  const lines = mode === 'show'
+    ? ['[code-graph] Raw grep for symbol definitions on indexed source was rewritten to `code-graph-mcp show` — this call\'s output is the definitions from the AST index:',
+      `$ ${cmdShown}`,
+      'Use these directly instead of re-running the search.']
+    : ['[code-graph] Raw `grep` on indexed source was rewritten to its AST-aware equivalent — this call\'s output comes from:',
+      `$ ${cmdShown}`,
+      'Each hit shows its containing fn/module — use these results directly instead of re-running the search.'];
+  if (droppedTail) lines.push(`(Your \`${droppedTail}\` stage was not applied to this output.)`);
   return lines.join('\n');
 }
 
-// v0.49 — show-mode deny: the model grepped for symbol DEFINITIONS with
-// context flags (-A/-B/-C = "show me the body"); the answer IS the bodies,
-// fetched via `code-graph-mcp show`. answer.text already carries per-symbol
-// `$ code-graph-mcp show <sym>` headers.
-function buildShowDenyReason(answer) {
-  const lines = [
-    '[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:',
-    answer.text,
-  ];
-  if (answer.truncated) {
-    lines.push('(truncated — re-run the `code-graph-mcp show <symbol>` command above for full source)');
-  }
-  lines.push('Use these directly instead of re-running the search.');
-  // NOTE (v0.63): forced-ack salience trialed + removed here too — see
-  // buildBlockReasonWithAnswer. The definitions are already delivered.
-  return lines.join('\n');
+// The pipeline remainder after the grep's own clause (`| head -20`), or null.
+// classifyDeny has already refused top-level `;`/`&&` tails, so what is left
+// here is a pipe or an `||` branch.
+function droppedPipelineTail(cmd) {
+  const clause = firstShellClause(cmd);
+  if (typeof cmd !== 'string' || clause === cmd) return null;
+  const tail = cmd.slice(clause.length).trim();
+  return tail || null;
 }
 
 // v0.49 — plain `grep` speaks BRE: alternation/grouping arrive escaped
@@ -1035,35 +1069,55 @@ function runMain() {
       return;
     }
 
-    // PreToolUse block via current CC schema (`hookSpecificOutput.permissionDecision`).
-    // Verified empirically 2026-05-24: legacy `{decision:"block",reason}` was
-    // ignored by Claude Code — the grep ran anyway. The hookSpecificOutput form
-    // is the documented modern path. Exit 0 — this is a routing decision, not
-    // a hook failure (exit 2 would mark the tool call as "hook errored").
     const answered = answer.status === 'hits';
     recordRecommendation(root, {
+      // Still `deny` in the funnel: the event it counts — a raw grep intercepted
+      // and answered in place — is unchanged, and the Rust aggregator keys on
+      // it. `delivery` says HOW the answer arrived.
       hook: 'grep', action: 'deny', answered,
       // pattern fingerprints the denied search so the funnel can score a verbatim
       // re-grep of it (the inline answer was ignored) as fall-through, not a win.
       ...(pattern ? { pattern } : {}),
       // mode segments which answer type converts (show=bodies, grep=hits).
-      ...(answered ? { mode: answeredMode } : {}),
+      ...(answered ? { mode: answeredMode, delivery: 'rewrite' } : {}),
       // reason segments WHY an unanswered deny fell back to the static copy:
       // 'no-binary' (flagship answer-in-deny dark — binary missing) vs
       // 'unavailable' (binary ran but failed/timed out). Without this the two
       // are indistinguishable in the funnel ("broken" looks like "no hits").
       ...(answered ? {} : { reason: answer.status }),
     });
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: !answered
-          ? buildBlockReason()
-          : answeredMode === 'show'
-            ? buildShowDenyReason(answer)
-            : buildBlockReasonWithAnswer(formatCgCommand(args), answer),
-      },
+
+    if (!answered) {
+      // CODE_GRAPH_NO_ANSWER_IN_DENY=1 — the user opted into the v0.46 static
+      // deny, so nothing ran and there is nothing to rewrite into. Current CC
+      // schema (`hookSpecificOutput.permissionDecision`): the legacy
+      // `{decision:"block"}` was ignored (verified 2026-05-24). Exit 0 — a
+      // routing decision, not a hook failure.
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: buildBlockReason(),
+        },
+      }) + '\n');
+      return;
+    }
+
+    // Re-run exactly what answered: the resolved symbols for `show`, the same
+    // argv for `grep`.
+    const argvList = answeredMode === 'show'
+      ? answer.symbols.map((sym) => ['show', sym])
+      : [args];
+    const command = buildRewriteCommand(argvList, {
+      invocation: cgInvocation(resolveAnswerBinary({})),
+      root,
+      shellCwd,
+    });
+    const cmdShown = argvList.map((a) => formatCgCommand(a)).join('; ');
+    process.stdout.write(emitPreToolRewrite({
+      updatedInput: { ...input.tool_input, command },
+      reason: '[code-graph] raw grep → AST-aware equivalent',
+      context: buildRewriteContext(answeredMode, cmdShown, droppedPipelineTail(cmd)),
     }) + '\n');
     return;
   }
@@ -1093,7 +1147,10 @@ module.exports = {
   firstShellClause,      // v0.96 — grep's own clause (up to first top-level separator)
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
-  buildShowDenyReason,   // v0.49 — show-mode deny copy
+  cgInvocation,          // rewrite — the binary name the Bash shell resolves
+  buildRewriteCommand,   // rewrite — the command the grep becomes
+  buildRewriteContext,   // rewrite — what the model is told about it
+  droppedPipelineTail,   // rewrite — the pipe stage the rewrite did not keep
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
@@ -1107,7 +1164,6 @@ module.exports = {
   pickBlockPattern,
   buildHint,
   buildBlockReason,
-  buildBlockReasonWithAnswer,
   buildNoHitsFyi,
   buildUnavailableFyi,   // v0.92 — allow-on-unavailable breadcrumb
   commandHash,

@@ -34,20 +34,43 @@ test('emitPostToolContext is permission-neutral', () => {
 // boundary (audit 2026-08-16 P0-2). This is that enforcement: adding the allow
 // envelope to any other hook fails here, and the new hook's author has to argue
 // the case in this list rather than inherit it silently.
-const ALLOW_ELEVATION_ALLOWLIST = new Set(['pre-read-guide.js']);
+//
+// pre-grep-guide.js holds the rewrite envelope, and its case is narrower than
+// "Bash is read-only" (it is not): the call it allows is the rewritten one, a
+// `code-graph-mcp grep`/`show` argv the hook built and shell-quoted itself. The
+// model's own command text never survives into what runs — pinned in
+// pre-grep-guide.test.js by the hostile-pattern rewrite test.
+const ALLOW_ELEVATION_ALLOWLIST = {
+  emitPreToolAllowContext: new Set(['pre-read-guide.js']),
+  emitPreToolRewrite: new Set(['pre-grep-guide.js']),
+};
 
-test('only read-only hooks may use the allow+additionalContext envelope', () => {
+test('only the argued hooks may use an allow envelope', () => {
   const offenders = [];
   for (const name of fs.readdirSync(__dirname)) {
     if (!name.endsWith('.js') || name.endsWith('.test.js')) continue;
     if (name === 'hook-emit.js') continue; // the definition itself
     const src = fs.readFileSync(path.join(__dirname, name), 'utf8');
-    // Ignore prose: only a real call/import of the helper counts.
-    const uses = /emitPreToolAllowContext\s*[(,}]/.test(src.replace(/^\s*\/\/.*$/gm, ''));
-    if (uses && !ALLOW_ELEVATION_ALLOWLIST.has(name)) offenders.push(name);
+    for (const [helper, allowed] of Object.entries(ALLOW_ELEVATION_ALLOWLIST)) {
+      // Ignore prose: only a real call/import of the helper counts.
+      const uses = new RegExp(helper + '\\s*[(,}]').test(src.replace(/^\s*\/\/.*$/gm, ''));
+      if (uses && !allowed.has(name)) offenders.push(name + ' → ' + helper);
+    }
   }
   assert.deepEqual(offenders, [],
     `these hooks elevate a tool call to auto-allowed: ${offenders.join(', ')}`);
+});
+
+test('emitPreToolRewrite carries the whole replacement input, a user reason, and capped context', () => {
+  const input = { command: 'code-graph-mcp grep X src', description: 'd', timeout: 5000 };
+  const out = JSON.parse(require('./hook-emit').emitPreToolRewrite({
+    updatedInput: input, reason: 'why', context: 'ctx',
+  })).hookSpecificOutput;
+  assert.equal(out.hookEventName, 'PreToolUse');
+  assert.equal(out.permissionDecision, 'allow');
+  assert.deepEqual(out.updatedInput, input, 'updatedInput replaces the input — nothing may be dropped');
+  assert.equal(out.permissionDecisionReason, 'why');
+  assert.equal(out.additionalContext, 'ctx');
 });
 
 test('no hook hand-rolls an allow decision outside hook-emit.js', () => {

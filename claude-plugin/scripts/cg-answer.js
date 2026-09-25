@@ -170,16 +170,22 @@ const SHELL_SAFE_ARG = /^[A-Za-z0-9_.,:@%+=/-]+$/;
 // POSIX single-quote escape: close, emit an escaped quote, reopen.
 const SQ_ESCAPED = "'\\''";
 
-function formatCgCommand(args) {
+function shellQuoteArg(a) {
   // Deliberately no nested template literal, and no regex holding a quote.
   // windows-hide.test.js masks literals with a character scanner that pairs
   // backticks like any other quote, so a `${…`…`…}` inside a template closes the
   // outer one early and swallows the rest of the file — which took all three of
   // THIS file's spawn call sites out of that guard's view until it was written
   // this way. Code a guard cannot parse is code the guard is not checking.
-  const shown = args.map((a) =>
-    (SHELL_SAFE_ARG.test(a) ? a : "'" + a.split("'").join(SQ_ESCAPED) + "'"));
-  return 'code-graph-mcp ' + shown.join(' ');
+  const s = String(a);
+  return SHELL_SAFE_ARG.test(s) ? s : "'" + s.split("'").join(SQ_ESCAPED) + "'";
+}
+
+// `invocation` is what names the binary. The default is the name a reader can
+// paste; pre-grep-guide's rewrite passes an already-quoted absolute path when
+// that name would not resolve in the Bash tool's shell.
+function formatCgCommand(args, invocation = 'code-graph-mcp') {
+  return invocation + ' ' + args.map(shellQuoteArg).join(' ');
 }
 
 /**
@@ -356,6 +362,9 @@ function runShowAnswer(opts = {}) {
     if (!binary) return { status: 'no-binary' };
 
     const parts = [];
+    // Which symbols actually resolved — the rewrite re-runs exactly these, so a
+    // symbol that printed nothing here cannot turn into an exit-1 in the Bash call.
+    const resolved = [];
     for (const sym of symbols.slice(0, 3)) {
       if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
       const res = runCg(binary, ['show', sym], { cwd, timeoutMs });
@@ -375,10 +384,11 @@ function runShowAnswer(opts = {}) {
       const out = (res.stdout || '').trim();
       if (isEmptyAnswer(out)) continue;
       parts.push(`$ code-graph-mcp show ${sym}\n${out}`);
+      resolved.push(sym);
     }
     if (parts.length === 0) return { status: 'no-hits' };
     const { text, truncated } = truncateAtLine(parts.join('\n\n'), maxBytes);
-    return { status: 'hits', text, truncated };
+    return { status: 'hits', text, truncated, symbols: resolved };
   } catch {
     return { status: 'unavailable' };
   }
@@ -498,7 +508,9 @@ module.exports = {
   truncateAtLine, sanitizeSearchPath,
   // The one argv builder + its renderer, so the deny copy and the child process
   // cannot describe different commands.
-  splitSearchPathGlob, buildGrepArgs, formatCgCommand,
+  splitSearchPathGlob, buildGrepArgs, formatCgCommand, shellQuoteArg,
+  // pre-grep-guide names this binary in the command it rewrites a grep into.
+  resolveAnswerBinary,
   // Exported so the integer property can be asserted where it is ESTABLISHED.
   // Asserting it end-to-end instead passes either way: `remainingMs` floors
   // again downstream, so such a test cannot fail and proves nothing (NEW-02).

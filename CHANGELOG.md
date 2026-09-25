@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### An intercepted grep no longer prints a red `Error`
+
+Behavior change in the PreToolUse grep hook. When a raw `grep`/`rg`/`ag`/`git
+grep` on indexed source was answerable, the hook ran `code-graph-mcp grep` (or
+`show`) itself and **denied** the call with the output in the deny reason. The
+model used the answer, but Claude Code renders every deny as a failed tool call,
+so each intercepted search showed up as a red `Error` block over a perfectly good
+result — on almost every search in a session (user report).
+
+The hook now **rewrites** the call instead: PreToolUse `updatedInput` replaces
+the command with the cg command that answers it, and the call runs as an ordinary
+success. Verified on Claude Code 2.1.282 with a headless session: the model sent
+`grep -rn "buildRewriteContext" claude-plugin/scripts/pre-grep-guide.js`, the tool
+result was the `code-graph-mcp grep` output with `is_error: false`.
+
+- The hook still runs the answer first. That run is what tells an answerable grep
+  (rewrite) from a regex-dialect miss or a broken binary (the raw grep runs, as
+  before). A `show` rewrite re-runs only the symbols that resolved.
+- `updatedInput` is honored only with a decision, and `"ask"` would prompt on
+  every grep, so the rewrite carries `allow`. The command that runs is built from
+  the hook's own argv with every argument shell-quoted. It is never the model's
+  text: a test runs a pattern full of shell syntax through the rewrite and gets
+  it back as one argument. Claude Code re-checks deny/ask rules against the
+  rewritten input. `hook-emit.test.js` now allowlists this envelope for
+  `pre-grep-guide.js` alone.
+- The rewritten command carries `CODE_GRAPH_INTERNAL=1` on each cg call, so a
+  delivered answer is not recorded as a model-initiated `use`. A shell sitting
+  in a subdirectory runs it as `(cd <root> || exit 1; …)`, because the argv is
+  root-relative. The bare `code-graph-mcp` name is used only when it will
+  resolve (on PATH, or a plugin-cache install's `bin/`); otherwise the resolved
+  binary's absolute path is used.
+- The model gets one context line naming the command its output came from. If
+  its grep was piped (`| head -20`), that line says the stage was not applied.
+- The funnel row stays `action:"deny"`, the event the Rust aggregator counts,
+  and gains `delivery:"rewrite"`.
+- The output is no longer capped at 4000 bytes: it is the cg command's full
+  output, bounded by the Bash tool's own limit, the same as the grep it
+  replaces. Each intercepted search now runs cg twice (the hook's check and the
+  real call).
+- `CODE_GRAPH_NO_ANSWER_IN_DENY=1` still gives the static deny.
+
 ### The `doctor --check-only` help still read as a complete residue list
 
 Help text only. 0.153.0 replaced "without changing anything" with a sentence

@@ -49,7 +49,10 @@ const {
   countNamedPaths,
   extractDeclSymbols,
   translateBreToRg,
-  buildShowDenyReason,
+  cgInvocation,
+  buildRewriteCommand,
+  buildRewriteContext,
+  droppedPipelineTail,
   extractSedReadTargets,
   extractUnansweredTail,
   extractPatterns,
@@ -61,7 +64,6 @@ const {
   pickBlockPattern,
   buildHint,
   buildBlockReason,
-  buildBlockReasonWithAnswer,
   buildNoHitsFyi,
   commandHash,
   isSilenced,
@@ -1003,62 +1005,88 @@ const { buildGrepArgs, formatCgCommand } = require('./cg-answer');
 const cg = (pattern, searchPath, flags) =>
   formatCgCommand(buildGrepArgs({ pattern, searchPath, flags }));
 
-test('buildBlockReasonWithAnswer: embeds results and command', () => {
-  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/storage/'), {
-    status: 'hits', text: 'src/storage/db.rs:42  fn fts5_search()', truncated: false,
-  });
-  assert.match(reason, /already ran/);
-  assert.match(reason, /code-graph-mcp grep fts5_search src\/storage\//);
-  assert.match(reason, /src\/storage\/db\.rs:42/);
-  assert.doesNotMatch(reason, /truncated/);
+test('buildRewriteContext: names the command the output came from', () => {
+  const ctx = buildRewriteContext('grep', cg('fts5_search', 'src/storage/'));
+  assert.match(ctx, /rewritten to its AST-aware equivalent/);
+  assert.match(ctx, /\$ code-graph-mcp grep fts5_search src\/storage\//);
+  assert.match(ctx, /use these results directly/i);
 });
 
-test('deny copy prints the command that actually ran, flags and glob included', () => {
-  // The whole point of the signature change: this string and the child's argv
-  // are the same array. A `-l` grep on `tests/*.mjs` must print BOTH.
+test('rewrite copy prints the command that actually runs, flags and glob included', () => {
+  // The printed command and the rewrite are rendered from ONE argv. A `-l` grep
+  // on `tests/*.mjs` must carry both into each.
   const args = buildGrepArgs({ pattern: 'applyTierFilter', searchPath: 'tests/*.mjs', flags: ['-l'] });
   assert.deepEqual(args, ['grep', '-l', 'applyTierFilter', 'tests', '-g', '*.mjs']);
-  const reason = buildBlockReasonWithAnswer(formatCgCommand(args), {
-    status: 'hits', text: 'tests/a.mjs', truncated: false,
-  });
-  assert.match(reason, /code-graph-mcp grep -l applyTierFilter tests -g '\*\.mjs'/);
+  assert.match(buildRewriteContext('grep', formatCgCommand(args)),
+    /code-graph-mcp grep -l applyTierFilter tests -g '\*\.mjs'/);
+  assert.equal(buildRewriteCommand([args]),
+    "CODE_GRAPH_INTERNAL=1 code-graph-mcp grep -l applyTierFilter tests -g '*.mjs'");
 });
 
-test('buildBlockReasonWithAnswer: NEVER advertises the bypass (v0.48 — one deny taught a 14-grep permanent prefix)', () => {
-  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/storage/'), {
-    status: 'hits', text: 'hit', truncated: false,
-  });
-  assert.doesNotMatch(reason, /CODE_GRAPH_NO_BLOCK_GREP/);
+test('buildRewriteContext: NEVER advertises the bypass (v0.48 — one deny taught a 14-grep permanent prefix)', () => {
+  for (const mode of ['grep', 'show']) {
+    assert.doesNotMatch(buildRewriteContext(mode, cg('fts5_search', 'src/')), /CODE_GRAPH_NO_BLOCK_GREP/);
+  }
 });
 
-test('buildBlockReasonWithAnswer: no salience restatement — answer is already in context (v0.63 removed)', () => {
-  // A forced "name the hit you will act on" line was trialed and removed: the
-  // answer is delivered, so restatement is performative friction. Keep the deny
-  // copy to delivery + the plain "use directly" nudge only.
-  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/storage/'), {
-    status: 'hits', text: 'hit', truncated: false,
-  });
-  assert.doesNotMatch(reason, /name the hit you will act on/i);
-  assert.match(reason, /use these results directly/i);
+test('buildRewriteContext: no salience restatement — the answer is the output (v0.63 removed)', () => {
+  const grep = buildRewriteContext('grep', cg('fts5_search', 'src/storage/'));
+  assert.doesNotMatch(grep, /name the hit you will act on/i);
+  const show = buildRewriteContext('show', 'code-graph-mcp show X');
+  assert.doesNotMatch(show, /name which definition above you will change/i);
+  assert.match(show, /definitions from the AST index/);
 });
 
-test('buildShowDenyReason: no salience restatement (v0.63 removed)', () => {
-  const reason = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
-  assert.doesNotMatch(reason, /name which definition above you will change/i);
+test('buildRewriteContext: a dropped pipe stage is named, and only then', () => {
+  const cmd = cg('fts5_search', 'src/');
+  assert.doesNotMatch(buildRewriteContext('grep', cmd), /not applied/);
+  assert.match(buildRewriteContext('grep', cmd, '| wc -l'), /`\| wc -l` stage was not applied/);
 });
 
-test('buildBlockReasonWithAnswer: no searchPath → command has no path arg', () => {
-  const reason = buildBlockReasonWithAnswer(cg('fts5_search', undefined), {
-    status: 'hits', text: 'hit', truncated: false,
-  });
-  assert.match(reason, /code-graph-mcp grep fts5_search\n/);
+test('droppedPipelineTail: the pipe remainder, or null', () => {
+  assert.equal(droppedPipelineTail('grep -rn "Foo" src/ | head -20'), '| head -20');
+  assert.equal(droppedPipelineTail('grep -rn "Foo" src/'), null);
+  assert.equal(droppedPipelineTail('grep -rn "a|b" src/'), null, 'a quoted | is pattern text');
 });
 
-test('buildBlockReasonWithAnswer: truncated flag adds marker', () => {
-  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/'), {
-    status: 'hits', text: 'hit', truncated: true,
+test('buildRewriteCommand: every call carries the internal marker, and a subdir shell runs from the root', () => {
+  const root = pathTmp.join(osTmp.tmpdir(), 'proj root');
+  const two = buildRewriteCommand([['show', 'A'], ['show', 'B']], { root, shellCwd: root });
+  assert.equal(two,
+    'CODE_GRAPH_INTERNAL=1 code-graph-mcp show A; echo; CODE_GRAPH_INTERNAL=1 code-graph-mcp show B',
+    'a bare prefix on a `;` list would scope to the first command only');
+  const sub = buildRewriteCommand([['grep', 'X', 'src']], {
+    root, shellCwd: pathTmp.join(root, 'backend'),
   });
-  assert.match(reason, /truncated/);
+  assert.equal(sub, "(cd '" + root + "' || exit 1; CODE_GRAPH_INTERNAL=1 code-graph-mcp grep X src)",
+    'root-relative paths need the root as cwd; a subshell keeps the persistent shell where it was');
+});
+
+test('buildRewriteCommand: hostile pattern text stays one quoted argument', () => {
+  // The allow this rewrite carries is argued on "the model's text never runs as
+  // shell" (hook-emit.test.js allowlist). Pin it: a pattern full of shell syntax
+  // must reach the binary as ONE argument, byte for byte.
+  const hostile = "x'; touch /tmp/pwned; echo '$(id)`id`\\";
+  const cmd = buildRewriteCommand([['grep', hostile, 'src']], { invocation: "printf '%s\\n'" });
+  const res = require('child_process').spawnSync('sh', ['-c', cmd.replace('CODE_GRAPH_INTERNAL=1 ', '')], { encoding: 'utf8' });
+  if (res.error) return; // no POSIX sh on this runner
+  assert.equal(res.stdout, 'grep\n' + hostile + '\nsrc\n');
+});
+
+test('cgInvocation: bare name only where the Bash shell will resolve it', () => {
+  const bin = '/opt/cg bin/code-graph-mcp';
+  const dirs = ['/usr/bin', '/home/u/.local/bin'].join(pathTmp.delimiter);
+  const onPath = (p) => p === pathTmp.join('/home/u/.local/bin', 'code-graph-mcp');
+  assert.equal(cgInvocation(bin, { env: { PATH: dirs }, pluginBin: '/nope', exists: onPath }),
+    'code-graph-mcp');
+  // Plugin-cache install: Claude Code puts <plugin-root>/bin on the Bash PATH.
+  const cached = '/home/u/.claude/plugins/cache/cg/cg/1.0.0/bin/code-graph-mcp';
+  assert.equal(cgInvocation(bin, { env: { PATH: '' }, pluginBin: cached, exists: (p) => p === cached }),
+    'code-graph-mcp');
+  // A repo checkout's bin/ is NOT on anyone's PATH — its existence proves nothing.
+  const repo = '/home/u/dev/cg/claude-plugin/bin/code-graph-mcp';
+  assert.equal(cgInvocation(bin, { env: { PATH: '' }, pluginBin: repo, exists: (p) => p === repo }),
+    "'/opt/cg bin/code-graph-mcp'", 'falls back to the resolved binary, shell-quoted');
 });
 
 // ── v0.50 compound-command tail: deny answers the grep, NOT the rest ─
@@ -1109,12 +1137,10 @@ test('buildBlockReason: the static deny stands alone', () => {
 // This is the residual guard: whatever a builder is handed, it must not grow the
 // apology back. A deny that says "I threw away half your command" is a deny that
 // should have been an allow.
-test('no deny builder can produce a compound-tail apology', () => {
-  const answered = buildBlockReasonWithAnswer(cg('fts5_search', 'src/'), {
-    status: 'hits', text: 'hit', truncated: false,
-  });
-  const show = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
-  for (const reason of [answered, show, buildBlockReason()]) {
+test('no rewrite or deny copy can produce a compound-tail apology', () => {
+  const grep = buildRewriteContext('grep', cg('fts5_search', 'src/'), '| head');
+  const show = buildRewriteContext('show', 'code-graph-mcp show X');
+  for (const reason of [grep, show, buildBlockReason()]) {
     assert.doesNotMatch(reason, /did NOT run/);
     assert.doesNotMatch(reason, /compound tail/);
     assert.doesNotMatch(reason, /re-issue it separately/);
@@ -1274,13 +1300,24 @@ function e2eFixture(stubBody) {
   return { dir, stub };
 }
 
+// PATH minus every directory holding a `code-graph-mcp`. The rewrite names the
+// binary by bare name whenever it would resolve, and a developer's shell (or
+// Claude Code's, which puts the plugin's bin/ on PATH) usually has one — so
+// without this the rewritten command would run the REAL binary, not the stub.
+function pathWithoutCg() {
+  return String(process.env.PATH || '').split(pathE2e.delimiter)
+    .filter((d) => d && !fsE2e.existsSync(pathE2e.join(d, 'code-graph-mcp')))
+    .join(pathE2e.delimiter);
+}
+
 function runHook(cmd, fixture, cwdOverride) {
   const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
     cwd: cwdOverride || fixture.dir,
-    input: JSON.stringify({ tool_input: { command: cmd } }),
+    input: JSON.stringify({ tool_input: { command: cmd, description: 'search' } }),
     encoding: 'utf8',
     env: {
       ...process.env,
+      PATH: pathWithoutCg(),
       _CG_ANSWER_BINARY: fixture.stub,
       CODE_GRAPH_QUIET_HOOKS: '0',
       CODE_GRAPH_NO_BLOCK_GREP: '0',
@@ -1288,6 +1325,29 @@ function runHook(cmd, fixture, cwdOverride) {
     },
   });
   return res;
+}
+
+// The rewrite decision in a hook's stdout. Asserts the SHAPE Claude Code needs —
+// allow + a whole replacement input — so every caller gets that check for free.
+function rewriteOf(res) {
+  assert.equal(res.status, 0, res.stderr);
+  const out = JSON.parse(res.stdout).hookSpecificOutput;
+  assert.equal(out.permissionDecision, 'allow', `expected a rewrite, got ${res.stdout}`);
+  assert.equal(typeof out.updatedInput.command, 'string');
+  assert.equal(out.updatedInput.description, 'search',
+    'updatedInput REPLACES the tool input — every field the model sent must survive');
+  return { command: out.updatedInput.command, context: out.additionalContext };
+}
+
+// Run a rewritten command the way the Bash tool would, from `cwd` (default: the
+// fixture root). This is the answer the model now receives — so the stubs that
+// echo their argv assert what the binary is asked for in the REAL call, not
+// what the copy claims. POSIX-shell only; Windows runners skip the execution.
+function runRewrite(rw, cwd) {
+  if (process.platform === 'win32') return null;
+  const res = spawnHook('bash', ['-c', rw.command], { cwd, encoding: 'utf8' });
+  assert.equal(res.status, 0, `rewrite failed: ${rw.command}\n${res.stderr}`);
+  return res.stdout;
 }
 
 // The command-hash tail of a cooldown flag. The flag's full name is
@@ -1351,25 +1411,25 @@ test('e2e: cleanupFixture actually removes the cooldown flag the hook wrote', ()
   assert.deepEqual(flags(), [], 'cleanupFixture leaves no cooldown flag behind');
 });
 
-test('e2e: denied grep with stub hits → deny JSON embeds the answer + records answered:true', () => {
+test('e2e: answerable grep → rewritten into the cg call that answers it + records answered:true', () => {
   const uniq = `StubHit${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
   const cmd = `grep -rn "${uniq}" src/`;
   try {
-    const res = runHook(cmd, fixture);
-    assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(out.hookSpecificOutput.permissionDecisionReason, /src\/foo\.rs:7/);
-    assert.match(out.hookSpecificOutput.permissionDecisionReason, new RegExp(uniq));
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ grep ${uniq} src/$`));
+    assert.match(rw.context, new RegExp(`\\$ code-graph-mcp grep ${uniq} src/`));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, new RegExp(`src/foo\\.rs:7  fn ${uniq}\\(\\)`));
     const recs = fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
     const rec = JSON.parse(recs.trim().split('\n').pop());
     assert.equal(rec.action, 'deny');
     assert.equal(rec.answered, true);
-    // An answered deny carries no failure reason — the field is reserved for
-    // the not-answered fallback so 'no-binary' vs 'unavailable' stays legible.
+    assert.equal(rec.delivery, 'rewrite');
+    // An answered interception carries no failure reason — the field is reserved
+    // for the not-answered fallback so 'no-binary' vs 'unavailable' stays legible.
     assert.equal(rec.reason, undefined);
   } finally {
     cleanupFixture(fixture, cmd);
@@ -1414,13 +1474,14 @@ test('e2e: the reported `grep …; sed …` shape is not denied', () => {
   }
 });
 
-test('e2e: a piped grep still denies — a pipe discards no command', () => {
+test('e2e: a piped grep is still rewritten — a pipe discards no command — and the dropped stage is named', () => {
   const uniq = `StubPipe${Date.now()}`;
   const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
   const cmd = `grep -rn "${uniq}" src/ | head -20`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.doesNotMatch(rw.command, /head/);
+    assert.match(rw.context, /`\| head -20` stage was not applied/);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1432,17 +1493,20 @@ test('e2e: a piped grep still denies — a pipe discards no command', () => {
 const ARGV_STUB =
   `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`;
 
-test('e2e: -l reaches the answer binary AND the printed command', () => {
+test('e2e: -l reaches the binary the rewrite runs AND the printed command', () => {
   const uniq = `StubEll${Date.now()}`;
   const fixture = e2eFixture(ARGV_STUB);
   const cmd = `grep -rln "${uniq}" src/`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, new RegExp(`ARGV\\[grep -l ${uniq} src/\\]`),
-      `the answer ran without -l, so it returned hits where a file list was asked for: ${reason}`);
-    assert.match(reason, /code-graph-mcp grep -l /,
-      'the printed command must show the flag that actually ran');
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(` grep -l ${uniq} src/$`));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.match(ran, new RegExp(`ARGV\\[grep -l ${uniq} src/\\]`),
+        `the rewrite ran without -l, so it returned hits where a file list was asked for: ${ran}`);
+    }
+    assert.match(rw.context, /code-graph-mcp grep -l /,
+      'the printed command must show the flag that actually runs');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1459,10 +1523,13 @@ test('e2e: -F forwards the flag AND leaves the literal pattern unescaped', (t) =
   const fixture = e2eFixture(ARGV_STUB);
   const cmd = `grep -rF "${uniq}\\|other_symbol" src/`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, new RegExp(`ARGV\\[grep -F ${uniq}\\\\\\|other_symbol src/\\]`),
-      `-F must forward and must not unescape: ${reason}`);
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.ok(rw.command.endsWith(` grep -F '${uniq}\\|other_symbol' src/`), rw.command);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.match(ran, new RegExp(`ARGV\\[grep -F ${uniq}\\\\\\|other_symbol src/\\]`),
+        `-F must forward and must not unescape: ${ran}`);
+    }
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1476,11 +1543,12 @@ test('e2e: a `-F` sitting in a VALUE position does not trigger the literal guard
   const fixture = e2eFixture(ARGV_STUB);
   const cmd = `grep -rn --include -F "${uniq}\\|other_symbol" src/`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    const rw = rewriteOf(runHook(cmd, fixture));
     // -F is --include's value here, so the BRE unescape MUST still run.
-    assert.match(reason, new RegExp(`ARGV\\[grep -g -F ${uniq}\\|other_symbol src/\\]`),
-      `the guard fired on a filename glob and left the pattern escaped: ${reason}`);
+    assert.ok(rw.command.endsWith(` grep -g -F '${uniq}|other_symbol' src/`),
+      `the guard fired on a filename glob and left the pattern escaped: ${rw.command}`);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -g -F ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1530,9 +1598,10 @@ test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
   const fixture = e2eFixture(ARGV_STUB);
   const cmd = `grep -rn "${uniq}\\|other_symbol" src/`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    assert.match(out.hookSpecificOutput.permissionDecisionReason,
-      new RegExp(`ARGV\\[grep ${uniq}\\|other_symbol src/\\]`));
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.ok(rw.command.endsWith(` grep '${uniq}|other_symbol' src/`), rw.command);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1548,9 +1617,30 @@ test('e2e: the show-mode fallback to grep also carries the flags', (t) => {
     `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
   const cmd = `grep -iA3 "fn ${uniq}" src/`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, /ARGV\[grep -i /, `the fallback dropped -i: ${reason}`);
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, / grep -i /, `the fallback dropped -i: ${rw.command}`);
+    assert.doesNotMatch(rw.command, / show /, 'show did not answer, so the rewrite must not run it');
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, /ARGV\[grep -i /);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: show-mode rewrite re-runs only the symbols that resolved', () => {
+  const uniq = `StubShow${Date.now()}`;
+  // Resolves `${uniq}A` only; `${uniq}B` exits 1 like an unknown symbol.
+  const fixture = e2eFixture(
+    `if (process.argv[2] !== 'show' || !process.argv[3].endsWith('A')) process.exit(1);\n` +
+    `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
+  const cmd = `grep -A5 "fn ${uniq}A\\|fn ${uniq}B" src/`;
+  try {
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ show ${uniq}A$`),
+      'an unresolved symbol in the rewrite would end the Bash call on exit 1');
+    assert.match(rw.context, /definitions from the AST index/);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, new RegExp(`fn ${uniq}A  src/foo\\.rs:1-3`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1561,27 +1651,26 @@ test('e2e: a globbed path becomes scope + -g, not a silently widened scope', () 
   const fixture = e2eFixture(ARGV_STUB);
   const cmd = `grep -rn "${uniq}" tests/*.mjs`;
   try {
-    const out = JSON.parse(runHook(cmd, fixture).stdout);
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, new RegExp(`ARGV\\[grep ${uniq} tests -g \\*\\.mjs\\]`),
-      `the answer searched all of tests/ instead of its .mjs files: ${reason}`);
-    assert.match(reason, /-g '\*\.mjs'/, 'the printed command must show the glob it honoured');
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.ok(rw.command.endsWith(` grep ${uniq} tests -g '*.mjs'`),
+      `the rewrite searched all of tests/ instead of its .mjs files: ${rw.command}`);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep ${uniq} tests -g \\*\\.mjs\\]`));
+    assert.match(rw.context, /-g '\*\.mjs'/, 'the printed command must show the glob it honoured');
   } finally {
     cleanupFixture(fixture, cmd);
   }
 });
 
-test('e2e: `git grep` identifier on src/ → deny with the embedded answer', () => {
+test('e2e: `git grep` identifier on src/ → rewritten to the cg call', () => {
   const uniq = `GitHit${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('src/foo.rs:9  fn ' + process.argv[3] + '()\\n');`);
   const cmd = `git grep -n "${uniq}" src/`;
   try {
-    const res = runHook(cmd, fixture);
-    assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(out.hookSpecificOutput.permissionDecisionReason, new RegExp(uniq));
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(` grep ${uniq} src/$`));
+    assert.doesNotMatch(rw.command, /git /);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1671,7 +1760,7 @@ test('e2e: stub ran-and-failed → grep ALLOWED (no static deny) + records fallt
   }
 });
 
-test('e2e: ABS-path grep under fixture root → deny fires, CLI argv gets relative path', () => {
+test('e2e: ABS-path grep under fixture root → rewrite fires, CLI argv gets relative path', () => {
   const uniq = `StubAbs${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('args=' + JSON.stringify(process.argv.slice(2)) + '\\n');`);
@@ -1680,12 +1769,10 @@ test('e2e: ABS-path grep under fixture root → deny fires, CLI argv gets relati
   const realDir = fsE2e.realpathSync(fixture.dir);
   const cmd = `grep -rn "${uniq}" ${realDir}/src/storage/`;
   try {
-    const res = runHook(cmd, fixture);
-    assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(out.hookSpecificOutput.permissionDecisionReason,
-      /args=\["grep","StubAbs\d+","src\/storage\/"\]/);
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(` grep ${uniq} src/storage/$`));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.match(ran, /args=\["grep","StubAbs\d+","src\/storage\/"\]/);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1777,15 +1864,13 @@ test('e2e: compound cmd + answer failure → grep ALLOWED, whole command runs in
   }
 });
 
-test('e2e: simple (non-compound) denied grep → no tail field in the deny record', () => {
+test('e2e: simple (non-compound) rewritten grep → no tail field in the record', () => {
   const uniq = `StubNoTail${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
   const cmd = `grep -rn "${uniq}" src/`;
   try {
-    const res = runHook(cmd, fixture);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    rewriteOf(runHook(cmd, fixture));
     const rec = JSON.parse(fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
     assert.equal(rec.action, 'deny');
@@ -2138,16 +2223,21 @@ test('replay: daagu denied glob command → block + sanitized search path', () =
 
 // ── v0.48 e2e: hook process spawned exactly as CC does ──
 
-test('e2e: subdir cwd — hook resolves root, rebases path, records at root', () => {
+test('e2e: subdir cwd — hook resolves root, rebases path, records at root, rewrite runs from root', () => {
   const uniq = `sub_dir_fix_${Date.now()}`;
   const fixture = e2eFixture(
-    `process.stdout.write('backend/app/x.py:1  fn hit()\\n');`);
+    `process.stdout.write('cwd=' + process.cwd() + ' args=' + process.argv.slice(2).join(' ') + '\\n');`);
   const cmd = `grep -rn "${uniq}\\|max_retries" app`;
   try {
     fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'backend', 'app'), { recursive: true });
-    const res = runHook(cmd, fixture, pathE2e.join(fixture.dir, 'backend'));
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    const sub = pathE2e.join(fixture.dir, 'backend');
+    const rw = rewriteOf(runHook(cmd, fixture, sub));
+    assert.match(rw.command, /^\(cd /, 'root-relative argv from a subdir shell needs the root as cwd');
+    const ran = runRewrite(rw, sub);
+    if (ran !== null) {
+      assert.equal(ran.trim(),
+        `cwd=${fsE2e.realpathSync(fixture.dir)} args=grep ${uniq}|max_retries backend/app`);
+    }
     const recs = fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
     assert.match(recs, /"action":"deny"/);
@@ -2186,12 +2276,13 @@ test('e2e: glob path arg → scope plus -g, and a literal glob still never reach
   const cmd = `grep -rn "${uniq}" src/storage/*.rs`;
   try {
     fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src', 'storage'), { recursive: true });
-    const res = runHook(cmd, fixture);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, new RegExp(`args=\\["grep","${uniq}","src/storage","-g","\\*\\.rs"\\]`));
-    assert.doesNotMatch(reason, /"src\/storage\/\*\.rs"/, 'a literal glob must never be a path arg');
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.ok(rw.command.endsWith(` grep ${uniq} src/storage -g '*.rs'`), rw.command);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.match(ran, new RegExp(`args=\\["grep","${uniq}","src/storage","-g","\\*\\.rs"\\]`));
+      assert.doesNotMatch(ran, /"src\/storage\/\*\.rs"/, 'a literal glob must never be a path arg');
+    }
   } finally {
     cleanupFixture(fixture, cmd);
   }
