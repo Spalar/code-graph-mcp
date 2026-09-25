@@ -24,6 +24,7 @@ import sys
 import numpy as np
 from metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 from eval_retrieval import Backend
+from leakage import is_leaked
 
 DB_NS = 10_000_000
 STOP = {"a", "an", "and", "the", "or", "in", "of", "for", "to", "with", "is", "it", "this",
@@ -113,6 +114,9 @@ def main():
     ap.add_argument("--db", action="append", required=True, help="frozen index.db, in build's db_idx order")
     ap.add_argument("--queries", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--max-leak", type=float, default=0.05,
+                    help="fail when more than this fraction of bootstrap queries appear verbatim "
+                         "in their gold's context_string (default 0.05; 1 accepts any)")
     args = ap.parse_args()
 
     queries = []
@@ -126,6 +130,34 @@ def main():
         g = q.get("gold_node_ids")
         if g:
             by_db.setdefault(g[0] // DB_NS, []).append(q)
+
+    # Both channels here read the doc a bootstrap query was made from: the vector
+    # channel embeds context_string (which carries `doc:`), and the FTS channel is
+    # the real nodes_fts, which indexes doc_comment and context_string. Unlike
+    # eval_retrieval.py there is no doc-free variant of the FTS side short of a
+    # rebuilt index, so a leaked query set is refused rather than half-cleaned.
+    boot = [q for q in queries if q.get("source") == "bootstrap"]
+    leaked = 0
+    for db_idx, qs in by_db.items():
+        conn = sqlite3.connect(args.db[db_idx])
+        for q in qs:
+            if q.get("source") != "bootstrap":
+                continue
+            for g in q["gold_node_ids"]:
+                row = conn.execute("SELECT context_string FROM nodes WHERE id = ?",
+                                   (g - db_idx * DB_NS,)).fetchone()
+                if row and is_leaked(q["query"], (row[0] or "")[:2000]):
+                    leaked += 1
+                    break
+        conn.close()
+    leak_rate = leaked / len(boot) if boot else 0.0
+    print(f"[rrf_ab] leakage: {leaked}/{len(boot)} bootstrap queries appear verbatim in their "
+          f"gold's context_string ({leak_rate:.1%})", file=sys.stderr)
+    if leak_rate > args.max_leak:
+        raise SystemExit(
+            f"[rrf_ab] leakage {leak_rate:.1%} > --max-leak {args.max_leak:.0%}: both channels "
+            f"see the query's own doc. Run it on real_queries / tier3_slice queries, or pass "
+            f"--max-leak 1 to measure the leaked number on purpose.")
 
     mb, cb = Backend("minilm"), Backend("coderank")
     arms = {"minilm": {"overall": [], "lang": {}}, "coderank": {"overall": [], "lang": {}}}

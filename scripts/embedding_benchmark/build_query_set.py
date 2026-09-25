@@ -14,6 +14,8 @@ import json
 import sqlite3
 import sys
 
+from leakage import is_leaked
+
 # node id namespacing: ids are per-DB, so prefix with a DB index to keep them globally unique.
 def _rows(db_path: str, db_idx: int):
     conn = sqlite3.connect(db_path)
@@ -33,6 +35,7 @@ def _rows(db_path: str, db_idx: int):
 
 def build(dbs: list[str], min_doc_len: int):
     queries = []
+    skipped_in_body = 0
     # Map (db_idx, name)/(db_idx, qualified_name) -> global id, for resolving real-query hint_symbol.
     name_index: dict[tuple[int, str], int] = {}
     for db_idx, db_path in enumerate(dbs):
@@ -48,6 +51,12 @@ def build(dbs: list[str], min_doc_len: int):
             doc = doc.replace("/*", " ").replace("*/", " ").replace("*", " ").strip()
             if len(doc) >= min_doc_len and row["name"] and row["name"] not in doc:
                 # Exclude docs that just restate the symbol name (trivial match).
+                # Exclude docs that sit INSIDE the body (a Python docstring):
+                # code_content then carries the query verbatim, and no field the
+                # evaluator can strip removes it.
+                if is_leaked(doc, row["code_content"] or ""):
+                    skipped_in_body += 1
+                    continue
                 queries.append({
                     "query_id": f"doc:{gid}",
                     "query": " ".join(doc.split()[:75]),
@@ -55,6 +64,9 @@ def build(dbs: list[str], min_doc_len: int):
                     "source": "bootstrap",
                     "language": row["language"],
                 })
+    if skipped_in_body:
+        print(f"[build_query_set] skipped {skipped_in_body} bootstrap queries whose doc is inside "
+              "the body (code_content carries the query verbatim)", file=sys.stderr)
     return queries, name_index
 
 

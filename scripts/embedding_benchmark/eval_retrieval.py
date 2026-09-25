@@ -6,6 +6,11 @@ Usage:
       --db .code-graph/index.db --queries query_set.jsonl --out results/minilm_context.json
   python eval_retrieval.py --backend potion  --field code_content \
       --db .code-graph/index.db --queries query_set.jsonl --out results/potion_code.json
+
+`--field context_string_nodoc` is `context_string` with its `doc:` part removed
+from EVERY candidate. Use it for the bootstrap (doc -> code) queries: on plain
+`context_string` the gold carries its own query verbatim (see leakage.py), and
+the run fails unless `--max-leak` is raised to accept that.
 """
 import argparse
 import json
@@ -13,6 +18,7 @@ import os
 import sqlite3
 import numpy as np
 
+from leakage import is_leaked, strip_doc
 from metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 
 MINILM_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -69,18 +75,22 @@ class Backend:
 
 def load_candidates(dbs: list[str], field: str):
     """Return (global_ids, texts) for all non-test symbols across the DBs."""
+    column = "context_string" if field == "context_string_nodoc" else field
     ids, texts = [], []
     for db_idx, db_path in enumerate(dbs):
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            f"""SELECT n.id, n.{field} AS text
+            f"""SELECT n.id, n.{column} AS text
                 FROM nodes n JOIN files f ON n.file_id = f.id
                 WHERE n.is_test = 0 AND f.language IS NOT NULL"""
         )
         for r in cur:
             ids.append(db_idx * 10_000_000 + int(r["id"]))
-            texts.append((r["text"] or "")[:2000])  # cap to keep runtime bounded
+            text = r["text"] or ""
+            if field == "context_string_nodoc":
+                text = strip_doc(text)
+            texts.append(text[:2000])  # cap to keep runtime bounded
         conn.close()
     return ids, texts
 
@@ -88,17 +98,17 @@ def load_candidates(dbs: list[str], field: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=["minilm", "potion", "coderank", "jina"], required=True)
-    ap.add_argument("--field", choices=["context_string", "code_content"], required=True)
+    ap.add_argument("--field", choices=["context_string", "context_string_nodoc", "code_content"],
+                    required=True)
     ap.add_argument("--db", action="append", required=True)
     ap.add_argument("--queries", default="query_set.jsonl")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--max-leak", type=float, default=0.05,
+                    help="fail when more than this fraction of bootstrap queries appear "
+                         "verbatim in their gold's text (default 0.05; 1 accepts any)")
     args = ap.parse_args()
 
     ids, texts = load_candidates(args.db, args.field)
-
-    backend = Backend(args.backend)
-    print(f"[eval] encoding {len(texts)} candidates with {args.backend}/{args.field}...")
-    cand = backend.encode(texts, is_query=False)  # (N, dim), L2-normalized
 
     queries = []
     with open(args.queries) as fh:
@@ -106,6 +116,26 @@ def main():
             line = line.strip()
             if line:
                 queries.append(json.loads(line))
+
+    # Leakage before any encoding cost: a leaked run is not worth the minutes.
+    text_by_id = dict(zip(ids, texts))
+    boot = [q for q in queries if q.get("source") == "bootstrap"]
+    leaked = sum(
+        1 for q in boot
+        if any(is_leaked(q["query"], text_by_id.get(g, "")) for g in q["gold_node_ids"])
+    )
+    leak_rate = leaked / len(boot) if boot else 0.0
+    print(f"[eval] leakage: {leaked}/{len(boot)} bootstrap queries appear verbatim in their "
+          f"gold's {args.field} ({leak_rate:.1%})")
+    if leak_rate > args.max_leak:
+        raise SystemExit(
+            f"[eval] leakage {leak_rate:.1%} > --max-leak {args.max_leak:.0%}: on this field the "
+            f"bootstrap queries score string overlap, not retrieval. Use --field "
+            f"context_string_nodoc, or pass --max-leak 1 to measure the leaked number on purpose.")
+
+    backend = Backend(args.backend)
+    print(f"[eval] encoding {len(texts)} candidates with {args.backend}/{args.field}...")
+    cand = backend.encode(texts, is_query=False)  # (N, dim), L2-normalized
 
     q_texts = [q["query"] for q in queries]
     q_emb = backend.encode(q_texts, is_query=True)  # (Q, dim), L2-normalized
@@ -141,6 +171,7 @@ def main():
         "backend": args.backend,
         "field": args.field,
         "candidates": len(ids),
+        "bootstrap_leak": {"leaked": leaked, "bootstrap": len(boot), "rate": round(leak_rate, 4)},
         "overall": agg(overall),
         "by_language": {lg: agg(rows) for lg, rows in sorted(per_lang.items())},
     }

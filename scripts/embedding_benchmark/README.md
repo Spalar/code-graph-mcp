@@ -21,30 +21,85 @@ python3 build_query_set.py \
   --real real_queries.jsonl \
   --out query_set.jsonl
 
-# Evaluate one cell of the 2x2 matrix (venv python required — ML deps)
+# Evaluate one cell of the matrix (venv python required — ML deps)
 .venv/bin/python eval_retrieval.py \
   --backend {minilm,potion} \
-  --field {context_string,code_content} \
+  --field {context_string_nodoc,code_content} \
   --db .code-graph/index.db \
   [--db extra.db ...] \
   --queries query_set.jsonl \
   --out results/<backend>_<field>.json
 ```
 
-To run the full 2x2 matrix:
+Every run first prints how many bootstrap queries appear verbatim in their
+gold's text on the chosen field, and fails above `--max-leak` (default 5%) —
+see [Leakage](#leakage-2026-09-25). `context_string_nodoc` is the production
+`context_string` with its `doc:` part removed from every candidate; plain
+`context_string` leaks 100% and needs `--max-leak 1` to run at all.
+
+To run the full matrix:
 
 ```bash
 Q=query_set.jsonl
 D="--db .code-graph/index.db --db /path/to/ts-project/.code-graph/index.db"
 for backend in minilm potion; do
-  for field in context_string code_content; do
+  for field in context_string_nodoc code_content; do
     .venv/bin/python eval_retrieval.py --backend $backend --field $field $D \
       --queries $Q --out results/${backend}_${field}.json
   done
 done
 ```
 
+## Leakage (2026-09-25)
+
+> **CORRECTION.** The 2026-06-21 table below scored bootstrap queries on
+> `context_string`, and every one of them is in its gold's `context_string`
+> verbatim: a bootstrap query IS the symbol's doc comment
+> (`build_query_set.py`), and `src/embedding/context.rs` writes that doc into
+> the embedded text as `doc: {doc}`. Measured on this repo's index today, the
+> leak check (`leakage.py`: the query's first 12 words, contiguous, in the gold)
+> fires on **1536/1536** bootstrap queries on `context_string`, **1/1508** on
+> `context_string_nodoc`, **0/1508** on `code_content`. Python docstrings sit
+> inside `code_content`, so `build_query_set.py` now drops the 28 queries whose
+> doc is in the body (27 Python, 1 JS) — no field can strip those.
+
+Re-measured 2026-09-25 on the same query set for every cell (n=1513: rust 1183,
+javascript 323, python 4, bash 3; 3974 candidates). **One DB only** —
+`code-graph-mcp` at v0.155.0 HEAD, snapshotted with `sqlite3 .backup`; the `sgc`
+TS index the 06-21 run also used is not on this machine, so these numbers are
+comparable with each other, not with the table below.
+
+| backend | field | leak | NDCG@10 | rust | javascript | recall@1 | recall@10 | MRR |
+|---|---|---|---|---|---|---|---|---|
+| minilm | context_string (`--max-leak 1`) | 100.0% | 0.9107 | 0.9064 | 0.9372 | 0.8553 | 0.9636 | 0.8950 |
+| minilm | **context_string_nodoc** | 0.1% | **0.4082** | 0.4393 | 0.2970 | 0.2307 | 0.6021 | 0.3574 |
+| minilm | code_content | 0.0% | 0.3743 | 0.3944 | 0.3023 | 0.2062 | 0.5644 | 0.3261 |
+| potion | context_string (`--max-leak 1`) | 100.0% | 0.8692 | 0.8797 | 0.8372 | 0.7964 | 0.9385 | 0.8495 |
+| potion | **context_string_nodoc** | 0.1% | **0.3706** | 0.3921 | 0.2940 | 0.2168 | 0.5479 | 0.3262 |
+| potion | code_content | 0.0% | 0.3232 | 0.3353 | 0.2828 | 0.1818 | 0.4865 | 0.2831 |
+
+What survives, what does not:
+
+- **The minilm-over-potion NO-GO holds.** Leak-free, minilm leads by 3.76pp
+  overall (0.4082 vs 0.3706) and 4.72pp on rust (0.4393 vs 0.3921) — still past
+  the 0.02 threshold. The leak inflated both arms by roughly the same amount.
+- **"context_string dominates code_content" does not.** The leaked gap was
+  53.64pp here (0.9107 vs 0.3743); leak-free it is 3.39pp overall, and on
+  javascript `code_content` is ahead (0.3023 vs 0.2970). What `context_string`
+  adds beyond the code — signature, relations, path — is worth a few points, not
+  the doubling the table below shows.
+- **The honest baseline for doc -> code retrieval is NDCG@10 ≈ 0.41** (minilm),
+  not 0.87. Any model or context-string change must be judged against the
+  `context_string_nodoc` row.
+- `eval_ranking.py` (end-to-end) and `eval_rrf_ab.py` read the real index, whose
+  FTS columns and vectors both carry the doc. `eval_rrf_ab.py` now refuses a
+  leaked query set the same way; `eval_ranking.py`'s NL numbers below remain
+  leaked (see "Separate future threads" 2) — use the tier3 slice or real
+  queries for anything decided on it.
+
 ## Results (2026-06-21, query_set n=648, candidates=5879)
+
+> Leaked — see [Leakage](#leakage-2026-09-25). Kept for history.
 
 DBs: `code-graph-mcp` (rust+js) + `sgc` (ts+js).  
 By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limited statistical power; treat TS numbers as directional), python=1 (n=1; included in the overall mean but too small to interpret — negligible weight, ~0.0001 effect).
@@ -61,7 +116,7 @@ By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limi
 
 ## Key findings
 
-1. **context_string dominates code_content for both backends** — the gap is large (minilm: 0.8655 vs 0.4394; potion: 0.7898 vs 0.3804). The spec §0.4 field choice is answered: use `context_string`.
+1. **[Refuted 2026-09-25 — the gap was the leak; leak-free it is 3.39pp, see [Leakage](#leakage-2026-09-25).]** **context_string dominates code_content for both backends** — the gap is large (minilm: 0.8655 vs 0.4394; potion: 0.7898 vs 0.3804). The spec §0.4 field choice is answered: use `context_string`.
 
 2. **minilm beats potion overall** (0.8655 vs 0.7898, −7.6pp). The gap is consistent across rust (0.9355 vs 0.8782) and javascript (0.6890 vs 0.5312).
 
@@ -73,7 +128,7 @@ By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limi
 
 ## Go/no-go gate
 
-**Decision: NO-GO** — `potion-code-16M` does not replace `all-MiniLM-L6-v2`. potion's best config (context_string) trails minilm overall (0.7898 vs 0.8655, −7.6pp) and on rust (−5.7pp, beyond the 0.02 regression threshold); it only ties on TS (n=58, directional). Phase 2 (Rust static inference + 384→256 migration) is not authorized. Full rationale: `docs/superpowers/specs/2026-06-21-tier1-static-embeddings-decision.md`.
+**Decision: NO-GO** (re-confirmed leak-free 2026-09-25: minilm +3.76pp overall, +4.72pp rust — see [Leakage](#leakage-2026-09-25); the margins quoted in this paragraph are the leaked ones) — `potion-code-16M` does not replace `all-MiniLM-L6-v2`. potion's best config (context_string) trails minilm overall (0.7898 vs 0.8655, −7.6pp) and on rust (−5.7pp, beyond the 0.02 regression threshold); it only ties on TS (n=58, directional). Phase 2 (Rust static inference + 384→256 migration) is not authorized. Full rationale: `docs/superpowers/specs/2026-06-21-tier1-static-embeddings-decision.md`.
 
 Best config measured: **minilm / context_string** (NDCG@10 = 0.8655, recall@10 = 0.9306) — the current production embedding remains the strongest, so no change is made.
 
