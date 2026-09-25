@@ -827,6 +827,9 @@ function buildRewriteContext(mode, cmdShown) {
 //
 //   (grep | rg | ag | git grep) ARG… [2>&1 | 2>/dev/null]
 //
+// (`2>/dev/null` parses, but countNamedPaths counts it as a second path, so in
+// practice only a `show`-mode grep carrying it reaches a rewrite.)
+//
 // Every ARG is a flag from the verb's allowlist (values, where a flag takes
 // one, are checked like any other word) or a plain/quoted operand: exactly one
 // pattern and at most one path. Not accepted: any pipe, any other redirect, a
@@ -839,7 +842,7 @@ function shellWords(s) {
   const words = [];
   let cur = null;
   const push = () => { if (cur) words.push(cur); cur = null; };
-  const start = (quoted) => { if (!cur) cur = { text: '', startsQuoted: quoted, anyQuoted: false, bareSpecial: false }; };
+  const start = (quoted) => { if (!cur) cur = { text: '', startsQuoted: quoted, anyQuoted: false, bareSpecial: false, bareOp: false }; };
   for (let i = 0; i < s.length;) {
     const c = s[i];
     if (c === ' ' || c === '\t') { push(); i++; continue; }
@@ -862,6 +865,10 @@ function shellWords(s) {
     if (!WORD_CHAR.test(c)) return null;
     start(false);
     if ('<>&*?'.includes(c)) cur.bareSpecial = true;
+    // Per character, independent of quoting elsewhere in the word: `-g'!x'>out`
+    // is one word whose quoted part must not excuse the redirect after it
+    // (pre-ship review round 4 M1).
+    if ('<>&'.includes(c)) cur.bareOp = true;
     cur.text += c;
     i++;
   }
@@ -924,14 +931,19 @@ function rewritePlan(cmd) {
       // Only an ATTACHED file-filter value may be quoted or carry a glob
       // (`--include='*.rs'`, rg `-g'*.rs'`); an unquoted `<>&` is shell syntax.
       const attachedFilter = /^--(?:include|glob|type)=/.test(w.text) || (verb === 'rg' && /^-[gt]./.test(w.text));
-      if (!attachedFilter || (!w.anyQuoted && /[<>&]/.test(w.text))) return null;
+      if (!attachedFilter || w.bareOp) return null;
+      // GNU grep's --include has no `!` negation; cg's -g does (round 4 L2).
+      if (/^--include=!/.test(w.text)) return null;
     }
     if (w.text === '--') { endOfFlags = true; continue; }
     if (w.text.startsWith('--')) {
       const eq = w.text.indexOf('=');
       const name = w.text.slice(2, eq === -1 ? undefined : eq);
       if (!ALLOWED_LONG[verb].has(name)) return null;
-      if (VALUE_LONG.has(name) && eq === -1 && !valueWordOk(words[++i], false)) return null;
+      if (VALUE_LONG.has(name) && eq === -1) {
+        const v = words[++i];
+        if (!valueWordOk(v, false) || (name === 'include' && v.text.startsWith('!'))) return null;
+      }
       if (name === 'ignore-case' || name === 'case-sensitive') caseFlag = true;
       continue;
     }
@@ -961,10 +973,13 @@ function rewritePlan(cmd) {
   // The path: bash expands a glob at one level with no dotfiles; cg's `-g`
   // matches recursively and includes them (round 3 M5). Not reproducible.
   if (target && (/[*?[\]{}]/.test(target.text) || target.bareSpecial)) return null;
+  // A `..` segment: extractSearchPath refuses to scope it, so the answer would
+  // search the whole repo (round 4 M2).
+  if (target && /(?:^|\/)\.\.(?:\/|$)/.test(target.text)) return null;
   // ag is smart-case by default: an all-lowercase pattern matches any case,
   // and cg's search is case-sensitive, so the answer would find less.
   if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(pattern.text)) return null;
-  return { pattern: pattern.text, context };
+  return { pattern: pattern.text, target: target ? target.text : undefined, context };
 }
 
 // The plan must describe the same search classifyBlock decided on. The pattern
@@ -977,10 +992,17 @@ function rewritePlan(cmd) {
 function rewriteMatchesBlock(plan, block, cmd, rawPattern) {
   if (!plan || !block) return false;
   if (plan.pattern !== rawPattern) return false;
+  // Same for the path: extractSearchPath takes the first src-prefixed token,
+  // which can be a quoted PATTERN (`grep -rn "src/foo_mod" tmp/` searched
+  // src/foo_mod — round 4 H1, inherited from the deny's answer).
+  const norm = (p) => (p === undefined ? undefined : p.replace(/^\.\//, '').replace(/\/+$/, ''));
+  if (norm(plan.target) !== norm(extractSearchPath(cmd))) return false;
   if (block.mode === 'grep' && plan.context) return false;
   if (block.mode === 'show') {
     const f = cgFlagSet(extractCgFlags(cmd));
     if (f.has('-l') || f.has('-c')) return false;
+    // show answers at most three symbols; a fourth would silently vanish.
+    if (extractDeclSymbols(extractPatterns(cmd)).length > 3) return false;
   }
   return true;
 }

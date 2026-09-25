@@ -1041,20 +1041,23 @@ test('buildRewriteContext: no salience restatement — the answer is the output 
 
 test('rewritePlan: only the narrow shape the rewrite reproduces', () => {
   const plan = (c) => rewritePlan(c);
-  assert.deepEqual(plan('grep -rn "Foo" src/'), { pattern: 'Foo', context: false });
-  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null'), { pattern: 'Foo', context: false });
-  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1'), { pattern: 'Foo', context: false });
-  assert.deepEqual(plan('grep -rn "a|b" src/'), { pattern: 'a|b', context: false }, 'a quoted | is pattern text');
-  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { pattern: 'describe\\|runHook', context: false },
+  assert.deepEqual(plan('grep -rn "Foo" src/'), { pattern: 'Foo', target: 'src/', context: false });
+  // Parses; countNamedPaths then counts it as a second path, so only a
+  // show-mode grep carrying it reaches a rewrite.
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null'), { pattern: 'Foo', target: 'src/', context: false });
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1'), { pattern: 'Foo', target: 'src/', context: false });
+  assert.deepEqual(plan('grep -rn "a|b" src/'), { pattern: 'a|b', target: 'src/', context: false }, 'a quoted | is pattern text');
+  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { pattern: 'describe\\|runHook', target: 'tests/a.mjs', context: false },
     'a backslash before | inside double quotes is literal — the BRE shape models write');
-  assert.deepEqual(plan('grep -rnA3 "fn foo" src/'), { pattern: 'fn foo', context: true });
+  assert.deepEqual(plan('grep -rnA3 "fn foo" src/'), { pattern: 'fn foo', target: 'src/', context: true });
   // Flags cg honors or ignores, with their values.
   for (const cmd of ['grep -rnw "Foo" src/', 'grep -rli "Foo" src/', 'grep -rc "Foo" src/',
     'grep -rn --include=*.rs "Foo" src/', "grep -rn --include='*.rs' \"Foo\" src/",
     "grep -rn --include '*.rs' \"Foo\" src/", 'grep -rn --include -F "Foo" src/',
     'rg -t rust "Foo" src/', 'rg -trust "Foo" src/', "rg -g '*.rs' \"Foo\" src/", "rg -g'*.rs' \"Foo\" src/",
     'grep -rnE "Foo" src/', 'grep -rnP "Foo" src/', 'grep -rn -A 3 "fn foo" src/', 'rg -C 5 "fn foo" src/',
-    'git grep -n "Foo" src/', 'ag "FooBar" src/', 'ag -s "foo_bar" src/', 'grep -rn "Foo"']) {
+    'git grep -n "Foo" src/', 'ag "FooBar" src/', 'ag -s "foo_bar" src/',
+    'ag --case-sensitive "foo_bar" src/', "rg -g '!target' \"Foo\" src/", 'grep -rn "Foo"']) {
     assert.notEqual(plan(cmd), null, cmd);
   }
   // Not rewritable: a stage, command, redirect, flag, glob or prefix the cg
@@ -1098,26 +1101,47 @@ test('rewritePlan: only the narrow shape the rewrite reproduces', () => {
     'grep -rn "$PAT" src/', 'grep -rn "Foo" $(cat dirs)', 'grep -rn "Foo" `cat dirs`', 'grep -rn "Foo" {src,lib}/',
     'grep -rn "Foo" ~/src/', 'grep "Foo" src/ lib/', 'grep -rn',
     'grep -rn --include=*.rs>out.txt "Foo" src/', "rg -g*.rs>out.txt 'Foo' src/",
+    // Round 4: a quoted part of an attached value must not excuse a bare
+    // redirect or `&` after it; a separate value with `&`; a `..` path; a
+    // negated --include (GNU grep has none); a non-digit separate count.
+    "rg -g'!x'>out.txt \"FooBar\" src/", "rg --glob='!x'>out.txt \"FooBar\" src/",
+    "grep -rn --include='!x'>out.txt \"FooBar\" src/", "rg -g'!x'2>err.txt \"FooBar\" src/",
+    "rg -g'!x'& \"FooBar\" src/", 'rg -g x& "Foo" src/', 'grep -rn --include x& "Foo" src/',
+    'grep -rn "FooBar" src/../tmp', 'grep -rn "FooBar" src/nested/../../tmp', 'grep -rn "FooBar" src/..',
+    "grep -rn --include='!*.md' \"Foo\" src/", "grep -rn --include '!*.md' \"Foo\" src/",
+    'grep -A x "fn foo" src/',
   ]) {
     assert.equal(plan(cmd), null, cmd);
   }
 });
 
 test('rewriteMatchesBlock: the plan must describe the search classifyBlock chose', () => {
-  const plan = { pattern: 'FooBar', context: false };
+  const plan = { pattern: 'FooBar', target: 'src/', context: false };
   assert.equal(rewriteMatchesBlock(plan, { mode: 'grep' }, 'grep -rn "FooBar" src/', 'FooBar'), true);
   assert.equal(rewriteMatchesBlock(null, { mode: 'grep' }, 'x', 'FooBar'), false);
   // `"is"'FooBar'`: the shell searches `isFooBar`, the answer ran `FooBar` (round 3 L3).
-  assert.equal(rewriteMatchesBlock({ pattern: 'isFooBar', context: false }, { mode: 'grep' },
+  assert.equal(rewriteMatchesBlock({ pattern: 'isFooBar', target: 'src/', context: false }, { mode: 'grep' },
     "grep -rn \"is\"'FooBar' src/", 'FooBar'), false);
   // A context count the raw-text check missed would reach grep mode and lose it.
-  assert.equal(rewriteMatchesBlock({ pattern: 'FooBar', context: true }, { mode: 'grep' },
+  assert.equal(rewriteMatchesBlock({ pattern: 'FooBar', target: 'src/', context: true }, { mode: 'grep' },
     'grep -rn -A"3" "FooBar" src/', 'FooBar'), false);
   // show prints bodies; a file list or counts is a different question (round 3 M6).
-  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', context: true }, { mode: 'show', symbols: ['foo'] },
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', target: 'src/', context: true }, { mode: 'show', symbols: ['foo'] },
     'grep -rl -A3 "fn foo" src/', 'fn foo'), false);
-  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', context: true }, { mode: 'show', symbols: ['foo'] },
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', target: 'src/', context: true }, { mode: 'show', symbols: ['foo'] },
     'grep -rn -A3 "fn foo" src/', 'fn foo'), true);
+  // The path must be the one the answer searched: a quoted pattern that looks
+  // like a source path was taken as the scope (round 4 H1).
+  assert.equal(rewriteMatchesBlock({ pattern: 'src/foo_mod', target: 'tmp/', context: false }, { mode: 'grep' },
+    'grep -rn "src/foo_mod" tmp/', 'src/foo_mod'), false);
+  assert.equal(rewriteMatchesBlock({ pattern: 'src/foo_mod', target: undefined, context: false }, { mode: 'grep' },
+    'rg -n "src/foo_mod"', 'src/foo_mod'), false);
+  assert.equal(rewriteMatchesBlock({ pattern: 'Foo', target: './src', context: false }, { mode: 'grep' },
+    'grep -rn "Foo" src/', 'Foo'), true, './ and a trailing / do not make a different path');
+  // show answers three symbols at most; a fourth would vanish (round 4 M3).
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn a1|fn b2|fn c3|fn d4', target: 'src/', context: true },
+    { mode: 'show', symbols: ['a1', 'b2', 'c3'] }, 'grep -rn -A1 "fn a1|fn b2|fn c3|fn d4" src/',
+    'fn a1|fn b2|fn c3|fn d4'), false);
 });
 
 test('shellWords: anything but plain words, quotes and `|` is not tokenized', () => {
