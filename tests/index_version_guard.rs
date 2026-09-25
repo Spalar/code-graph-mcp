@@ -44,9 +44,11 @@ const REGEN_CMD: &str =
 /// src/utils, `9045f4c` call-edge resolution) that touched none of the
 /// originally covered files — so the walk also folds in the file-selection
 /// seams (`utils/config.rs` language detection, `utils/gitignore.rs`,
-/// `indexer/merkle.rs` walk/exclusion). Changes outside this set can still
-/// require a bump; this guard catches the common case, it does not replace the
-/// judgment.
+/// `indexer/merkle.rs` walk/exclusion). The tree-sitter* versions pinned in
+/// Cargo.lock join these files in the digest (`grammar_pins`, folded in by
+/// `observe`): a grammar bump moves output with no edit here. Changes outside
+/// this set can still require a bump; this guard catches the common case, it
+/// does not replace the judgment.
 fn extraction_sources(root: &Path) -> Vec<(String, PathBuf)> {
     let mut files = collect_rs(root, "src/parser", true);
     files.extend(collect_rs(root, "src/indexer/pipeline", false));
@@ -149,6 +151,40 @@ fn normalize_newlines(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `name@version` for every `tree-sitter*` package in a Cargo.lock, sorted.
+/// The grammars and the core decide what a parse produces, so a version move
+/// in any of them can change extraction output with no edit under `src/`.
+/// Other packages are left out on purpose (see the test that pins this).
+fn grammar_pins(lock: &str) -> Vec<String> {
+    let mut pins = Vec::new();
+    let mut name: Option<&str> = None;
+    for line in lock.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            name = None;
+        } else if let Some(v) = line.strip_prefix("name = ") {
+            name = Some(v.trim_matches('"'));
+        } else if let Some(v) = line.strip_prefix("version = ") {
+            if let Some(n) = name.filter(|n| *n == "tree-sitter" || n.starts_with("tree-sitter-")) {
+                pins.push(format!("{n}@{}", v.trim_matches('"')));
+            }
+        }
+    }
+    pins.sort();
+    pins
+}
+
+/// The extraction digest: the source-file fingerprint plus the grammar pins.
+fn extraction_digest(files_fp: &str, pins: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(files_fp.as_bytes());
+    for pin in pins {
+        hasher.update(b"\0");
+        hasher.update(pin.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Read `pub const <name>: i32 = <digits>` out of a source file.
 ///
 /// Parsed from source rather than read from the linked constant on purpose:
@@ -190,7 +226,10 @@ struct Observed {
 
 fn observe(root: &Path) -> Observed {
     Observed {
-        extraction_fp: fingerprint(&extraction_sources(root)),
+        extraction_fp: extraction_digest(
+            &fingerprint(&extraction_sources(root)),
+            &grammar_pins(&read_to_string(&root.join("Cargo.lock"))),
+        ),
         index_version: parse_const(
             &read_to_string(&root.join("src/domain.rs")),
             "INDEX_VERSION",
@@ -289,7 +328,8 @@ fn extraction_and_schema_sources_match_recorded_fingerprints() {
             // this guard against a path the message said it did not cover, and
             // the reader's first move is to go looking for the real cause.
             "EXTRACTION SOURCES CHANGED (src/parser/**, src/indexer/pipeline/*.rs, \
-             src/utils/config.rs, src/utils/gitignore.rs, src/indexer/merkle.rs)\n\
+             src/utils/config.rs, src/utils/gitignore.rs, src/indexer/merkle.rs, \
+             and the tree-sitter* versions pinned in Cargo.lock)\n\
              \x20 recorded {rec_extraction_fp} at INDEX_VERSION {rec_index_version}\n\
              \x20 current  {} at INDEX_VERSION {}\n\
              \x20 {}\n\
@@ -403,6 +443,68 @@ fn fingerprint_reacts_to_content_path_and_membership() {
         fingerprint(&with_extra),
         "adding a file did not move the digest — a NEW extractor would slip through"
     );
+}
+
+/// A grammar bump moves extraction output without touching a single file under
+/// `src/` — the tree-sitter 0.25 upgrade (INDEX_VERSION 72) tripped this guard
+/// only because it also edited `treesitter.rs`; `cargo update -p
+/// tree-sitter-cpp` alone would have gone green. So the lockfile's
+/// `tree-sitter*` pins are part of the extraction digest, and ONLY those: a
+/// serde or tokio bump cannot move what the parser emits, and a guard that
+/// fired on every dependency update would teach people to regenerate blindly.
+#[test]
+fn a_grammar_version_bump_moves_the_extraction_digest_and_others_do_not() {
+    let lock = |cpp: &str, serde: &str| {
+        format!(
+            "[[package]]\nname = \"serde\"\nversion = \"{serde}\"\n\n\
+             [[package]]\nname = \"tree-sitter-cpp\"\nversion = \"{cpp}\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"tree-sitter\"\nversion = \"0.25.10\"\n"
+        )
+    };
+    let base = extraction_digest("files", &grammar_pins(&lock("0.23.4", "1.0.200")));
+    assert_ne!(
+        base,
+        extraction_digest("files", &grammar_pins(&lock("0.23.5", "1.0.200"))),
+        "a tree-sitter grammar bump did not move the digest"
+    );
+    assert_eq!(
+        base,
+        extraction_digest("files", &grammar_pins(&lock("0.23.4", "1.0.201"))),
+        "a non-grammar dependency bump moved the digest"
+    );
+    assert_ne!(
+        base,
+        extraction_digest("other-files", &grammar_pins(&lock("0.23.4", "1.0.200"))),
+        "the source-file digest no longer feeds the extraction digest"
+    );
+    assert_eq!(
+        grammar_pins(&lock("0.23.4", "1.0.200")),
+        vec![
+            "tree-sitter-cpp@0.23.4".to_string(),
+            "tree-sitter@0.25.10".to_string(),
+        ],
+    );
+}
+
+/// Anti-vacuity for the pin scan on the REAL lockfile: an absolute floor, not a
+/// number derived from the scan, so a format change that made it read nothing
+/// (or one pin) cannot pass. 19 grammar crates are linked, plus the core.
+#[test]
+fn the_real_lockfile_yields_every_linked_grammar_pin() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let pins = grammar_pins(&read_to_string(&root.join("Cargo.lock")));
+    assert!(
+        pins.len() >= 20,
+        "only {} tree-sitter pins read: {pins:?}",
+        pins.len()
+    );
+    for must in ["tree-sitter@", "tree-sitter-rust@", "tree-sitter-swift@"] {
+        assert!(
+            pins.iter().any(|p| p.starts_with(must)),
+            "{must} missing from {pins:?}"
+        );
+    }
 }
 
 /// The recorded versions are parsed out of source text; this pins that parse to
