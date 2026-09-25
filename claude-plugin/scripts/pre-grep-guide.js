@@ -481,9 +481,6 @@ function extractCgFlags(cmd) {
  */
 function classifyDeny(cmd) {
   if (extractUnansweredTail(cmd)) return null;
-  // The rewrite replaces the whole command, so it must be equivalent to it —
-  // see rewritableTail. Not equivalent → the raw command runs untouched.
-  if (!rewritableTail(cmd)) return null;
   return classifyBlock(cmd);
 }
 
@@ -658,6 +655,7 @@ function countNamedPaths(cmd, patterns) {
     const tok = raw.replace(/^["']|["']$/g, '');
     if (!tok || tok.startsWith('-')) continue;     // a flag
     if (pats.has(tok)) continue;                    // the search pattern, not a path
+    if (/^\d*[<>]/.test(tok)) continue;             // a redirect (`2>/dev/null`), not a path
     if (tok.includes('/') || /\.[A-Za-z0-9]{1,6}$/.test(tok)) n++;  // dir-sep or file extension
   }
   return n;
@@ -790,7 +788,7 @@ function buildBlockReason() {
 // one only, and `export` would leak into the persistent shell. Paths in the argv
 // are root-relative, so a shell sitting in a subdirectory runs them from the
 // root in a subshell, leaving its own cwd alone. `filter` is an output filter
-// rebuilt by `rewritableTail` (never the model's text), piped after the lot.
+// rebuilt by `renderFilter` from parsed numbers (never the model's text).
 //
 // `invocation` is the binary that ANSWERED, by quoted absolute path — runMain
 // passes it. Pre-ship review of the first cut: naming it `code-graph-mcp` let
@@ -824,71 +822,159 @@ function buildRewriteContext(mode, cmdShown) {
 }
 
 // A rewrite REPLACES the whole command and reports success, so it is only
-// honest when the cg call is equivalent to everything the command would have
-// done. Pre-ship review of the first cut (HIGH): `grep -rl X src/ | xargs sed
-// -i …` became a successful `cg grep -l` and the `sed -i` never ran — under
-// the old deny the model at least knew nothing had run. The same held for
-// `| tee f`, `> out.txt`, a trailing `&`, and flags cg cannot express (`-q`
-// `-o` `-x` `-m`), which printed "success" in a shape nobody asked for.
+// honest when the cg call does everything the command would have done. Two
+// rounds of pre-ship review each found a way past a scan that looked for known
+// hazards — `| xargs sed -i` (round 1), then a command after `|| …` on the next
+// line, and meaning-changing flags the list did not name (round 2). A denylist
+// over shell syntax does not terminate, so this is a GRAMMAR instead: the whole
+// command must parse as
 //
-// So the rule is an allowlist, not a denylist of known side effects:
-//   - after the grep's clause, nothing, an `||` branch (with hits it would not
-//     have run), or ONE pure line filter — `head`/`tail` with a count, or
-//     `sed -n 'A,Bp'` — which is rebuilt from its numbers and kept;
-//   - inside the clause, no redirect but `2>/dev/null` / `2>&1`, no `&`, no
-//     command substitution, no flag outside what cg honors.
-// Everything else is not rewritten: the raw command runs as typed, the way a
-// `;`/`&&` compound already does. Returns `{ filter }` (filter may be null) or
-// null when the command must run as typed.
-const PIPE_FILTERS = [
-  [/^(head|tail)$/, (m) => `${m[1]} -n 10`],
-  [/^(head|tail)\s+(?:-n\s*|--lines=|-)(\d+)$/, (m) => `${m[1]} -n ${m[2]}`],
-  [/^sed\s+-n\s+(["']?)(\d+),(\d+)p\1$/, (m) => `sed -n '${m[2]},${m[3]}p'`],
-];
-// Output-shaping flags cg has no spelling for. Short letters are grep/rg/ag
-// flags whose loss changes what the output MEANS (quiet, only-matching,
-// whole-line, max-count, byte offsets, NUL separators); rg's `-r` is REPLACE,
-// not recursive. Long forms by name.
-const UNREWRITABLE_SHORT = 'qoxmbzZ';
-const UNREWRITABLE_LONG =
-  /^--(?:quiet|silent|only-matching|line-regexp|max-count|json|null|null-data|byte-offset|replace|vimgrep|count-matches|passthru|files)(?:=|$)/;
-// Short flags that take a value: the value ends the cluster (`-g*.rs`).
-const VALUE_SHORT = 'gtefABCd';
-
-function rewritableTail(cmd) {
-  if (!cmd || typeof cmd !== 'string') return null;
-  const clause = firstShellClause(cmd);
-  // Double-quoted spans still expand `$`/backticks, so the pattern the hook
-  // read is not the one the shell would pass — not ours to rewrite.
-  if (/"[^"]*[$`][^"]*"/.test(clause)) return null;
-  const bare = clause.replace(/"[^"]*"|'[^']*'/g, ' ');
-  if (/[$`]/.test(bare)) return null;
-  const unredirected = bare.replace(/(?:^|\s)2>(?:\/dev\/null|&1)(?=\s|$)/g, ' ');
-  if (/[<>&]/.test(unredirected)) return null;
-  const toks = unredirected.replace(VERB_STRIP, '').trim().split(/\s+/);
-  const isRg = RG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '');
-  for (const tok of toks) {
-    if (!tok || tok[0] !== '-' || tok === '-' || tok === '--') continue;
-    if (tok.startsWith('--')) {
-      if (UNREWRITABLE_LONG.test(tok)) return null;
+//   [NAME=value …] (grep | rg | ag | git grep) ARG… [2>&1 | 2>/dev/null] [| FILTER]
+//
+// where every ARG is an allowlisted flag (ALLOWED_SHORT / ALLOWED_LONG, values
+// only for the ones that take one) or a quoted/plain operand, and FILTER is one
+// `head`/`tail` with a count or `sed -n 'A,Bp'`. Anything the tokenizer does not
+// recognize — a newline, `;`, `&`, `\`, `$`, a backtick, parentheses, braces, any
+// other redirect, a second `|`, `||` — means "not ours": the command runs as
+// typed. Returns `{ filter }` (a parsed filter or null), or null.
+const WORD_CHAR = /[A-Za-z0-9_.,:@%+=/*?<>&-]/;
+function shellWords(s) {
+  const words = [];
+  let cur = null;
+  const push = () => { if (cur) words.push(cur); cur = null; };
+  for (let i = 0; i < s.length;) {
+    const c = s[i];
+    if (c === ' ' || c === '\t') { push(); i++; continue; }
+    if (c === '|') { push(); words.push({ op: '|' }); i++; continue; }
+    if (c === "'" || c === '"') {
+      const j = s.indexOf(c, i + 1);
+      if (j === -1) return null;
+      const body = s.slice(i + 1, j);
+      // Inside double quotes the shell still expands `$`/backticks, and a
+      // backslash escapes `"` `\` `$` backtick — so the span may not be what
+      // it looks like. A backslash before anything else is literal (`"a\|b"`,
+      // the BRE alternation models write constantly).
+      if (c === '"' && (/[$`!]|\\["\\$`]/.test(body) || body.endsWith('\\'))) return null;
+      if (!cur) cur = { text: '', startsQuoted: true, bareRedirect: false };
+      cur.text += body;
+      i = j + 1;
       continue;
     }
-    for (const ch of tok.slice(1)) {
-      if (VALUE_SHORT.includes(ch)) break;
-      if (UNREWRITABLE_SHORT.includes(ch) || (isRg && ch === 'r')) return null;
-    }
+    if (!WORD_CHAR.test(c)) return null;
+    if (!cur) cur = { text: '', startsQuoted: false, bareRedirect: false };
+    if (c === '<' || c === '>' || c === '&') cur.bareRedirect = true;
+    cur.text += c;
+    i++;
   }
-  const tail = cmd.slice(clause.length).trim();
-  if (!tail || tail.startsWith('||')) return { filter: null };
-  if (tail[0] !== '|') return null;
-  // Anchored whole-stage matches: a second `|`, a redirect or a `;` in the
-  // stage can never match, so they fall through to "run as typed".
-  const stage = tail.slice(1).trim();
-  for (const [re, build] of PIPE_FILTERS) {
-    const m = stage.match(re);
-    if (m) return { filter: build(m) };
+  push();
+  return words;
+}
+
+// Flags cg honors (`-i -w -F -l -c`, extractCgFlags) or that are no-ops for it
+// (recursion, line numbers, filenames, binary skipping, the regex dialect).
+// Context letters are legal only because a context grep reaches the rewrite in
+// `show` mode alone (classifyBlock), where the answer IS the body.
+const ALLOWED_SHORT = { grep: 'rRnHsIiwFlcEPABC', git: 'rnHIiwFlcEPABC', rg: 'nHiwFlcsABC', ag: 'nHiwlcsABC' };
+const VALUE_SHORT_BY_VERB = { grep: 'ABC', git: 'ABC', rg: 'gtABC', ag: 'ABC' };
+const ALLOWED_LONG = new Set([
+  'ignore-case', 'word-regexp', 'fixed-strings', 'files-with-matches', 'count', 'recursive',
+  'line-number', 'with-filename', 'extended-regexp', 'perl-regexp', 'no-messages',
+  'color', 'colour', 'no-heading', 'include', 'glob', 'type',
+]);
+const VALUE_LONG = new Set(['include', 'glob', 'type']);
+function parseFilter(words) {
+  // Exact, anchored matches only: a second `|`, a redirect or any other word
+  // in the stage cannot match, so it falls through to "run as typed".
+  const t = words.map((w) => (w.op ? '|' : w.text));
+  if (t[0] === 'head' || t[0] === 'tail') {
+    const rest = t.slice(1).join(' ');
+    if (rest === '') return { kind: t[0], n: 10 };
+    const m = rest.match(/^(?:-n ?|--lines=|-)(\d+)$/);
+    return m ? { kind: t[0], n: Number(m[1]) } : null;
+  }
+  if (t[0] === 'sed' && t[1] === '-n' && t.length === 3) {
+    const m = t[2].match(/^(\d+),(\d+)p$/);
+    return m ? { kind: 'sed', a: Number(m[1]), b: Number(m[2]) } : null;
   }
   return null;
+}
+
+function rewritePlan(cmd) {
+  if (!cmd || typeof cmd !== 'string' || cmd.length > 1000) return null;
+  const words = shellWords(cmd);
+  if (!words) return null;
+  const pipe = words.findIndex((w) => w.op);
+  const head = pipe === -1 ? words : words.slice(0, pipe);
+  let filter = null;
+  if (pipe !== -1) {
+    filter = parseFilter(words.slice(pipe + 1));
+    if (!filter) return null;
+  }
+  let i = 0;
+  const skipAssignments = () => {
+    while (i < head.length && !head[i].startsQuoted && /^[A-Za-z_][A-Za-z0-9_]*=[^<>&]*$/.test(head[i].text)) i++;
+  };
+  skipAssignments();
+  if (head[i] && !head[i].startsQuoted && head[i].text === 'env') { i++; skipAssignments(); }
+  let verb = head[i] && !head[i].startsQuoted ? head[i].text : '';
+  if (verb === 'git') {
+    if (!head[i + 1] || head[i + 1].text !== 'grep') return null;
+    i++;
+  } else if (!['grep', 'rg', 'ag'].includes(verb)) {
+    return null;
+  }
+  i++;
+  const allowed = ALLOWED_SHORT[verb];
+  const valueShort = VALUE_SHORT_BY_VERB[verb];
+  const operands = [];
+  let caseFlag = false;
+  let endOfFlags = false;
+  for (; i < head.length; i++) {
+    const w = head[i];
+    if (!w.startsQuoted && (w.text === '2>&1' || w.text === '2>/dev/null')) continue;
+    if (w.bareRedirect) return null;
+    if (w.startsQuoted || endOfFlags || w.text[0] !== '-' || w.text === '-') {
+      operands.push(w.text);
+      continue;
+    }
+    if (w.text === '--') { endOfFlags = true; continue; }
+    if (w.text.startsWith('--')) {
+      const eq = w.text.indexOf('=');
+      const name = w.text.slice(2, eq === -1 ? undefined : eq);
+      if (!ALLOWED_LONG.has(name)) return null;
+      if (VALUE_LONG.has(name) && eq === -1) i++;  // the value is the next word
+      if (name === 'ignore-case') caseFlag = true;
+      continue;
+    }
+    const letters = w.text.slice(1);
+    for (let k = 0; k < letters.length; k++) {
+      const ch = letters[k];
+      if (valueShort.includes(ch)) {
+        const attached = letters.slice(k + 1);
+        // Context counts are digits; rg's -g/-t values are anything.
+        if ('ABC'.includes(ch) ? !/^\d*$/.test(attached) : false) return null;
+        if (!attached) i++;
+        break;
+      }
+      if (!allowed.includes(ch)) return null;
+      if (ch === 'i' || ch === 's') caseFlag = true;
+    }
+  }
+  if (operands.length === 0 || operands.length > 2) return null;
+  // ag is smart-case by default: an all-lowercase pattern matches any case,
+  // and cg's search is case-sensitive, so the answer would find less.
+  if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(operands[0])) return null;
+  return { filter };
+}
+
+// Render a parsed filter against the rewrite's output. A cg `grep` hit is TWO
+// lines (the hit, then its `→ fn …` line), so `head -20` asked for 20 hits and
+// gets `head -n 40`; `-l`/`-c` and `show` output are one line per unit.
+function renderFilter(filter, linesPerUnit) {
+  if (!filter) return null;
+  const k = linesPerUnit;
+  if (filter.kind === 'sed') return `sed -n '${(filter.a - 1) * k + 1},${filter.b * k}p'`;
+  return `${filter.kind} -n ${filter.n * k}`;
 }
 
 // v0.49 — plain `grep` speaks BRE: alternation/grouping arrive escaped
@@ -1060,6 +1146,11 @@ function runMain() {
   // switch silencing the hook that carries the telemetry is coherent; silently
   // claiming coverage it does not have is not.
   const block = isBlockDisabled() ? null : classifyDeny(cmd);
+  // The rewrite replaces the WHOLE command. One it cannot reproduce runs as
+  // typed (see rewritePlan) — decided before the answer is spent on it. The
+  // opt-in static deny keeps its own, older scope.
+  const plan = block && !isAnswerDisabled() ? rewritePlan(cmd) : null;
+  if (block && !isAnswerDisabled() && !plan) return;
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the
@@ -1077,14 +1168,13 @@ function runMain() {
     const flags = cgFlags;  // computed once above, beside the -F pattern guard
     // ONE argv, used to run the child AND to render the command the deny prints.
     const args = buildGrepArgs({ pattern, searchPath, flags });
-    let answeredMode = block.mode;
+    const answeredMode = block.mode;
     if (!isAnswerDisabled()) {
       if (block.mode === 'show') {
+        // No fallback to a grep answer: a context grep (`-A5`) asked for the
+        // body, and the grep rewrite would drop the context silently (pre-ship
+        // review round 2). A show miss lets the raw grep run.
         answer = runShowAnswer({ cwd: root, symbols: block.symbols });
-        if (answer.status !== 'hits' && pattern) {
-          answeredMode = 'grep';
-          answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
-        }
       } else if (pattern) {
         answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
       }
@@ -1155,8 +1245,9 @@ function runMain() {
     const argvList = answeredMode === 'show'
       ? answer.symbols.map((sym) => ['show', sym])
       : [args];
-    // classifyDeny already proved the tail rewritable; this only reads its filter.
-    const { filter } = rewritableTail(cmd);
+    const cgFlagsSet = cgFlagSet(flags);
+    const filter = renderFilter(plan.filter,
+      answeredMode === 'grep' && !cgFlagsSet.has('-l') && !cgFlagsSet.has('-c') ? 2 : 1);
     const command = buildRewriteCommand(argvList, {
       invocation: shellQuoteArg(resolveAnswerBinary({})),
       root,
@@ -1204,7 +1295,9 @@ module.exports = {
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
   buildRewriteCommand,   // rewrite — the command the grep becomes
   buildRewriteContext,   // rewrite — what the model is told about it
-  rewritableTail,        // rewrite — is the cg call equivalent to the whole command
+  shellWords,            // rewrite — the tokenizer rewritePlan's grammar reads
+  rewritePlan,           // rewrite — does the whole command parse as one the rewrite reproduces
+  renderFilter,          // rewrite — a kept filter, scaled to cg's lines per hit
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests

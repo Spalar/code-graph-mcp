@@ -51,7 +51,9 @@ const {
   translateBreToRg,
   buildRewriteCommand,
   buildRewriteContext,
-  rewritableTail,
+  shellWords,
+  rewritePlan,
+  renderFilter,
   extractSedReadTargets,
   extractUnansweredTail,
   extractPatterns,
@@ -1049,49 +1051,88 @@ test('buildRewriteCommand: a kept filter pipes after the whole call, grouped whe
     ' || exit 1; CODE_GRAPH_INTERNAL=1 code-graph-mcp grep X src) | tail -n 3');
 });
 
-test('rewritableTail: only a command the cg call is equivalent to', () => {
-  // Rewritable: nothing after, an `||` branch (with hits it would not run), or
-  // one pure line filter — rebuilt from its numbers, never the model's text.
-  assert.deepEqual(rewritableTail('grep -rn "Foo" src/'), { filter: null });
-  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ || echo none'), { filter: null });
-  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ 2>/dev/null | head -20'), { filter: 'head -n 20' });
-  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ 2>&1 | tail -n 5'), { filter: 'tail -n 5' });
-  assert.deepEqual(rewritableTail('grep -rn "Foo" src/ | head'), { filter: 'head -n 10' });
-  assert.deepEqual(rewritableTail("grep -n \"Foo\" src/a.rs | sed -n '1,60p'"), { filter: "sed -n '1,60p'" });
-  assert.deepEqual(rewritableTail('grep -rn "a|b" src/'), { filter: null }, 'a quoted | is pattern text');
-  // Not rewritable (pre-ship review H1/L3/L6): the stage would silently not run,
-  // or the output would not mean what was asked.
+test('rewritePlan: only a command that parses as one the rewrite reproduces', () => {
+  const plan = (c) => rewritePlan(c);
+  assert.deepEqual(plan('grep -rn "Foo" src/'), { filter: null });
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null | head -20'), { filter: { kind: 'head', n: 20 } });
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1 | tail -n 5'), { filter: { kind: 'tail', n: 5 } });
+  assert.deepEqual(plan('grep -rn "Foo" src/ | head'), { filter: { kind: 'head', n: 10 } });
+  assert.deepEqual(plan("grep -n \"Foo\" src/a.rs | sed -n '1,60p'"), { filter: { kind: 'sed', a: 1, b: 60 } });
+  assert.deepEqual(plan('grep -rn "a|b" src/'), { filter: null }, 'a quoted | is pattern text');
+  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { filter: null },
+    'a backslash before | inside double quotes is literal — the BRE shape models write');
+  assert.deepEqual(plan('env FOO=1 grep -rn "Foo" src/'), { filter: null });
+  // Flags cg honors or ignores, with their values.
+  for (const cmd of ['grep -rnw "Foo" src/', 'grep -rli "Foo" src/', 'grep -rc "Foo" src/',
+    'grep -rn --include=*.rs "Foo" src/', "grep -rn --include '*.rs' \"Foo\" src/",
+    'rg -t rust "Foo" src/', 'rg -trust "Foo" src/', "rg -g '*.rs' \"Foo\" src/",
+    'grep -rnE "Foo" src/', 'grep -rnP "Foo" src/', 'grep -rnA3 "fn foo" src/', 'rg -C 5 "fn foo" src/',
+    'git grep -n "Foo" src/', 'grep -rn --color=never "Foo" src/']) {
+    assert.notEqual(plan(cmd), null, cmd);
+  }
+  // Not rewritable: a stage, command or flag the cg call would silently drop
+  // (pre-ship review round 1 H1, round 2 H1/M1/L1/N1-N3).
   for (const cmd of [
     'grep -rl "Foo" src/ | xargs sed -i s/Foo/Bar/g',
     'grep -rn "Foo" src/ | tee /tmp/out.txt',
-    'grep -rn "Foo" src/ | sort > /tmp/out.txt',
     'grep -rn "Foo" src/ > /tmp/out.txt',
+    'grep -rn "Foo" src/ >> /tmp/out.txt',
+    'grep -rn "Foo" src/ &> /tmp/out.txt',
     'grep -rn "Foo" src/ &',
     'grep -rn "Foo" src/ | wc -l',
     'grep -rn "Foo" src/ | head -20 | tail -5',
-    'grep -rq "Foo" src/',
-    'grep -rno "Foo" src/',
-    'grep -rnx "Foo" src/',
-    'grep -rn -m1 "Foo" src/',
-    'grep -rn --max-count=1 "Foo" src/',
-    'rg --json "Foo" src/',
-    'rg -r Bar "Foo" src/',
-    'grep -rn "$PAT" src/',
-    'grep -rn "Foo" $(cat dirs)',
+    'grep -rn "Foo" src/ | head -20 2>/dev/null',
+    "grep -rn \"Foo\" src/ | sed -n '1,5p;w out'",
+    "grep -rn \"Foo\" src/ | sed -n '1,5p' | sh",
+    'grep -rn "Foo" src/ || echo none',
+    'grep -rn "Foo" src/ || echo none\ntouch created',
+    'grep -rn "Foo" src/ || true & touch created',
     'grep -rn "Foo" src/\nrm -rf src/',
+    "grep -rn \\'Foo[ >pwned ]*' src/ '",
+    'grep -rn "a\\"b" src/',
+    'grep -rq "Foo" src/', 'grep -rno "Foo" src/', 'grep -rnx "Foo" src/', 'grep -rn -m1 "Foo" src/',
+    'grep -rh "Foo" src/', 'grep -rn --max-count=1 "Foo" src/', 'grep -rn -e "Foo" -e "baz_qux" src/',
+    'rg -e "Foo" -e "baz_qux" src/', 'rg --json "Foo" src/', 'rg -r Bar "Foo" src/', 'rg -T rust "Foo" src/',
+    "rg --iglob '*.rs' \"Foo\" src/", 'rg -d 1 "Foo" src/', 'rg --max-depth 1 "Foo" src/', 'rg -S "foo_bar" src/',
+    'rg -U "Foo" src/', 'rg -l0 "Foo" src/',
+    "ag -G '\\.py$' \"Foo\" src/", "ag --ignore '*.rs' \"Foo\" src/", 'ag "foo_bar" src/',
+    'git grep --name-only "Foo" src/', 'git grep -e "Foo" --and -e "baz" src/', 'git grep -O "Foo" src/',
+    'grep -rn "$PAT" src/', 'grep -rn "Foo" $(cat dirs)', 'grep -rn "Foo" `cat dirs`', 'grep -rn "Foo" {src,lib}/',
+    'grep -rn "Foo" ~/src/',
+    'grep -rn "Foo" src/>out.txt',
+    'grep -rn "Foo" src/ 2>err.txt',
+    'grep -rn "Foo" src/ 2> /dev/null',
+    'grep -rnA3q "fn foo" src/',
+    'grep "Foo" src/ lib/ tests/',
+    'grep -rn',
   ]) {
-    assert.equal(rewritableTail(cmd), null, cmd);
+    assert.equal(plan(cmd), null, cmd);
   }
-  // A value-taking flag ends its cluster: `-g*.rs`'s `r`/`s` are not flags.
-  assert.deepEqual(rewritableTail("rg -g*.rs 'Foo' src/"), { filter: null });
-  assert.deepEqual(rewritableTail('grep -rnA3 "fn Foo" src/'), { filter: null });
+  assert.notEqual(plan('ag "FooBar" src/'), null, 'ag with an uppercase pattern is case-sensitive, like cg');
+  assert.notEqual(plan('ag -s "foo_bar" src/'), null, 'ag -s forces case-sensitive');
 });
 
-test('classifyDeny: a command the rewrite cannot reproduce is not intercepted', () => {
-  assert.notEqual(classifyDeny('grep -rn "SomeSymbol" src/ | head -20'), null);
-  assert.equal(classifyDeny('grep -rl "SomeSymbol" src/ | xargs sed -i s/a/b/'), null);
-  assert.equal(classifyDeny('grep -rn "SomeSymbol" src/ > hits.txt'), null);
+test('shellWords: anything but plain words, quotes and `|` is not tokenized', () => {
+  assert.deepEqual(shellWords("grep -rn 'a b' src/").map((w) => w.text), ['grep', '-rn', 'a b', 'src/']);
+  for (const s of ['a\nb', 'a;b', 'a\\ b', 'a $(b)', 'a `b`', 'a (b)', 'a {b}', "a 'b", 'a ~/b', 'a #b']) {
+    assert.equal(shellWords(s), null, JSON.stringify(s));
+  }
 });
+
+test('renderFilter: counts scale to cg lines per unit, rebuilt from numbers only', () => {
+  assert.equal(renderFilter(null, 2), null);
+  assert.equal(renderFilter({ kind: 'head', n: 20 }, 2), 'head -n 40', 'a grep hit is two lines');
+  assert.equal(renderFilter({ kind: 'tail', n: 5 }, 1), 'tail -n 5');
+  assert.equal(renderFilter({ kind: 'sed', a: 1, b: 60 }, 2), "sed -n '1,120p'");
+  assert.equal(renderFilter({ kind: 'sed', a: 3, b: 4 }, 2), "sed -n '5,8p'", 'hits 3-4 are lines 5-8');
+});
+
+test('countNamedPaths: a `2>/dev/null` redirect is not a second path', () => {
+  assert.equal(countNamedPaths('grep -rn "Foo" src/ 2>/dev/null', ['Foo']), 1);
+  assert.notEqual(classifyDeny('grep -rn "SomeSymbol" src/ 2>/dev/null | head -20'), null);
+});
+
+
 
 test('buildRewriteCommand: every call carries the internal marker, and a subdir shell runs from the root', () => {
   const root = pathTmp.join(osTmp.tmpdir(), 'proj root');
@@ -1491,31 +1532,60 @@ test('e2e: the reported `grep …; sed …` shape is not denied', () => {
   }
 });
 
-test('e2e: `| head -20` is kept on the rewrite, rebuilt from its count', () => {
+test('e2e: `| head -20` is kept on the rewrite, scaled to 20 hits of two lines', () => {
   const uniq = `StubPipe${Date.now()}`;
   const fixture = e2eFixture(
-    `for (let i = 0; i < 50; i++) process.stdout.write('src/foo.rs:' + i + '  hit\\n');`);
+    `for (let i = 0; i < 50; i++) process.stdout.write('src/foo.rs:' + i + '  hit\\n  → fn f\\n');`);
   const cmd = `grep -rn "${uniq}" src/ | head -20`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, / \| head -n 20$/);
-    assert.match(rw.context, /\| head -n 20/, 'the printed command shows the filter it ran');
+    assert.match(rw.command, / \| head -n 40$/);
+    assert.match(rw.context, /\| head -n 40/, 'the printed command shows the filter it ran');
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.equal(ran.trim().split('\n').length, 20);
+    if (ran !== null) assert.equal(ran.trim().split('\n').filter((l) => l.startsWith('src/')).length, 20);
   } finally {
     cleanupFixture(fixture, cmd);
   }
 });
 
-test('e2e: a side-effecting pipe stage is not rewritten — the command runs as typed', () => {
-  // Pre-ship review H1: the rewrite reported success and the `sed -i` never ran.
+test('e2e: commands the rewrite cannot reproduce get no decision — they run as typed', () => {
+  // Pre-ship review: round 1 `| xargs sed -i`, round 2 a command after `|| …`
+  // on the next line and a dropped second `-e` pattern.
   const uniq = `StubSed${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs\\n');`);
+  const cmds = [
+    `grep -rl "${uniq}" src/ | xargs sed -i s/${uniq}/Bar/g`,
+    `grep -rn "${uniq}" src/ || echo none\ntouch created`,
+    `grep -rn -e "${uniq}" -e "other_sym" src/`,
+  ];
+  try {
+    for (const cmd of cmds) {
+      const res = runHook(cmd, fixture);
+      assert.equal(res.status, 0);
+      assert.equal(res.stdout.trim(), '', `the hook must not decide for ${JSON.stringify(cmd)}: ${res.stdout}`);
+      assert.equal(res.stderr.trim(), '', 'decided cleanly, not by crashing into fail-open');
+    }
+    assert.deepEqual(readRecs(fixture).filter((r) => r.hook === 'grep'), [],
+      'nothing recorded as intercepted: the answer was never run for these');
+  } finally {
+    for (const cmd of cmds) cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: CODE_GRAPH_NO_ANSWER_IN_DENY=1 keeps its static-deny scope', () => {
+  // Round 2 L2: gating the static deny on rewritability shrank it.
+  const uniq = `StubStatic${Date.now()}`;
   const fixture = e2eFixture(`process.stdout.write('src/foo.rs\\n');`);
   const cmd = `grep -rl "${uniq}" src/ | xargs sed -i s/${uniq}/Bar/g`;
   try {
-    const res = runHook(cmd, fixture);
-    assert.equal(res.status, 0);
-    assert.equal(res.stdout.trim(), '', `the hook must not decide for this command: ${res.stdout}`);
+    const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
+      cwd: fixture.dir, input: JSON.stringify({ tool_input: { command: cmd } }), encoding: 'utf8',
+      env: {
+        ...process.env, _CG_ANSWER_BINARY: fixture.stub,
+        CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_NO_BLOCK_GREP: '0', CODE_GRAPH_NO_ANSWER_IN_DENY: '1',
+      },
+    });
+    assert.equal(JSON.parse(res.stdout).hookSpecificOutput.permissionDecision, 'deny');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1707,18 +1777,20 @@ test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
 // Round 2: `flags` reached the show-mode FALLBACK call site in neither hook's
 // test, so dropping it there was a green mutation in both. The stub refuses
 // `show` so the fallback is the path under test.
-test('e2e: the show-mode fallback to grep also carries the flags', (t) => {
+test('e2e: a show miss lets the context grep run — no grep answer that drops -A', () => {
+  // Round 2 M1: the show→grep fallback rewrote `grep -iA3 "fn X"` to a grep
+  // with no context, reported as success.
   const uniq = `StubShowFb${Date.now()}`;
   const fixture = e2eFixture(
     `if (process.argv[2] === 'show') process.exit(1);\n` +
-    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+    `process.stdout.write('src/foo.rs:1  hit\\n');`);
   const cmd = `grep -iA3 "fn ${uniq}" src/`;
   try {
-    const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, / grep -i /, `the fallback dropped -i: ${rw.command}`);
-    assert.doesNotMatch(rw.command, / show /, 'show did not answer, so the rewrite must not run it');
-    const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, /ARGV\[grep -i /);
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    assert.throws(() => JSON.parse(res.stdout), 'no decision: an FYI line at most');
+    const rec = readRecs(fixture).filter((r) => r.hook === 'grep').pop();
+    assert.equal(rec.fallthrough, 'no-hits');
   } finally {
     cleanupFixture(fixture, cmd);
   }
