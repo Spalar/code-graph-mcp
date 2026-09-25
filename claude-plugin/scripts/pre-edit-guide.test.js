@@ -228,14 +228,30 @@ test('pattern-sync: the suite runs the hook\'s own patterns, not a copy', () => 
 // growth 4.0x. Restoring the Java/C# arm ALONE stays linear (1.9 ms -> 7.4 ms,
 // 4.0x) and correctly does not fire — the backtracking driver is the two JS
 // arms, not that one.
+//
+// Timed in process CPU time, not wall time, and each size is the MINIMUM of up
+// to REDOS_SAMPLES runs. Wall time made the ratio a measure of scheduler luck:
+// under parallel `node --test` 2 of 20 full-suite runs went red on 2026-09-25 at
+// 8.2x (100 KB 41.9 ms -> 400 KB 341.9 ms) and 8.6x (2.4 ms -> 20.4 ms), both
+// linear work with the large sample preempted. Min-of-3 wall time alone still
+// went red 1 in 20 in the suite (8.8x) and 7 in 30 run alone beside 12 busy
+// loops, because contention outlasts three samples. CPU time does not accrue
+// while descheduled; the minimum absorbs what is left (GC, cache). A sample past
+// the absolute ceiling ends the loop — that is not noise, and it keeps the
+// quadratic case at one run's cost.
 const REDOS_GROWTH_LIMIT = 8; // linear 4.0x, quadratic 16.9x — sits between them
 const REDOS_ABSOLUTE_CEILING_MS = 5000; // 57x the linear number, 9x below quadratic
+const REDOS_SAMPLES = 3;
 test('SEC-04: bracket-free word-dense input matches in linear time', () => {
+  // CPU time of this process, not wall time: the claim is about the work the
+  // regexes do, and wall time also bills every millisecond the scheduler spent
+  // running someone else.
   const timeAt = (build, bytes) => {
     const input = build(bytes);
-    const t0 = process.hrtime.bigint();
+    const t0 = process.cpuUsage();
     for (const pat of fnPatterns) input.match(pat);
-    return Number(process.hrtime.bigint() - t0) / 1e6;
+    const d = process.cpuUsage(t0);
+    return (d.user + d.system) / 1e3;
   };
   for (const build of [
     (n) => 'a'.repeat(n),                        // one unbroken \w run
@@ -243,8 +259,14 @@ test('SEC-04: bracket-free word-dense input matches in linear time', () => {
     (n) => 'public static void '.repeat(Math.ceil(n / 19)).slice(0, n), // feeds the \S+ pattern
   ]) {
     timeAt(build, 32 * 1024); // warm-up: don't bill regex compilation to the small sample
-    const small = timeAt(build, 100 * 1024);
-    const large = timeAt(build, 400 * 1024);
+    let small = Infinity;
+    let large = Infinity;
+    for (let i = 0; i < REDOS_SAMPLES; i++) {
+      small = Math.min(small, timeAt(build, 100 * 1024));
+      const sample = timeAt(build, 400 * 1024);
+      large = Math.min(large, sample);
+      if (sample >= REDOS_ABSOLUTE_CEILING_MS) break;
+    }
     // Floor the divisor: a sub-millisecond `small` would inflate the ratio, and
     // it can only be sub-millisecond when the bounds ARE holding (the quadratic
     // case takes seconds at 100 KB).
