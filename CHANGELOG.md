@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 71 → 72 because the parser moved to tree-sitter 0.25 and
+tree-sitter-rust 0.24, and an existing index keeps symbols the old Rust grammar
+lost until the file that holds them is next edited. Nothing to run; the first
+query or index run after upgrading re-extracts. To pin back: `npm i -g
+@sdsrs/code-graph@0.154.0` or `cargo install code-graph-mcp --version 0.154.0`;
+plugin users can set the version in the marketplace entry. An older binary
+leaves a v72 index intact and warns on every open instead of rebuilding it — to
+get the old grammar's output back, delete `.code-graph/index.db*` after pinning.
+
+### Rust borrows of a binding named `raw` are indexed
+
+`&raw`, `&raw[..]` and `&raw.field` on an ordinary binding were read by
+tree-sitter-rust 0.23 as the start of the `&raw const` / `&raw mut` operator,
+so the expression — and sometimes the whole function — became ERROR nodes and
+left the index. On this repository indexed fresh, 9 Rust files were parsed with
+errors and `cmd_affected` (called from `main`) was missing from `show`,
+`callgraph` and `refs`; after the upgrade, 0 files and the function is there.
+
+Measured over a 4,491-file corpus covering all 19 languages, old binary against
+new with nodes and edges compared by content: in every file that parses cleanly,
+the other 18 languages keep exactly the same symbols and edges; the only change
+there is the stored caller/callee summary of a symbol that names one in a
+damaged file. Files that were already parsed with errors can recover
+differently under the new tree-sitter core:
+
+- **C++** (macro-heavy headers): 15 real symbols recovered — 13 in gmock
+  (`DefaultValue<T&>`, `DefaultValue<void>`, `ActionInterface` and their
+  members, `Produce`), `join` and `is_container_adaptor` in fmt; a bogus
+  macro-named `FMT_VISIBILITY` struct gone; a template specialization whose
+  name was cut short before its closing `>>` now carries it whole, which renames
+  it and its 6 methods.
+- **C#:** a bogus method named `if` is gone.
+- **Swift:** one class whose body holds `#if`/`#error` (Alamofire `Protected`)
+  is no longer recovered; its 3 methods lose the `Protected.` prefix and the 12
+  calls into it from other files are dropped.
+
+Those files are the ones `health-check` already lists under `Parse:`.
+
+The per-file parse timeout (`CODE_GRAPH_PARSE_TIMEOUT_MS`, default 5000) now
+runs as a progress callback, because tree-sitter 0.25 deprecates the old
+setting and 0.26 removes it. Same behavior: a parse past the limit is abandoned
+and the file is skipped as before, and `0` still means no limit.
+
+### `stats` no longer counts the dev build's own queries as adoption
+
+In a checkout where the tool itself is developed, every query run through the
+cargo build output (to test it) was recorded as a model-initiated `cli use`,
+inflating the `Deny→use` / `Hint→use` funnel. Runs of a binary inside a cargo
+target directory are no longer recorded. Installed copies (plugin, npm, `cargo
+install`) record as before; existing rows are not rewritten.
+
+### Not covered
+
+- The Swift regression above: a class body containing `#if` directives is a
+  tree-sitter-swift limitation, and which symbols survive the damage is up to
+  the core's error recovery. No workaround short of moving the `#if` block
+  out of the class body; it is listed so the one lost class is not a surprise.
+
 ## 0.154.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71) and

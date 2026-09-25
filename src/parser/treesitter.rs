@@ -37,14 +37,14 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(language) {
             let mut p = tree_sitter::Parser::new();
-            p.set_timeout_micros(parse_timeout_ms() * 1000);
             p.set_language(&lang)?;
             cache.insert(language.to_string(), p);
         }
         let parser = cache
             .get_mut(language)
             .ok_or_else(|| anyhow!("parser cache inconsistency for {}", language))?;
-        match parser.parse(source, None) {
+        let timeout = std::time::Duration::from_millis(parse_timeout_ms());
+        match parse_with_deadline(parser, source, timeout) {
             Some(tree) => Ok(tree),
             None => {
                 parser.reset();
@@ -52,6 +52,25 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             }
         }
     })
+}
+
+/// Parse `source`, giving up once `timeout` has elapsed — `None` then, as for any
+/// failed parse. tree-sitter 0.25 deprecated `set_timeout_micros` (removal due in
+/// 0.26) for a progress callback, which returns `true` to cancel. The deadline
+/// starts per call, where the old parser-level setting also applied per parse.
+/// A zero timeout means no deadline, as `set_timeout_micros(0)` did.
+fn parse_with_deadline(
+    parser: &mut tree_sitter::Parser,
+    source: &str,
+    timeout: std::time::Duration,
+) -> Option<tree_sitter::Tree> {
+    let bytes = source.as_bytes();
+    let start = std::time::Instant::now();
+    let mut read = |offset: usize, _: tree_sitter::Point| bytes.get(offset..).unwrap_or(&[]);
+    let mut past_deadline = |_: &tree_sitter::ParseState| start.elapsed() >= timeout;
+    let options = (!timeout.is_zero())
+        .then(|| tree_sitter::ParseOptions::new().progress_callback(&mut past_deadline));
+    parser.parse_with_options(&mut read, None, options)
 }
 
 pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
@@ -1915,6 +1934,79 @@ fn extract_dart_declaration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Polarity of the deadline callback (it returns true to CANCEL): wrong one
+    // way it never times out, the other way it cancels every parse. The wiring
+    // and units are pinned separately by `tests/parse_failure_recording.rs`
+    // (CODE_GRAPH_PARSE_TIMEOUT_MS=5 must time out a 200k-paren file).
+    //
+    // A zero timeout means NO deadline — `set_timeout_micros(0)` did, and a user
+    // who set CODE_GRAPH_PARSE_TIMEOUT_MS=0 to disable it must not get every
+    // file skipped instead (pre-merge review of the 0.25 migration: a 3-file
+    // project indexed as 172 nodes before, 2 after).
+    #[test]
+    fn parse_with_deadline_cancels_past_the_deadline_and_zero_means_none() {
+        let lang = get_language("rust").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).unwrap();
+        // Large enough that the parser reports progress many times.
+        let source = "fn f() { let x = 1; }\n".repeat(50_000);
+
+        assert!(
+            parse_with_deadline(&mut parser, &source, std::time::Duration::from_nanos(1)).is_none(),
+            "a deadline that has already passed must cancel the parse"
+        );
+        parser.reset();
+        let tree = parse_with_deadline(&mut parser, &source, std::time::Duration::from_secs(60))
+            .expect("a generous deadline must let the parse finish");
+        assert!(!tree.root_node().has_error());
+        assert_eq!(tree.root_node().named_child_count(), 50_000);
+
+        parser.reset();
+        let tree = parse_with_deadline(&mut parser, &source, std::time::Duration::ZERO)
+            .expect("a zero timeout means no deadline, not an immediate cancel");
+        assert_eq!(tree.root_node().named_child_count(), 50_000);
+    }
+
+    // tree-sitter-rust 0.23 read a borrow of a binding named `raw` as the start of
+    // the `&raw const` / `&raw mut` pointer operator, turning the expression — and
+    // on this repo's own `cmd_affected`, the whole function — into ERROR nodes that
+    // the index then lost. 0.24 (with core 0.25) parses all four shapes. Only the
+    // `for r in &raw {` one (affected.rs's) LOSES its function under 0.23; the
+    // other three keep theirs and fail only the has_error check, so the name
+    // assertions below are live only because `by_for` is in the fixture. The
+    // genuine operator is kept as a control that must still parse.
+    #[test]
+    fn a_borrow_of_a_binding_named_raw_parses_and_keeps_its_function() {
+        let source = r#"
+fn by_ref(raw: Vec<u8>) -> usize { let r = &raw; r.len() }
+fn by_slice(raw: Vec<u8>) -> usize { let s = &raw[..]; s.len() }
+struct Holder { field: u8 }
+fn by_field(raw: Holder) -> u8 { let f = &raw.field; *f }
+fn by_for(raw: Vec<u8>) -> usize { let mut n = 0; for r in &raw { n += *r as usize; } n }
+fn real_raw_pointer(x: u8) -> *const u8 { &raw const x }
+"#;
+        let tree = parse_tree(source, "rust").unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "ERROR nodes in: {}",
+            tree.root_node().to_sexp()
+        );
+        let names: Vec<String> = extract_nodes_from_tree(&tree, source, "rust")
+            .into_iter()
+            .filter(|n| n.node_type == "function")
+            .map(|n| n.name)
+            .collect();
+        for f in [
+            "by_ref",
+            "by_slice",
+            "by_field",
+            "by_for",
+            "real_raw_pointer",
+        ] {
+            assert!(names.iter().any(|n| n == f), "{f} missing from {names:?}");
+        }
+    }
 
     // L10: extracted code_content must not carry NUL bytes into FTS5 (the tokenizer
     // treats stored TEXT as a C-string and stops at the first NUL → the tail is
