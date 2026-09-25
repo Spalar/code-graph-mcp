@@ -61,15 +61,23 @@ pub fn record_cli_use(project_root: &Path, cmd: &str, exe: Option<&Path>) {
 }
 
 /// True when `exe` sits in a cargo target directory: `<target>/<profile>/`,
-/// `<target>/<triple>/<profile>/`, or a `deps/` below either. Cargo marks the
-/// target root (wherever `CARGO_TARGET_DIR` puts it) with a CACHEDIR.TAG, but
-/// the tag's signature line is shared by every cachedir-aware tool, so only a
-/// tag naming cargo counts.
+/// `<target>/<triple>/<profile>/`, or a `deps/` below either. Two markers, either
+/// one suffices:
+/// - the profile dir (parent, or grandparent for `deps/`) holds the
+///   `.cargo-lock` file AND `.fingerprint/` dir cargo writes on every build —
+///   present even when the target root was pre-created or is a symlink;
+/// - the target root carries cargo's CACHEDIR.TAG. Cargo writes that only when
+///   it creates the root itself, and the signature line is shared by every
+///   cachedir-aware tool, so only a tag naming cargo counts.
 pub fn is_cargo_build_output(exe: &Path) -> bool {
-    exe.ancestors().skip(2).take(3).any(|dir| {
+    let is_profile_dir =
+        |dir: &Path| dir.join(".cargo-lock").is_file() && dir.join(".fingerprint").is_dir();
+    let has_cargo_tag = |dir: &Path| {
         std::fs::read_to_string(dir.join("CACHEDIR.TAG"))
             .is_ok_and(|tag| tag.contains("created by cargo"))
-    })
+    };
+    exe.ancestors().skip(1).take(2).any(is_profile_dir)
+        || exe.ancestors().skip(2).take(3).any(has_cargo_tag)
 }
 
 /// Aggregated per-tool counts across sessions.

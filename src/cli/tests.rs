@@ -853,6 +853,37 @@ fn cargo_build_output_is_recognised_by_the_tag_cargo_writes() {
     assert!(!is_cargo_build_output(&foreign));
 }
 
+/// Cargo writes CACHEDIR.TAG only when it CREATES the target root, so a
+/// pre-created or symlinked `CARGO_TARGET_DIR` has none (pre-ship review of
+/// 2feabc5, reproduced with cargo 1.95). What cargo writes on every build is the
+/// profile dir's `.cargo-lock` file and `.fingerprint/` directory — checked
+/// against a pre-created and a symlinked target, both carry them.
+#[test]
+fn a_cargo_profile_dir_without_the_tag_still_counts_as_build_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let profile = |root: &str| {
+        let dir = t.join(root);
+        std::fs::create_dir_all(dir.join(".fingerprint")).unwrap();
+        std::fs::write(dir.join(".cargo-lock"), b"").unwrap();
+    };
+    profile("pre/release");
+    let exe = fake_exe(t, "pre/release/code-graph-mcp", None);
+    let test_bin = fake_exe(t, "pre/release/deps/cli_e2e-0123", None);
+    profile("x/x86_64-unknown-linux-gnu/debug");
+    let cross = fake_exe(t, "x/x86_64-unknown-linux-gnu/debug/code-graph-mcp", None);
+    assert!(is_cargo_build_output(&exe));
+    assert!(is_cargo_build_output(&test_bin));
+    assert!(is_cargo_build_output(&cross));
+
+    // Half a marker is not a profile dir: a stray `.cargo-lock` next to an
+    // installed copy must not silence its telemetry.
+    std::fs::create_dir_all(t.join("inst/bin")).unwrap();
+    std::fs::write(t.join("inst/bin/.cargo-lock"), b"").unwrap();
+    let installed = fake_exe(t, "inst/bin/code-graph-mcp", None);
+    assert!(!is_cargo_build_output(&installed));
+}
+
 #[test]
 fn a_dev_build_does_not_record_a_use_but_an_installed_copy_does() {
     // In a dogfood checkout the tool's own dev build is run to TEST it; those

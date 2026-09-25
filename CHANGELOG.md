@@ -51,8 +51,13 @@ and the file is skipped as before, and `0` still means no limit.
 In a checkout where the tool itself is developed, every query run through the
 cargo build output (to test it) was recorded as a model-initiated `cli use`,
 inflating the `Deny→use` / `Hint→use` funnel. Runs of a binary inside a cargo
-target directory are no longer recorded. Installed copies (plugin, npm, `cargo
-install`) record as before; existing rows are not rewritten.
+target directory are no longer recorded — recognised by the profile directory's
+`.cargo-lock` + `.fingerprint/`, or cargo's `CACHEDIR.TAG` on the target root,
+so a pre-created or symlinked `CARGO_TARGET_DIR` counts too. Installed copies
+(plugin, npm, `cargo install`) record as before; existing rows are not
+rewritten. One side effect: a from-source build used in place (README "Build
+from Source", pointing the config at `target/release/code-graph-mcp`) no longer
+shows its queries in `stats` either.
 
 ### Not covered
 

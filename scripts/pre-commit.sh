@@ -112,29 +112,37 @@ if [ "$js_staged" -gt 0 ]; then
   # first test file anyone puts in a subdirectory, in silence. Note the staged-file
   # detection above is already recursive (`.*\.js$`), so the asymmetry meant a
   # nested test could TRIGGER this gate without ever being RUN by it.
-  # Fed by process substitution, NOT a pipe: a pipe would put the loop in a
-  # subshell where `exit 1` only leaves the subshell and the hook would pass a
-  # failing test.
+  # Fed by process substitution, NOT a pipe: a pipe would run the loop in a
+  # subshell, leave `js_tests` empty here, and the stage below would test
+  # nothing and pass.
   js_tests=()
   while IFS= read -r t; do
     [ -f "$t" ] && js_tests+=("$t")
   done < <(find "$ROOT/claude-plugin/scripts" "$ROOT/scripts" -type f -name '*.test.js' | sort)
   # Fast path: every file in ONE parallel `node --test` (measured 2026-09-25 on
-  # the CI discovery set: 13-25 s parallel vs 93 s serial). Green here is final.
-  # Red is NOT final: parallel runs share the box, and a timing assertion or the
-  # find-binary cache race can go red under contention alone — which is why CI
-  # runs serially. So a red falls through to the serial per-file loop below,
-  # which is the gate it always was: a real failure fails there too, by name.
+  # this set, 45 files: 72 s as the serial per-file loop, 13 s parallel).
+  # Green here is final. Red is NOT final: parallel runs share the box, and a
+  # timing assertion or the find-binary cache race can go red under contention
+  # alone — which is why CI runs serially. So a red names the files it failed
+  # in (from the TAP `location:` lines) and falls through to the serial
+  # per-file loop below over EVERY file, which is the gate it always was: a real
+  # failure fails there too, by name. Every file, not just the named ones — a
+  # file-level failure carries no `location:` and would otherwise go unchecked.
   # The count guard is not decoration: a bare `node --test` with no file
   # arguments falls back to Node's OWN discovery, a different set. And
   # `${arr[@]+…}` below, not "${arr[@]}": under `set -u` bash 3.2 (macOS's
   # /usr/bin/env bash) calls an empty array unbound.
   confirm_serially=true
-  if [ "${#js_tests[@]}" -gt 0 ] \
-    && "${git_clean[@]}" node --test "${js_tests[@]}" > /dev/null 2>&1; then
-    confirm_serially=false
-  elif [ "${#js_tests[@]}" -gt 0 ]; then
-    echo "  parallel run red — confirming file by file (serial)..."
+  if [ "${#js_tests[@]}" -gt 0 ]; then
+    js_log=$(mktemp)
+    if "${git_clean[@]}" node --test --test-reporter=tap "${js_tests[@]}" > "$js_log" 2>&1; then
+      confirm_serially=false
+    else
+      red=$(awk '/^not ok /{f=1; next} f && /^  location: /{s=$2; gsub(/\047/, "", s); sub(/:[0-9]+:[0-9]+$/, "", s); sub(/.*\//, "", s); print s; f=0}' "$js_log" \
+        | sort -u | tr '\n' ' ')
+      echo "  parallel run red in: ${red:-<no location reported>}— confirming every file serially..."
+    fi
+    rm -f "${js_log:?}"
   fi
   $confirm_serially || js_tests=()
   for t in ${js_tests[@]+"${js_tests[@]}"}; do

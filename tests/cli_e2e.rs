@@ -10115,6 +10115,18 @@ fn every_json_command_answers_a_miss_in_a_shape_its_consumer_can_parse() {
 // copy positive control; this pins the wiring in `main`.
 #[test]
 fn a_query_through_the_dev_build_records_no_funnel_use() {
+    // Precondition, checked rather than assumed: if the binary under test is
+    // not recognisable as cargo output, a `use` row below says nothing about
+    // `main`'s wiring (pre-ship review of 2feabc5 moved the target's
+    // CACHEDIR.TAG away and got a red that blamed main.rs).
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_code-graph-mcp"));
+    assert!(
+        code_graph_mcp::cli::is_cargo_build_output(exe),
+        "precondition: {} is not recognised as a cargo build output (no \
+         .cargo-lock + .fingerprint/ in its profile dir, no cargo CACHEDIR.TAG) — \
+         fix the detector or the environment; this is not a main.rs wiring failure",
+        exe.display()
+    );
     let project = setup_indexed_project();
     let rec = project
         .path()
