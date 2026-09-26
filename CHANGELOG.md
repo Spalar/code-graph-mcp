@@ -6,6 +6,35 @@
 `INDEX_VERSION` goes 74 → 75 because the C++ fix below changes which `calls`
 edges a file produces.
 
+### Changing a class re-resolves typed calls in files the edit did not touch
+
+A typed call (`f = Field(); f.clean()`, `it->Next()` on an `Iterator*`) binds
+by the whole project's classes: whether a class of that name exists, whether
+the name is unique and top-level, which classes subclass it, and which of them
+define the method. An edit that changed any of that left callers in other files
+as they were until `rebuild-index`. Deleting django's `forms/fields.py` left 19
+edges a rebuild has. Deleting leveldb's `iterator.h` left 861 edges missing and
+457 stale. Renaming django's `forms.CharField` left 5 missing edges. The
+incremental run now compares its files' classes, base classes and methods
+before and after. It re-indexes the files holding a typed call that the change
+can move, along with the callers a new same-named definition reaches. In all
+five cases measured (those three, plus deleting leveldb's `skiplist.h` and
+adding a `Field` override in django), the incremental graph now equals a
+rebuild's.
+
+The price is paid only by edits that change a class. Adding or removing one,
+renaming it, changing its bases, or adding or removing a method all qualify.
+Deleting `forms/fields.py` took 6.9 s instead of 4.6 s, renaming `CharField`
+3.2 s instead of 1.0 s, and deleting `iterator.h` 392 ms instead of 20 ms. A
+one-file edit that leaves classes alone is unchanged on django: 1,209 → 1,246
+ms median of 9, within both runs' spread; a no-op run takes 102 ms in both.
+
+Not covered: a typed call that bound nothing leaves nothing to find. That is
+either a call on a class the project did not define, once its buffered row
+has aged out, or a call on a class that lacks the method when the method name
+is too common to guess at (`build`, `run`). If the class, or the method, is
+added later, `rebuild-index` binds the call.
+
 ### A buffered typed call from a free function binds like a rebuild
 
 A typed call whose class lacks the method (`def f(): a = A(); a.f()`, with

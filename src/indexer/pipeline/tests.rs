@@ -2112,6 +2112,308 @@ fn test_typed_receiver_incremental_matches_rebuild() {
     );
 }
 
+// D#97 M-N3: a typed call binds by the whole project's class structure — which
+// classes carry its receiver's name, which are nested, which subclass which, and
+// which of those define the method. An edit that changes that structure changes
+// what a rebuild binds for callers in files the edit never touched. One shape per
+// test, so each reports on its own.
+
+const TYPED_USER_PY: &str = "def g():\n    f = Field()\n    f.clean()\n";
+
+/// Two same-named classes: the caller's own file's `Field` wins, but a name two
+/// classes share seeds no overrides. Deleting the other makes the name unique
+/// and `Char.clean` an override — for a caller with no edge into the deleted file
+/// (django: deleting forms/fields.py, 19 edges).
+const B_PY: &str = "class Field:\n    def clean(self):\n        pass\n\n\
+                    def g():\n    f = Field()\n    f.clean()\n";
+const CHAR_PY: &str =
+    "from b import Field\n\nclass Char(Field):\n    def clean(self):\n        pass\n";
+
+#[test]
+fn test_class_delete_re_resolves_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            ("b.py", B_PY),
+            ("sub.py", CHAR_PY),
+        ],
+        &[("a.py", None)],
+    );
+}
+
+/// Renaming a class away has the same effect as deleting it; renaming one TO
+/// the name has the reverse one.
+#[test]
+fn test_class_rename_re_resolves_untouched_typed_callers() {
+    let a = "class Field:\n    def clean(self):\n        pass\n";
+    let widget = "class Widget:\n    def clean(self):\n        pass\n";
+    let files = [("b.py", B_PY), ("sub.py", CHAR_PY)];
+    assert_incremental_matches_rebuild(
+        &[("a.py", a), files[0], files[1]],
+        &[("a.py", Some(widget))],
+    );
+    assert_incremental_matches_rebuild(
+        &[("a.py", widget), files[0], files[1]],
+        &[("a.py", Some(a))],
+    );
+}
+
+/// A subclass added later overrides the method: its override runs too.
+#[test]
+fn test_new_subclass_override_reaches_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            ("user.py", TYPED_USER_PY),
+        ],
+        &[(
+            "sub.py",
+            Some("from a import Field\n\nclass Char(Field):\n    def clean(self):\n        pass\n"),
+        )],
+    );
+}
+
+/// The twin defines no `clean`: only its name's uniqueness moves — shared to
+/// unique when it goes, unique to shared (overrides no longer followed) when a
+/// class is renamed to it.
+#[test]
+fn test_methodless_class_delete_re_resolves_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    pass\n"),
+            ("b.py", B_PY),
+            ("sub.py", CHAR_PY),
+        ],
+        &[("a.py", None)],
+    );
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Widget:\n    pass\n"),
+            ("b.py", B_PY),
+            ("sub.py", CHAR_PY),
+        ],
+        &[("a.py", Some("class Field:\n    pass\n"))],
+    );
+}
+
+/// A subclass of a subclass: the typed class is an ancestor two levels up.
+#[test]
+fn test_new_grandchild_override_reaches_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            (
+                "sub.py",
+                "from a import Field\n\nclass Char(Field):\n    def clean(self):\n        pass\n",
+            ),
+            ("user.py", TYPED_USER_PY),
+        ],
+        &[(
+            "slug.py",
+            Some("from sub import Char\n\nclass Slug(Char):\n    def clean(self):\n        pass\n"),
+        )],
+    );
+}
+
+/// A grandchild changes its base: `Field`, two levels up, is in no moved row, so
+/// only the ancestor closure of the old base reaches its callers.
+#[test]
+fn test_grandchild_changed_base_drops_override_from_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            (
+                "sub.py",
+                "from a import Field\n\nclass Char(Field):\n    def clean(self):\n        pass\n",
+            ),
+            ("o.py", "class Other:\n    pass\n"),
+            (
+                "slug.py",
+                "from sub import Char\n\nclass Slug(Char):\n    def clean(self):\n        pass\n",
+            ),
+            ("user.py", TYPED_USER_PY),
+        ],
+        &[(
+            "slug.py",
+            Some("from o import Other\n\nclass Slug(Other):\n    def clean(self):\n        pass\n"),
+        )],
+    );
+}
+
+/// The drift is derived from rows free of line numbers, so an edit that only
+/// moves code pulls no typed caller into the fan-out round — the ordinary edit
+/// pays for two snapshots and nothing else. Positive control in the same tree:
+/// adding the override does pull `user.py`.
+#[test]
+fn test_moving_code_is_no_class_drift() {
+    let sub = "from a import Field\n\nclass Char(Field):\n    def other(self):\n        pass\n";
+    let (project, _d, db) = fresh_index_of(&[
+        ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+        ("sub.py", sub),
+        ("user.py", TYPED_USER_PY),
+    ]);
+    let drift_after = |body: String| {
+        fs::write(project.path().join("sub.py"), body).unwrap();
+        let paths = vec!["sub.py".to_string()];
+        super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+        index_files(
+            &db,
+            project.path(),
+            &paths,
+            &std::collections::HashMap::new(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        let typed = super::resolve::typed_callers_of_class_drift(db.conn()).unwrap();
+        super::resolve::drop_fanout_temps(db.conn()).unwrap();
+        typed
+    };
+    assert_eq!(
+        drift_after(format!("# moved\n\n{sub}\n# touched\n")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        drift_after(format!("{sub}\n    def clean(self):\n        pass\n")),
+        vec!["user.py".to_string()],
+        "control: a new override must count as drift"
+    );
+}
+
+/// A call typed by a name two classes share follows no overrides, so a new
+/// override of it changes nothing a rebuild binds and pulls no caller (django's
+/// `Field`: without this filter one such edit re-extracted callers for +1.1 s
+/// and moved no edge). Control: the same edit under a unique name does pull.
+#[test]
+fn test_override_of_a_shared_class_name_is_no_drift() {
+    let drift = |shared: bool| {
+        let mut files = vec![
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            ("user.py", TYPED_USER_PY),
+        ];
+        if shared {
+            files.push(("b.py", "class Field:\n    def clean(self):\n        pass\n"));
+        }
+        let (project, _d, db) = fresh_index_of(&files);
+        let paths = vec!["sub.py".to_string()];
+        fs::write(
+            project.path().join("sub.py"),
+            "from a import Field\n\nclass Char(Field):\n    def clean(self):\n        pass\n",
+        )
+        .unwrap();
+        super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+        index_files(
+            &db,
+            project.path(),
+            &paths,
+            &std::collections::HashMap::new(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        let typed = super::resolve::typed_callers_of_class_drift(db.conn()).unwrap();
+        super::resolve::drop_fanout_temps(db.conn()).unwrap();
+        typed
+    };
+    assert_eq!(drift(true), Vec::<String>::new());
+    assert_eq!(drift(false), vec!["user.py".to_string()], "control");
+}
+
+/// A class whose name another class shares gains the method, turned from a free
+/// function of the same file: `assemble`'s count is unchanged (no D#24 round) and
+/// the caller's edge went to another file (nothing to restore), yet a rebuild
+/// binds the class's own method where the untyped call bound `Other.assemble`.
+/// (A noise name such as `build` is not covered: the untyped call binds nothing
+/// and leaves no edge or buffered row for the drift to find.)
+#[test]
+fn test_free_function_turned_method_re_resolves_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "a.py",
+                "class Foo:\n    pass\n\n\ndef assemble():\n    pass\n",
+            ),
+            ("c.py", "class Foo:\n    pass\n"),
+            (
+                "o.py",
+                "class Other:\n    def assemble(self):\n        pass\n",
+            ),
+            (
+                "b.py",
+                "from a import Foo\n\ndef g():\n    x = Foo()\n    x.assemble()\n",
+            ),
+        ],
+        &[(
+            "a.py",
+            Some("class Foo:\n    def assemble(self):\n        pass\n"),
+        )],
+    );
+}
+
+/// An existing subclass gains the override.
+#[test]
+fn test_new_override_method_reaches_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            (
+                "sub.py",
+                "from a import Field\n\nclass Char(Field):\n    def other(self):\n        pass\n",
+            ),
+            ("user.py", TYPED_USER_PY),
+        ],
+        &[(
+            "sub.py",
+            Some(
+                "from a import Field\n\nclass Char(Field):\n    def other(self):\n        pass\n\n    \
+                 def clean(self):\n        pass\n",
+            ),
+        )],
+    );
+}
+
+/// A subclass that stops inheriting the class is no longer an override of it.
+#[test]
+fn test_changed_base_drops_override_from_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def clean(self):\n        pass\n"),
+            ("o.py", "class Other:\n    pass\n"),
+            (
+                "sub.py",
+                "from a import Field\n\nclass Char(Field):\n    def clean(self):\n        pass\n",
+            ),
+            ("user.py", TYPED_USER_PY),
+        ],
+        &[(
+            "sub.py",
+            Some("from o import Other\n\nclass Char(Other):\n    def clean(self):\n        pass\n"),
+        )],
+    );
+}
+
+/// C++: a nested `SkipList::Iterator` answers to a bare `Iterator` only when no
+/// top-level class has that name (leveldb: deleting iterator.h, 861 edges).
+#[test]
+fn test_top_level_class_delete_re_resolves_untouched_cpp_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "iterator.hpp",
+                "class Iterator {\n public:\n  void Next() {}\n};\n",
+            ),
+            (
+                "skiplist.hpp",
+                "class SkipList {\n public:\n  class Iterator {\n   public:\n    void Next() {}\n  };\n};\n",
+            ),
+            ("user.cc", "void g(Iterator* it) { it->Next(); }\n"),
+        ],
+        &[("iterator.hpp", None)],
+    );
+}
+
 /// A typed call its class did not decide (two same-named bases) is as much a
 /// guess as an untyped one: `ambiguous`, not the `inferred` a typed bind earns.
 #[test]

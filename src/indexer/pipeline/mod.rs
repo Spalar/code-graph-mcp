@@ -554,7 +554,11 @@ pub fn run_incremental_index_cached(
 }
 
 /// D#24's second extraction round: re-extract the bare-name callers that a run
-/// just gave a new same-name definition to.
+/// just gave a new same-name definition to — and, since D#97, the typed callers
+/// (`rtype` / `super`) whose answer the run's change to the class structure
+/// moved (`resolve::typed_callers_of_class_drift`). Both are callers in files the
+/// run never opened that a rebuild would bind differently; re-extracting them is
+/// the rebuild's own resolution, not a second copy of it.
 ///
 /// A bare call fans out to EVERY same-name candidate, so a rebuild of a tree
 /// where `c.py` defines a second `helper` carries both `b.py:caller ->
@@ -630,14 +634,25 @@ fn fan_out_to_new_duplicate_definitions(
     hashes: &HashMap<String, String>,
     model: Option<&EmbeddingModel>,
 ) -> Result<usize> {
-    let callers = resolve::bare_name_callers_of_new_duplicates(db.conn())?;
+    // Typed callers first: the bare-name half drops the snapshot both read.
+    let typed = resolve::typed_callers_of_class_drift(db.conn())?;
+    let bare = resolve::bare_name_callers_of_new_duplicates(db.conn())?;
+    let callers: Vec<String> = typed
+        .iter()
+        .chain(bare.iter())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     if callers.is_empty() {
         return Ok(0);
     }
     tracing::info!(
-        "[index] fan-out round: re-extracting {} bare-name caller file(s) reached by a new \
-         same-name definition",
-        callers.len()
+        "[index] fan-out round: re-extracting {} caller file(s): {} bare-name caller(s) reached \
+         by a new same-name definition, {} typed caller(s) of a changed class structure",
+        callers.len(),
+        bare.len(),
+        typed.len()
     );
     // Same reason round one captures it: re-indexing these files replaces their
     // node ids, so the context strings of nodes in OTHER files that point at

@@ -747,7 +747,193 @@ pub(super) fn snapshot_definition_counts(
            GROUP BY n.name, f.language;
          CREATE INDEX cg_fanout_before_k ON cg_fanout_before(nm, lang);",
     )?;
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE cg_shape_before AS {CLASS_SHAPE_SELECT};"
+    ))?;
     Ok(())
+}
+
+/// The class structure of `cg_fanout_paths` that typed-call resolution reads
+/// ([`recv_type_targets`]), as `(kind, path, value)` rows free of line numbers,
+/// so an edit that only moves code produces the same rows:
+/// `c` a class-like node (`language`, qualified name, nested), `i` an `inherits`
+/// edge out of the file (`sub`, `base` names), `m` a method (qualified name).
+const CLASS_SHAPE_SELECT: &str = "
+    SELECT 'c' AS k, f.path AS p,
+           COALESCE(f.language, '') || char(31) || COALESCE(n.qualified_name, n.name)
+             || char(31) || EXISTS (
+               SELECT 1 FROM nodes o
+               WHERE o.file_id = n.file_id AND o.id <> n.id
+                 AND o.type IN ('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')
+                 AND o.start_line <= n.start_line AND o.end_line >= n.end_line) AS v
+    FROM nodes n
+    JOIN files f ON f.id = n.file_id
+    JOIN cg_fanout_paths fp ON fp.path = f.path
+    WHERE n.type IN ('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')
+    UNION
+    SELECT 'i', f.path, s.name || char(31) || t.name
+    FROM edges e
+    JOIN nodes s ON s.id = e.source_id
+    JOIN files f ON f.id = s.file_id
+    JOIN cg_fanout_paths fp ON fp.path = f.path
+    JOIN nodes t ON t.id = e.target_id
+    WHERE e.relation = 'inherits'
+    UNION
+    SELECT 'm', f.path, n.qualified_name
+    FROM nodes n
+    JOIN files f ON f.id = n.file_id
+    JOIN cg_fanout_paths fp ON fp.path = f.path
+    WHERE n.type IN ('function', 'method') AND n.qualified_name LIKE '%.%'";
+
+/// The files outside this run holding a typed call (`rtype` / `super`, bound or
+/// buffered) whose answer this run's change to the class structure can move —
+/// D#97's answer to "who binds differently now". Pair with
+/// [`snapshot_definition_counts`], and call before
+/// [`bare_name_callers_of_new_duplicates`], which drops the snapshot.
+///
+/// A typed call reads the whole project's class structure: whether a class of
+/// its receiver's name exists, whether that name is unique and top-level, which
+/// classes subclass it, and which of those define the method. So the answer is
+/// derived as a before/after difference over this run's paths, never kept as a
+/// ledger: the class names whose rows moved, each with every ancestor (a moved
+/// subclass changes its ancestors' overrides), and for a moved method only the
+/// calls of that method on its class and the class's ancestors. Empty — no scan
+/// of the typed calls — when the structure did not move, which is every edit
+/// that leaves classes, bases and method sets alone.
+pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+    fn rows(conn: &rusqlite::Connection, sql: &str) -> Result<HashSet<(String, String, String)>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?)))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(rows)
+    }
+    let last = |s: &str| class_path(s).last().map(|l| l.to_string());
+    let before = rows(conn, "SELECT k, p, v FROM cg_shape_before")?;
+    let after = rows(conn, &format!("SELECT k, p, v FROM ({CLASS_SHAPE_SELECT})"))?;
+    // `classes`: names whose class nodes moved. `bases`-side names: both ends of a
+    // moved `inherits` edge. `methods`: (owner, method) of a moved method.
+    let (mut classes, mut linked, mut methods) = (HashSet::new(), HashSet::new(), HashSet::new());
+    for (k, _, v) in before.symmetric_difference(&after) {
+        let fields: Vec<&str> = v.split('\u{1f}').collect();
+        match (k.as_str(), fields.as_slice()) {
+            ("c", [_, name, _]) => classes.extend(last(name)),
+            ("i", [sub, base]) => linked.extend(last(sub).into_iter().chain(last(base))),
+            ("m", [q]) => {
+                if let Some((owner, m)) = q.rsplit_once('.') {
+                    methods.extend(last(owner).map(|o| (o, m.to_string())));
+                }
+            }
+            _ => {}
+        }
+    }
+    if classes.is_empty() && linked.is_empty() && methods.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A call typed `T` follows overrides only when `T` names one class (the
+    // `seeds` rule in `recv_type_targets`), so a moved subclass or override
+    // reaches only its UNIQUELY named ancestors. Current counts are exact for the
+    // ones that did not move: a name whose count changed had a class node added
+    // or removed in this run, and is in `classes`, which is not filtered.
+    let mut class_count: HashMap<String, usize> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(qualified_name, name) FROM nodes
+             WHERE type IN ('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')",
+        )?;
+        for name in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            if let Some(l) = last(&name?) {
+                *class_count.entry(l).or_default() += 1;
+            }
+        }
+    }
+    let unique = |n: &String| class_count.get(n) == Some(&1);
+
+    // Ancestors by name, as `recv_type_targets` reaches overrides by name.
+    let mut bases: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT s.name, t.name FROM edges e
+             JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id
+             WHERE e.relation = 'inherits'",
+        )?;
+        let pairs = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for pair in pairs {
+            let (sub, base) = pair?;
+            if let (Some(sub), Some(base)) = (last(&sub), last(&base)) {
+                bases.entry(sub).or_default().push(base);
+            }
+        }
+    }
+    let closure = |from: &mut dyn Iterator<Item = String>| -> HashSet<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = from.collect();
+        while let Some(n) = stack.pop() {
+            if seen.insert(n.clone()) {
+                stack.extend(bases.get(&n).into_iter().flatten().cloned());
+            }
+        }
+        seen
+    };
+    // A moved class answers for its own name whatever its count: whether a class
+    // of that name exists, is unique, is nested. Its ancestors, for overrides.
+    let mut any: HashSet<String> = closure(&mut classes.iter().chain(linked.iter()).cloned())
+        .into_iter()
+        .filter(|n| unique(n))
+        .collect();
+    any.extend(classes);
+    // A moved method answers for calls of it on its own class (own method vs
+    // inherited), and on the class's ancestors for overrides.
+    let mut per_method: HashSet<(String, String)> = HashSet::new();
+    for (owner, m) in methods {
+        for n in closure(&mut std::iter::once(owner.clone())) {
+            if n == owner || unique(&n) {
+                per_method.insert((n, m.clone()));
+            }
+        }
+    }
+
+    let in_run: HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM cg_fanout_paths")?;
+        let paths = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        paths
+    };
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT f.path, json_extract(e.metadata, '$.v'), t.name
+         FROM edges e
+         JOIN nodes s ON s.id = e.source_id JOIN files f ON f.id = s.file_id
+         JOIN nodes t ON t.id = e.target_id
+         WHERE e.relation = 'calls' AND json_extract(e.metadata, '$.q') IN ('rtype', 'super')
+         UNION
+         SELECT f.path, json_extract(p.metadata, '$.v'), p.target_name
+         FROM pending_unresolved_calls p
+         JOIN nodes s ON s.id = p.source_id JOIN files f ON f.id = s.file_id
+         WHERE json_extract(p.metadata, '$.q') IN ('rtype', 'super')",
+    )?;
+    let calls = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for call in calls {
+        let (path, v, target) = call?;
+        if in_run.contains(&path) || out.contains(&path) {
+            continue;
+        }
+        let Some(class) = v.as_deref().and_then(last) else {
+            continue;
+        };
+        if any.contains(&class) || per_method.contains(&(class, target)) {
+            out.insert(path);
+        }
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// Drop everything the fan-out pair creates.
@@ -766,7 +952,8 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
         "DROP TABLE IF EXISTS temp.cg_fanout_paths;
          DROP TABLE IF EXISTS temp.cg_fanout_before;
          DROP TABLE IF EXISTS temp.cg_fanout_after;
-         DROP TABLE IF EXISTS temp.cg_fanout_up;",
+         DROP TABLE IF EXISTS temp.cg_fanout_up;
+         DROP TABLE IF EXISTS temp.cg_shape_before;",
     )?;
     Ok(())
 }
