@@ -825,6 +825,33 @@ fn test_cpp_field_receiver_outside_its_class_body_is_marked_field() {
 }
 
 #[test]
+fn test_cpp_chained_receiver_is_marked_via() {
+    let cpp = call_meta(
+        "Status TableBuilder::Finish() {\n  Rep* r = rep_;\n  r->index_block.Add(k);\n  \
+         versions_->current()->Ref();\n  this->opts_.env->NowMicros();\n  \
+         m[0].Clear();\n  Make().Reset();\n}\n",
+        "cpp",
+    );
+    assert_eq!(
+        meta_of(&cpp, "Add"),
+        Some(r#"{"b":{"t":"Rep"},"ba":1,"q":"via","s":[["f","index_block",0]]}"#)
+    );
+    assert_eq!(
+        meta_of(&cpp, "Ref"),
+        Some(
+            r#"{"b":{"c":"TableBuilder","v":"versions_"},"ba":1,"q":"via","s":[["m","current",1]]}"#
+        )
+    );
+    assert_eq!(
+        meta_of(&cpp, "NowMicros"),
+        Some(r#"{"b":{"t":"TableBuilder"},"ba":1,"q":"via","s":[["f","opts_",0],["f","env",1]]}"#)
+    );
+    // A subscript or a free function's result: not a chain of names.
+    assert_eq!(meta_of(&cpp, "Clear"), Some(MEMBER));
+    assert_eq!(meta_of(&cpp, "Reset"), Some(MEMBER));
+}
+
+#[test]
 fn test_cpp_class_fields_records_each_typed_field() {
     let code = "class DBImpl : public DB {\n private:\n  SnapshotList snapshots_;\n  \
                 VersionSet* const versions_;\n  std::unique_ptr<Logger> log_;\n  \

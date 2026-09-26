@@ -3,8 +3,30 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 74 → 77 because the fixes below change which `calls` and
+`INDEX_VERSION` goes 74 → 78 because the fixes below change which `calls` and
 `inherits` edges a file produces.
+
+### A C++ call through a chain of fields and calls is typed
+
+`r->index_block.Add()`, `versions_->current()->Ref()` and
+`env_.target()->GetChildren()` call a method on the result of a member
+access or another call. Each such call was untyped and bound every `Add`,
+`Ref` or `GetChildren` in reach. The chain is now typed one step at a time,
+through the recorded field types and the methods' declared return types,
+following base classes where a class inherits the member. The call is typed
+only when the chain ends in a project class. A subscript, a free function's
+result, or a primitive or library type leaves it untyped, as before. Editing
+the header that declares a field or a return type on the chain re-resolves
+the callers in other files.
+
+On leveldb, scored against SCIP, the `inferred` tier goes from 2513/2550 to
+2605/2642 (98.6%). Recall rises from 2738 to 2789 of 3470. Same-file precision
+goes from 1497/1534 to 1497/1529.
+
+Typing a call through a field declared in a base class, or through a chain step
+a class inherits, read the class hierarchy before a full index had resolved
+its cross-file `inherits` edges. A rebuild typed fewer of these calls than an
+incremental run did. Both now read it after.
 
 ### A typed call on a class without the method binds what that class runs
 

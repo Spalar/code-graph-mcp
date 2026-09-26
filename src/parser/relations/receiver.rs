@@ -102,6 +102,95 @@ pub(super) fn cpp_field_receiver(
     Some((class, name.to_string(), arrow))
 }
 
+/// A C++ member call whose receiver is itself a member access or a call:
+/// `r->index_block.Add()`, `versions_->current()->Ref()`, `this->opts_.env->Now()`.
+/// Returns `{"q":"via","b":<base>,"ba":<op>,"s":[[kind,name,op],…]}` with the
+/// steps from the base outward: `"f"` a field, `"m"` a method whose return type
+/// the next step goes through, each `op` 1 when the next access is `->`. The
+/// base is `{"t":<class>}` for `this` or a typed local/parameter/in-class
+/// field, else `{"c":<class>,"v":<field>}` for a field the function cannot see
+/// declared ([`cpp_field_receiver`]). The resolver walks the steps through the
+/// recorded fields and method return types; None when any link is not a plain
+/// name (a subscript, a free function's result, an untyped local).
+pub(super) fn cpp_chain_receiver(
+    call: tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> Option<String> {
+    if family != "cpp" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "field_expression" {
+        return None;
+    }
+    let object = function.child_by_field_name("argument")?;
+    if !matches!(object.kind(), "field_expression" | "call_expression") {
+        return None;
+    }
+    let is_arrow = |n: tree_sitter::Node| {
+        n.child_by_field_name("operator")
+            .is_some_and(|o| node_text(&o, source) == "->")
+    };
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    let mut op = is_arrow(function);
+    let mut cur = object;
+    let base = loop {
+        if steps.len() > 8 {
+            return None;
+        }
+        match cur.kind() {
+            "field_expression" => {
+                let name = cur.child_by_field_name("field")?;
+                if name.kind() != "field_identifier" {
+                    return None;
+                }
+                steps.push(serde_json::json!(["f", node_text(&name, source), op as u8]));
+                op = is_arrow(cur);
+                cur = cur.child_by_field_name("argument")?;
+            }
+            "call_expression" => {
+                let f = cur.child_by_field_name("function")?;
+                if f.kind() != "field_expression" {
+                    return None;
+                }
+                let name = f.child_by_field_name("field")?;
+                if name.kind() != "field_identifier" {
+                    return None;
+                }
+                steps.push(serde_json::json!(["m", node_text(&name, source), op as u8]));
+                op = is_arrow(f);
+                cur = f.child_by_field_name("argument")?;
+            }
+            "this" => break serde_json::json!({ "t": cpp_enclosing_class(cur, source)? }),
+            "identifier" => {
+                let name = node_text(&cur, source);
+                let func = ancestor(cur, &["function_definition"])?;
+                let mut types = Vec::new();
+                collect_cpp_decl_types(func, name, source, &mut types, 0);
+                if let Some(body) = enclosing_class_body(func) {
+                    collect_cpp_field_types(body, name, source, &mut types);
+                }
+                if types.is_empty() {
+                    let class = cpp_enclosing_class(cur, source).or_else(|| {
+                        let declarator = func.child_by_field_name("declarator")?;
+                        let case = crate::parser::treesitter::extract_gtest_test_name(
+                            &declarator,
+                            source,
+                        )?;
+                        case.split_once('.').map(|(suite, _)| suite.to_string())
+                    })?;
+                    break serde_json::json!({ "c": class, "v": name });
+                }
+                break serde_json::json!({ "t": cpp_declared_class(func, name, op, source)? });
+            }
+            _ => return None,
+        }
+    };
+    steps.reverse();
+    Some(serde_json::json!({ "q": "via", "b": base, "ba": op as u8, "s": steps }).to_string())
+}
+
 /// A field declared in a C++ class body, with the class a call through it names:
 /// `dot` for `x.f()`, `arrow` for `x->f()` (a pointer's pointee, or a smart
 /// pointer's `T`), as [`cpp_declared_class`] reads an in-class field.

@@ -2526,6 +2526,109 @@ fn test_inherits_never_targets_a_function_or_method() {
     );
 }
 
+const VERSION_HPP: &str = "class Version {\n public:\n  void Ref() {}\n};\n\
+    class Other {\n public:\n  void Ref() {}\n};\n\
+    class VersionSet {\n public:\n  Version* current() const { return current_; }\n\
+     private:\n  Version* current_;\n};\n\
+    class BlockBuilder {\n public:\n  void Add(int k) {}\n};\n\
+    class DBImpl {\n public:\n  void Get();\n  void Add(int k) {}\n\
+     private:\n  struct Rep {\n    BlockBuilder index_block;\n  };\n  \
+    VersionSet* versions_;\n  Rep* rep_;\n};\n";
+const GET_CC: &str = "#include \"version.hpp\"\n\
+    void DBImpl::Get() {\n  versions_->current()->Ref();\n  Rep* r = rep_;\n  r->index_block.Add(1);\n}\n";
+
+/// A receiver that is a chain of fields and calls is typed through the recorded
+/// field types and return types: `versions_->current()->Ref()` binds
+/// `Version::Ref`, `r->index_block.Add()` binds `BlockBuilder::Add`, where each
+/// bound every same-named method (leveldb: 23 of the wrong same-file edges).
+#[test]
+fn test_cpp_chained_receiver_binds_through_fields_and_returns() {
+    let (_p, _d, db) = fresh_index_of(&[("version.hpp", VERSION_HPP), ("get.cc", GET_CC)]);
+    assert_eq!(
+        callees_of(&db, "Get"),
+        vec![
+            "version.hpp.BlockBuilder.Add".to_string(),
+            "version.hpp.Version.Ref".to_string(),
+            "version.hpp.VersionSet.current".to_string()
+        ]
+    );
+}
+
+/// A chain whose step is inherited (`env_.target()` on an `ErrorEnv` that gets
+/// `target()` from `EnvWrapper`) is typed on a FULL index too, where the
+/// cross-file `inherits` edges are resolved in the same deferred pass: loading
+/// the class hierarchy before them left it empty, so a rebuild typed nothing
+/// that an incremental run typed. The field's type is namespaced
+/// (`test::ErrorEnv`), which is no nesting.
+#[test]
+fn test_cpp_inherited_chain_step_is_typed_on_a_full_index() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "env.hpp",
+            "class Env {\n public:\n  virtual void GetChildren() {}\n};\n\
+             class EnvWrapper : public Env {\n public:\n  Env* target() const { return t_; }\n\
+              private:\n  Env* t_;\n};\n",
+        ),
+        (
+            "testutil.hpp",
+            "#include \"env.hpp\"\nnamespace test {\nclass ErrorEnv : public EnvWrapper {};\n}\n",
+        ),
+        (
+            "other.cc",
+            "class Lister {\n public:\n  void GetChildren() {}\n};\n",
+        ),
+        (
+            "corruption_test.cc",
+            "#include \"testutil.hpp\"\nclass CorruptionTest {\n public:\n  void Corrupt();\n\
+              private:\n  test::ErrorEnv env_;\n};\n\
+             void CorruptionTest::Corrupt() {\n  env_.target()->GetChildren();\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        callees_of(&db, "Corrupt"),
+        vec![
+            "env.hpp.Env.GetChildren".to_string(),
+            "env.hpp.EnvWrapper.target".to_string()
+        ]
+    );
+    // `target()` is what `test::ErrorEnv` inherits: decided, not the untyped
+    // guess (the only same-named method would bind either way).
+    let target: Vec<String> = call_edges_with_confidence(&db)
+        .into_iter()
+        .filter(|e| e.contains("-> env.hpp.EnvWrapper.target "))
+        .collect();
+    assert_eq!(target.len(), 1, "{target:?}");
+    assert!(
+        !target[0].contains(r#""amb""#) && target[0].ends_with(" inferred"),
+        "{target:?}"
+    );
+}
+
+/// The header changes what `current()` returns; the `.cc` caller is untouched.
+#[test]
+fn test_cpp_return_type_change_re_resolves_untouched_chain_callers() {
+    let other = VERSION_HPP.replace(
+        "Version* current() const { return current_; }",
+        "Other* current() const { return nullptr; }",
+    );
+    assert_incremental_matches_rebuild(
+        &[("version.hpp", VERSION_HPP), ("get.cc", GET_CC)],
+        &[("version.hpp", Some(&other))],
+    );
+    // Only a field in the middle of `r->index_block.Add()` changes type; the
+    // call's edge into `BlockBuilder::Add` would be restored as it was.
+    let retyped = VERSION_HPP
+        .replace("BlockBuilder index_block;", "Other index_block;")
+        .replace(
+            "class Other {\n public:\n  void Ref() {}\n};",
+            "class Other {\n public:\n  void Ref() {}\n  void Add(int k) {}\n};",
+        );
+    assert_incremental_matches_rebuild(
+        &[("version.hpp", VERSION_HPP), ("get.cc", GET_CC)],
+        &[("version.hpp", Some(&retyped))],
+    );
+}
+
 /// Re-indexing a base's file restores the edges into it by name: a subclass's
 /// `inherits` edge must come back to the class, not also to its same-named
 /// constructors (leveldb: editing env.h left 24 such edges a rebuild lacks).

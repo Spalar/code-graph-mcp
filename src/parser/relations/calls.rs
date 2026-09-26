@@ -387,10 +387,18 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 let field = (receiver_type.is_none() && member)
                     .then(|| super::receiver::cpp_field_receiver(node, source, ctx.config.name))
                     .flatten();
+                // A receiver that is itself a member access or call: typed at
+                // resolution through recorded fields and return types.
+                // (`this->opts_.env->f()` is one too, though its root is `this`.)
+                let chain = (receiver_type.is_none() && field.is_none() && unqualified)
+                    .then(|| super::receiver::cpp_chain_receiver(node, source, ctx.config.name))
+                    .flatten();
                 let metadata = if let Some(ty) = receiver_type {
                     Some(serialize_rtype_metadata(&ty))
                 } else if let Some((class, field, arrow)) = field {
                     Some(serialize_field_metadata(&class, &field, arrow))
+                } else if chain.is_some() {
+                    chain
                 } else if member {
                     Some(super::member::MEMBER_META.to_string())
                 } else if ctx.config.name == "cpp" && is_cpp_scoped_call(node) {

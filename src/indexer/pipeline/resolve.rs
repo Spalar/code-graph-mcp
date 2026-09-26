@@ -51,6 +51,10 @@ pub(super) enum CalleeMeta {
         field: String,
         arrow: bool,
     },
+    /// C++ call on a receiver that is a chain of fields and method calls
+    /// (`r->index_block.Add()`, `versions_->current()->Ref()`; parser
+    /// `receiver::cpp_chain_receiver`). Rewritten like [`Self::Field`].
+    Via,
     /// Python `m.f()` where `m` is bound by an absolute import of module `v`
     /// (`relations/member.rs`): no project code runs unless `v` is a project
     /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
@@ -66,6 +70,7 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
     let q = v.get("q")?.as_str()?;
     match q {
         "chain" => Some(CalleeMeta::Chain),
+        "via" => Some(CalleeMeta::Via),
         "field" => Some(CalleeMeta::Field {
             class: v.get("c")?.as_str()?.to_string(),
             field: v.get("v")?.as_str()?.to_string(),
@@ -802,7 +807,7 @@ const CLASS_SHAPE_SELECT: &str = "
     JOIN nodes s ON s.id = e.source_id
     WHERE e.relation = 'inherits'
     UNION
-    SELECT 'm', f.path, n.qualified_name
+    SELECT 'm', f.path, n.qualified_name || char(31) || COALESCE(n.return_type, '')
     FROM nodes n
     JOIN files f ON f.id = n.file_id
     JOIN cg_fanout_paths fp ON fp.path = f.path
@@ -861,7 +866,9 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
                 linked.extend(last(sub).into_iter().chain(last(base)));
             }
             ("f", [class, ..]) => field_owners.extend(last(class)),
-            ("m", [q]) => {
+            // The return type too: a C++ chain (`x->current()->Ref()`) goes
+            // through it.
+            ("m", [q, _]) => {
                 if let Some((owner, m)) = q.rsplit_once('.') {
                     methods.extend(last(owner).map(|o| (o, m.to_string())));
                 }
@@ -937,9 +944,9 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
     // inherited), on the class's ancestors for overrides, and on its
     // descendants, which inherit it.
     let mut per_method: HashSet<(String, String)> = HashSet::new();
-    for (owner, m) in methods {
+    for (owner, m) in &methods {
         for n in closure(&mut std::iter::once(owner.clone())) {
-            if n == owner || unique(&n) {
+            if n == *owner || unique(&n) {
                 per_method.insert((n, m.clone()));
             }
         }
@@ -959,27 +966,37 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
     // A C++ call through a field (`fc`) looked its type up in `fc`'s fields,
     // else its bases': it moves with any of them, or with their bases or
     // existence. Typed (`rtype`) or not (`member`).
+    let method_owners: HashSet<String> = methods.iter().map(|(o, _)| o.clone()).collect();
     let field_keys: HashSet<&String> = field_owners
         .iter()
         .chain(classes.iter())
         .chain(linked.iter())
         .collect();
+    // A C++ chain (`vc`) went through fields and return types of each class it
+    // names: it moves with any of them, their bases, or their methods.
+    let via_keys: HashSet<&String> = field_keys
+        .iter()
+        .copied()
+        .chain(method_owners.iter())
+        .collect();
     let mut stmt = conn.prepare(
         "SELECT f.path, json_extract(e.metadata, '$.q'), json_extract(e.metadata, '$.v'),
-                json_extract(e.metadata, '$.fc'), t.name
+                json_extract(e.metadata, '$.fc'), t.name, json_extract(e.metadata, '$.vc')
          FROM edges e
          JOIN nodes s ON s.id = e.source_id JOIN files f ON f.id = s.file_id
          JOIN nodes t ON t.id = e.target_id
          WHERE e.relation = 'calls'
            AND (json_extract(e.metadata, '$.q') IN ('rtype', 'super')
-                OR json_extract(e.metadata, '$.fc') IS NOT NULL)
+                OR json_extract(e.metadata, '$.fc') IS NOT NULL
+                OR json_extract(e.metadata, '$.vc') IS NOT NULL)
          UNION
          SELECT f.path, json_extract(p.metadata, '$.q'), json_extract(p.metadata, '$.v'),
-                json_extract(p.metadata, '$.fc'), p.target_name
+                json_extract(p.metadata, '$.fc'), p.target_name, json_extract(p.metadata, '$.vc')
          FROM pending_unresolved_calls p
          JOIN nodes s ON s.id = p.source_id JOIN files f ON f.id = s.file_id
          WHERE json_extract(p.metadata, '$.q') IN ('rtype', 'super')
-            OR json_extract(p.metadata, '$.fc') IS NOT NULL",
+            OR json_extract(p.metadata, '$.fc') IS NOT NULL
+            OR json_extract(p.metadata, '$.vc') IS NOT NULL",
     )?;
     let calls = stmt.query_map([], |r| {
         Ok((
@@ -988,10 +1005,11 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, String>(4)?,
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     for call in calls {
-        let (path, q, v, fc, target) = call?;
+        let (path, q, v, fc, target, vc) = call?;
         if in_run.contains(&path) || out.contains(&path) {
             continue;
         }
@@ -1005,7 +1023,17 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
             && v.as_deref()
                 .and_then(last)
                 .is_some_and(|class| any.contains(&class) || per_method.contains(&(class, target)));
-        if through_field || by_class {
+        let through_chain = vc
+            .as_deref()
+            .and_then(|vc| serde_json::from_str::<Vec<String>>(vc).ok())
+            .is_some_and(|names| {
+                names.into_iter().any(|n| {
+                    closure(&mut std::iter::once(n))
+                        .iter()
+                        .any(|a| via_keys.contains(a))
+                })
+            });
+        if through_field || by_class || through_chain {
             out.insert(path);
         }
     }
@@ -1750,6 +1778,8 @@ pub(super) struct CppFieldTypes {
     by_last: HashMap<String, Vec<(i64, Vec<String>)>>,
     /// Class node id → direct base class ids (`inherits` edges).
     parents: HashMap<i64, Vec<i64>>,
+    /// (owner class last name, method) → recorded return types.
+    returns: HashMap<(String, String), HashSet<String>>,
 }
 
 impl CppFieldTypes {
@@ -1772,11 +1802,121 @@ impl CppFieldTypes {
         for (sub, sup) in crate::storage::queries::inherits_edges(conn)? {
             parents.entry(sub).or_default().push(sup);
         }
+        let mut returns: HashMap<(String, String), HashSet<String>> = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT n.qualified_name, n.return_type FROM nodes n JOIN files f ON f.id = n.file_id
+             WHERE f.language = 'cpp' AND n.type IN ('function', 'method')
+               AND n.qualified_name LIKE '%.%' AND n.return_type IS NOT NULL",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (q, ret) = row?;
+            if let Some((owner, m)) = q.rsplit_once('.') {
+                if let Some(o) = owner_path(&q).last() {
+                    returns
+                        .entry((o.to_string(), m.to_string()))
+                        .or_default()
+                        .insert(ret);
+                }
+                let _ = owner;
+            }
+        }
         Ok(Self {
             fields,
             by_last,
             parents,
+            returns,
         })
+    }
+
+    /// The class nodes a class spelling names (a `::` path matched by suffix).
+    fn nodes_of(&self, class: &str) -> Vec<i64> {
+        let want = class_path(class);
+        let Some(last) = want.last() else {
+            return Vec::new();
+        };
+        self.by_last
+            .get(*last)
+            .into_iter()
+            .flatten()
+            .filter(|(_, path)| {
+                let k = path.len().min(want.len());
+                path[path.len() - k..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(want[want.len() - k..].iter().copied())
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// The return type of `class.method`, as the class declares it or its
+    /// nearest base does; None unless every class of that spelling agrees.
+    fn return_of(&self, class: &str, method: &str) -> Option<String> {
+        let names: HashMap<i64, &str> = self
+            .by_last
+            .iter()
+            .flat_map(|(last, nodes)| nodes.iter().map(move |(id, _)| (*id, last.as_str())))
+            .collect();
+        let mut found: Vec<&String> = Vec::new();
+        for start in self.nodes_of(class) {
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut stack = vec![start];
+            while let Some(c) = stack.pop() {
+                if !seen.insert(c) {
+                    continue;
+                }
+                let key = (
+                    names.get(&c).copied().unwrap_or_default().to_string(),
+                    method.to_string(),
+                );
+                match self.returns.get(&key) {
+                    Some(types) => found.extend(types.iter()),
+                    None => stack.extend(self.parents.get(&c).into_iter().flatten()),
+                }
+            }
+        }
+        let first = *found.first()?;
+        found.iter().all(|t| *t == first).then(|| first.clone())
+    }
+
+    /// The class a [`CalleeMeta::Via`] chain's receiver has, and every class
+    /// the walk went through (for [`typed_callers_of_class_drift`]).
+    fn walk_via(&self, meta: &serde_json::Value) -> (Option<String>, Vec<String>) {
+        let mut through: Vec<String> = Vec::new();
+        let base = meta.get("b");
+        let ba = meta.get("ba").and_then(|v| v.as_u64()) == Some(1);
+        let mut ty = match (
+            base.and_then(|b| b.get("t")).and_then(|t| t.as_str()),
+            base.and_then(|b| b.get("c")).and_then(|c| c.as_str()),
+            base.and_then(|b| b.get("v")).and_then(|v| v.as_str()),
+        ) {
+            (Some(t), _, _) => Some(t.to_string()),
+            (None, Some(c), Some(v)) => {
+                through.extend(class_path(c).last().map(|l| l.to_string()));
+                self.type_of(c, v, ba)
+            }
+            _ => None,
+        };
+        for step in meta
+            .get("s")
+            .and_then(|s| s.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(t) = ty.take() else { break };
+            through.extend(class_path(&t).last().map(|l| l.to_string()));
+            let (kind, name, arrow) = (
+                step.get(0).and_then(|k| k.as_str()),
+                step.get(1).and_then(|n| n.as_str()),
+                step.get(2).and_then(|a| a.as_u64()) == Some(1),
+            );
+            ty = match (kind, name) {
+                (Some("f"), Some(f)) => self.type_of(&t, f, arrow),
+                (Some("m"), Some(m)) => self.return_of(&t, m),
+                _ => None,
+            };
+        }
+        (ty, through)
     }
 
     /// The class a call through `class::field` names: the field as the class
@@ -1821,6 +1961,25 @@ impl CppFieldTypes {
     /// global, an untyped field). `fc`/`ff` keep the field, for
     /// [`typed_callers_of_class_drift`]. None for any other metadata.
     pub(super) fn rewrite(&self, metadata: Option<&str>) -> Option<String> {
+        if let Some(CalleeMeta::Via) = parse_callee_metadata(metadata) {
+            let meta: serde_json::Value = serde_json::from_str(metadata?).ok()?;
+            let (ty, through) = self.walk_via(&meta);
+            // Only a project class: a primitive or library return type (or a
+            // template parameter recorded as a type) keeps the untyped call.
+            let known = ty.as_deref().and_then(|t| {
+                class_path(t)
+                    .last()
+                    .filter(|l| self.by_last.contains_key(**l))
+                    .map(|_| t.to_string())
+            });
+            return Some(
+                match known {
+                    Some(ty) => serde_json::json!({ "q": "rtype", "v": ty, "vc": through }),
+                    None => serde_json::json!({ "q": "member", "vc": through }),
+                }
+                .to_string(),
+            );
+        }
         let Some(CalleeMeta::Field {
             class,
             field,
@@ -2254,16 +2413,10 @@ fn inherited_or_overridden<'a>(
     let Some(named) = want.last().and_then(|l| by_last.get(*l)) else {
         return RecvTypeTargets::Fallback;
     };
-    let fits: Vec<&ClassNode> = named
-        .iter()
-        .filter(|c| {
-            if want.len() > 1 {
-                c.nested
-            } else {
-                !top_level || !c.nested
-            }
-        })
-        .collect();
+    // A `::` path may be a namespace (`test::ErrorEnv`) as well as an outer
+    // class, so the nesting rule is the one `recv_type_targets` applies to a
+    // bare name: a top-level class answers when one exists.
+    let fits: Vec<&ClassNode> = named.iter().filter(|c| !top_level || !c.nested).collect();
     let caller_file = classes.file_ids.get(caller_path);
     let start = match fits.as_slice() {
         [only] => only.id,

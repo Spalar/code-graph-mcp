@@ -1071,6 +1071,7 @@ pub(super) struct FileIndexed {
 /// else is buffered here and re-run once after the batch loop, when
 /// `global_name_map` finally holds the whole tree
 /// (`resolve_deferred_relations`).
+#[derive(Clone)]
 struct DeferredRelation {
     /// Source node ids resolved at batch time (the source side is same-file,
     /// so it is complete then). Empty only for the `routes_to` imported-handler
@@ -1793,7 +1794,8 @@ fn resolve_batch_relations(
                     }
                     Some(CalleeMeta::RecvType(_))
                     | Some(CalleeMeta::SuperType(_))
-                    | Some(CalleeMeta::Field { .. }) => {
+                    | Some(CalleeMeta::Field { .. })
+                    | Some(CalleeMeta::Via) => {
                         // A field's type is recorded by its class's file, which may
                         // be in a later batch: typed in the deferred pass.
                         // Same partial-view argument as SelfRecv/SelfType
@@ -2465,27 +2467,6 @@ Restart every code-graph server on this project so they run one version.",
     // context strings see the recovered edges.
     let mut deferred_edges = 0usize;
     if !deferred.is_empty() {
-        // Type C++ calls through fields the caller's file never declares, now
-        // that every file of the run has recorded its class fields.
-        let mut field_types: Option<super::resolve::CppFieldTypes> = None;
-        for d in deferred.iter_mut() {
-            if !d
-                .metadata
-                .as_deref()
-                .is_some_and(|m| m.contains(r#""q":"field""#))
-            {
-                continue;
-            }
-            if field_types.is_none() {
-                field_types = Some(super::resolve::CppFieldTypes::load(db.conn())?);
-            }
-            if let Some(m) = field_types
-                .as_ref()
-                .and_then(|t| t.rewrite(d.metadata.as_deref()))
-            {
-                d.metadata = Some(m);
-            }
-        }
         let deferred_count = deferred.len();
         let tx = db.savepoint("idx_deferred")?;
         let (d_edges, d_nodes) = resolve_deferred_relations(
@@ -3253,7 +3234,30 @@ fn resolve_deferred_relations(
         .iter()
         .filter(|d| d.relation != REL_CALLS)
         .chain(deferred.iter().filter(|d| d.relation == REL_CALLS));
+    // Loaded at the first C++ call through a field or a chain, which comes after
+    // every other relation: the `inherits` edges its bases are read from may be
+    // among this pass's own (a full index defers every cross-file one), and a
+    // load before them typed differently from an incremental run.
+    let mut field_types: Option<super::resolve::CppFieldTypes> = None;
+    let mut typed_call: DeferredRelation;
     for d in ordered {
+        let d = if d.relation == REL_CALLS
+            && d.metadata
+                .as_deref()
+                .is_some_and(|m| m.contains(r#""q":"field""#) || m.contains(r#""q":"via""#))
+        {
+            if field_types.is_none() {
+                field_types = Some(super::resolve::CppFieldTypes::load(db.conn())?);
+            }
+            typed_call = d.clone();
+            typed_call.metadata = field_types
+                .as_ref()
+                .and_then(|t| t.rewrite(d.metadata.as_deref()))
+                .or_else(|| d.metadata.clone());
+            &typed_call
+        } else {
+            d
+        };
         // routes_to whose imported-handler source never resolved at batch time.
         let source_ids: Vec<i64> = if d.relation == REL_ROUTES_TO && d.source_ids.is_empty() {
             let all = name_to_ids.get(&d.source_name).cloned().unwrap_or_default();
