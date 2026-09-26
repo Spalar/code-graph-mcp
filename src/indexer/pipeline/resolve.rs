@@ -2165,6 +2165,74 @@ mod tests {
             );
         }
 
+        /// Three same-named classes `A` define `f`, none in the caller's file: the
+        /// class does not decide, so the sweep binds all three (no proximity
+        /// refinement, which would keep only `app/sub/a.py`'s) and marks each edge
+        /// `amb`, as the deferred pass's `RecvTypeTargets::Ambiguous` arm does.
+        #[test]
+        fn pending_sweep_typed_call_on_same_named_classes_binds_all_marked_amb() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app/main.py");
+            let caller = method(conn, "run", None, f_app);
+            let mut want = Vec::new();
+            for path in ["app/sub/a.py", "x/a.py", "y/z/a.py"] {
+                let file = pyfile(conn, path);
+                insert_node(
+                    conn,
+                    &NodeRecord {
+                        file_id: file,
+                        node_type: "class".into(),
+                        name: "A".into(),
+                        qualified_name: Some("A".into()),
+                        start_line: 1,
+                        end_line: 3,
+                        code_content: "class A: pass".into(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: None,
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )
+                .unwrap();
+                want.push(method(conn, "f", Some("A.f"), file));
+            }
+            insert_pending_unresolved_call(
+                conn,
+                caller,
+                "f",
+                "python",
+                Some(r#"{"q":"rtype","v":"A"}"#),
+            )
+            .unwrap();
+
+            resolve_pending_calls(&db, &Default::default()).unwrap();
+            want.sort_unstable();
+            assert_eq!(
+                call_targets(conn, caller),
+                want,
+                "all three `A.f`, unrefined"
+            );
+            let metas: Vec<String> = conn
+                .prepare("SELECT metadata FROM edges WHERE source_id = ?1")
+                .unwrap()
+                .query_map([caller], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(metas.len(), 3);
+            for m in &metas {
+                assert_eq!(
+                    m, r#"{"amb":1,"q":"rtype","v":"A"}"#,
+                    "undecided bind keeps its type, marked"
+                );
+            }
+        }
+
         /// Bare (no-qualifier) pending calls keep the existing behavior: a unique
         /// same-language target still resolves. Negative control — proves the
         /// qualifier gate doesn't break the common bare path.
