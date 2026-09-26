@@ -379,7 +379,18 @@ pub(super) fn resolve_pending_calls_touching(
                                 node_id_to_path.get(id).map(String::as_str) == Some(caller_path)
                             })
                             .collect();
-                        if !local.is_empty() || caller_shares_name {
+                        // The deferred pass's same-file tier holds member
+                        // candidates only: a free function named like the method
+                        // is not in it, so it does not stop the cross-file pool.
+                        let caller_in_tier = caller_shares_name
+                            && !classes
+                                .member_call_candidates(
+                                    db,
+                                    row.metadata.as_deref(),
+                                    vec![row.source_id],
+                                )?
+                                .is_empty();
+                        if !local.is_empty() || caller_in_tier {
                             refine = false;
                             local
                         } else if crate::domain::is_cross_file_call_noise(
@@ -2100,6 +2111,57 @@ mod tests {
                 list_pending_unresolved_calls(conn).unwrap().len(),
                 0,
                 "the resolved pending row must be drained"
+            );
+        }
+
+        /// A typed call whose class lacks the method resolves as the untyped member
+        /// call it is. The deferred pass's same-file tier holds member candidates
+        /// only, so a FREE function named like the method (`def f(): a.f()`) is not
+        /// in it and the call binds cross-file. The sweep counted the caller as a
+        /// same-file candidate by name alone and bound nothing (D#97).
+        #[test]
+        fn pending_sweep_fallback_free_function_caller_binds_cross_file() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app.py");
+            let f_other = pyfile(conn, "other.py");
+            let caller = method(conn, "f", None, f_app);
+            insert_node(
+                conn,
+                &NodeRecord {
+                    file_id: f_app,
+                    node_type: "class".into(),
+                    name: "A".into(),
+                    qualified_name: Some("A".into()),
+                    start_line: 5,
+                    end_line: 6,
+                    code_content: "class A: pass".into(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
+            let b_f = method(conn, "f", Some("B.f"), f_other);
+            insert_pending_unresolved_call(
+                conn,
+                caller,
+                "f",
+                "python",
+                Some(r#"{"q":"rtype","v":"A"}"#),
+            )
+            .unwrap();
+
+            resolve_pending_calls(&db, &Default::default()).unwrap();
+            assert_eq!(
+                call_targets(conn, caller),
+                vec![b_f],
+                "a free-function caller is no same-file member candidate"
             );
         }
 

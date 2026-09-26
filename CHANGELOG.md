@@ -6,6 +6,14 @@
 `INDEX_VERSION` goes 74 → 75 because the C++ fix below changes which `calls`
 edges a file produces.
 
+### A buffered typed call from a free function binds like a rebuild
+
+A typed call whose class lacks the method (`def f(): a = A(); a.f()`, with
+`A` defining no `f`) resolves as an untyped member call. When such a call waited
+in the pending buffer and its caller was a free function named like the
+method, the incremental sweep counted the caller as a same-file candidate and
+bound nothing, while a rebuild binds the method in the other file.
+
 ### A C++ local constructed with arguments is typed
 
 `ModelDB model(CurrentOptions());` and `Block block(contents);` parse as
