@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 74 → 75 because the C++ fix below changes which `calls`
+edges a file produces.
+
+### A C++ local constructed with arguments is typed
+
+`ModelDB model(CurrentOptions());` and `Block block(contents);` parse as
+function declarations, a C++ ambiguity known as the most vexing parse, so
+`model.Put()` was an untyped member call and bound every `Put` in the file. Inside a
+function body such a line declares a variable, and the call now binds that
+class's method. On leveldb, scored against SCIP, same-file precision goes
+from 1484/1563 to 1484/1559 and the `inferred` tier from 1355/1395 to 1361/1401
+(recall 2620 → 2626 of 3431). `T f(args);` in a class body is still a method
+declaration.
+
 ### Two read-fanout hints in one Bash call reach the model
 
 A compound command whose `sed -n` range reads pushed two directories past the

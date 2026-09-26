@@ -765,6 +765,35 @@ fn test_member_call_on_an_object_is_marked_member() {
 }
 
 #[test]
+fn test_cpp_direct_initialized_local_is_typed() {
+    // `ModelDB model(CurrentOptions());` and `Block block(contents);` parse as a
+    // function declarator (C++'s most vexing parse), yet inside a function body
+    // they declare a variable of that type: leveldb had 10 wrong edges from them.
+    let cpp = call_meta(
+        "void F() {\n  ModelDB model(CurrentOptions());\n  Block block(contents);\n  \
+         Slice s(\"x\");\n  Arena* a(NewArena());\n  \
+         model.Put(1);\n  block.NewIterator();\n  s.size();\n  a->Allocate(1);\n}\n",
+        "cpp",
+    );
+    assert_eq!(meta_of(&cpp, "Put"), Some(r#"{"q":"rtype","v":"ModelDB"}"#));
+    assert_eq!(
+        meta_of(&cpp, "NewIterator"),
+        Some(r#"{"q":"rtype","v":"Block"}"#)
+    );
+    assert_eq!(meta_of(&cpp, "size"), Some(r#"{"q":"rtype","v":"Slice"}"#));
+    assert_eq!(
+        meta_of(&cpp, "Allocate"),
+        Some(r#"{"q":"rtype","v":"Arena"}"#)
+    );
+    // In a class body the same shape is a method, not a field.
+    let cpp = call_meta(
+        "class A {\n  Block block(int n);\n  void f() { block.NewIterator(); }\n};\n",
+        "cpp",
+    );
+    assert_eq!(meta_of(&cpp, "NewIterator"), Some(MEMBER));
+}
+
+#[test]
 fn test_extract_bash_source_imports() {
     let code = r#"#!/usr/bin/env bash
 source ./lib/utils.sh

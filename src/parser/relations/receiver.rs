@@ -206,7 +206,7 @@ fn collect_cpp_decl_types<'a>(
             | "declaration"
             | "for_range_loop"
     ) {
-        declared_types(node, name, source, out);
+        declared_types(node, name, source, node.kind() == "declaration", out);
     }
     for i in 0..node.named_child_count() {
         if let Some(c) = node.named_child(i) {
@@ -224,23 +224,27 @@ fn collect_cpp_field_types<'a>(
     for i in 0..body.named_child_count() {
         if let Some(c) = body.named_child(i) {
             if c.kind() == "field_declaration" {
-                declared_types(c, name, source, out);
+                declared_types(c, name, source, false, out);
             }
         }
     }
 }
 
-/// One entry per declarator of `decl` that declares `name`.
+/// One entry per declarator of `decl` that declares `name`. `local`: `decl` is
+/// a declaration inside a function body, where `T x(args);` declares a variable
+/// even though it parses as a function declarator (C++'s most vexing parse:
+/// `ModelDB model(CurrentOptions());`). In a class body it is a method.
 fn declared_types<'a>(
     decl: tree_sitter::Node<'a>,
     name: &str,
     source: &str,
+    local: bool,
     out: &mut Vec<Decl<'a>>,
 ) {
     let ty = decl.child_by_field_name("type");
     let mut cursor = decl.walk();
     for d in decl.children_by_field_name("declarator", &mut cursor) {
-        match declares(d, name, source, false, 0) {
+        match declares(d, name, source, false, local, 0) {
             Some(Some(pointer)) => out.push(ty.map(|t| (t, pointer))),
             Some(None) => out.push(None),
             None => {}
@@ -255,6 +259,7 @@ fn declares(
     name: &str,
     source: &str,
     pointer: bool,
+    local: bool,
     depth: usize,
 ) -> Option<Option<bool>> {
     if depth > MAX_SUBTREE_DEPTH {
@@ -269,6 +274,7 @@ fn declares(
             name,
             source,
             true,
+            local,
             depth + 1,
         ),
         "init_declarator" => declares(
@@ -276,10 +282,22 @@ fn declares(
             name,
             source,
             pointer,
+            local,
+            depth + 1,
+        ),
+        // A local `T x(args);` / `T* p(args);`: see [`declared_types`].
+        "function_declarator" if local => declares(
+            d.child_by_field_name("declarator")?,
+            name,
+            source,
+            pointer,
+            local,
             depth + 1,
         ),
         // `T& x` / `T&& x`: the declarator is the node's only named child.
-        "reference_declarator" => declares(d.named_child(0)?, name, source, pointer, depth + 1),
+        "reference_declarator" => {
+            declares(d.named_child(0)?, name, source, pointer, local, depth + 1)
+        }
         _ => mentions(d, name, source, depth).then_some(None),
     }
 }
