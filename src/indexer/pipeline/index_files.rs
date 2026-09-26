@@ -31,7 +31,9 @@ use crate::domain::{
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::hash_file;
-use crate::parser::relations::extract_relations_from_tree;
+use crate::parser::relations::{
+    cpp_class_fields, extract_relations_from_tree, CppField, ParsedRelation,
+};
 use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree};
 use crate::storage::db::Database;
 use crate::storage::queries::{
@@ -232,10 +234,16 @@ struct FilePreParsed {
     rel_path: String,
     source: String,
     language: String,
-    tree: tree_sitter::Tree,
     hash: String,
     last_modified: i64,
     parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+    /// The file's relations, extracted here beside its nodes: a pure function
+    /// of the tree, and the costliest one (django: 3.6 s of a 12.5 s full index
+    /// while it ran sequentially in Phase 2). The tree is dropped with the
+    /// worker's closure instead of being held through Phase 2.
+    relations: Vec<ParsedRelation>,
+    /// C++ only: each class body's typed fields (`record_cpp_fields`).
+    cpp_fields: Vec<CppField>,
     /// This file's tree carried ERROR node(s). Travels beside the `parse_errors`
     /// counter rather than replacing it: the counter is this run's total, this
     /// flag is which file, and only the second can be folded into the index's
@@ -246,14 +254,14 @@ struct FilePreParsed {
 }
 
 // Heavyweight per-file data used during Phase 1+2, dropped after each batch.
-// No blanket `#[allow(dead_code)]`: all nine fields have real readers, and the
+// No blanket `#[allow(dead_code)]`: every field has a real reader, and the
 // allow was suppressing FIELD-level dead-code detection for the struct that
 // carries a whole batch's parse state (audit 2026-08-29 ARC-04).
 struct FileParsed {
     rel_path: String,
-    source: String,
     language: String,
-    tree: tree_sitter::Tree,
+    relations: Vec<ParsedRelation>,
+    cpp_fields: Vec<CppField>,
     file_id: i64,
     node_ids: Vec<i64>,
     node_names: Vec<String>,
@@ -369,8 +377,26 @@ enum PreParseOutcome {
     Nothing,
 }
 
+/// Phase 1a's workers. They run the relation walk, which recurses to
+/// `MAX_RELATION_DEPTH`, so they get the index thread's stack budget
+/// ([`crate::domain::INDEX_THREAD_STACK_SIZE`]) instead of rayon's default,
+/// `thread::spawn`'s 2 MiB. None when the pool cannot be built: Phase 1a then
+/// runs on the calling thread.
+fn parse_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("code-graph-parse-{i}"))
+            .stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)
+            .build()
+            .map_err(|e| tracing::warn!("[index] parse pool unavailable, parsing serially: {e}"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Phase 1a: the parallel, CPU-bound half of indexing one batch — read, parse,
-/// extract nodes. Touches no DB state (Phase 1b does the inserts sequentially),
+/// extract nodes and relations. Touches no DB state (Phase 1b does the inserts sequentially),
 /// which is what makes it safe to fan out over rayon. Files it cannot handle
 /// are counted in `counters`; those whose hash is nonetheless known come back
 /// as [`SkippedFile`] so Phase 1b can record them instead of leaving stale
@@ -381,172 +407,180 @@ fn pre_parse_batch(
     hashes: &HashMap<String, String>,
     counters: &SkipCounters,
 ) -> PreParsed {
-    let outcomes: Vec<PreParseOutcome> = batch
-        .par_iter()
-        .map(|rel_path| {
-            let mut language = match detect_language(rel_path) {
-                Some(l) => l,
-                None => {
-                    counters.language.fetch_add(1, AtomicOrdering::Relaxed);
-                    return PreParseOutcome::Nothing;
-                }
-            };
-            let abs_path = root.join(rel_path);
-
-            let file_meta = std::fs::metadata(&abs_path).ok();
-            let last_modified = file_meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            // Resolve the hash up front so an oversize file can still be
-            // RECORDED (we know exactly which bytes we are declining to parse).
-            // Falls back to hashing only when the caller did not supply one.
-            // A caller with hashes already in hand (the incremental paths, the
-            // query-time refresh) supplies them; a full index does not, and for
-            // those the hash comes from the bytes read below rather than from a
-            // second full read of the same file (audit 2026-08-22 P2-16).
-            let provided_hash = hashes.get(rel_path.as_str()).cloned();
-            if let Some(ref meta) = file_meta {
-                if meta.len() > max_file_size() {
-                    tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
-                    counters.size.fetch_add(1, AtomicOrdering::Relaxed);
-                    // This branch never reads the file, so an unsupplied hash
-                    // still costs one read — unchanged from before, and it
-                    // applies only to files we refuse to parse.
-                    let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
-                    return match known_hash {
-                        Some(hash) => PreParseOutcome::Skipped(SkippedFile {
-                            rel_path: rel_path.clone(),
-                            hash,
-                            last_modified,
-                            language: language.to_string(),
-                        }),
-                        None => PreParseOutcome::Nothing,
-                    };
-                }
+    let parse_one = |rel_path: &String| {
+        let mut language = match detect_language(rel_path) {
+            Some(l) => l,
+            None => {
+                counters.language.fetch_add(1, AtomicOrdering::Relaxed);
+                return PreParseOutcome::Nothing;
             }
+        };
+        let abs_path = root.join(rel_path);
 
-            // Read as BYTES, then decode — so the encoding verdict and the hash we
-            // record come from the SAME read and cannot describe different content.
-            //
-            // The first cut used `read_to_string` and, on failure, `hash_file`,
-            // which is an independent second `File::open` (merkle.rs). Its comment
-            // claimed that "succeeds exactly where the failure was an encoding one";
-            // it does not — it succeeds wherever the bytes are readable at that
-            // later moment, a strictly larger set. So a TRANSIENT first-read failure
-            // (fd exhaustion under this rayon fan-out, an EIO blip, a concurrent
-            // non-atomic writer caught mid-multibyte) would fail read 1, succeed
-            // read 2, and record a `files` row whose hash matches what is on disk —
-            // after `buffer_then_delete_files` had already purged the file's
-            // symbols. `compute_diff` then sees it as unchanged and never re-offers
-            // it, so the symbols stay gone until the content changes again or
-            // INDEX_VERSION moves. Under the old `Nothing` that case was
-            // self-healing (pre-tag review P2-2).
-            //
-            // One read makes the two agree by construction: an identity is recorded
-            // only for bytes actually held.
-            let bytes = match read_source_bytes(&abs_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("Skipping file {}: {}", rel_path, e);
-                    counters.read.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Genuinely unreadable — deleted mid-scan, EACCES, EIO. No bytes
-                    // in hand, so no identity can honestly be claimed: keep the old
-                    // `Nothing` and let the file re-diff until a read succeeds.
-                    return PreParseOutcome::Nothing;
-                }
-            };
-            let source = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        "Skipping file {}: not valid UTF-8 ({})",
-                        rel_path,
-                        e.utf8_error()
-                    );
-                    counters.read.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Same reasoning as the parse-failure branch below: the file
-                    // exists and we hold exactly the bytes we are declining, so
-                    // record the identity. Without it a Latin-1 source (legacy
-                    // C/C++/Java trees) was listed as changed on EVERY run forever,
-                    // and symbols indexed before the file stopped being UTF-8 were
-                    // never purged (audit 2026-09-02 P2-1).
-                    //
-                    // Hashed from `e.as_bytes()` rather than `provided_hash`: the
-                    // scan's hash was taken earlier and may already describe
-                    // different content, which is the same disagreement this branch
-                    // exists to avoid.
-                    return PreParseOutcome::Skipped(SkippedFile {
-                        rel_path: rel_path.clone(),
-                        hash: crate::indexer::merkle::hash_bytes(e.as_bytes()),
-                        last_modified,
-                        language: language.to_string(),
-                    });
-                }
-            };
-
-            // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
-            // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
-            // declared in a `.h` header (the MOST common C++ layout) — and their
-            // base-class `inherits` edges — were silently dropped. When the header's
-            // content actually contains C++ constructs, parse it as C++ so those
-            // symbols are captured. Gated on markers so a pure-C header stays C;
-            // false positives are low-harm (the C++ grammar is a near-superset of C).
-            if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
-                language = "cpp";
-            }
-
-            // `read_to_string` succeeded, so these bytes ARE the file's bytes —
-            // `hash_file` streams the same content through the same hasher.
-            let hash = provided_hash
-                .unwrap_or_else(|| blake3::hash(source.as_bytes()).to_hex().to_string());
-
-            let tree = match parse_tree(&source, language) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Parse failed for {}: {}", rel_path, e);
-                    counters.parse.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Readable and hashed, just not parseable by this grammar:
-                    // record the identity so its stale symbols go away and the
-                    // file stops re-diffing on every run.
-                    return PreParseOutcome::Skipped(SkippedFile {
+        let file_meta = std::fs::metadata(&abs_path).ok();
+        let last_modified = file_meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Resolve the hash up front so an oversize file can still be
+        // RECORDED (we know exactly which bytes we are declining to parse).
+        // Falls back to hashing only when the caller did not supply one.
+        // A caller with hashes already in hand (the incremental paths, the
+        // query-time refresh) supplies them; a full index does not, and for
+        // those the hash comes from the bytes read below rather than from a
+        // second full read of the same file (audit 2026-08-22 P2-16).
+        let provided_hash = hashes.get(rel_path.as_str()).cloned();
+        if let Some(ref meta) = file_meta {
+            if meta.len() > max_file_size() {
+                tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
+                counters.size.fetch_add(1, AtomicOrdering::Relaxed);
+                // This branch never reads the file, so an unsupplied hash
+                // still costs one read — unchanged from before, and it
+                // applies only to files we refuse to parse.
+                let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
+                return match known_hash {
+                    Some(hash) => PreParseOutcome::Skipped(SkippedFile {
                         rel_path: rel_path.clone(),
                         hash,
                         last_modified,
                         language: language.to_string(),
-                    });
-                }
-            };
+                    }),
+                    None => PreParseOutcome::Nothing,
+                };
+            }
+        }
 
-            // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
-            // nodes and still returning a tree, so parse "succeeds" but symbol
-            // extraction below runs over a damaged parse and can silently drop
-            // symbols. Surface it: warn once per file and count the pass total.
-            let has_parse_errors = tree.root_node().has_error();
-            if has_parse_errors {
+        // Read as BYTES, then decode — so the encoding verdict and the hash we
+        // record come from the SAME read and cannot describe different content.
+        //
+        // The first cut used `read_to_string` and, on failure, `hash_file`,
+        // which is an independent second `File::open` (merkle.rs). Its comment
+        // claimed that "succeeds exactly where the failure was an encoding one";
+        // it does not — it succeeds wherever the bytes are readable at that
+        // later moment, a strictly larger set. So a TRANSIENT first-read failure
+        // (fd exhaustion under this rayon fan-out, an EIO blip, a concurrent
+        // non-atomic writer caught mid-multibyte) would fail read 1, succeed
+        // read 2, and record a `files` row whose hash matches what is on disk —
+        // after `buffer_then_delete_files` had already purged the file's
+        // symbols. `compute_diff` then sees it as unchanged and never re-offers
+        // it, so the symbols stay gone until the content changes again or
+        // INDEX_VERSION moves. Under the old `Nothing` that case was
+        // self-healing (pre-tag review P2-2).
+        //
+        // One read makes the two agree by construction: an identity is recorded
+        // only for bytes actually held.
+        let bytes = match read_source_bytes(&abs_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Skipping file {}: {}", rel_path, e);
+                counters.read.fetch_add(1, AtomicOrdering::Relaxed);
+                // Genuinely unreadable — deleted mid-scan, EACCES, EIO. No bytes
+                // in hand, so no identity can honestly be claimed: keep the old
+                // `Nothing` and let the file re-diff until a read succeeds.
+                return PreParseOutcome::Nothing;
+            }
+        };
+        let source = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
                 tracing::warn!(
+                    "Skipping file {}: not valid UTF-8 ({})",
+                    rel_path,
+                    e.utf8_error()
+                );
+                counters.read.fetch_add(1, AtomicOrdering::Relaxed);
+                // Same reasoning as the parse-failure branch below: the file
+                // exists and we hold exactly the bytes we are declining, so
+                // record the identity. Without it a Latin-1 source (legacy
+                // C/C++/Java trees) was listed as changed on EVERY run forever,
+                // and symbols indexed before the file stopped being UTF-8 were
+                // never purged (audit 2026-09-02 P2-1).
+                //
+                // Hashed from `e.as_bytes()` rather than `provided_hash`: the
+                // scan's hash was taken earlier and may already describe
+                // different content, which is the same disagreement this branch
+                // exists to avoid.
+                return PreParseOutcome::Skipped(SkippedFile {
+                    rel_path: rel_path.clone(),
+                    hash: crate::indexer::merkle::hash_bytes(e.as_bytes()),
+                    last_modified,
+                    language: language.to_string(),
+                });
+            }
+        };
+
+        // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
+        // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
+        // declared in a `.h` header (the MOST common C++ layout) — and their
+        // base-class `inherits` edges — were silently dropped. When the header's
+        // content actually contains C++ constructs, parse it as C++ so those
+        // symbols are captured. Gated on markers so a pure-C header stays C;
+        // false positives are low-harm (the C++ grammar is a near-superset of C).
+        if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
+            language = "cpp";
+        }
+
+        // `read_to_string` succeeded, so these bytes ARE the file's bytes —
+        // `hash_file` streams the same content through the same hasher.
+        let hash =
+            provided_hash.unwrap_or_else(|| blake3::hash(source.as_bytes()).to_hex().to_string());
+
+        let tree = match parse_tree(&source, language) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Parse failed for {}: {}", rel_path, e);
+                counters.parse.fetch_add(1, AtomicOrdering::Relaxed);
+                // Readable and hashed, just not parseable by this grammar:
+                // record the identity so its stale symbols go away and the
+                // file stops re-diffing on every run.
+                return PreParseOutcome::Skipped(SkippedFile {
+                    rel_path: rel_path.clone(),
+                    hash,
+                    last_modified,
+                    language: language.to_string(),
+                });
+            }
+        };
+
+        // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
+        // nodes and still returning a tree, so parse "succeeds" but symbol
+        // extraction below runs over a damaged parse and can silently drop
+        // symbols. Surface it: warn once per file and count the pass total.
+        let has_parse_errors = tree.root_node().has_error();
+        if has_parse_errors {
+            tracing::warn!(
                     "Syntax errors in {} — symbols may be incomplete (parsed with tree-sitter error recovery)",
                     rel_path
                 );
-                counters.parse_errors.fetch_add(1, AtomicOrdering::Relaxed);
-            }
+            counters.parse_errors.fetch_add(1, AtomicOrdering::Relaxed);
+        }
 
-            let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+        let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+        let relations = extract_relations_from_tree(&tree, &source, language);
+        let cpp_fields = if language == "cpp" {
+            cpp_class_fields(&tree, &source)
+        } else {
+            Vec::new()
+        };
 
-            PreParseOutcome::Parsed(Box::new(FilePreParsed {
-                rel_path: rel_path.clone(),
-                source,
-                language: language.to_string(),
-                tree,
-                hash,
-                last_modified,
-                parsed_nodes,
-                has_parse_errors,
-            }))
-        })
-        .collect();
+        PreParseOutcome::Parsed(Box::new(FilePreParsed {
+            rel_path: rel_path.clone(),
+            source,
+            language: language.to_string(),
+            hash,
+            last_modified,
+            parsed_nodes,
+            has_parse_errors,
+            relations,
+            cpp_fields,
+        }))
+    };
+    let outcomes: Vec<PreParseOutcome> = match parse_pool() {
+        Some(pool) => pool.install(|| batch.par_iter().map(parse_one).collect()),
+        None => batch.iter().map(parse_one).collect(),
+    };
 
     let mut out = PreParsed::default();
     for outcome in outcomes {
@@ -701,9 +735,9 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
 
         parsed.push(FileParsed {
             rel_path: pp.rel_path,
-            source: pp.source,
             language: pp.language,
-            tree: pp.tree,
+            relations: pp.relations,
+            cpp_fields: pp.cpp_fields,
             file_id,
             node_ids,
             node_names,
@@ -1136,7 +1170,7 @@ struct BatchRelations {
 /// class body. A class specifier's node is the innermost same-named class-like
 /// node whose lines contain it.
 fn record_cpp_fields(db: &Database, pf: &FileParsed) -> Result<()> {
-    let fields = crate::parser::relations::cpp_class_fields(&pf.tree, &pf.source);
+    let fields = &pf.cpp_fields;
     if fields.is_empty() {
         return Ok(());
     }
@@ -1153,7 +1187,7 @@ fn record_cpp_fields(db: &Database, pf: &FileParsed) -> Result<()> {
             .min_by_key(|&i| pf.node_lines[i].1 - pf.node_lines[i].0)
             .map(|i| pf.node_ids[i]);
         if let Some(class_id) = class_id {
-            rows.push((class_id, f.field, f.dot, f.arrow));
+            rows.push((class_id, f.field.clone(), f.dot.clone(), f.arrow.clone()));
         }
     }
     crate::storage::queries::insert_cpp_fields(db.conn(), &rows)
@@ -1228,7 +1262,7 @@ fn resolve_batch_relations(
     // Loaded on the first supertype relation: this batch's nodes are inserted.
     let mut callable_ids: Option<HashSet<i64>> = None;
     for pf in batch_parsed {
-        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        let relations = &pf.relations;
         if pf.language == "cpp" {
             record_cpp_fields(db, pf)?;
         }
@@ -1246,7 +1280,7 @@ fn resolve_batch_relations(
         // resolved file path, so `m.foo()` member calls (CalleeMeta::Receiver)
         // bind to the required module in the call-resolution pass below.
         let mut ns_module_map: HashMap<String, String> = HashMap::new();
-        for rel in &relations {
+        for rel in relations {
             if rel.relation != REL_IMPORTS {
                 continue;
             }
@@ -1271,7 +1305,7 @@ fn resolve_batch_relations(
             }
         }
 
-        for rel in &relations {
+        for rel in relations {
             // Contract: extract_relations_from_tree stamps every relation with
             // source_language equal to the language argument. The
             // same-language resolution at line 811+ depends on it. Hard
@@ -2440,7 +2474,7 @@ Restart every code-graph server on this project so they run one version.",
                 node_ids: pf.node_ids,
                 node_names: pf.node_names,
             });
-            // pf.tree and pf.source are dropped here — memory freed
+            // pf.relations are dropped here — memory freed
         }
 
         // Report progress after each batch

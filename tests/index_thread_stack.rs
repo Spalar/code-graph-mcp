@@ -117,3 +117,78 @@ fn startup_index_thread_declares_its_stack_size() {
          stack is below the unoptimized peak of the relation walk)"
     );
 }
+
+/// Phase 1a extracts relations on its worker threads, not on the index thread.
+/// The index here runs on a thread sized like the startup one, so the parse
+/// workers are the only threads this input can overflow. Measured need of this
+/// walk in an unoptimized build: between 512 KiB and 1 MiB, so it would also
+/// pass on rayon's 2 MiB default today; the budget itself is pinned by
+/// `parse_workers_declare_their_stack_size` below.
+#[test]
+fn relation_walk_survives_depth_cap_in_the_parse_workers() {
+    use code_graph_mcp::indexer::pipeline::run_full_index;
+    use code_graph_mcp::storage::db::Database;
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("deep.js"),
+        format!(
+            "function g(x) {{ return x; }}\n{}\n",
+            nested_calls(MAX_RELATION_DEPTH * 2)
+        ),
+    )
+    .unwrap();
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("index.db");
+    let root = project.path().to_path_buf();
+
+    let calls = std::thread::Builder::new()
+        .stack_size(INDEX_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let db = Database::open(&db_path).unwrap();
+            run_full_index(&db, &root, None, None).unwrap();
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id = e.target_id
+                     WHERE e.relation = 'calls' AND t.name = 'g'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        })
+        .expect("spawn sized index thread")
+        .join()
+        .expect("index must not unwind");
+    // The file was indexed: `<module>` calls `g`.
+    assert_eq!(calls, 1);
+}
+
+/// Phase 1a's pool must keep an explicit stack size: rayon's default worker
+/// stack is `thread::spawn`'s 2 MiB, and the relation walk runs there.
+#[test]
+fn parse_workers_declare_their_stack_size() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/indexer/pipeline/index_files.rs");
+    let src = std::fs::read_to_string(&path).expect("read index_files.rs");
+    let body = |name: &str| {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found in {}", path.display()));
+        let rest = &src[start..];
+        rest[..rest.find("\n}\n").expect("function end")].to_string()
+    };
+    assert!(
+        body("parse_pool").contains(".stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)"),
+        "parse_pool must pass domain::INDEX_THREAD_STACK_SIZE to ThreadPoolBuilder::stack_size"
+    );
+    let pre_parse = body("pre_parse_batch");
+    assert!(
+        pre_parse.contains("pool.install("),
+        "pre_parse_batch must run its parallel iterator inside parse_pool's pool"
+    );
+    assert_eq!(
+        pre_parse.matches("par_iter()").count(),
+        1,
+        "pre_parse_batch must have exactly one parallel iterator, the one inside pool.install"
+    );
+}

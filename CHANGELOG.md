@@ -6,6 +6,34 @@
 `INDEX_VERSION` goes 74 → 78 because the fixes below change which `calls` and
 `inherits` edges a file produces.
 
+### A full index is faster than 0.157.0 again
+
+0.158.0 made a full index 7% slower on django, 11% on hono and 21% on leveldb,
+and the typing fixes below added more. Timers on each phase put most of the
+time in reading each file's calls and imports from its syntax tree: 3.6 s of
+django's 12.5 s, 400 of hono's 905 ms and 220 of leveldb's 640 ms. That step
+ran one file at a time, after the file's symbols were stored. It now runs on
+the parser's worker threads beside symbol extraction. The worker threads get
+the same 8 MiB stack as the index thread, because this step recurses once per
+syntax level.
+
+Full index, median of interleaved runs (3 for django, 5 otherwise), against
+0.157.0:
+
+| | 0.157.0 | before this change | now |
+|---|---|---|---|
+| django (3,290 files) | 11.9 s | 12.6 s | 9.4 s |
+| hono | 792 ms | 919 ms | 558 ms |
+| leveldb | 508 ms | 636 ms | 447 ms |
+
+Peak memory drops too: django from 471 to 457 MiB, hono from 107 to 76 MiB,
+leveldb from 61 to 51 MiB, because each syntax tree is freed once its file is
+read instead of being held until its batch is resolved. The graph is identical.
+Every edge, buffered call, recorded field, symbol and context string matches
+on django, hono, express, flask, leveldb and this repository. A one-file edit
+on django takes the same time: 498 → 504 ms median of 9, within both runs'
+spread; a no-op run takes 95 → 94 ms.
+
 ### A C++ call through a chain of fields and calls is typed
 
 `r->index_block.Add()`, `versions_->current()->Ref()` and
