@@ -23,7 +23,9 @@
 //! (`CallCtx`) — splitting THAT per language would duplicate the walk.
 
 use super::helpers::{self, extract_callee, extract_string_from_subtree};
-use super::{node_text, serialize_callee_qualifier, serialize_rtype_metadata};
+use super::{
+    node_text, serialize_callee_qualifier, serialize_field_metadata, serialize_rtype_metadata,
+};
 use super::{LangKey, LanguageConfig, ParsedRelation};
 use crate::domain::{REL_CALLS, REL_IMPORTS};
 
@@ -380,8 +382,15 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 let receiver_type = unqualified
                     .then(|| super::receiver::receiver_type(node, source, ctx.config.name))
                     .flatten();
+                // A field the enclosing function cannot see declared (an
+                // out-of-line member, a gtest body): typed at resolution.
+                let field = (receiver_type.is_none() && member)
+                    .then(|| super::receiver::cpp_field_receiver(node, source, ctx.config.name))
+                    .flatten();
                 let metadata = if let Some(ty) = receiver_type {
                     Some(serialize_rtype_metadata(&ty))
+                } else if let Some((class, field, arrow)) = field {
+                    Some(serialize_field_metadata(&class, &field, arrow))
                 } else if member {
                     Some(super::member::MEMBER_META.to_string())
                 } else if ctx.config.name == "cpp" && is_cpp_scoped_call(node) {

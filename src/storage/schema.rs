@@ -187,6 +187,21 @@ CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
 CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
 CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);
+
+-- C++ class fields and the class a call through each names (`dot` for `x.f()`,
+-- `arrow` for `x->f()`), recorded from the class body's own file. A member
+-- function defined outside its class (`DBImpl::Get` in db_impl.cc, the fields in
+-- db_impl.h) or a gtest `TEST_F` body calls through fields its own file never
+-- declares; the resolver types those calls from here. Keyed on the class node,
+-- so re-indexing or deleting the class's file clears its rows. Additive: created
+-- IF NOT EXISTS on an older database, and filled by the INDEX_VERSION rebuild.
+CREATE TABLE IF NOT EXISTS cpp_fields (
+    class_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    field      TEXT NOT NULL,
+    dot_type   TEXT,
+    arrow_type TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cpp_fields_class ON cpp_fields(class_id);
 "#
     )
 }

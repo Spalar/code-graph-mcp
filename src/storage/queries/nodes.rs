@@ -1008,6 +1008,27 @@ pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Ve
     Ok(kept)
 }
 
+/// A recorded C++ field: `(class node id, field, dot type, arrow type)`.
+pub type CppFieldRow = (i64, String, Option<String>, Option<String>);
+
+/// Record C++ class fields.
+pub fn insert_cpp_fields(conn: &Connection, rows: &[CppFieldRow]) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO cpp_fields (class_id, field, dot_type, arrow_type) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (class_id, field, dot, arrow) in rows {
+        stmt.execute(rusqlite::params![class_id, field, dot, arrow])?;
+    }
+    Ok(())
+}
+
+/// Every recorded C++ field.
+pub fn cpp_fields(conn: &Connection) -> Result<Vec<CppFieldRow>> {
+    let mut stmt = conn.prepare("SELECT class_id, field, dot_type, arrow_type FROM cpp_fields")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Node types that define a class-like type, for receiver-type resolution.
 const CLASS_LIKE_TYPES: &str = "('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')";
 

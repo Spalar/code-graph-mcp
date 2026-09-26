@@ -57,6 +57,7 @@ mod java;
 mod member;
 mod python;
 mod receiver;
+pub use receiver::{cpp_class_fields, CppField};
 mod routes;
 mod rust;
 mod typescript;
@@ -90,6 +91,16 @@ fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
 /// inputs it actually receives. Mirrors `serialize_callee_qualifier`.
 fn serialize_rtype_metadata(ty: &str) -> String {
     serde_json::json!({ "q": "rtype", "v": ty }).to_string()
+}
+
+/// Build `{"q":"field","c":<class>,"v":<field>}` (`"a":1` through `->`): a C++
+/// member call on a field the resolver types from its class's recorded fields.
+fn serialize_field_metadata(class: &str, field: &str, arrow: bool) -> String {
+    let mut m = serde_json::json!({ "q": "field", "c": class, "v": field });
+    if arrow {
+        m["a"] = serde_json::json!(1);
+    }
+    m.to_string()
 }
 
 /// Build the `{"q":"impl_method","v":<ty>}` implements-edge metadata (Rust trait

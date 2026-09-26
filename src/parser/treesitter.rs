@@ -47,7 +47,12 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
         // The tree's byte ranges index the ORIGINAL source: blanking keeps every
         // offset, so callers slice node text from `source`, macro included.
         let parsed = if matches!(language, "c" | "cpp") {
-            blank_class_decl_macros(source)
+            let classes = blank_class_decl_macros(source);
+            let annotated = match blank_thread_annotations(&classes) {
+                Cow::Owned(s) => Some(s),
+                Cow::Borrowed(_) => None,
+            };
+            annotated.map(Cow::Owned).unwrap_or(classes)
         } else {
             Cow::Borrowed(source)
         };
@@ -59,6 +64,174 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             }
         }
     })
+}
+
+/// Name suffixes of the Clang thread-safety annotation macros (`GUARDED_BY`,
+/// `ABSL_GUARDED_BY`, `EXCLUSIVE_LOCKS_REQUIRED`, …).
+const THREAD_ANNOTATION_SUFFIXES: &[&str] = &[
+    "GUARDED_BY",
+    "LOCKS_REQUIRED",
+    "LOCKS_EXCLUDED",
+    "LOCK_RETURNED",
+    "ACQUIRED_AFTER",
+    "ACQUIRED_BEFORE",
+    "LOCK_FUNCTION",
+    "TRYLOCK_FUNCTION",
+    "EXCLUDES",
+    "REQUIRES",
+    "REQUIRES_SHARED",
+    "ACQUIRE",
+    "ACQUIRE_SHARED",
+    "RELEASE",
+    "RELEASE_SHARED",
+    "TRY_ACQUIRE",
+    "ASSERT_CAPABILITY",
+    "RETURN_CAPABILITY",
+    "NO_THREAD_SAFETY_ANALYSIS",
+];
+
+/// Blank (with spaces, same byte length) Clang thread-safety annotations after a
+/// declarator: `SnapshotList snapshots_ GUARDED_BY(mutex_);`, `void f()
+/// EXCLUSIVE_LOCKS_REQUIRED(mutex_);`. tree-sitter reads `snapshots_
+/// GUARDED_BY(mutex_)` as an ERROR followed by a function `GUARDED_BY`, so the
+/// field's name is lost. An annotation here is an all-caps macro whose name is
+/// or ends in `_` + one of [`THREAD_ANNOTATION_SUFFIXES`], with its argument
+/// list (`NO_THREAD_SAFETY_ANALYSIS` may have none), right after a declarator
+/// (a non-keyword identifier, `)` or `]`, or another annotation) and before
+/// `;`, `{`, `=`, `,`, another annotation, or `const`/`override`/`final`/
+/// `noexcept`. `return REQUIRES(x);`, `#define GUARDED_BY(x) …` and a call's
+/// argument are left alone.
+fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
+    const KEYWORDS: &[&str] = &[
+        "return",
+        "throw",
+        "case",
+        "else",
+        "do",
+        "co_return",
+        "co_yield",
+        "sizeof",
+        "new",
+        "delete",
+        "define",
+        "typedef",
+        "using",
+        "goto",
+        "if",
+        "while",
+        "for",
+        "switch",
+    ];
+    let b = source.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let is_annotation = |w: &str| {
+        w.bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+            && THREAD_ANNOTATION_SUFFIXES
+                .iter()
+                .any(|s| w == *s || (w.ends_with(s) && w[..w.len() - s.len()].ends_with('_')))
+    };
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let word_at = |i: usize| {
+        let mut e = i;
+        while e < b.len() && ident(b[e]) {
+            e += 1;
+        }
+        &source[i..e]
+    };
+    // The byte just past a balanced `( ... )` starting at `i`, or None.
+    let parens_end = |mut i: usize| {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                b';' | b'{' | b'}' => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !ident(b[i]) || (i > 0 && ident(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let word = word_at(i);
+        let end = i + word.len();
+        if !is_annotation(word) {
+            i = end;
+            continue;
+        }
+        let open = skip_ws(end);
+        let macro_end = if b.get(open) == Some(&b'(') {
+            parens_end(open)
+        } else if word.ends_with("NO_THREAD_SAFETY_ANALYSIS") {
+            Some(end)
+        } else {
+            None
+        };
+        let Some(macro_end) = macro_end else {
+            i = end;
+            continue;
+        };
+        // What precedes: a declarator's end, or an annotation already taken.
+        let mut p = i;
+        while p > 0 && b[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        let after_declarator = p > 0
+            && (matches!(b[p - 1], b')' | b']')
+                || ident(b[p - 1]) && {
+                    let mut s = p;
+                    while s > 0 && ident(b[s - 1]) {
+                        s -= 1;
+                    }
+                    let prev = &source[s..p];
+                    !KEYWORDS.contains(&prev)
+                        && !prev.bytes().next().is_some_and(|c| c.is_ascii_digit())
+                        && (s == 0 || b[s - 1] != b'#')
+                });
+        let next = skip_ws(macro_end);
+        let before_end = match b.get(next) {
+            Some(b';' | b'{' | b'=' | b',') => true,
+            Some(&c) if ident(c) => {
+                let w = word_at(next);
+                is_annotation(w) || matches!(w, "const" | "override" | "final" | "noexcept")
+            }
+            _ => false,
+        };
+        if after_declarator && before_end {
+            spans.push((i, macro_end));
+        }
+        i = macro_end.max(end);
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut out = b.to_vec();
+    for (s, e) in spans {
+        for c in &mut out[s..e] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    }
+    // Only ASCII bytes were replaced by ASCII spaces, so this stays valid UTF-8.
+    Cow::Owned(String::from_utf8(out).expect("blanking ASCII keeps UTF-8 valid"))
 }
 
 /// Blank (with spaces, same byte length) the attribute macros between `class` /
@@ -2462,6 +2635,72 @@ describe('Widget', () => {
             if lang == "c" {
                 assert_eq!(fns, ["f", "g"], "functions must stay; got {fns:?}");
             }
+        }
+    }
+
+    #[test]
+    fn blank_thread_annotations_only_blanks_an_annotation_after_a_declarator() {
+        let blanked: [(&str, &[&str]); 9] = [
+            (
+                "  SnapshotList snapshots_ GUARDED_BY(mutex_);",
+                &["GUARDED_BY(mutex_)"],
+            ),
+            (
+                "  MemTable* imm_ GUARDED_BY(mutex_);  // c",
+                &["GUARDED_BY(mutex_)"],
+            ),
+            (
+                "  VersionSet* const versions_ PT_GUARDED_BY(mu);",
+                &["PT_GUARDED_BY(mu)"],
+            ),
+            (
+                "  int n_ ABSL_GUARDED_BY(mu_) = 0;",
+                &["ABSL_GUARDED_BY(mu_)"],
+            ),
+            (
+                "  void F() EXCLUSIVE_LOCKS_REQUIRED(mutex_);",
+                &["EXCLUSIVE_LOCKS_REQUIRED(mutex_)"],
+            ),
+            (
+                "  void F() LOCKS_EXCLUDED(a) EXCLUSIVE_LOCKS_REQUIRED(b);",
+                &["LOCKS_EXCLUDED(a)", "EXCLUSIVE_LOCKS_REQUIRED(b)"],
+            ),
+            (
+                "  void G() const SHARED_LOCKS_REQUIRED(m) {",
+                &["SHARED_LOCKS_REQUIRED(m)"],
+            ),
+            (
+                "  void H() NO_THREAD_SAFETY_ANALYSIS {",
+                &["NO_THREAD_SAFETY_ANALYSIS"],
+            ),
+            (
+                "  Mutex mu_ ACQUIRED_AFTER(a,\n    b);",
+                &["ACQUIRED_AFTER(a,", "b)"],
+            ),
+        ];
+        for (src, macros) in blanked {
+            let want = macros.iter().fold(src.to_string(), |s, m| {
+                s.replacen(m, &" ".repeat(m.len()), 1)
+            });
+            let got = blank_thread_annotations(src);
+            assert_eq!(got, want, "for {src:?}");
+            assert_eq!(got.len(), src.len());
+        }
+        for src in [
+            "  return REQUIRES(x);",
+            "#define GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(guarded_by(x))",
+            "#define EXCLUDES(...)",
+            "  f(GUARDED_BY(x));",
+            "  x = 1; REQUIRES(mu);",
+            "  ASSERT_OK(Put(k));",
+            "  int n_ GUARDED_BY_X(mu);",
+            "  Foo foo_ GUARDED_BY(mu) + 1;",
+            "  void Release() { mu_.Unlock(); }",
+        ] {
+            assert!(
+                matches!(blank_thread_annotations(src), Cow::Borrowed(_)),
+                "must not touch {src:?}"
+            );
         }
     }
 

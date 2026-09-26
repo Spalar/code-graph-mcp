@@ -57,6 +57,162 @@ fn cpp_receiver_type(function: tree_sitter::Node, source: &str) -> Option<String
     }
 }
 
+/// A C++ member call whose receiver is a bare name that the enclosing function
+/// neither declares nor finds in the class body holding it: a field used in a
+/// member function defined outside its class (`snapshots_.Delete()` in
+/// `DBImpl::ReleaseSnapshot`, the field declared in db_impl.h) or in a gtest
+/// `TEST_F(DBTest, …)` body (`db_->Put()`, a field of the fixture). Returns the
+/// class, the field and whether the call goes through `->`; the resolver looks the
+/// field's type up in what the class's own file recorded ([`cpp_class_fields`]),
+/// and a name that is no field there (a global) stays an untyped member call.
+pub(super) fn cpp_field_receiver(
+    call: tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> Option<(String, String, bool)> {
+    if family != "cpp" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "field_expression" {
+        return None;
+    }
+    let object = function.child_by_field_name("argument")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+    let arrow = function
+        .child_by_field_name("operator")
+        .is_some_and(|o| node_text(&o, source) == "->");
+    let name = node_text(&object, source);
+    let func = ancestor(function, &["function_definition"])?;
+    let mut types = Vec::new();
+    collect_cpp_decl_types(func, name, source, &mut types, 0);
+    if let Some(body) = enclosing_class_body(func) {
+        collect_cpp_field_types(body, name, source, &mut types);
+    }
+    if !types.is_empty() {
+        return None; // declared here: typed already, or bound untyped (`auto`)
+    }
+    let class = cpp_enclosing_class(function, source).or_else(|| {
+        let declarator = func.child_by_field_name("declarator")?;
+        let case = crate::parser::treesitter::extract_gtest_test_name(&declarator, source)?;
+        case.split_once('.').map(|(suite, _)| suite.to_string())
+    })?;
+    Some((class, name.to_string(), arrow))
+}
+
+/// A field declared in a C++ class body, with the class a call through it names:
+/// `dot` for `x.f()`, `arrow` for `x->f()` (a pointer's pointee, or a smart
+/// pointer's `T`), as [`cpp_declared_class`] reads an in-class field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppField {
+    /// The class's name as its specifier writes it (last segment).
+    pub class_name: String,
+    /// 1-based lines of the class specifier, to find its node.
+    pub class_lines: (u32, u32),
+    pub field: String,
+    pub dot: Option<String>,
+    pub arrow: Option<String>,
+}
+
+/// Every typed field of every class or struct body in a C++ file. A field whose
+/// type is a template parameter of its class is left out: it is whatever
+/// instantiates it.
+pub fn cpp_class_fields(tree: &tree_sitter::Tree, source: &str) -> Vec<CppField> {
+    let mut out = Vec::new();
+    collect_class_fields(tree.root_node(), source, &mut out, 0);
+    out
+}
+
+fn collect_class_fields(
+    node: tree_sitter::Node,
+    source: &str,
+    out: &mut Vec<CppField>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH * 4 {
+        return;
+    }
+    if matches!(node.kind(), "class_specifier" | "struct_specifier") {
+        if let (Some(body), Some(name)) = (
+            node.child_by_field_name("body"),
+            node.child_by_field_name("name")
+                .and_then(|n| last_segment(n, source)),
+        ) {
+            let lines = (
+                node.start_position().row as u32 + 1,
+                node.end_position().row as u32 + 1,
+            );
+            for i in 0..body.named_child_count() {
+                let Some(decl) = body.named_child(i) else {
+                    continue;
+                };
+                if decl.kind() != "field_declaration" {
+                    continue;
+                }
+                let Some(ty) = decl.child_by_field_name("type") else {
+                    continue;
+                };
+                let text = node_text(&ty, source);
+                let head = text.split(['<', ':']).next().unwrap_or(text).trim();
+                if is_template_parameter(node, head, source) {
+                    continue;
+                }
+                let mut cursor = decl.walk();
+                for d in decl.children_by_field_name("declarator", &mut cursor) {
+                    if let Some((field, pointer)) = field_declarator(d, source, false, 0) {
+                        out.push(CppField {
+                            class_name: name.clone(),
+                            class_lines: lines,
+                            field,
+                            dot: (!pointer)
+                                .then(|| cpp_type_name(ty, source, false))
+                                .flatten(),
+                            arrow: cpp_type_name(ty, source, !pointer),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i) {
+            collect_class_fields(c, source, out, depth + 1);
+        }
+    }
+}
+
+/// The name a field declarator declares and whether through a pointer; None for
+/// a method declaration or an array.
+fn field_declarator(
+    d: tree_sitter::Node,
+    source: &str,
+    pointer: bool,
+    depth: usize,
+) -> Option<(String, bool)> {
+    if depth > MAX_SUBTREE_DEPTH {
+        return None;
+    }
+    match d.kind() {
+        "field_identifier" | "identifier" => Some((node_text(&d, source).to_string(), pointer)),
+        "pointer_declarator" => field_declarator(
+            d.child_by_field_name("declarator")?,
+            source,
+            true,
+            depth + 1,
+        ),
+        "init_declarator" => field_declarator(
+            d.child_by_field_name("declarator")?,
+            source,
+            pointer,
+            depth + 1,
+        ),
+        "reference_declarator" => field_declarator(d.named_child(0)?, source, pointer, depth + 1),
+        _ => None,
+    }
+}
+
 /// The class a C++ receiver `name` is declared with in `func` (a local or
 /// parameter), else in the class whose body holds `func` (a field).
 fn cpp_declared_class(

@@ -3,8 +3,33 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 74 → 75 because the C++ fix below changes which `calls`
+`INDEX_VERSION` goes 74 → 76 because the C++ fixes below change which `calls`
 edges a file produces.
+
+### A C++ call through a field declared in another file is typed
+
+`snapshots_.Delete()` in `DBImpl::ReleaseSnapshot` (db_impl.cc) calls through a
+field declared in db_impl.h, and `db_->Put()` in a gtest `TEST_F(DBTest, …)`
+body calls through a field of the fixture. The caller's file declares neither,
+so each was an untyped member call that bound every `Delete` or `Put` in reach,
+including `DBImpl::Delete` itself. Class bodies now record the type of each field. Such a call is typed from its
+class's fields, or its base classes' when the class does not declare it, and
+binds that type's method. A `std::` type such as `std::string saved_key_`
+binds nothing, where `saved_key_.clear()` used to reach a project `clear`. A
+name that is no field of the class, such as a global, resolves as before.
+
+A field followed by a Clang thread-safety annotation
+(`SnapshotList snapshots_ GUARDED_BY(mutex_);`, `void F()
+EXCLUSIVE_LOCKS_REQUIRED(mutex_);`) did not parse: tree-sitter read the
+annotation as a function and lost the field's name. These annotations are now
+blanked before parsing, as class export macros already were.
+
+On leveldb, scored against SCIP, same-file precision goes from 1484/1559 to
+1500/1548 (95.2% → 96.9%) and the `inferred` tier from 1361/1401 to 1528/1565
+(97.1% → 97.6%), with recall 2730 of 3470 (the denominator grows because
+annotated member functions now parse). Editing the header re-resolves the
+callers in other files. Dropping or retyping a field, or deleting a header,
+leaves the incremental graph equal to a rebuild's.
 
 ### Changing a class re-resolves typed calls in files the edit did not touch
 

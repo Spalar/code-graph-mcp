@@ -41,6 +41,16 @@ pub(super) enum CalleeMeta {
     /// (parser `relations/member.rs`): resolves like a bare call, minus the free
     /// functions, which no member call can reach.
     Member,
+    /// C++ `x.f()` / `x->f()` on a field the caller's file never declares (an
+    /// out-of-line member, a gtest body; parser `receiver::cpp_field_receiver`).
+    /// Never resolved as such: [`CppFieldTypes::rewrite`] turns it into the
+    /// `rtype` its recorded type names, else a `member` call, before the
+    /// deferred pass.
+    Field {
+        class: String,
+        field: String,
+        arrow: bool,
+    },
     /// Python `m.f()` where `m` is bound by an absolute import of module `v`
     /// (`relations/member.rs`): no project code runs unless `v` is a project
     /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
@@ -56,6 +66,11 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
     let q = v.get("q")?.as_str()?;
     match q {
         "chain" => Some(CalleeMeta::Chain),
+        "field" => Some(CalleeMeta::Field {
+            class: v.get("c")?.as_str()?.to_string(),
+            field: v.get("v")?.as_str()?.to_string(),
+            arrow: v.get("a").is_some(),
+        }),
         "member" => Some(CalleeMeta::Member),
         "module" => v
             .get("v")?
@@ -783,7 +798,14 @@ const CLASS_SHAPE_SELECT: &str = "
     FROM nodes n
     JOIN files f ON f.id = n.file_id
     JOIN cg_fanout_paths fp ON fp.path = f.path
-    WHERE n.type IN ('function', 'method') AND n.qualified_name LIKE '%.%'";
+    WHERE n.type IN ('function', 'method') AND n.qualified_name LIKE '%.%'
+    UNION
+    SELECT 'f', f.path, n.name || char(31) || cf.field || char(31)
+             || COALESCE(cf.dot_type, '') || char(31) || COALESCE(cf.arrow_type, '')
+    FROM cpp_fields cf
+    JOIN nodes n ON n.id = cf.class_id
+    JOIN files f ON f.id = n.file_id
+    JOIN cg_fanout_paths fp ON fp.path = f.path";
 
 /// The files outside this run holding a typed call (`rtype` / `super`, bound or
 /// buffered) whose answer this run's change to the class structure can move —
@@ -814,11 +836,15 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
     // `classes`: names whose class nodes moved. `bases`-side names: both ends of a
     // moved `inherits` edge. `methods`: (owner, method) of a moved method.
     let (mut classes, mut linked, mut methods) = (HashSet::new(), HashSet::new(), HashSet::new());
+    // Classes whose recorded C++ fields moved: a call through one of their
+    // fields (`fc`) may now be typed differently, or at all.
+    let mut field_owners: HashSet<String> = HashSet::new();
     for (k, _, v) in before.symmetric_difference(&after) {
         let fields: Vec<&str> = v.split('\u{1f}').collect();
         match (k.as_str(), fields.as_slice()) {
             ("c", [_, name, _]) => classes.extend(last(name)),
             ("i", [sub, base]) => linked.extend(last(sub).into_iter().chain(last(base))),
+            ("f", [class, ..]) => field_owners.extend(last(class)),
             ("m", [q]) => {
                 if let Some((owner, m)) = q.rsplit_once('.') {
                     methods.extend(last(owner).map(|o| (o, m.to_string())));
@@ -827,7 +853,7 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
             _ => {}
         }
     }
-    if classes.is_empty() && linked.is_empty() && methods.is_empty() {
+    if classes.is_empty() && linked.is_empty() && methods.is_empty() && field_owners.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -882,7 +908,7 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
         .into_iter()
         .filter(|n| unique(n))
         .collect();
-    any.extend(classes);
+    any.extend(classes.iter().cloned());
     // A moved method answers for calls of it on its own class (own method vs
     // inherited), and on the class's ancestors for overrides.
     let mut per_method: HashSet<(String, String)> = HashSet::new();
@@ -902,34 +928,56 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
         paths
     };
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // A C++ call through a field (`fc`) looked its type up in `fc`'s fields,
+    // else its bases': it moves with any of them, or with their bases or
+    // existence. Typed (`rtype`) or not (`member`).
+    let field_keys: HashSet<&String> = field_owners
+        .iter()
+        .chain(classes.iter())
+        .chain(linked.iter())
+        .collect();
     let mut stmt = conn.prepare(
-        "SELECT f.path, json_extract(e.metadata, '$.v'), t.name
+        "SELECT f.path, json_extract(e.metadata, '$.q'), json_extract(e.metadata, '$.v'),
+                json_extract(e.metadata, '$.fc'), t.name
          FROM edges e
          JOIN nodes s ON s.id = e.source_id JOIN files f ON f.id = s.file_id
          JOIN nodes t ON t.id = e.target_id
-         WHERE e.relation = 'calls' AND json_extract(e.metadata, '$.q') IN ('rtype', 'super')
+         WHERE e.relation = 'calls'
+           AND (json_extract(e.metadata, '$.q') IN ('rtype', 'super')
+                OR json_extract(e.metadata, '$.fc') IS NOT NULL)
          UNION
-         SELECT f.path, json_extract(p.metadata, '$.v'), p.target_name
+         SELECT f.path, json_extract(p.metadata, '$.q'), json_extract(p.metadata, '$.v'),
+                json_extract(p.metadata, '$.fc'), p.target_name
          FROM pending_unresolved_calls p
          JOIN nodes s ON s.id = p.source_id JOIN files f ON f.id = s.file_id
-         WHERE json_extract(p.metadata, '$.q') IN ('rtype', 'super')",
+         WHERE json_extract(p.metadata, '$.q') IN ('rtype', 'super')
+            OR json_extract(p.metadata, '$.fc') IS NOT NULL",
     )?;
     let calls = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Option<String>>(1)?,
-            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, String>(4)?,
         ))
     })?;
     for call in calls {
-        let (path, v, target) = call?;
+        let (path, q, v, fc, target) = call?;
         if in_run.contains(&path) || out.contains(&path) {
             continue;
         }
-        let Some(class) = v.as_deref().and_then(last) else {
-            continue;
-        };
-        if any.contains(&class) || per_method.contains(&(class, target)) {
+        let through_field = fc.as_deref().and_then(last).is_some_and(|owner| {
+            closure(&mut std::iter::once(owner))
+                .iter()
+                .any(|n| field_keys.contains(n))
+        });
+        let typed = matches!(q.as_deref(), Some("rtype" | "super"));
+        let by_class = typed
+            && v.as_deref()
+                .and_then(last)
+                .is_some_and(|class| any.contains(&class) || per_method.contains(&(class, target)));
+        if through_field || by_class {
             out.insert(path);
         }
     }
@@ -1662,6 +1710,104 @@ impl<'a> ProjectPythonModules<'a> {
             });
         self.seen.insert(module.to_string(), known);
         known
+    }
+}
+
+/// The C++ field types `cpp_fields` records, loaded once per pass, to type
+/// [`CalleeMeta::Field`] calls.
+pub(super) struct CppFieldTypes {
+    /// (class node id, field) → (dot type, arrow type).
+    fields: HashMap<(i64, String), (Option<String>, Option<String>)>,
+    /// Class-like nodes by last name segment, with their class path.
+    by_last: HashMap<String, Vec<(i64, Vec<String>)>>,
+    /// Class node id → direct base class ids (`inherits` edges).
+    parents: HashMap<i64, Vec<i64>>,
+}
+
+impl CppFieldTypes {
+    pub(super) fn load(conn: &rusqlite::Connection) -> Result<Self> {
+        let mut fields = HashMap::new();
+        for (class_id, field, dot, arrow) in crate::storage::queries::cpp_fields(conn)? {
+            fields.insert((class_id, field), (dot, arrow));
+        }
+        let mut by_last: HashMap<String, Vec<(i64, Vec<String>)>> = HashMap::new();
+        for (id, _, spelling, _) in crate::storage::queries::class_like_names(conn)? {
+            let path: Vec<String> = class_path(&spelling)
+                .into_iter()
+                .map(String::from)
+                .collect();
+            if let Some(last) = path.last() {
+                by_last.entry(last.clone()).or_default().push((id, path));
+            }
+        }
+        let mut parents: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (sub, sup) in crate::storage::queries::inherits_edges(conn)? {
+            parents.entry(sub).or_default().push(sup);
+        }
+        Ok(Self {
+            fields,
+            by_last,
+            parents,
+        })
+    }
+
+    /// The class a call through `class::field` names: the field as the class
+    /// declares it, else as its nearest base does. None unless every class of
+    /// that path agrees on one type.
+    fn type_of(&self, class: &str, field: &str, arrow: bool) -> Option<String> {
+        let want = class_path(class);
+        let last = *want.last()?;
+        let mut found: Vec<Option<&String>> = Vec::new();
+        for (id, path) in self.by_last.get(last)? {
+            let k = path.len().min(want.len());
+            if path[path.len() - k..]
+                .iter()
+                .map(String::as_str)
+                .ne(want[want.len() - k..].iter().copied())
+            {
+                continue;
+            }
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut stack = vec![*id];
+            while let Some(c) = stack.pop() {
+                if !seen.insert(c) {
+                    continue;
+                }
+                match self.fields.get(&(c, field.to_string())) {
+                    Some((dot, via_arrow)) => {
+                        found.push(if arrow { via_arrow } else { dot }.as_ref())
+                    }
+                    None => stack.extend(self.parents.get(&c).into_iter().flatten()),
+                }
+            }
+        }
+        let first = (*found.first()?)?;
+        found
+            .iter()
+            .all(|t| *t == Some(first))
+            .then(|| first.clone())
+    }
+
+    /// A [`CalleeMeta::Field`] call's metadata rewritten as the call it is: the
+    /// `rtype` of the field's recorded type, else an untyped `member` call (a
+    /// global, an untyped field). `fc`/`ff` keep the field, for
+    /// [`typed_callers_of_class_drift`]. None for any other metadata.
+    pub(super) fn rewrite(&self, metadata: Option<&str>) -> Option<String> {
+        let Some(CalleeMeta::Field {
+            class,
+            field,
+            arrow,
+        }) = parse_callee_metadata(metadata)
+        else {
+            return None;
+        };
+        Some(
+            match self.type_of(&class, &field, arrow) {
+                Some(ty) => serde_json::json!({ "q": "rtype", "v": ty, "fc": class, "ff": field }),
+                None => serde_json::json!({ "q": "member", "fc": class, "ff": field }),
+            }
+            .to_string(),
+        )
     }
 }
 

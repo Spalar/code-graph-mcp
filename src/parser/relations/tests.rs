@@ -708,8 +708,15 @@ fn test_member_call_on_an_object_is_marked_member() {
         "void A::run() { snapshots_.Delete(s); p->clear(); this->Put(); Helper(); }",
         "cpp",
     );
-    assert_eq!(meta_of(&cpp, "Delete"), Some(MEMBER));
-    assert_eq!(meta_of(&cpp, "clear"), Some(MEMBER));
+    // Undeclared in an out-of-line member: a field of `A`, typed at resolution.
+    assert_eq!(
+        meta_of(&cpp, "Delete"),
+        Some(r#"{"c":"A","q":"field","v":"snapshots_"}"#)
+    );
+    assert_eq!(
+        meta_of(&cpp, "clear"),
+        Some(r#"{"a":1,"c":"A","q":"field","v":"p"}"#)
+    );
     // `this` names its class (D#89).
     assert_eq!(meta_of(&cpp, "Put"), Some(r#"{"q":"rtype","v":"A"}"#));
     assert_eq!(meta_of(&cpp, "Helper"), None);
@@ -765,6 +772,76 @@ fn test_member_call_on_an_object_is_marked_member() {
 }
 
 #[test]
+fn test_cpp_field_receiver_outside_its_class_body_is_marked_field() {
+    let cpp = call_meta(
+        "Status DBImpl::Get() { versions_->Current(); Slice k; k.size(); \
+         auto it = Make(); it->Next(); }\n\
+         TEST_F(DBTest, Get) { db_->Put(1); }\n\
+         TEST(Plain, Case) { g_env->Run(); }\n\
+         void Free() { global_.Reset(); }\n",
+        "cpp",
+    );
+    assert_eq!(
+        meta_of(&cpp, "Current"),
+        Some(r#"{"a":1,"c":"DBImpl","q":"field","v":"versions_"}"#)
+    );
+    // A local, typed or not, is no field.
+    assert_eq!(meta_of(&cpp, "size"), Some(r#"{"q":"rtype","v":"Slice"}"#));
+    assert_eq!(meta_of(&cpp, "Next"), Some(MEMBER));
+    // gtest: the fixture is the suite.
+    assert_eq!(
+        meta_of(&cpp, "Put"),
+        Some(r#"{"a":1,"c":"DBTest","q":"field","v":"db_"}"#)
+    );
+    assert_eq!(
+        meta_of(&cpp, "Run"),
+        Some(r#"{"a":1,"c":"Plain","q":"field","v":"g_env"}"#)
+    );
+    // No class at all: a free function's global.
+    assert_eq!(meta_of(&cpp, "Reset"), Some(MEMBER));
+}
+
+#[test]
+fn test_cpp_class_fields_records_each_typed_field() {
+    let code = "class DBImpl : public DB {\n private:\n  SnapshotList snapshots_;\n  \
+                VersionSet* const versions_;\n  std::unique_ptr<Logger> log_;\n  \
+                int n_, *m_;\n  Status Get();\n};\n\
+                template <typename Key> class SkipList {\n  Key head_;\n  Arena* arena_;\n};\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(code, None).unwrap();
+    let got: Vec<(String, String, Option<String>, Option<String>)> =
+        crate::parser::relations::cpp_class_fields(&tree, code)
+            .into_iter()
+            .map(|f| (f.class_name, f.field, f.dot, f.arrow))
+            .collect();
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        got,
+        vec![
+            (
+                "DBImpl".into(),
+                "snapshots_".into(),
+                s("SnapshotList"),
+                None
+            ),
+            ("DBImpl".into(), "versions_".into(), None, s("VersionSet")),
+            (
+                "DBImpl".into(),
+                "log_".into(),
+                s("std::unique_ptr<Logger>"),
+                s("Logger")
+            ),
+            ("DBImpl".into(), "n_".into(), None, None),
+            ("DBImpl".into(), "m_".into(), None, None),
+            ("SkipList".into(), "arena_".into(), None, s("Arena")),
+        ]
+    );
+}
+
+#[test]
 fn test_cpp_direct_initialized_local_is_typed() {
     // `ModelDB model(CurrentOptions());` and `Block block(contents);` parse as a
     // function declarator (C++'s most vexing parse), yet inside a function body
@@ -785,12 +862,16 @@ fn test_cpp_direct_initialized_local_is_typed() {
         meta_of(&cpp, "Allocate"),
         Some(r#"{"q":"rtype","v":"Arena"}"#)
     );
-    // In a class body the same shape is a method, not a field.
+    // In a class body the same shape is a method, not a field: no type here,
+    // and the resolver finds no field `block` in `A` (an untyped member call).
     let cpp = call_meta(
         "class A {\n  Block block(int n);\n  void f() { block.NewIterator(); }\n};\n",
         "cpp",
     );
-    assert_eq!(meta_of(&cpp, "NewIterator"), Some(MEMBER));
+    assert_eq!(
+        meta_of(&cpp, "NewIterator"),
+        Some(r#"{"c":"A","q":"field","v":"block"}"#)
+    );
 }
 
 #[test]

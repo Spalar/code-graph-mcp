@@ -1130,6 +1130,34 @@ struct BatchRelations {
 /// Returns the edge count plus the two unresolved-target lists the caller
 /// feeds to `mint_external_sentinels` immediately afterwards.
 #[allow(clippy::too_many_arguments)]
+/// Record the typed fields of a C++ file's class bodies against their class
+/// nodes (`cpp_fields`), for calls through them from files that never see the
+/// class body. A class specifier's node is the innermost same-named class-like
+/// node whose lines contain it.
+fn record_cpp_fields(db: &Database, pf: &FileParsed) -> Result<()> {
+    let fields = crate::parser::relations::cpp_class_fields(&pf.tree, &pf.source);
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let mut rows = Vec::with_capacity(fields.len());
+    for f in fields {
+        let (start, end) = f.class_lines;
+        let class_id = (0..pf.node_ids.len())
+            .filter(|&i| {
+                matches!(pf.node_types[i].as_str(), "class" | "struct")
+                    && pf.node_names[i] == f.class_name
+                    && pf.node_lines[i].0 <= start
+                    && pf.node_lines[i].1 >= end
+            })
+            .min_by_key(|&i| pf.node_lines[i].1 - pf.node_lines[i].0)
+            .map(|i| pf.node_ids[i]);
+        if let Some(class_id) = class_id {
+            rows.push((class_id, f.field, f.dot, f.arrow));
+        }
+    }
+    crate::storage::queries::insert_cpp_fields(db.conn(), &rows)
+}
+
 fn resolve_batch_relations(
     db: &Database,
     batch_parsed: &[FileParsed],
@@ -1198,6 +1226,9 @@ fn resolve_batch_relations(
 
     for pf in batch_parsed {
         let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        if pf.language == "cpp" {
+            record_cpp_fields(db, pf)?;
+        }
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
         // Same-file qualified names, for C++ implicit-`this` member lookup below.
         let local_qualified: HashMap<i64, &str> = pf
@@ -1758,7 +1789,11 @@ fn resolve_batch_relations(
                         ));
                         continue;
                     }
-                    Some(CalleeMeta::RecvType(_)) | Some(CalleeMeta::SuperType(_)) => {
+                    Some(CalleeMeta::RecvType(_))
+                    | Some(CalleeMeta::SuperType(_))
+                    | Some(CalleeMeta::Field { .. }) => {
+                        // A field's type is recorded by its class's file, which may
+                        // be in a later batch: typed in the deferred pass.
                         // Same partial-view argument as SelfRecv/SelfType
                         // above; additionally this arm's EMPTY case falls
                         // through to bare default resolution rather than
@@ -2419,6 +2454,27 @@ Restart every code-graph server on this project so they run one version.",
     // context strings see the recovered edges.
     let mut deferred_edges = 0usize;
     if !deferred.is_empty() {
+        // Type C++ calls through fields the caller's file never declares, now
+        // that every file of the run has recorded its class fields.
+        let mut field_types: Option<super::resolve::CppFieldTypes> = None;
+        for d in deferred.iter_mut() {
+            if !d
+                .metadata
+                .as_deref()
+                .is_some_and(|m| m.contains(r#""q":"field""#))
+            {
+                continue;
+            }
+            if field_types.is_none() {
+                field_types = Some(super::resolve::CppFieldTypes::load(db.conn())?);
+            }
+            if let Some(m) = field_types
+                .as_ref()
+                .and_then(|t| t.rewrite(d.metadata.as_deref()))
+            {
+                d.metadata = Some(m);
+            }
+        }
         let deferred_count = deferred.len();
         let tx = db.savepoint("idx_deferred")?;
         let (d_edges, d_nodes) = resolve_deferred_relations(

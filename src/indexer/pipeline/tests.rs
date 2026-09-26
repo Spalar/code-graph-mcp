@@ -2414,6 +2414,98 @@ fn test_top_level_class_delete_re_resolves_untouched_cpp_callers() {
     );
 }
 
+// D#97: C++ calls through a field the caller's own file never declares — an
+// out-of-line member (fields in the header), a gtest `TEST_F` body (fields of
+// the fixture) — are typed from the fields the class's file recorded.
+
+/// The callee (path.qualified) of every call from a caller named `caller`.
+fn callees_of(db: &Database, caller: &str) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ft.path || '.' || COALESCE(nt.qualified_name, nt.name) FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             WHERE e.relation = 'calls' AND ns.name = ?1 ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([caller], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+const DB_IMPL_HPP: &str = "#include <string>\n\
+    class SnapshotList {\n public:\n  void Delete(int s) {}\n  void clear() {}\n};\n\
+    class DBImpl {\n public:\n  void Delete(int k) {}\n  void Release(int s);\n\
+     private:\n  SnapshotList snapshots_ GUARDED_BY(mutex_);\n  std::string saved_;\n};\n";
+const DB_IMPL_CC: &str = "#include \"db_impl.hpp\"\n\
+    void DBImpl::Release(int s) {\n  snapshots_.Delete(s);\n  saved_.clear();\n}\n";
+
+#[test]
+fn test_cpp_out_of_line_member_binds_its_field_type() {
+    let (_p, _d, db) = fresh_index_of(&[("db_impl.hpp", DB_IMPL_HPP), ("db_impl.cc", DB_IMPL_CC)]);
+    // Not `DBImpl.Delete`; and `std::string::clear` is no project method.
+    assert_eq!(
+        callees_of(&db, "Release"),
+        vec!["db_impl.hpp.SnapshotList.Delete".to_string()]
+    );
+}
+
+#[test]
+fn test_cpp_field_declared_in_a_base_class_is_typed() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "base.hpp",
+            "class Arena {\n public:\n  void Allocate(int n) {}\n};\n\
+             class Pool {\n public:\n  void Allocate(int n) {}\n};\n\
+             class Base {\n protected:\n  Arena* arena_;\n};\n\
+             class Derived : public Base {\n public:\n  void Grow();\n};\n",
+        ),
+        (
+            "derived.cc",
+            "#include \"base.hpp\"\nvoid Derived::Grow() {\n  arena_->Allocate(1);\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        callees_of(&db, "Grow"),
+        vec!["base.hpp.Arena.Allocate".to_string()]
+    );
+}
+
+#[test]
+fn test_cpp_gtest_body_types_the_fixture_field() {
+    let (_p, _d, db) = fresh_index_of(&[(
+        "db_test.cc",
+        "class DB {\n public:\n  virtual void Put(int v) {}\n};\n\
+         class DBTest {\n public:\n  DB* db_;\n  void Put(int v) {}\n};\n\
+         TEST_F(DBTest, Get) {\n  db_->Put(1);\n}\n",
+    )]);
+    assert_eq!(
+        callees_of(&db, "DBTest.Get"),
+        vec!["db_test.cc.DB.Put".to_string()]
+    );
+}
+
+/// The header changes the field's type; the `.cc` caller is untouched.
+#[test]
+fn test_cpp_field_type_change_re_resolves_untouched_callers() {
+    let other = DB_IMPL_HPP
+        .replace("SnapshotList snapshots_", "Other snapshots_")
+        .replace(
+            "class DBImpl {",
+            "class Other {\n public:\n  void Delete(int s) {}\n};\nclass DBImpl {",
+        );
+    assert_incremental_matches_rebuild(
+        &[("db_impl.hpp", DB_IMPL_HPP), ("db_impl.cc", DB_IMPL_CC)],
+        &[("db_impl.hpp", Some(&other))],
+    );
+    // A field that appears later: the call was an untyped member call.
+    let without = DB_IMPL_HPP.replace("  SnapshotList snapshots_ GUARDED_BY(mutex_);\n", "");
+    assert_incremental_matches_rebuild(
+        &[("db_impl.hpp", &without), ("db_impl.cc", DB_IMPL_CC)],
+        &[("db_impl.hpp", Some(DB_IMPL_HPP))],
+    );
+}
+
 /// A typed call its class did not decide (two same-named bases) is as much a
 /// guess as an untyped one: `ambiguous`, not the `inferred` a typed bind earns.
 #[test]
