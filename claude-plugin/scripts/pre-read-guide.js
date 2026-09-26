@@ -157,13 +157,14 @@ function isAnswerDisabled(env = process.env) {
 
 // --- Shared tracking core (also driven by pre-grep-guide's sed-range path) ---
 
-/// Record one read of `rel` (project-root-relative source path) and fire the
-/// fanout hint when the threshold crosses. Emits to stdout + records the
-/// recommendation. Returns true when a hint fired.
-function trackReadAndMaybeHint(root, rel, now = Date.now()) {
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+/// Record one read of `rel` (project-root-relative source path). Returns the
+/// dir when this read crossed the fanout threshold (the hint is marked as
+/// delivered), else null. Writes nothing to stdout: a hook's stdout is parsed as
+/// ONE JSON value, so only the entry point may write, and only once.
+function trackRead(root, rel, now = Date.now()) {
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
   const dir = path.dirname(rel);
-  if (!dir || dir === '.' || dir === '') return false;  // top-level file: not fanout
+  if (!dir || dir === '.' || dir === '') return null;  // top-level file: not fanout
 
   const state = loadState(root, now);
   recordRead(state, dir, now);
@@ -178,12 +179,18 @@ function trackReadAndMaybeHint(root, rel, now = Date.now()) {
     // Record it (best-effort) so `stats` can measure the model's read fan-out —
     // e.g. a read right after cg answered a grep in-place (search-decay).
     recordRecommendation(root, { hook: 'read', action: 'observe' });
-    return false;
+    return null;
   }
+  return dir;
+}
 
+/// The fanout hint text for `dir`, with the overview answer embedded when the
+/// CLI delivers one. `maxBytes` bounds that answer — the pre-grep sed path
+/// splits one envelope's budget between several dirs.
+function buildFanoutHint(root, dir, { maxBytes } = {}) {
   let answer = { status: 'unavailable' };
   if (!isAnswerDisabled()) {
-    answer = runOverviewAnswer({ cwd: root, dir });
+    answer = runOverviewAnswer({ cwd: root, dir, ...(maxBytes ? { maxBytes } : {}) });
   }
   const answered = answer.status === 'hits';
   recordRecommendation(root, {
@@ -202,14 +209,14 @@ function trackReadAndMaybeHint(root, rel, now = Date.now()) {
     ...(answered ? {} : { reason: answer.status }),
     ...(answered || !answer.reason ? {} : { fallthrough_reason: answer.reason }),
   });
-  // Compound-grep sibling sweep: emit via the PreToolUse allow+additionalContext
-  // envelope (shared hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in
-  // the debug log only and never reaches the model (CC docs v2026-06); the
-  // additionalContext channel is what actually surfaces the fanout hint. Read is
-  // a safe tool, so the allow elevation is negligible.
-  const hintText = answered ? buildHintWithAnswer(dir, answer) : buildHint(dir);
-  process.stdout.write(emitPreToolAllowContext(hintText) + '\n');
-  return true;
+  return answered ? buildHintWithAnswer(dir, answer) : buildHint(dir);
+}
+
+/// trackRead + buildFanoutHint for one read. Returns the hint text when the
+/// hint fired, else null. The caller emits it.
+function trackReadAndMaybeHint(root, rel, now = Date.now()) {
+  const dir = trackRead(root, rel, now);
+  return dir === null ? null : buildFanoutHint(root, dir);
 }
 
 // --- Main execution ---
@@ -237,7 +244,13 @@ function runMain() {
     rel = path.relative(root, filePath);
   } catch { return; }
 
-  trackReadAndMaybeHint(root, rel);
+  const hint = trackReadAndMaybeHint(root, rel);
+  // Emit via the PreToolUse allow+additionalContext envelope (shared
+  // hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in the debug log
+  // only and never reaches the model (CC docs v2026-06); the additionalContext
+  // channel is what actually surfaces the fanout hint. Read is a safe tool, so
+  // the allow elevation is negligible.
+  if (hint) process.stdout.write(emitPreToolAllowContext(hint) + '\n');
 }
 
 if (require.main === module) {
@@ -249,5 +262,6 @@ module.exports = {
   loadState, saveState, recordRead, shouldHint, markHint,
   buildHint, buildHintWithAnswer, isSilenced, isAnswerDisabled,
   trackReadAndMaybeHint,   // v0.49 — shared with pre-grep-guide's sed-range path
+  trackRead, buildFanoutHint,  // the sed path's two halves: one envelope for every dir that fired
   FANOUT_THRESHOLD, COOLDOWN_MS, STATE_TTL_MS, SRC_EXT,
 };

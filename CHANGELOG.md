@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Two read-fanout hints in one Bash call reach the model
+
+A compound command whose `sed -n` range reads pushed two directories past the
+read-fanout threshold (`sed -n 1,10p lib/a.js; sed -n 1,6p tests/a.test.js`)
+wrote two JSON envelopes to the Bash hook's stdout. Claude Code parses a hook's
+output as one JSON value, rejected the pair ("Unexpected non-whitespace
+character after JSON ... line 2 column 1"), and the model saw neither hint —
+while the tracker recorded both as delivered, so neither fired again for five
+minutes. Seen 4 times in two weeks of claude-mem-lite sessions. The hints now
+share one envelope, each overview answer taking an equal share of the 4000-byte
+context cap so a large first answer cannot cut the second directory out.
+
+That envelope also no longer carries `permissionDecision: "allow"`. It was the
+Read hook's envelope, written from inside the tracker the Bash hook shares, and
+on a Bash call it skipped the user's permission prompt for the whole command —
+including anything after the `sed`. The hint still arrives as
+`additionalContext`; the command goes through the normal permission flow.
+
 ## 0.158.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

@@ -2631,6 +2631,86 @@ test('extractSedReadTargets: non-range sed (substitution) ignored', () => {
   assert.deepEqual(extractSedReadTargets('sed -n /pattern/p src/a.py'), []);
 });
 
+// One Bash call whose sed reads push TWO dirs over the fanout threshold used to
+// write two envelopes to stdout. Claude Code parses a hook's stdout as ONE JSON
+// value, so it rejected the pair ("Unexpected non-whitespace character after
+// JSON ... line 2 column 1") and dropped both hints — while the state file
+// recorded both as delivered (claude-mem-lite transcripts, 4 occurrences).
+test('sed-range fanout: two dirs crossing in one command emit ONE envelope naming both', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture('process.stdout.write("overview stub " + process.argv.slice(2).join(" ") + "\\n");');
+  try {
+    // Seed the tracker the child will load: 4 reads each, one short of firing.
+    const root = resolveProjectRoot(fixture.dir);
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) {
+      readGuide.recordRead(state, 'lib');
+      readGuide.recordRead(state, 'tests');
+    }
+    readGuide.saveState(root, state);
+
+    const res = runHook(`cd ${fixture.dir}; sed -n 1,10p lib/core.js; sed -n 1,6p tests/core.test.js`, fixture);
+    assert.equal(res.status, 0, res.stderr);
+    const out = JSON.parse(res.stdout).hookSpecificOutput;  // throws on two envelopes
+    assert.equal(out.hookEventName, 'PreToolUse');
+    assert.ok(!('permissionDecision' in out),
+      'a Bash hint must not auto-allow the command it rides on');
+    assert.match(out.additionalContext, /5\+ Reads into lib\//);
+    assert.match(out.additionalContext, /5\+ Reads into tests\//);
+    const after = readGuide.loadState(root).by_dir;
+    assert.ok(after.lib.last_hint_at > 0 && after.tests.last_hint_at > 0, 'both hints recorded as delivered');
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('sed-range fanout: a full-size first overview cannot crowd the second dir out', () => {
+  const readGuide = require('./pre-read-guide');
+  // Each overview is larger than the whole envelope cap on its own.
+  const fixture = e2eFixture(
+    'const d = process.argv[3]; for (let i = 0; i < 200; i++) process.stdout.write(d + " symbol_" + i + " (src/some/long/path.rs)\\n");');
+  try {
+    const root = resolveProjectRoot(fixture.dir);
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) {
+      readGuide.recordRead(state, 'lib');
+      readGuide.recordRead(state, 'tests');
+    }
+    readGuide.saveState(root, state);
+
+    const res = runHook('sed -n 1,10p lib/core.js; sed -n 1,6p tests/core.test.js', fixture);
+    assert.equal(res.status, 0, res.stderr);
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /5\+ Reads into lib\/ — module overview/);
+    assert.match(ctx, /5\+ Reads into tests\/ — module overview/);
+    assert.match(ctx, /^tests symbol_0 /m, 'the second dir keeps part of its answer');
+    assert.doesNotMatch(ctx, /truncated at \d+ bytes/, 'the split budget fits without the envelope cut');
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('sed-range fanout: one dir crossing still emits its single envelope', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture('process.stdout.write("overview stub\\n");');
+  try {
+    const root = resolveProjectRoot(fixture.dir);
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) readGuide.recordRead(state, 'lib');
+    readGuide.saveState(root, state);
+
+    // tests/ is read once here — below threshold, so it must add nothing.
+    const res = runHook('sed -n 1,10p lib/core.js; sed -n 1,6p tests/core.test.js', fixture);
+    assert.equal(res.status, 0, res.stderr);
+    const out = JSON.parse(res.stdout).hookSpecificOutput;
+    assert.match(out.additionalContext, /5\+ Reads into lib\//);
+    assert.doesNotMatch(out.additionalContext, /Reads into tests\//);
+    assert.match(out.additionalContext, /overview stub/, 'the overview answer still rides in the envelope');
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test('extractSedReadTargets: pipeline sed after grep still extracted', () => {
   assert.deepEqual(
     extractSedReadTargets('grep -n "x" src/a.py | sed -n 1,5p src/b.py'),

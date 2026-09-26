@@ -56,7 +56,7 @@ const {
   runGrepAnswer, runShowAnswer, sanitizeSearchPath, buildGrepArgs, formatCgCommand, shellQuoteArg,
   resolveAnswerBinary,
 } = require('./cg-answer');
-const { emitPreToolRewrite } = require('./hook-emit');
+const { emitPreToolRewrite, emitPreToolContext, MAX_INJECTED_BYTES } = require('./hook-emit');
 
 // --- Pure logic (testable) ---
 
@@ -1198,18 +1198,37 @@ function runMain() {
   // v0.49 — sed-range reads count toward the read-fanout state (the Read hook
   // never sees Bash-side file reads). A fired fanout hint already delivered an
   // overview — skip grep hinting for this command to avoid double output.
+  //
+  // Every dir that fired goes into ONE envelope. Claude Code parses a hook's
+  // stdout as a single JSON value: two envelopes (two dirs crossing in one
+  // compound command) were rejected whole, so the model saw neither hint while
+  // the state recorded both as delivered. The shared context cap is split
+  // between the answers, so a large first overview cannot truncate the second
+  // dir out of the envelope.
+  //
+  // No permission decision: this is a Bash call, and `allow` would skip the
+  // user's prompt for the WHOLE command (`sed -n 1,5p a.js; <anything>`). The
+  // read hook's allow envelope used to leak here because pre-read-guide wrote
+  // it from inside the shared tracker, out of hook-emit.test.js's allowlist view.
   const sedTargets = extractSedReadTargets(rawCmd);
   if (sedTargets.length > 0) {
     const readGuide = require('./pre-read-guide');
-    let fanoutFired = false;
+    const firedDirs = [];
     for (const t of sedTargets) {
       if (!readGuide.isSourceFile(t)) continue;
       const abs = path.isAbsolute(t) ? t : path.resolve(shellCwd, t);
-      if (readGuide.trackReadAndMaybeHint(root, path.relative(root, abs))) {
-        fanoutFired = true;
-      }
+      const dir = readGuide.trackRead(root, path.relative(root, abs));
+      if (dir !== null) firedDirs.push(dir);  // a dir fires once: markHint starts its cooldown
     }
-    if (fanoutFired) return;
+    if (firedDirs.length > 0) {
+      // 300 bytes per dir for its header line, truncation footer and separator.
+      const maxBytes = firedDirs.length > 1
+        ? Math.floor(MAX_INJECTED_BYTES / firedDirs.length) - 300
+        : undefined;
+      const hints = firedDirs.map((dir) => readGuide.buildFanoutHint(root, dir, { maxBytes }));
+      process.stdout.write(emitPreToolContext(hints.join('\n\n')) + '\n');
+      return;
+    }
   }
 
   // v0.47.1 — match against the root-stripped form so absolute paths under the
