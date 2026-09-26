@@ -117,11 +117,13 @@ Deleting `forms/fields.py` took 6.9 s instead of 4.6 s, renaming `CharField`
 one-file edit that leaves classes alone is unchanged on django: 1,209 → 1,246
 ms median of 9, within both runs' spread; a no-op run takes 102 ms in both.
 
-Not covered: a typed call that bound nothing leaves nothing to find. That is
-either a call on a class the project did not define, once its buffered row
-has aged out, or a call on a class that lacks the method when the method name
-is too common to guess at (`build`, `run`). If the class, or the method, is
-added later, `rebuild-index` binds the call.
+A typed call that binds nothing is kept as a buffered row, so the class or
+method that answers it later still finds it. This covers a call on a class the
+project does not define, and a call on a class without the method whose name
+is too common to guess at (`x.build()`, `x.run()`). The second kind used to be
+dropped with no trace, and it adds 42 buffered rows on django's 29,075. Not
+covered: once a row has aged out (50 index runs that parsed something), only
+`rebuild-index` binds the call.
 
 ### A buffered typed call from a free function binds like a rebuild
 

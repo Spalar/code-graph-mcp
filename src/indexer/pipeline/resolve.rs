@@ -417,7 +417,9 @@ pub(super) fn resolve_pending_calls_touching(
                             &row.target_name,
                             &row.source_language,
                         ) {
-                            Vec::new()
+                            // Stays buffered, as the deferred pass buffers it:
+                            // only the class gaining the method answers it.
+                            continue;
                         } else {
                             pool
                         }

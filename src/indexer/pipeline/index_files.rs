@@ -3663,6 +3663,25 @@ fn resolve_deferred_relations(
                 continue;
             }
             if is_cross_file_call_noise(&d.target_name, &d.language) {
+                // A typed call its class hierarchy could not answer (`x.build()`
+                // on a `Foo` without `build`) is no guess to drop: buffer it, as
+                // a call on a class the project lacks is, so a later run that
+                // gives the class the method can bind it and a class change can
+                // find it (`typed_callers_of_class_drift`).
+                if matches!(
+                    parse_callee_metadata(call_meta),
+                    Some(CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))
+                ) {
+                    for &src_id in &source_ids {
+                        crate::storage::queries::insert_pending_unresolved_call(
+                            db.conn(),
+                            src_id,
+                            &d.target_name,
+                            &d.language,
+                            call_meta,
+                        )?;
+                    }
+                }
                 continue;
             }
             // Cross-file pool: batch-time exclusion is BY SOURCE FILE (local_ids),

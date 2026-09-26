@@ -92,14 +92,4 @@ typed 调用只在 deferred pass 一处解析。它的输入变了，就把调�
 
 ## 不覆盖
 
-- 没绑到任何东西的 typed 调用不留痕迹，漂移判定无从反查。具体有两种：
-  - 类不在项目里，pending 行 50 次后被清掉；
-  - 类缺这个方法且方法名是噪声名（`build`、`run`），走 Fallback 时被直接丢弃。
-- 之后类或方法才出现时，需要 `rebuild-index`。要覆盖需要持久化的（文件, 类名）依赖表，或者让噪声名的 Fallback 调用进入 pending，两者都要单独评估成本。
-
-## 验收
-
-- 6 个语料测试转绿，全量测试套件为绿。
-- django：删除 `forms/fields.py` 后，增量与 rebuild 的边集合一致。
-- leveldb：删除 `include/leveldb/iterator.h` 后，增量与 rebuild 的边集合一致。
-- 在 django 上测无操作增量和单文件编辑的耗时，与修复前对比。
+- 不留痕迹的 typed 调用。噪声名 Fallback（`x.build()`）原先会被直接丢弃，后来改为进入 pending 缓冲（django 增加 42 行，原有 29,075 行）。现在只剩一种情况：pending 行经过 50 次解析运行后被清掉，之后类或方法才出现，这时需要 `rebuild-index`。要彻底覆盖，需要持久化的（文件, 类名）依赖表。

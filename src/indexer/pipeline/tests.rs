@@ -2352,6 +2352,27 @@ fn test_free_function_turned_method_re_resolves_untouched_typed_callers() {
     );
 }
 
+/// The same with a method name too common to guess at (`build`): the untyped
+/// call binds nothing, so only a buffered row remembers it.
+#[test]
+fn test_noise_named_method_gained_later_reaches_untouched_typed_callers() {
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Foo:\n    pass\n\n\ndef build():\n    pass\n"),
+            ("c.py", "class Foo:\n    pass\n"),
+            ("o.py", "class Other:\n    def build(self):\n        pass\n"),
+            (
+                "b.py",
+                "from a import Foo\n\ndef g():\n    x = Foo()\n    x.build()\n",
+            ),
+        ],
+        &[(
+            "a.py",
+            Some("class Foo:\n    def build(self):\n        pass\n"),
+        )],
+    );
+}
+
 /// An existing subclass gains the override.
 #[test]
 fn test_new_override_method_reaches_untouched_typed_callers() {
