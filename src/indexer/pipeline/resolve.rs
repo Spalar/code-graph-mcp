@@ -794,6 +794,14 @@ const CLASS_SHAPE_SELECT: &str = "
     JOIN nodes t ON t.id = e.target_id
     WHERE e.relation = 'inherits'
     UNION
+    SELECT 'j', ft.path, s.name || char(31) || t.name
+    FROM edges e
+    JOIN nodes t ON t.id = e.target_id
+    JOIN files ft ON ft.id = t.file_id
+    JOIN cg_fanout_paths fp ON fp.path = ft.path
+    JOIN nodes s ON s.id = e.source_id
+    WHERE e.relation = 'inherits'
+    UNION
     SELECT 'm', f.path, n.qualified_name
     FROM nodes n
     JOIN files f ON f.id = n.file_id
@@ -839,11 +847,19 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
     // Classes whose recorded C++ fields moved: a call through one of their
     // fields (`fc`) may now be typed differently, or at all.
     let mut field_owners: HashSet<String> = HashSet::new();
+    // Subclasses whose bases moved: they and their own subclasses inherit
+    // differently now.
+    let mut rebased: HashSet<String> = HashSet::new();
     for (k, _, v) in before.symmetric_difference(&after) {
         let fields: Vec<&str> = v.split('\u{1f}').collect();
         match (k.as_str(), fields.as_slice()) {
             ("c", [_, name, _]) => classes.extend(last(name)),
-            ("i", [sub, base]) => linked.extend(last(sub).into_iter().chain(last(base))),
+            // `i`: out of this run's files; `j`: into them (a deleted base's
+            // subclasses live in files this run never opened).
+            ("i" | "j", [sub, base]) => {
+                rebased.extend(last(sub));
+                linked.extend(last(sub).into_iter().chain(last(base)));
+            }
             ("f", [class, ..]) => field_owners.extend(last(class)),
             ("m", [q]) => {
                 if let Some((owner, m)) = q.rsplit_once('.') {
@@ -878,6 +894,7 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
 
     // Ancestors by name, as `recv_type_targets` reaches overrides by name.
     let mut bases: HashMap<String, Vec<String>> = HashMap::new();
+    let mut subs: HashMap<String, Vec<String>> = HashMap::new();
     {
         let mut stmt = conn.prepare(
             "SELECT s.name, t.name FROM edges e
@@ -888,20 +905,24 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
         for pair in pairs {
             let (sub, base) = pair?;
             if let (Some(sub), Some(base)) = (last(&sub), last(&base)) {
+                subs.entry(base.clone()).or_default().push(sub.clone());
                 bases.entry(sub).or_default().push(base);
             }
         }
     }
-    let closure = |from: &mut dyn Iterator<Item = String>| -> HashSet<String> {
+    let walk = |edges: &HashMap<String, Vec<String>>, from: &mut dyn Iterator<Item = String>| {
         let mut seen: HashSet<String> = HashSet::new();
         let mut stack: Vec<String> = from.collect();
         while let Some(n) = stack.pop() {
             if seen.insert(n.clone()) {
-                stack.extend(bases.get(&n).into_iter().flatten().cloned());
+                stack.extend(edges.get(&n).into_iter().flatten().cloned());
             }
         }
         seen
     };
+    // Ancestors (for overrides) and descendants (which inherit the method).
+    let closure = |from: &mut dyn Iterator<Item = String>| walk(&bases, from);
+    let descendants = |from: &mut dyn Iterator<Item = String>| walk(&subs, from);
     // A moved class answers for its own name whatever its count: whether a class
     // of that name exists, is unique, is nested. Its ancestors, for overrides.
     let mut any: HashSet<String> = closure(&mut classes.iter().chain(linked.iter()).cloned())
@@ -909,14 +930,21 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
         .filter(|n| unique(n))
         .collect();
     any.extend(classes.iter().cloned());
+    // A class whose bases moved, and every class below it, inherits from a
+    // different chain now.
+    any.extend(descendants(&mut rebased.iter().cloned()));
     // A moved method answers for calls of it on its own class (own method vs
-    // inherited), and on the class's ancestors for overrides.
+    // inherited), on the class's ancestors for overrides, and on its
+    // descendants, which inherit it.
     let mut per_method: HashSet<(String, String)> = HashSet::new();
     for (owner, m) in methods {
         for n in closure(&mut std::iter::once(owner.clone())) {
             if n == owner || unique(&n) {
                 per_method.insert((n, m.clone()));
             }
+        }
+        for n in descendants(&mut std::iter::once(owner.clone())) {
+            per_method.insert((n, m.clone()));
         }
     }
 
@@ -1904,6 +1932,10 @@ pub(super) struct ProjectClassNames {
     /// loaded. The deferred pass resolves calls after every other relation, so
     /// these are complete when the first call reads them.
     children: Option<HashMap<i64, Vec<i64>>>,
+    /// Subclass id → direct superclass ids, loaded with `children`.
+    parents: HashMap<i64, Vec<i64>>,
+    /// File path → file id, loaded with `children` (a caller's own class).
+    file_ids: HashMap<String, i64>,
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
@@ -1978,20 +2010,32 @@ impl ProjectClassNames {
         Ok(())
     }
 
-    /// Every class inheriting, directly or not, from `seeds` (seeds excluded).
-    fn subclasses(
-        &mut self,
-        db: &crate::storage::db::Database,
-        seeds: &[i64],
-    ) -> anyhow::Result<HashSet<i64>> {
-        if self.children.is_none() {
-            let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
-            for (sub, sup) in crate::storage::queries::inherits_edges(db.conn())? {
-                children.entry(sup).or_default().push(sub);
-            }
-            self.children = Some(children);
+    /// Load the class hierarchy (`inherits` edges both ways) and the file ids,
+    /// once per pass.
+    fn load_hierarchy(&mut self, db: &crate::storage::db::Database) -> anyhow::Result<()> {
+        if self.children.is_some() {
+            return Ok(());
         }
-        let children = self.children.as_ref().expect("loaded above");
+        let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (sub, sup) in crate::storage::queries::inherits_edges(db.conn())? {
+            children.entry(sup).or_default().push(sub);
+            self.parents.entry(sub).or_default().push(sup);
+        }
+        self.children = Some(children);
+        let mut stmt = db.conn().prepare("SELECT path, id FROM files")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (path, id) = row?;
+            self.file_ids.insert(path, id);
+        }
+        Ok(())
+    }
+
+    /// Every class inheriting, directly or not, from `seeds` (seeds excluded).
+    /// [`Self::load_hierarchy`] first.
+    fn subclasses(&self, seeds: &[i64]) -> HashSet<i64> {
+        let Some(children) = self.children.as_ref() else {
+            return HashSet::new();
+        };
         let mut seen: HashSet<i64> = HashSet::new();
         let mut stack: Vec<i64> = seeds.to_vec();
         while let Some(c) = stack.pop() {
@@ -2001,7 +2045,7 @@ impl ProjectClassNames {
                 }
             }
         }
-        Ok(seen)
+        seen
     }
 }
 
@@ -2077,6 +2121,8 @@ pub(super) fn recv_type_targets(
         return Ok(RecvTypeTargets::Drop);
     }
     classes.load(db, candidates)?;
+    classes.load_hierarchy(db)?;
+    let classes = &*classes;
     let by_last = classes.by_last.as_ref().expect("loaded above");
     let no_classes = Vec::new();
     // The class nodes a candidate's method may belong to.
@@ -2123,11 +2169,18 @@ pub(super) fn recv_type_targets(
         Vec::new()
     };
     if own.is_empty() {
-        return Ok(if known {
-            RecvTypeTargets::Fallback
-        } else {
-            RecvTypeTargets::Drop
-        });
+        if !known {
+            return Ok(RecvTypeTargets::Drop);
+        }
+        return Ok(inherited_or_overridden(
+            classes,
+            &want,
+            top_level,
+            dispatch,
+            candidates,
+            caller_path,
+            &owners,
+        ));
     }
     // Several same-named classes define it: the caller's file's, else all of
     // them as an untyped member call.
@@ -2162,7 +2215,7 @@ pub(super) fn recv_type_targets(
             .map(|&id| (id, owners(id).1.iter().map(|c| c.id).collect()))
             .collect();
         if !seeds.is_empty() {
-            let subclasses = classes.subclasses(db, &seeds)?;
+            let subclasses = classes.subclasses(&seeds);
             for (id, nodes) in overrides {
                 if !nodes.is_empty() && nodes.iter().all(|c| subclasses.contains(c)) {
                     targets.push(id);
@@ -2175,6 +2228,104 @@ pub(super) fn recv_type_targets(
     } else {
         RecvTypeTargets::Bind(targets)
     })
+}
+
+/// A call on a project class `T` that does not define the method: what runs is
+/// the definition `T` inherits — the nearest ancestor's — or, dispatching, an
+/// override in a subclass (a C++ pure virtual `DB::Get` has no node, its
+/// overrides do). Binding the untyped member call instead reached every
+/// same-named method in the caller's file (leveldb: `db->Get()` bound
+/// `DBTest::Get`). `T` must name one class node: the only one of that name, else
+/// the caller's file's; overrides only when the name is unique, as for a class
+/// that defines the method. `Fallback` when neither side finds one (a library
+/// base's method, an unbound name).
+fn inherited_or_overridden<'a>(
+    classes: &'a ProjectClassNames,
+    want: &[&str],
+    top_level: bool,
+    dispatch: bool,
+    candidates: &[i64],
+    caller_path: &str,
+    owners: &dyn Fn(i64) -> (Vec<&'a str>, Vec<&'a ClassNode>),
+) -> RecvTypeTargets {
+    let Some(by_last) = classes.by_last.as_ref() else {
+        return RecvTypeTargets::Fallback;
+    };
+    let Some(named) = want.last().and_then(|l| by_last.get(*l)) else {
+        return RecvTypeTargets::Fallback;
+    };
+    let fits: Vec<&ClassNode> = named
+        .iter()
+        .filter(|c| {
+            if want.len() > 1 {
+                c.nested
+            } else {
+                !top_level || !c.nested
+            }
+        })
+        .collect();
+    let caller_file = classes.file_ids.get(caller_path);
+    let start = match fits.as_slice() {
+        [only] => only.id,
+        _ => match fits
+            .iter()
+            .filter(|c| Some(&c.file_id) == caller_file)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [only] => only.id,
+            _ => return RecvTypeTargets::Fallback,
+        },
+    };
+    let cand_nodes: Vec<(i64, Vec<i64>)> = candidates
+        .iter()
+        .map(|&id| (id, owners(id).1.iter().map(|c| c.id).collect()))
+        .collect();
+    let all_in = |nodes: &[i64], set: &HashSet<i64>| {
+        !nodes.is_empty() && nodes.iter().all(|c| set.contains(c))
+    };
+    // Nearest ancestor level defining it.
+    let mut inherited: Vec<i64> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::from([start]);
+    let mut level: Vec<i64> = vec![start];
+    // Deep enough for any real hierarchy; `seen` already stops a cycle.
+    for _ in 0..32 {
+        let next: HashSet<i64> = level
+            .iter()
+            .flat_map(|c| classes.parents.get(c).into_iter().flatten().copied())
+            .filter(|c| seen.insert(*c))
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        inherited = cand_nodes
+            .iter()
+            .filter(|(_, nodes)| all_in(nodes, &next))
+            .map(|(id, _)| *id)
+            .collect();
+        if !inherited.is_empty() {
+            break;
+        }
+        level = next.into_iter().collect();
+    }
+    let mut targets = inherited.clone();
+    if dispatch && named.len() == 1 {
+        let subs = classes.subclasses(&[start]);
+        for (id, nodes) in &cand_nodes {
+            if all_in(nodes, &subs) && !targets.contains(id) {
+                targets.push(*id);
+            }
+        }
+    }
+    if targets.is_empty() {
+        RecvTypeTargets::Fallback
+    } else if inherited.len() > 1 {
+        // Two ancestors of one level define it (multiple bases, or a base name
+        // bound to two classes): not decided by the class.
+        RecvTypeTargets::Ambiguous(targets)
+    } else {
+        RecvTypeTargets::Bind(targets)
+    }
 }
 
 /// Filter candidates to those whose `qualified_name` denotes a METHOD — i.e.

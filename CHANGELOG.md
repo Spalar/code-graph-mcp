@@ -3,8 +3,49 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 74 → 76 because the C++ fixes below change which `calls`
-edges a file produces.
+`INDEX_VERSION` goes 74 → 77 because the fixes below change which `calls` and
+`inherits` edges a file produces.
+
+### A typed call on a class without the method binds what that class runs
+
+`db->Get()` on a `DB*` whose `Get` is pure virtual, or `self.helper()` in a
+class that inherits `helper`, names a class that does not define the method
+itself. Such a call used to resolve as an untyped member call. It bound every
+`Get` or `helper` in reach, preferring the caller's own file, so leveldb's
+`db->Get()` inside `DBTest` bound `DBTest::Get`. It now binds the
+definition the class inherits from its nearest ancestor that has one. Called
+through an object that may be a subclass, it also binds that class's
+subclasses' overrides, the same rule a class that defines the method already
+followed. A call stays untyped only when the class hierarchy has no
+definition, such as a method from a library base class.
+
+Two errors in `inherits` edges fed this and are fixed with it:
+
+- An `inherits` edge could point at a function or method named like the base:
+  a C++ class's own constructor, or, for `class DBTest : public
+  testing::Test`, a project method called `Test`. leveldb had 93 such edges,
+  which made unrelated classes subclasses of each other. A supertype is now
+  always a type, both when the subclass's file is indexed and when the base's
+  file is edited.
+- A C++ base written `log::Reader::Reporter` or `ns::Tmpl<int>` was recorded as
+  `Reader::Reporter` or `Tmpl<int>`, names no node has, so those subclasses
+  had no base. The last segment is recorded now.
+
+On leveldb, scored against SCIP, the `inferred` tier goes from 1528/1565 to
+2513/2550 (97.6% → 98.5%), and recall from 2730 to 2738 of 3470. Most of the
+gain is edges that were `ambiguous` guesses and are now decided. hono gains 2
+correct `inferred` edges and no wrong ones; express and this repository's own
+Rust and JavaScript are unchanged. flask gains 1 correct and 2 wrong: a
+session interface's `self.get_cookie_name()` now also reaches a test
+subclass's override. That is the dispatch rule above, and the oracle cannot
+credit it because scip-python records no overrides. A full index of django takes
+as long as before (12.5 s, three runs each).
+
+A class that inherits the method depends on its bases, so an incremental run
+that changes a base re-resolves the typed calls of every class below it. That
+covers a base gaining or losing the method, a class changing its bases, and a
+base being renamed out from under a subclass in another file. In each case the
+incremental graph equals a rebuild's.
 
 ### A C++ call through a field declared in another file is typed
 

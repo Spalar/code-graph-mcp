@@ -1224,6 +1224,8 @@ fn resolve_batch_relations(
     // (source_id, target_name, relation) — e.g., implements edges to external traits
     let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
 
+    // Loaded on the first supertype relation: this batch's nodes are inserted.
+    let mut callable_ids: Option<HashSet<i64>> = None;
     for pf in batch_parsed {
         let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
         if pf.language == "cpp" {
@@ -1861,6 +1863,15 @@ fn resolve_batch_relations(
                     all_target_ids,
                     db,
                 )?;
+            }
+            // A supertype is a type: never a same-named constructor or method
+            // (`class DBTest : public testing::Test` bound a `Harness::Test()`).
+            if rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS {
+                if callable_ids.is_none() {
+                    callable_ids = Some(crate::storage::queries::callable_node_ids(db.conn())?);
+                }
+                let callables = callable_ids.as_ref().expect("loaded above");
+                all_target_ids.retain(|id| !callables.contains(id));
             }
 
             let same_file_targets: Vec<i64> = all_target_ids
@@ -2991,18 +3002,20 @@ fn restore_inbound_edges(
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
         #[allow(clippy::type_complexity)]
-        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>)>> = HashMap::new();
+        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>, &str)>> =
+            HashMap::new();
         for pf in batch_parsed {
-            for ((id, name), q) in pf
+            for (((id, name), q), ty) in pf
                 .node_ids
                 .iter()
                 .zip(pf.node_names.iter())
                 .zip(pf.node_qualified_names.iter())
+                .zip(pf.node_types.iter())
             {
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
-                    .push((*id, q.as_deref()));
+                    .push((*id, q.as_deref(), ty.as_str()));
             }
         }
 
@@ -3036,13 +3049,18 @@ fn restore_inbound_edges(
             // until the caller's own file changed; a rebuild binds them to none.
             let typed = relation.as_str() == REL_CALLS
                 && super::resolve::parse_callee_metadata(metadata.as_deref()).is_some();
+            // A supertype is a type, as at resolution: never the class's own
+            // same-named constructor.
+            let supertype =
+                relation.as_str() == REL_INHERITS || relation.as_str() == REL_IMPLEMENTS;
             let new_target_ids: Option<Vec<i64>> = batch_name_to_ids
                 .get(&(*target_file_id, target_name.as_str()))
                 .map(|found| {
                     found
                         .iter()
-                        .filter(|(_, q)| !typed || *q == target_qualified.as_deref())
-                        .map(|(id, _)| *id)
+                        .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
+                        .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
+                        .map(|(id, _, _)| *id)
                         .collect::<Vec<i64>>()
                 })
                 .filter(|ids| !ids.is_empty());
@@ -3163,6 +3181,7 @@ fn resolve_deferred_relations(
     };
     let mut classes = ProjectClassNames::default();
     let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
+    let mut callable_ids: Option<HashSet<i64>> = None;
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
     // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
@@ -3684,7 +3703,15 @@ fn resolve_deferred_relations(
 
         // 7. Default name chain: same-file → same-language (refined) →
         //    (references: drop) / (structural: family pool → sentinel/drop).
-        let all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+        let mut all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+        // A supertype is a type, as at batch time.
+        if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {
+            if callable_ids.is_none() {
+                callable_ids = Some(crate::storage::queries::callable_node_ids(db.conn())?);
+            }
+            let callables = callable_ids.as_ref().expect("loaded above");
+            all_target_ids.retain(|id| !callables.contains(id));
+        }
         let same_file_targets: Vec<i64> = all_target_ids
             .iter()
             .filter(|id| node_id_to_path.get(id).map(|p| p.as_str()) == Some(d.rel_path.as_str()))

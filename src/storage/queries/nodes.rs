@@ -1008,6 +1008,15 @@ pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Ve
     Ok(kept)
 }
 
+/// Every function and method node: what an `inherits` / `implements` edge can
+/// never point at (a C++ constructor shares its class's name; a method may be
+/// named like a library base, `testing::Test` vs a `Test()` method).
+pub fn callable_node_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE type IN ('function', 'method')")?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// A recorded C++ field: `(class node id, field, dot type, arrow type)`.
 pub type CppFieldRow = (i64, String, Option<String>, Option<String>);
 

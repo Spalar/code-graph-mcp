@@ -11767,8 +11767,10 @@ fn the_qualified_path_still_discloses_the_callers_it_excluded() {
         "class Base:\n    def helper(self):\n        return 1\n",
     )
     .unwrap();
-    // A same-named method on an unrelated class, so `self.helper()` below is
-    // resolved by bare name and lands in the `ambiguous` tier.
+    // A same-named method on an unrelated class, so `obj.helper()` below (an
+    // untyped receiver) is resolved by bare name and lands in the `ambiguous`
+    // tier. (`self.helper()` in a `Base` subclass no longer would: it binds the
+    // inherited `Base.helper`, decided.)
     std::fs::write(
         project.path().join("other.py"),
         "class Other:\n    def helper(self):\n        return 2\n",
@@ -11776,7 +11778,7 @@ fn the_qualified_path_still_discloses_the_callers_it_excluded() {
     .unwrap();
     std::fs::write(
         project.path().join("child.py"),
-        "from base import Base\n\n\nclass Child(Base):\n    def run(self):\n        return self.helper()\n",
+        "def run(obj):\n    return obj.helper()\n",
     )
     .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);

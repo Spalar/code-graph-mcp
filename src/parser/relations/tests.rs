@@ -772,6 +772,29 @@ fn test_member_call_on_an_object_is_marked_member() {
 }
 
 #[test]
+fn test_cpp_nested_qualified_base_names_its_last_segment() {
+    // `log::Reader::Reporter`: the scope's tail is itself qualified. A local
+    // struct in a function body inherits like any other.
+    let code = "void Recover() {\n  struct LogReporter : public log::Reader::Reporter {};\n}\n\
+                class A : public ns::Tmpl<int>, private Plain {};\n";
+    let got: Vec<(String, String)> = extract_relations(code, "cpp")
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| (r.source_name, r.target_name))
+        .collect();
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(
+        got,
+        vec![
+            pair("LogReporter", "Reporter"),
+            pair("A", "Tmpl"),
+            pair("A", "Plain")
+        ]
+    );
+}
+
+#[test]
 fn test_cpp_field_receiver_outside_its_class_body_is_marked_field() {
     let cpp = call_meta(
         "Status DBImpl::Get() { versions_->Current(); Slice k; k.size(); \

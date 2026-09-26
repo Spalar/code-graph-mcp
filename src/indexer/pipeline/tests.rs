@@ -2485,6 +2485,186 @@ fn test_cpp_gtest_body_types_the_fixture_field() {
     );
 }
 
+/// A supertype is a type. A C++ class shares its name with its constructor, and
+/// `testing::Test` with any project method named `Test`: leveldb had 93 `inherits`
+/// edges into methods, which made unrelated classes each other's subclasses.
+#[test]
+fn test_inherits_never_targets_a_function_or_method() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "table_test.cc",
+            "class Constructor {\n public:\n  explicit Constructor(int n) {}\n};\n\
+             class BlockConstructor : public Constructor {\n public:\n  BlockConstructor() : Constructor(1) {}\n};\n\
+             class Harness {\n public:\n  void Test(int n) {}\n};\n",
+        ),
+        (
+            "db_test.cc",
+            "class DBTest : public testing::Test {\n public:\n  void Put(int v) {}\n};\n",
+        ),
+    ]);
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT s.name || ' -> ' || t.type || ' ' || COALESCE(t.qualified_name, t.name) \
+             FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
+             WHERE e.relation = 'inherits' ORDER BY 1",
+        )
+        .unwrap();
+    let got: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        got.iter()
+            .all(|e| !e.contains(" -> function ") && !e.contains(" -> method ")),
+        "{got:#?}"
+    );
+    assert!(
+        got.contains(&"BlockConstructor -> class Constructor".to_string()),
+        "{got:#?}"
+    );
+}
+
+/// Re-indexing a base's file restores the edges into it by name: a subclass's
+/// `inherits` edge must come back to the class, not also to its same-named
+/// constructors (leveldb: editing env.h left 24 such edges a rebuild lacks).
+#[test]
+fn test_restored_inherits_edge_skips_the_constructor() {
+    let base = "class WritableFile {\n public:\n  WritableFile() = default;\n  \
+                WritableFile(const WritableFile&) = delete;\n  virtual void Close() = 0;\n};\n";
+    let sub = "#include \"env.hpp\"\nclass StringSink : public WritableFile {\n public:\n  \
+               void Close() override {}\n};\n";
+    let (project, _d, db) = fresh_index_of(&[("env.hpp", base), ("sink.cc", sub)]);
+    let edited = format!("{base}// touched\n");
+    fs::write(project.path().join("env.hpp"), &edited).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, control) = fresh_index_of(&[("env.hpp", &edited), ("sink.cc", sub)]);
+    assert_eq!(edge_set(&db), edge_set(&control));
+    assert!(
+        edge_set(&db)
+            .contains(&"sink.cc.StringSink --inherits--> env.hpp.WritableFile".to_string()),
+        "{:#?}",
+        edge_set(&db)
+    );
+}
+
+/// A class that does not define the method runs what it inherits, or, called
+/// through a pointer, an override: `db->Get()` on a `DB` whose `Get` is pure
+/// virtual (no node) binds `DBImpl::Get`, not the caller's own `DBTest::Get`.
+#[test]
+fn test_typed_call_on_a_class_without_the_method_binds_overrides() {
+    let (_p, _d, db) = fresh_index_of(&[(
+        "db.cc",
+        "class DB {\n public:\n  virtual void Get() = 0;\n};\n\
+         class DBImpl : public DB {\n public:\n  void Get() override {}\n};\n\
+         class DBTest {\n public:\n  void Get() {}\n  void Check(DB* db) { db->Get(); }\n};\n",
+    )]);
+    assert_eq!(
+        callees_of(&db, "Check"),
+        vec!["db.cc.DBImpl.Get".to_string()]
+    );
+}
+
+const BASE_PY: &str = "class Base:\n    def helper(self):\n        pass\n";
+const SUB_PY: &str =
+    "from base import Base\n\n\nclass Sub(Base):\n    def run(self):\n        self.helper()\n";
+const OTHER_PY: &str = "class Other:\n    def helper(self):\n        pass\n";
+
+/// `self.helper()` in a class that inherits `helper` binds the base's, decided,
+/// not every `helper` in reach.
+#[test]
+fn test_typed_call_binds_the_inherited_method() {
+    let (_p, _d, db) = fresh_index_of(&[
+        ("base.py", BASE_PY),
+        ("sub.py", SUB_PY),
+        ("other.py", OTHER_PY),
+    ]);
+    let edges: Vec<String> = call_edges_with_confidence(&db)
+        .into_iter()
+        .filter(|e| e.starts_with("sub.py.run"))
+        .collect();
+    assert_eq!(
+        edges,
+        vec![r#"sub.py.run -> base.py.Base.helper {"q":"rtype","v":"Sub"} inferred"#.to_string()]
+    );
+}
+
+/// What a class inherits moves with its bases: a base gaining or losing the
+/// method, or its file going away, re-resolves the untouched subclass's calls.
+#[test]
+fn test_inherited_method_change_re_resolves_untouched_subclass_callers() {
+    let bare = "class Base:\n    pass\n";
+    let files = [("sub.py", SUB_PY), ("other.py", OTHER_PY)];
+    assert_incremental_matches_rebuild(
+        &[("base.py", bare), files[0], files[1]],
+        &[("base.py", Some(BASE_PY))],
+    );
+    assert_incremental_matches_rebuild(
+        &[("base.py", BASE_PY), files[0], files[1]],
+        &[("base.py", Some(bare))],
+    );
+    assert_incremental_matches_rebuild(
+        &[("base.py", BASE_PY), files[0], files[1]],
+        &[("base.py", None)],
+    );
+    // `helper` moves from a free function into the base: its count is unchanged
+    // (no D#24 round) and the caller's edge went to `Other` (nothing to restore).
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "base.py",
+                "class Base:\n    pass\n\n\ndef helper():\n    pass\n",
+            ),
+            files[0],
+            files[1],
+        ],
+        &[("base.py", Some(BASE_PY))],
+    );
+    // The middle class drops its mixin: the call bound `Mixin.helper` in a file
+    // the run never opens.
+    let mixin = (
+        "mixin.py",
+        "class Mixin:\n    def helper(self):\n        pass\n",
+    );
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "base.py",
+                "from mixin import Mixin\n\n\nclass Base(Mixin):\n    pass\n",
+            ),
+            mixin,
+            files[0],
+            files[1],
+        ],
+        &[("base.py", Some("class Base:\n    pass\n"))],
+    );
+    // The middle class is renamed: `Sub(Base)` loses its base without its file
+    // changing, and its call bound `Mixin.helper`.
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "base.py",
+                "from mixin import Mixin\n\n\nclass Base(Mixin):\n    pass\n",
+            ),
+            mixin,
+            files[0],
+            files[1],
+        ],
+        &[(
+            "base.py",
+            Some("from mixin import Mixin\n\n\nclass Base2(Mixin):\n    pass\n"),
+        )],
+    );
+    // Two levels down: `Leaf(Sub)` calls what `Sub` inherits.
+    let leaf =
+        "from sub import Sub\n\n\nclass Leaf(Sub):\n    def go(self):\n        self.helper()\n";
+    assert_incremental_matches_rebuild(
+        &[("base.py", bare), files[0], files[1], ("leaf.py", leaf)],
+        &[("base.py", Some(BASE_PY))],
+    );
+}
+
 /// The header changes the field's type; the `.cc` caller is untouched.
 #[test]
 fn test_cpp_field_type_change_re_resolves_untouched_callers() {
