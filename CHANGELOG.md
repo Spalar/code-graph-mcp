@@ -131,7 +131,8 @@ found nothing. It now reads that command closer to the way the shell does:
   unterminated quote has no readable pattern; words inside a quoted pattern are
   no longer rebased as paths from a subdirectory.
 
-On the same 16,352 commands the inject folds 1,734 commands instead of 1,807:
+On the same 16,352 commands, measured before the `||` repair above, the
+inject folds 1,734 commands instead of 1,807:
 32 real greps after a heredoc are now found, 7 heredoc-body greps and 23
 greps after a `cd` elsewhere are no longer answered, and 75 follow a command
 whose directory the hook cannot name. The PreToolUse rewrite decisions are
@@ -161,9 +162,16 @@ counts as the flag.
   `a.rs` after `use crate::a::widget` bound another file's `widget` also keeps
   the old edge until a rebuild. `<S as Tr>::go(s)` binds nothing.
 - A call through a renamed JavaScript import (`import { a as b }`,
-  `const { a: b } = require()`) still binds nothing.
+  `const { a: b } = require()`) still resolves by its local name, as in
+  0.159.0: to nothing, or to another file's function named `b`.
+- The module-path rule reads a lowercase last segment as a module, so a call
+  through a lowercase type that passes `self` itself loses its edge:
+  `u32::encode_to(&v, buf)` for a project trait implemented on `u32`, or
+  `sqlite3_db::close_db(&mut d)` for a `#[allow(non_camel_case_types)]` struct.
 - A grep that may not have run (`true || grep …`) is still answered by the
-  inject when its output is empty.
+  inject when its output is empty, and a `cd` inside a loop body
+  (`for d in "$@"; do cd x; done; grep …`) is followed although the body may
+  not have run.
 - The inject does not apply the `--include`-with-a-file rule, and forwards no
   `-x`; the rewrite declines both.
 - `\b` and `[[:alpha:]]` on non-ASCII text can differ between the dialects.
