@@ -449,7 +449,10 @@ pub(super) fn resolve_pending_calls_touching(
                 classes.member_call_candidates(db, row.metadata.as_deref(), candidates)?
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
-            // bare name too, so the existing behavior already matches.
+            // bare name too, so the existing behavior already matches. A buffered
+            // Rust `x.f()` (D#117) meets at most one method here: a second one
+            // arriving in the same run is a new duplicate definition, and
+            // `fan_out_to_new_duplicate_definitions` re-resolves the caller.
             _ => candidates,
         };
 

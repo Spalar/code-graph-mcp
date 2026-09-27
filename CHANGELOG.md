@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### An incremental run binds a Rust method added later, as a rebuild does
+
+A Rust method call `x.f()` (or `make().f()`) with no method `f` anywhere in
+the project was dropped, not kept for later: when a later edit added the
+method, an incremental run never bound the call, while a rebuild did. The
+call now waits in the pending-call buffer like a bare call, and the run that
+adds the method binds it.
+
 ### The grep hook answers only the search the grep ran
 
 Four shapes where the rewritten answer searched something else, all listed

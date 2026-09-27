@@ -3636,6 +3636,19 @@ fn resolve_deferred_relations(
                             Some(same_file_methods[0])
                         } else if same_file_methods.is_empty() && methods.len() == 1 {
                             Some(methods[0])
+                        } else if methods.is_empty() {
+                            // No such method anywhere yet: buffer the call, so the
+                            // run that adds one binds it as a rebuild would (D#117).
+                            for &src_id in &source_ids {
+                                crate::storage::queries::insert_pending_unresolved_call(
+                                    db.conn(),
+                                    src_id,
+                                    &d.target_name,
+                                    &d.language,
+                                    call_meta,
+                                )?;
+                            }
+                            None
                         } else {
                             None // ambiguous either way → drop, as at batch time
                         };

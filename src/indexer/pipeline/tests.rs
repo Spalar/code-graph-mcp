@@ -3628,6 +3628,64 @@ fn test_rust_module_then_type_path_reaches_the_method() {
     }
 }
 
+/// D#117: a Rust `x.f()` with no candidate yet was not buffered (only the
+/// `{"q":"member"}` shape `x.inner.f()` was), so an incremental run never bound
+/// a method a later file added, where a rebuild binds it.
+#[test]
+fn test_rust_receiver_call_binds_a_method_added_later() {
+    let early = (
+        "early.rs",
+        "pub fn early(x: &X) {\n    x.lonely(1);\n    x.inner.alone(1);\n}\n",
+    );
+    let late = (
+        "late.rs",
+        "pub struct Late;\nimpl Late {\n    pub fn lonely(&self, a: i32) {}\n    \
+         pub fn alone(&self, a: i32) {}\n}\n",
+    );
+    let (project, _d, db) = fresh_index_of(&[early]);
+    fs::write(project.path().join(late.0), late.1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&[early, late]);
+    let edges = edge_set(&fresh);
+    assert!(
+        edges.contains(&"early.rs.early --calls--> late.rs.lonely".to_string()),
+        "rebuild control: {edges:#?}"
+    );
+    assert_eq!(edge_set(&db), edges);
+}
+
+/// The buffered `x.f()` of D#117, when two methods of that name arrive in one
+/// later run: a rebuild binds neither (the unique-method rule), and so must the
+/// incremental run. The sweep binds both by name; the new duplicate definition
+/// then re-resolves the caller (D#24's fan-out), which drops them.
+#[test]
+fn test_rust_buffered_receiver_call_binds_no_ambiguous_method() {
+    let early = ("early.rs", "pub fn early(x: &X) {\n    x.lonely(1);\n}\n");
+    let a = (
+        "a.rs",
+        "pub struct A;\nimpl A {\n    pub fn lonely(&self, a: i32) {}\n}\n",
+    );
+    // At different distances, so proximity alone would pick `a.rs`.
+    let b = (
+        "deep/er/b.rs",
+        "pub struct B;\nimpl B {\n    pub fn lonely(&self, a: i32) {}\n}\n",
+    );
+    let (project, _d, db) = fresh_index_of(&[early]);
+    fs::write(project.path().join(a.0), a.1).unwrap();
+    fs::create_dir_all(project.path().join("deep/er")).unwrap();
+    fs::write(project.path().join(b.0), b.1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&[early, a, b]);
+    assert!(
+        !edge_set(&fresh)
+            .iter()
+            .any(|e| e.starts_with("early.rs.early --calls-->")),
+        "rebuild control: {:#?}",
+        edge_set(&fresh)
+    );
+    assert_eq!(edge_set(&db), edge_set(&fresh));
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs
