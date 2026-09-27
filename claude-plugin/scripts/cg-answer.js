@@ -354,14 +354,14 @@ function runGrepAnswer(opts = {}) {
  * caller that must account for every definition can refuse.
  */
 function showDefinitionFiles(out) {
-  const files = [];
+  const defs = [];
   for (const line of out.split('\n')) {
     if (line === '' || /^\s/.test(line)) continue;
-    const m = /^\S+ \S+ {2}(\S+):\d+-\d+(?: |$)/.exec(line);
+    const m = /^(\S+) \S+ {2}(\S+):\d+-\d+(?: |$)/.exec(line);
     if (!m) return null;
-    files.push(m[1]);
+    defs.push({ kind: m[1], file: m[2] });
   }
-  return files.length ? files : null;
+  return defs.length ? defs : null;
 }
 
 /** Whether a root-relative file lies under a grep path ('' = the whole root). */
@@ -381,6 +381,11 @@ function runShowAnswer(opts = {}) {
     // inside several files with more outside have no scoped equivalent, and
     // the whole answer is refused. undefined: unscoped, as before.
     within,
+    // Symbol → the show kind labels the grep's keyword finds (`fn foo` → fn).
+    // With `within`, a definition of another kind counts as one the grep does
+    // not match: `show foo --file F` must not print a `struct foo` beside the
+    // `fn foo` (review of D#125). A symbol with no entry takes every kind.
+    kinds,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxBytes = DEFAULT_MAX_BYTES,
   } = opts;
@@ -417,12 +422,17 @@ function runShowAnswer(opts = {}) {
       if (isEmptyAnswer(out)) continue;
       let argv = ['show', sym];
       if (within !== undefined) {
-        const files = showDefinitionFiles(out);
-        if (!files) return { status: 'unavailable', reason: 'scope' };
-        const inside = [...new Set(files.filter((f) => pathWithin(f, within)))];
+        const defs = showDefinitionFiles(out);
+        if (!defs) return { status: 'unavailable', reason: 'scope' };
+        const allowed = kinds && kinds[sym];
+        const matches = (d) => pathWithin(d.file, within) && (!allowed || allowed.includes(d.kind));
+        const inside = [...new Set(defs.filter(matches).map((d) => d.file))];
         if (inside.length === 0) continue;
-        if (files.some((f) => !pathWithin(f, within))) {
-          if (inside.length !== 1) return { status: 'unavailable', reason: 'scope' };
+        const others = defs.filter((d) => !matches(d));
+        if (others.length > 0) {
+          if (inside.length !== 1 || others.some((d) => d.file === inside[0])) {
+            return { status: 'unavailable', reason: 'scope' };
+          }
           argv = ['show', sym, '--file', inside[0]];
         }
       }

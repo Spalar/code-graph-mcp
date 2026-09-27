@@ -3590,3 +3590,108 @@ test('rewritePlan: a non-recursive plain grep of a directory, or of stdin, is no
   assert.notEqual(rewritePlan('rg -n "Foo" src/', dir), null);
   assert.notEqual(rewritePlan('git grep -n "Foo" src/', dir), null);
 });
+
+// ── pre-release review of D#125 ─────────────────────────────────────
+// R1 F1: re-picking the pattern after marking the root found another word, so
+// a pattern holding the root was still rewritten. Any word holding the root
+// must BE the search path.
+test('e2e: every word holding the project root must be the search path, or the grep runs as typed', () => {
+  const uniq = `StubRootW${Date.now()}`;
+  // Answers every verb: `show` with a header, anything else with a hit.
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'show') { process.stdout.write('fn ' + process.argv[3] + '  src/a.rs:1-3  ()\\n  body\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/a.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  const root = fsE2e.realpathSync(fixture.dir);
+  const cmds = [
+    `grep -rn "${root}/def ${uniq}" src/`,
+    `grep -rn -A3 "${root}/fn ${uniq}" src/`,
+    `grep -rn "abc_${root}/def" src/`,
+    `grep -rn "${root}/fn ${uniq}" --include="FooBar.rs" src/`,
+    `grep -rn "${root}/src/" ${root}/src/`,
+  ];
+  try {
+    for (const cmd of cmds) {
+      const res = runHook(cmd, fixture, root);
+      assert.equal(res.status, 0, res.stderr);
+      assert.ok(!res.stdout.trim().startsWith('{'), `${cmd}: must run as typed, got ${res.stdout}`);
+    }
+  } finally {
+    for (const cmd of cmds) cleanupFixture(fixture, cmd);
+  }
+});
+
+// R1 F2: `show` has no file filter; the grep's --include / -g / -t excluded
+// definitions the show printed.
+test('e2e: a show-mode grep with a file filter is not rewritten into show', () => {
+  const uniq = `StubShowFilt${Date.now()}`;
+  const fixture = e2eFixture(showStub(['src/a/x.rs', 'src/b/y.py']));
+  const cmds = [
+    `grep -rn -A3 --include='*.py' "def ${uniq}" src/`,
+    `rg -n -A3 -t py "def ${uniq}" src`,
+    `rg -n -A3 -g '*.py' "def ${uniq}" src`,
+  ];
+  try {
+    for (const cmd of cmds) {
+      const res = runHook(cmd, fixture);
+      const out = res.stdout.trim();
+      if (out.startsWith('{')) {
+        assert.doesNotMatch(JSON.parse(out).hookSpecificOutput.updatedInput.command, / show /,
+          `${cmd}: a show answer ignores the filter`);
+      }
+    }
+  } finally {
+    for (const cmd of cmds) cleanupFixture(fixture, cmd);
+  }
+});
+
+// R1 F3: `show foo` prints every kind; the grep searched `fn foo`.
+function kindStub(defs) {
+  return `if (process.argv[2] !== 'show') process.exit(1);\n` +
+    `const defs = ${JSON.stringify(defs)};\n` +
+    `const i = process.argv.indexOf('--file');\n` +
+    `const only = i > 0 ? process.argv[i + 1] : null;\n` +
+    `for (const [k, f] of defs) { if (only && f !== only) continue;\n` +
+    `  process.stdout.write(k + ' ' + process.argv[3] + '  ' + f + ':1-3  ()\\n  body\\n'); }`;
+}
+
+test('e2e: a show answer counts only definitions of the kind the grep searched', () => {
+  const uniq = `StubKind${Date.now()}`;
+  const cases = [
+    // only a struct inside lib/: the grep finds no `fn` there
+    [[['fn', 'src/a/x.rs'], ['struct', 'lib/z.rs']], `grep -rn -A3 "fn ${uniq}" lib/`, null],
+    // a struct beside the fn in the one file: `--file` would print both
+    [[['fn', 'lib/z.rs'], ['struct', 'lib/z.rs'], ['fn', 'src/a.rs']], `grep -rn -A3 "fn ${uniq}B" lib/`, null],
+    // the struct lies elsewhere: narrowed to the fn's file
+    [[['fn', 'lib/z.rs'], ['struct', 'lib/w.rs']], `grep -rn -A3 "fn ${uniq}C" lib/`, `--file lib/z.rs`],
+    // `trait` answers a Rust trait (iface)
+    [[['iface', 'lib/t.rs']], `grep -rn -A3 "trait ${uniq}D" lib/`, 'plain'],
+  ];
+  for (const [defs, cmd, want] of cases) {
+    const fixture = e2eFixture(kindStub(defs));
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
+    try {
+      const out = runHook(cmd, fixture).stdout.trim();
+      if (want === null) {
+        assert.ok(!out.startsWith('{'), `${cmd} over ${JSON.stringify(defs)}: must run as typed, got ${out}`);
+      } else {
+        const rw = rewriteOf({ status: 0, stdout: out, stderr: '' });
+        if (want === 'plain') assert.match(rw.command, / show \S+$/, rw.command);
+        else assert.match(rw.command, new RegExp(` show \\S+ ${want}$`), rw.command);
+      }
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  }
+});
+
+// R1 F5: BRE reads `*` as a literal at the start of a pattern, a group or an
+// alternative, and right after a leading `^`; rust regex rejects or repeats it.
+test('translateBreToRg: a * in a leading position has no translation', () => {
+  const t = (p) => translateBreToRg(`grep -rn "${p}" src/`, p);
+  assert.equal(t('^*foo_bar'), null);
+  assert.equal(t('*foo'), null);
+  assert.equal(t('\\(*x\\)'), null);
+  assert.equal(t('x\\|*y'), null);
+  assert.equal(t('fo*o'), 'fo*o');
+  assert.equal(t('^a*'), '^a*');
+});

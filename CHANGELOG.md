@@ -18,22 +18,29 @@ outside the module file its path names.
 
 ### The grep hook answers only the search the grep ran
 
-Four shapes where the rewritten answer searched something else, all listed
-under 0.160.0's Not covered, now run as typed or are answered exactly:
+Shapes where the rewritten answer searched something else now run as typed
+or are answered exactly (four were listed under 0.160.0's Not covered; the
+rest came from this release's review):
 
-- A pattern holding the project path (`grep -rn "/home/me/proj/Foo" src/`)
-  was answered for `Foo`: the hook strips the project path from path operands
-  and could not tell the pattern from one. It now runs as typed, and the
-  PostToolUse inject skips it.
-- A declaration grep with context (`grep -rn -A3 "fn load" lib/`) was
-  answered by `show load` over the whole project. The answer now stays inside
-  the grep's path: `show load --file lib/a.rs` when that one file holds every
-  definition inside it, nothing (the grep runs) when several files inside do
-  and more lie outside.
-- `grep -n Foo src/` without `-r` searches no directory, and `grep -n Foo`
-  with no path reads its input; both were answered with a recursive search.
-- A `^` or `$` in the middle of a basic regex (`getUser\|$user_id`) is a
-  literal to grep and an anchor to the answer; such a pattern runs as typed.
+- A command naming the project path anywhere but its search path
+  (`grep -rn "/home/me/proj/Foo" src/`) was answered for `Foo`: the hook strips
+  the project path from path operands and could not tell a pattern from one.
+  Such a command now runs as typed, and the PostToolUse inject skips it.
+- A declaration grep with context (`grep -rn -A3 "fn load" lib/`) was answered
+  by `show load` over the whole project and every kind of definition. The
+  answer now counts only definitions inside the grep's path and of the kind
+  its keyword finds (`fn` finds no `struct load`): `show load --file lib/a.rs`
+  when that one file holds all of them and nothing else, nothing (the grep
+  runs) when they span several files with others outside. A grep with a file
+  filter (`--include`, `-g`, `-t`) gets no `show` answer, which cannot filter.
+  The PostToolUse inject scopes its `show` the same way.
+- `grep -n Foo src/` without `-r` searches no directory under GNU grep, and
+  `grep -n Foo` with no path reads its input; neither is answered with a
+  recursive search (ugrep, which some shells run as `grep`, does descend: the
+  command runs as typed either way).
+- A `^` or `$` in the middle of a basic regex (`getUser\|$user_id`), and a `*`
+  where a pattern or alternative starts (`^*foo`), read differently in GNU
+  grep, ugrep and the answer's regex; such a pattern runs as typed.
 
 ### Rust call resolution, measured on tokio
 

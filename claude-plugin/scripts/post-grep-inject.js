@@ -52,7 +52,11 @@ const {
   operandMatches,
   firstShellClause,
   normalizeCommandPaths,
-  patternHoldsRoot,
+  rootOnlyInSearchPath,
+  grepSearchesNoDirectory,
+  isDirectory,
+  declKindsBySymbol,
+  extractPatterns,
   rebaseRelativePaths,
   resolveProjectRoot,
 } = require('./pre-grep-guide');
@@ -290,7 +294,10 @@ function runMain() {
   if ((segCwd !== root || relPrefix)
       && !operandMatches(firstShellClause(rawSegs[idx]), extractSearchPath(segment), root, segCwd)) return;
   // D#125 #1 — the root strip rewrote a pattern that held the root.
-  if (patternHoldsRoot(rawSegs[idx], root)) return;
+  if (!rootOnlyInSearchPath(rawSegs[idx], root, extractSearchPath(segment))) return;
+  // D#125 #3 — a plain grep without -r searched no directory.
+  if (grepSearchesNoDirectory(firstShellClause(segment), extractSearchPath(segment),
+    (t) => isDirectory(path.resolve(root, t)))) return;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
   // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they
@@ -385,7 +392,14 @@ function runMain() {
   if (answer.status !== 'hits') {
     if (block.mode === 'show') {
       answeredMode = 'show';
-      answer = runShowAnswer({ cwd: root, symbols: block.symbols });
+      // Scoped like the rewrite: the grep's path and declaration kinds; a grep
+      // with a file filter gets the grep answer, which honors it.
+      answer = flags.includes('-g') || flags.includes('-t')
+        ? { status: 'unavailable' }
+        : runShowAnswer({
+          cwd: root, symbols: block.symbols, within: searchPath ?? '',
+          kinds: declKindsBySymbol(extractPatterns(segment)),
+        });
       if (answer.status !== 'hits' && pattern) {
         answeredMode = 'grep';
         answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });

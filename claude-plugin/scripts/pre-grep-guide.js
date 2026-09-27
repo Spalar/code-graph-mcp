@@ -376,6 +376,26 @@ function clauseWords(s) {
 // name the exact symbols the model wants to READ — extract them for `show`.
 const DECL_SYMBOL = /(?:fn|def|class|function|struct|impl|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
 
+// The `show` kind labels (src/cli/symbols.rs format_node_compact) each
+// declaration keyword finds. `impl` names no definition of its own.
+const DECL_KIND_LABELS = {
+  fn: ['fn'], def: ['fn'], function: ['fn'], class: ['class'], struct: ['struct'],
+  trait: ['trait', 'iface'], impl: [],
+};
+
+// Symbol → the kind labels the grep's declaration keywords can find for it
+// (`fn foo\|struct foo` → foo: fn, struct), so a `show` answer counts only
+// definitions the grep matches (review of D#125).
+function declKindsBySymbol(patterns) {
+  const out = {};
+  for (const p of patterns) {
+    for (const m of p.matchAll(/\b(fn|def|class|function|struct|impl|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
+      out[m[2]] = [...new Set([...(out[m[2]] || []), ...DECL_KIND_LABELS[m[1]]])];
+    }
+  }
+  return out;
+}
+
 function extractDeclSymbols(patterns) {
   const out = [];
   for (const p of patterns) {
@@ -658,16 +678,24 @@ function normalizeCommandPaths(cmd, cwd) {
 
 // D#125 #1 — the strip above cannot tell a path operand from a PATTERN, and
 // strips both: `grep -rn "<root>/Foo" src/` searches the literal text
-// `<root>/Foo`, but was answered for `Foo`. Mark the root instead of removing
-// it and pick the pattern again: a pattern that holds the mark held the root,
-// and no answer searches what the grep searched.
-function patternHoldsRoot(cmd, cwd) {
-  if (!cmd || typeof cmd !== 'string') return false;
-  if (!cwd || typeof cwd !== 'string' || cwd === '/') return false;
-  const marked = cmd.split(cwd.endsWith('/') ? cwd : cwd + '/').join('\u0001');
-  if (marked === cmd) return false;
-  const picked = pickBlockPattern(marked);
-  return typeof picked === 'string' && picked.includes('\u0001');
+// `<root>/Foo`, but was answered for `Foo`. Re-picking the pattern with the
+// root marked was tried first and missed shapes where the mark changes which
+// word is picked (`"<root>/def foo"`, `"abc_<root>/def"`: review of D#125). The
+// narrow form: every shell word that holds `<root>/` must BE the search path
+// the answer scopes to; anything else runs as typed.
+function rootOnlyInSearchPath(cmd, cwd, target) {
+  if (!cmd || typeof cmd !== 'string') return true;
+  if (!cwd || typeof cwd !== 'string' || cwd === '/') return true;
+  const prefix = cwd.endsWith('/') ? cwd : cwd + '/';
+  if (!cmd.includes(prefix)) return true;
+  const words = shellWords(cmd);
+  if (!words || target === undefined) return false;
+  const norm = (p) => p.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+  const holding = words.filter((w) => !w.op && w.text.includes(prefix));
+  // One word only: a pattern spelled exactly like the path (`grep -rn
+  // "<root>/src" <root>/src`) holds the root too.
+  return holding.length === 1 && holding[0].text.startsWith(prefix)
+    && norm(holding[0].text.slice(prefix.length)) === norm(target);
 }
 
 // v0.48 — subdir-cwd fix; v0.49 — extracted to project-root.js so the read
@@ -1334,6 +1362,28 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   return { pattern: pattern.text, target: target ? target.text : undefined, context };
 }
 
+// D#125 #3 for the PostToolUse side, which has no rewrite grammar: a plain
+// `grep` with no recursion flag searches no directory ("Is a directory" under
+// GNU grep) and, with no path, reads its input.
+function grepSearchesNoDirectory(clause, target, isDir) {
+  const words = shellWords(clause || '');
+  if (!words || words.length === 0 || words[0].anyQuoted || words[0].text !== 'grep') return false;
+  for (let k = 1; k < words.length; k++) {
+    const w = words[k];
+    if (w.op || w.startsQuoted) continue;
+    if (w.text === '--') break;
+    if (/^--(?:recursive|dereference-recursive|directories=recurse)$/.test(w.text)) return false;
+    if (w.text === '-d' && words[k + 1] && words[k + 1].text === 'recurse') return false;
+    if (/^-[^-]/.test(w.text)) {
+      for (const ch of w.text.slice(1)) {
+        if (ch === 'r' || ch === 'R') return false;
+        if ('ABCefmdDg'.includes(ch)) break;  // the rest is that flag's value
+      }
+    }
+  }
+  return target === undefined || isDir(target);
+}
+
 // Does `rootTarget`, run from the root, name the path the grep clause's own
 // operand names from `cwd` — the directory the clause ran in? The raw clause is
 // parsed with the rewrite grammar; an absolute operand resolves the same from
@@ -1422,6 +1472,10 @@ function rewriteMatchesBlock(plan, block, cmd, rawPattern) {
   if (block.mode === 'show') {
     const f = cgFlagSet(extractCgFlags(cmd));
     if (f.has('-l') || f.has('-c')) return false;
+    // `show` has no file filter: `--include`/`-g`/`-t` excluded definitions it
+    // would print (review of D#125).
+    const all = extractCgFlags(cmd);
+    if (all.includes('-g') || all.includes('-t')) return false;
     // show answers at most three symbols; a fourth would silently vanish.
     if (extractDeclSymbols(extractPatterns(cmd)).length > 3) return false;
   }
@@ -1485,10 +1539,13 @@ const POSIX_CLASSES = new Set(['alpha', 'digit', 'alnum', 'upper', 'lower', 'spa
 function breToRustRegex(pattern) {
   let out = '';
   let altStart = true;
+  let anchor = false;
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
     const wasAltStart = altStart;
+    const wasAnchor = anchor;
     altStart = false;
+    anchor = c === '^' && wasAltStart;
     if (c === '\\' && i + 1 < pattern.length) {
       const n = pattern[++i];
       if (n === '(' && pattern.startsWith('\\)', i + 1)) return null;
@@ -1499,6 +1556,10 @@ function breToRustRegex(pattern) {
       continue;
     }
     if (c === '^' && !wasAltStart) return null;
+    // A `*` where an alternative starts, or right after its `^`, repeats
+    // nothing: BRE reads it as a literal, rust regex as an error or a repeat of
+    // the anchor (review of D#125).
+    if (c === '*' && (wasAltStart || (wasAnchor && out.endsWith('^')))) return null;
     if (c === '$' && i + 1 < pattern.length
       && !pattern.startsWith('\\)', i + 1) && !pattern.startsWith('\\|', i + 1)) return null;
     if (BRE_SWAPPED.includes(c)) { out += '\\' + c; continue; }
@@ -1683,7 +1744,7 @@ function runMain() {
   // forwarding `-F` without this guard would make it search the wrong text.
   const cgFlags = extractCgFlags(cmd);
   const rawGrepPattern = pickBlockPattern(cmd);
-  if (patternHoldsRoot(rawCmd, root)) return;
+  if (!rootOnlyInSearchPath(rawCmd, root, extractSearchPath(cmd))) return;
   const grepPattern = cgFlagSet(cgFlags).has('-F')
     ? rawGrepPattern
     : translateBreToRg(cmd, rawGrepPattern);
@@ -1764,7 +1825,10 @@ function runMain() {
         // review round 2). A show miss lets the raw grep run.
         // Scoped to the grep's path: `show` alone answers the whole project
         // (D#125 #2 — `grep -A3 "fn f" lib/` was answered from src/).
-        answer = runShowAnswer({ cwd: root, symbols: block.symbols, within: searchPath ?? '' });
+        answer = runShowAnswer({
+          cwd: root, symbols: block.symbols, within: searchPath ?? '',
+          kinds: declKindsBySymbol(extractPatterns(cmd)),
+        });
       } else if (pattern) {
         answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
       }
@@ -1897,7 +1961,10 @@ module.exports = {
   isRevisionScopedGitGrep, // v0.71 — git grep --cached/treeish exclusion
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
-  patternHoldsRoot, // D#125 #1
+  rootOnlyInSearchPath, // D#125 #1
+  isDirectory,
+  grepSearchesNoDirectory, // D#125 #3
+  declKindsBySymbol, // D#125 #2 review
   resolveProjectRoot,    // v0.48 — subdir-cwd dark fix
   rebaseRelativePaths,   // v0.48 — subdir-cwd dark fix
   commandHasBypass,      // v0.48 — bypass funnel visibility

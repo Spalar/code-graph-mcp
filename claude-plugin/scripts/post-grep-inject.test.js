@@ -1078,3 +1078,41 @@ test('e2e: a pattern holding the project root is not answered', (t) => {
     cleanupFixture(fixture, control);
   }
 });
+
+// Pre-release review of D#125, F1 and F4.
+test('e2e: the inject skips a -e pattern holding the root', (t) => {
+  const uniq = `InjRootE${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `process.stdout.write('src/foo.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  const root = fs.realpathSync(fixture.dir);
+  const cmd = `grep -rn -e "${root}/def ${uniq}" -e "BarBaz" src/; echo x`;
+  try {
+    const res = runHook(cmd, fixture, {}, root, '');
+    assert.equal(res.stdout.trim(), '', `must not inject: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the inject scopes show to the grep path and skips a non-recursive dir grep', (t) => {
+  const uniq = `InjScope${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `if (process.argv[2] === 'show') { process.stdout.write('fn ' + process.argv[3] + '  src/a/x.rs:1-3  ()\\n  body\\n'); process.exit(0); }\n` +
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  fs.mkdirSync(path.join(fixture.dir, 'lib'));
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  const scoped = `grep -rn -A3 "fn ${uniq}" lib/ && echo done`;
+  const flat = `grep -n "${uniq}Bar" src/ ; echo done`;
+  try {
+    const a = runHook(scoped, fixture, {}, undefined, '').stdout.trim();
+    if (a) assert.doesNotMatch(JSON.parse(a).hookSpecificOutput.additionalContext, /src\/a\/x\.rs/,
+      'a definition outside the grep path');
+    const b = runHook(flat, fixture, {}, undefined, '');
+    assert.equal(b.stdout.trim(), '', `a grep without -r searched no directory: ${b.stdout}`);
+  } finally {
+    cleanupFixture(fixture, scoped);
+    cleanupFixture(fixture, flat);
+  }
+});
