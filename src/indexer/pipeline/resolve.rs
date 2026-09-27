@@ -309,6 +309,7 @@ pub(super) fn resolve_pending_calls_touching(
             db,
             &row.source_language,
             row.metadata.as_deref(),
+            source_id_to_path.get(&row.source_id).map(String::as_str),
             candidates,
         )?;
         if candidates.is_empty() {
@@ -1667,23 +1668,29 @@ fn filter_by_segment_chain(
     node_id_to_path: &std::collections::HashMap<i64, String>,
     db: &crate::storage::db::Database,
 ) -> anyhow::Result<Vec<i64>> {
-    let path_chain = segments.join("/");
-    let qn_chain = segments.join(".");
-
     // Chunked under MAX_IN_PARAMS to keep large same-name candidate sets within
     // SQLite's variable cap (issue #30).
     let id_to_qn = get_node_qualified_names_by_ids(db.conn(), candidates)?;
 
-    // For the LAST segment, also accept the path ending in `<seg>.rs` —
-    // Rust commonly puts single-file mods at `src/<mod>.rs` (e.g. `src/domain.rs`
-    // for `crate::domain::*`), which has no `/domain/` directory boundary the
-    // directory-style check below would catch. Without this, every
-    // `crate::domain::foo()` call drops on the floor and `domain::foo` looks dead.
-    let last_seg = segments.last().cloned().unwrap_or_default();
-    let single_file_suffix = if !last_seg.is_empty() {
-        Some(format!("/{}.rs", last_seg))
-    } else {
-        None
+    // The file path carries `segs` as directories, or ends in the last one as a
+    // file: Rust commonly puts single-file mods at `src/<mod>.rs` (e.g.
+    // `src/domain.rs` for `crate::domain::*`), which has no `/domain/`
+    // directory boundary. Without the file arm, every `crate::domain::foo()`
+    // call drops on the floor and `domain::foo` looks dead.
+    let path_match = |path: &str, segs: &[String]| {
+        let chain = segs.join("/");
+        path.contains(&format!("/{chain}/"))
+            || path.starts_with(&format!("{chain}/"))
+            || segs
+                .last()
+                .is_some_and(|last| path.ends_with(&format!("/{last}.rs")))
+    };
+    let qn_match = |qn: &str, segs: &[String]| {
+        let chain = segs.join(".");
+        qn == chain
+            || qn.starts_with(&format!("{chain}."))
+            || qn.contains(&format!(".{chain}."))
+            || qn.ends_with(&format!(".{chain}"))
     };
 
     let kept: Vec<i64> = candidates
@@ -1692,19 +1699,15 @@ fn filter_by_segment_chain(
         .filter(|id| {
             let path = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
             let qn = id_to_qn.get(id).map(String::as_str).unwrap_or("");
-
-            let path_match = path.contains(&format!("/{}/", path_chain))
-                || path.starts_with(&format!("{}/", path_chain))
-                || single_file_suffix
-                    .as_deref()
-                    .is_some_and(|sfx| path.ends_with(sfx));
-
-            let qn_match = qn == qn_chain
-                || qn.starts_with(&format!("{}.", qn_chain))
-                || qn.contains(&format!(".{}.", qn_chain))
-                || qn.ends_with(&format!(".{}", qn_chain));
-
-            path_match || qn_match
+            // The whole chain names the file or the owner; or a module chain
+            // names the file and the rest the method's type
+            // (`runtime::Builder::new()`: `runtime/`, `Builder.new`).
+            path_match(path, segments)
+                || qn_match(qn, segments)
+                || (1..segments.len()).any(|k| {
+                    path_match(path, &segments[..k])
+                        && qn.starts_with(&format!("{}.", segments[k..].join(".")))
+                })
         })
         .collect();
     Ok(kept)
@@ -1879,24 +1882,132 @@ pub(super) struct RustFnShape {
     pub(super) takes_self: bool,
     /// Parameters, `self` included; None when the signature does not fix it.
     pub(super) params: Option<usize>,
+    /// An item of an `impl` or `trait` block, reached only through `Type::`,
+    /// `Self::` or a receiver — never by a bare `f()` (D#119). Implied by
+    /// `takes_self`; `Handle::spawn(me: &Arc<Self>, ..)` is one without it.
+    pub(super) associated: bool,
     /// The `impl`/`trait` type a method belongs to, kept only when it starts
     /// lowercase (`impl Encode for u32`, a `non_camel_case_types` struct): the
     /// one case where a lowercase path segment names a type, not a module.
     pub(super) lowercase_owner: Option<Box<str>>,
+    /// The `src/` directory of the crate that alone can call this function:
+    /// set for a `pub(crate)`/`pub(super)` item and a private free function of a
+    /// library, which another crate (an integration test, an example, a bench,
+    /// another package) cannot reach (D#119, [`rust_crate_admits`]).
+    pub(super) crate_private_dir: Option<Box<str>>,
+}
+
+/// The `impl`/`trait` type in a Rust function's qualified name (`Type.f`).
+fn rust_fn_owner(qualified_name: Option<&str>) -> Option<&str> {
+    qualified_name
+        .and_then(|q| q.rsplit_once('.'))
+        .map(|(owner, _)| owner.rsplit('.').next().unwrap_or(owner))
 }
 
 pub(super) fn rust_fn_shape(signature: Option<&str>, qualified_name: Option<&str>) -> RustFnShape {
     let takes_self = signature.is_some_and(rust_signature_takes_self);
+    let owner = rust_fn_owner(qualified_name);
     RustFnShape {
         takes_self,
         params: signature.and_then(rust_signature_param_count),
-        lowercase_owner: qualified_name
-            .filter(|_| takes_self)
-            .and_then(|q| q.rsplit_once('.'))
-            .map(|(owner, _)| owner.rsplit('.').next().unwrap_or(owner))
+        associated: takes_self || owner.is_some(),
+        lowercase_owner: owner
             .filter(|owner| owner.starts_with(|c: char| c.is_ascii_lowercase()))
             .map(Box::from),
+        crate_private_dir: None,
     }
+}
+
+/// The `src/` directory of the crate a Rust file belongs to (`tokio/src/`), or
+/// None outside one: an integration test, example or bench target, or a
+/// `src/bin/` binary, is a crate of its own.
+pub(super) fn rust_lib_dir(path: &str) -> Option<&str> {
+    let at = if path.starts_with("src/") {
+        0
+    } else {
+        path.rfind("/src/")? + 1
+    };
+    (!path[at + 4..].starts_with("bin/")).then(|| &path[..at + 4])
+}
+
+/// Whether a Rust function is callable only inside its own crate, by the
+/// visibility its source opens with. A `pub(crate)`, `pub(super)`, `pub(self)`
+/// or `pub(in …)` item is; so is a free function with no `pub`. An `impl` or
+/// `trait` item with no `pub` is not decided: a trait impl's method is written
+/// without one and is as public as the trait.
+fn rust_fn_crate_private(code: &str, associated: bool) -> bool {
+    match code.trim_start().strip_prefix("pub") {
+        Some(rest) if rest.starts_with(|c: char| c.is_whitespace() || c == '(') => {
+            rest.trim_start().starts_with('(')
+        }
+        _ => !associated,
+    }
+}
+
+/// Whether a Rust call from `caller_path` can reach a function, by crate
+/// visibility: a crate-private function only from its own crate's `src/`.
+pub(super) fn rust_crate_admits(caller_path: Option<&str>, callee: &RustFnShape) -> bool {
+    match (&callee.crate_private_dir, caller_path) {
+        (Some(dir), Some(caller)) => rust_lib_dir(caller) == Some(&**dir),
+        _ => true,
+    }
+}
+
+/// One Rust function as [`rust_fn_shapes_of_file`] reads it.
+pub(super) struct RustFnRow<'a> {
+    pub(super) id: i64,
+    pub(super) signature: Option<&'a str>,
+    pub(super) qualified_name: Option<&'a str>,
+    /// 1-based (start, end) lines.
+    pub(super) lines: (u32, u32),
+    /// The source, of which only the leading visibility is read.
+    pub(super) code: &'a str,
+}
+
+/// The shapes of one file's Rust functions. A `fn` nested in a method takes the
+/// method's `Type.` prefix (`Interest.mio_add` inside `Interest::to_mio`) but is
+/// a free function of that body, called bare: one strictly inside a function of
+/// the same owner is not associated. (An `impl` inside a function is another
+/// owner, and its functions stay associated.)
+pub(super) fn rust_fn_shapes_of_file(path: &str, rows: &[RustFnRow]) -> Vec<(i64, RustFnShape)> {
+    let lib_dir = rust_lib_dir(path);
+    let mut by_owner: HashMap<&str, Vec<&RustFnRow>> = HashMap::new();
+    for row in rows {
+        if let Some(owner) = rust_fn_owner(row.qualified_name) {
+            by_owner.entry(owner).or_default().push(row);
+        }
+    }
+    let mut nested: HashSet<i64> = HashSet::new();
+    for group in by_owner.values_mut().filter(|g| g.len() > 1) {
+        group.sort_by_key(|r| (r.lines.0, std::cmp::Reverse(r.lines.1)));
+        // Spans still open at this row's start, outermost first.
+        let mut open: Vec<(u32, u32)> = Vec::new();
+        for row in group.iter() {
+            while open.last().is_some_and(|&(_, end)| end < row.lines.0) {
+                open.pop();
+            }
+            if open
+                .iter()
+                .any(|&span| span != row.lines && span.1 >= row.lines.1)
+            {
+                nested.insert(row.id);
+            }
+            open.push(row.lines);
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let mut shape = rust_fn_shape(row.signature, row.qualified_name);
+            if nested.contains(&row.id) && !shape.takes_self {
+                shape.associated = false;
+                shape.lowercase_owner = None;
+            }
+            if rust_fn_crate_private(row.code, shape.associated) {
+                shape.crate_private_dir = lib_dir.map(Box::from);
+            }
+            (row.id, shape)
+        })
+        .collect()
 }
 
 /// Rust's primitive types: a path through one (`u32::encode_to(&v, buf)`) names a
@@ -1921,8 +2032,10 @@ const RUST_PRIMITIVE_TYPES: &[&str] = &[
 /// `ProjectClassNames::load(&mut self, db, candidates)`. A bare call carries no
 /// metadata, so no count.
 pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: &RustFnShape) -> bool {
+    // A bare `f()` reaches no item of an `impl` or `trait` (D#119): tokio's bare
+    // `spawn(fut)` bound `Handle::spawn(me: &Arc<Self>, ..)`.
     if metadata.is_none_or(str::is_empty) {
-        return !callee.takes_self;
+        return !callee.associated;
     }
     let meta = parse_callee_metadata(metadata);
     let method_call = matches!(
@@ -1937,8 +2050,9 @@ pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: &RustFnShap
     // With the arity rule leaving `Command::spawn(&mut self)` the only
     // one-parameter `spawn`, tokio's `tokio::spawn(fut)` calls all bound it.
     // A lowercase segment still names a type when it is a primitive or the
-    // method's own lowercase type (D#126: `u32::encode_to(&v, buf)`).
-    if callee.takes_self
+    // method's own lowercase type (D#126: `u32::encode_to(&v, buf)`). Nor does a
+    // module path reach an associated function without `self` (D#119).
+    if callee.associated
         && matches!(&meta, Some(CalleeMeta::Path(segments))
         if segments.last().is_some_and(|s| {
             s.starts_with(|c: char| c.is_ascii_lowercase())
@@ -2370,6 +2484,7 @@ impl ProjectClassNames {
         db: &crate::storage::db::Database,
         language: &str,
         metadata: Option<&str>,
+        caller_path: Option<&str>,
         mut candidates: Vec<i64>,
     ) -> anyhow::Result<Vec<i64>> {
         if language != "rust" {
@@ -2377,32 +2492,47 @@ impl ProjectClassNames {
         }
         if self.rust_fn_shapes.is_none() {
             let mut stmt = db.conn().prepare(
-                "SELECT n.id, n.signature, n.qualified_name FROM nodes n
-                 JOIN files f ON f.id = n.file_id
-                 WHERE f.language = 'rust' AND n.type = 'function'",
+                "SELECT n.id, n.signature, n.qualified_name, f.path, n.start_line, n.end_line,
+                        substr(n.code_content, 1, 64)
+                 FROM nodes n JOIN files f ON f.id = n.file_id
+                 WHERE f.language = 'rust' AND n.type = 'function'
+                 ORDER BY n.file_id",
             )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        (row.get::<_, u32>(4)?, row.get::<_, u32>(5)?),
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut map = HashMap::new();
-            for row in rows {
-                let (id, signature, qualified_name) = row?;
-                map.insert(
-                    id,
-                    rust_fn_shape(signature.as_deref(), qualified_name.as_deref()),
-                );
+            for file in rows.chunk_by(|a, b| a.3 == b.3) {
+                let fns: Vec<RustFnRow> = file
+                    .iter()
+                    .map(
+                        |(id, signature, qualified_name, _, lines, code)| RustFnRow {
+                            id: *id,
+                            signature: signature.as_deref(),
+                            qualified_name: qualified_name.as_deref(),
+                            lines: *lines,
+                            code,
+                        },
+                    )
+                    .collect();
+                map.extend(rust_fn_shapes_of_file(&file[0].3, &fns));
             }
             self.rust_fn_shapes = Some(map);
         }
         let shapes = self.rust_fn_shapes.as_ref().expect("loaded above");
         candidates.retain(|id| {
-            shapes
-                .get(id)
-                .is_none_or(|shape| rust_call_shape_admits(metadata, shape))
+            shapes.get(id).is_none_or(|shape| {
+                rust_call_shape_admits(metadata, shape) && rust_crate_admits(caller_path, shape)
+            })
         });
         Ok(candidates)
     }
@@ -2916,10 +3046,56 @@ mod tests {
             rust_fn_shape(Some("(&mut self)"), Some("Command.spawn")).lowercase_owner,
             None
         );
-        assert_eq!(
-            rust_fn_shape(Some("(x: u8)"), Some("t.f")).lowercase_owner,
-            None
-        );
+        let free = rust_fn_shape(Some("(x: u8)"), Some("f"));
+        assert!(!free.associated && free.lowercase_owner.is_none());
+        // A bare call reaches a free function, never an associated one, with or
+        // without `self`; a module path neither (D#119).
+        let assoc = rust_fn_shape(Some("(me: &Arc<Self>, f: F)"), Some("Handle.spawn"));
+        assert!(assoc.associated && !assoc.takes_self);
+        assert!(!rust_call_shape_admits(None, &assoc));
+        assert!(rust_call_shape_admits(None, &free));
+        assert!(!rust_call_shape_admits(
+            Some(r#"{"n":2,"q":"path","v":"tokio"}"#),
+            &assoc
+        ));
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":2,"q":"path","v":"Handle"}"#),
+            &assoc
+        ));
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
+            &free
+        ));
+    }
+
+    /// A `fn` nested in a method of the same owner is a free function of that
+    /// body; an `impl` inside a function keeps its functions associated.
+    #[test]
+    fn rust_fn_shapes_of_file_tells_nested_fns_from_associated_ones() {
+        let row = |id, q, lines| RustFnRow {
+            id,
+            signature: Some("(a: u8)"),
+            qualified_name: Some(q),
+            lines,
+            code: "fn f(a: u8) {}",
+        };
+        let rows = [
+            row(1, "Interest.to_mio", (10, 20)),
+            row(2, "Interest.mio_add", (11, 13)),
+            row(3, "Interest.other", (21, 22)),
+            row(4, "outer", (30, 40)),
+            row(5, "Local.helper", (32, 33)),
+            // Two one-line methods on the same line are siblings.
+            row(6, "Pair.a", (50, 50)),
+            row(7, "Pair.b", (50, 50)),
+        ];
+        let shapes: HashMap<i64, RustFnShape> = rust_fn_shapes_of_file("src/a.rs", &rows)
+            .into_iter()
+            .collect();
+        let assoc = |id: i64| shapes[&id].associated;
+        assert!(assoc(1) && !assoc(2) && assoc(3));
+        assert!(!assoc(4) && assoc(5));
+        assert!(assoc(6) && assoc(7));
     }
 
     mod crate_roots {

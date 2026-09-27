@@ -701,7 +701,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
-        let mut rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape> = HashMap::new();
+        let mut rust_fns: Vec<super::resolve::RustFnRow> = Vec::new();
 
         let module_node_id = insert_node_cached(
             db.conn(),
@@ -757,16 +757,21 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_types.push(pn.node_type.clone());
             node_lines.push((pn.start_line, pn.end_line));
             if pp.language == "rust" && pn.node_type == "function" {
-                rust_fn_shapes.insert(
-                    node_id,
-                    super::resolve::rust_fn_shape(
-                        pn.signature.as_deref(),
-                        pn.qualified_name.as_deref(),
-                    ),
-                );
+                rust_fns.push(super::resolve::RustFnRow {
+                    id: node_id,
+                    signature: pn.signature.as_deref(),
+                    qualified_name: pn.qualified_name.as_deref(),
+                    lines: (pn.start_line, pn.end_line),
+                    code: &pn.code_content,
+                });
             }
             nodes_created += 1;
         }
+        let rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape> =
+            super::resolve::rust_fn_shapes_of_file(&pp.rel_path, &rust_fns)
+                .into_iter()
+                .collect();
+        drop(rust_fns);
 
         parsed.push(FileParsed {
             rel_path: pp.rel_path,
@@ -3113,6 +3118,20 @@ fn restore_inbound_edges(
             // same-named constructor.
             let supertype =
                 relation.as_str() == REL_INHERITS || relation.as_str() == REL_IMPLEMENTS;
+            // The caller's file: crate visibility needs it below, and a requeue
+            // records it.
+            let (src_path, src_lang) = src_file_info
+                .entry(*source_file_id)
+                .or_insert_with(|| {
+                    db.conn()
+                        .query_row(
+                            "SELECT path, COALESCE(language, '') FROM files WHERE id = ?1",
+                            [*source_file_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .unwrap_or_default()
+                })
+                .clone();
             let new_target_ids: Option<Vec<i64>> = batch_name_to_ids
                 .get(&(*target_file_id, target_name.as_str()))
                 .map(|found| {
@@ -3125,6 +3144,9 @@ fn restore_inbound_edges(
                                 || rust_fn_shapes.get(id).is_none_or(|shape| {
                                     super::resolve::rust_call_shape_admits(
                                         metadata.as_deref(),
+                                        shape,
+                                    ) && super::resolve::rust_crate_admits(
+                                        Some(src_path.as_str()).filter(|p| !p.is_empty()),
                                         shape,
                                     )
                                 })
@@ -3158,18 +3180,6 @@ fn restore_inbound_edges(
                 // edit path never did). Requeue instead: calls through the
                 // persistent pending buffer, everything else through the deferred
                 // pass, both of which apply the normal resolution rules.
-                let (src_path, src_lang) = src_file_info
-                    .entry(*source_file_id)
-                    .or_insert_with(|| {
-                        db.conn()
-                            .query_row(
-                                "SELECT path, COALESCE(language, '') FROM files WHERE id = ?1",
-                                [*source_file_id],
-                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                            )
-                            .unwrap_or_default()
-                    })
-                    .clone();
                 if src_path.is_empty() {
                     continue; // source file row gone — nothing to requeue for
                 }
@@ -3552,8 +3562,13 @@ fn resolve_deferred_relations(
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
-            let all =
-                classes.rust_call_shape_candidates(db, &d.language, d.metadata.as_deref(), all)?;
+            let all = classes.rust_call_shape_candidates(
+                db,
+                &d.language,
+                d.metadata.as_deref(),
+                Some(&d.rel_path),
+                all,
+            )?;
             let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
 
             // 6a. JS namespace-receiver constraint captured at batch time

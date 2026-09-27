@@ -364,6 +364,11 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                 // method) is still a method call: as a bare call it
                                 // could bind only a function not taking `self`.
                                 qualifier = helpers::CalleeQualifier::Member;
+                            } else if let Some(trait_name) = enclosing_rust_trait(node, source) {
+                                // `Self::f()` in a trait's default method names the
+                                // trait: as a bare call it could reach no
+                                // associated function at all.
+                                qualifier = helpers::CalleeQualifier::SelfType(trait_name);
                             } else {
                                 // `Self::f()` outside an impl block — drop qualifier (Bare).
                                 qualifier = helpers::CalleeQualifier::Bare;
@@ -433,6 +438,23 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             }
         }
     }
+}
+
+/// The name of the `trait` whose body holds `node`, stopping at an `impl`.
+fn enclosing_rust_trait(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "trait_item" => {
+                return n
+                    .child_by_field_name("name")
+                    .map(|name| node_text(&name, source).to_string());
+            }
+            "impl_item" => return None,
+            _ => cur = n.parent(),
+        }
+    }
+    None
 }
 
 /// `metadata` with `"n"`: the arguments `call` passes. Comments and attributes

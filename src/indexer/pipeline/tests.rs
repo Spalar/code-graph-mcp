@@ -3385,6 +3385,249 @@ fn test_rust_ufcs_through_a_lowercase_type_reaches_the_method() {
     );
 }
 
+/// D#119: a bare `f()` or a module path `m::f()` never reaches a function of an
+/// `impl` or `trait` block, whether or not it takes `self` — only `Type::f()`,
+/// `Self::f()` or `x.f()` do. On tokio-1.41.1, 92 bare `spawn(fut)` calls bound
+/// `Handle::spawn(me: &Arc<Self>, ..)`, whose first parameter is not `self`.
+/// A turbofish or a qualified self no longer hides the path (`Block::<u8>::new`
+/// was a bare `new`), and a fn nested in a method is still a free function.
+#[test]
+fn test_rust_bare_and_module_calls_never_reach_an_associated_fn() {
+    let files: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod block;\npub mod rt;\npub mod other;\npub mod io;\npub mod tr;\n",
+        ),
+        (
+            "src/rt.rs",
+            "pub struct Handle;\nimpl Handle {\n    pub fn spawn(me: u8) {}\n}\n",
+        ),
+        (
+            "src/block.rs",
+            "pub struct Block<T>(T);\nimpl<T> Block<T> {\n    pub fn new(x: T) {}\n}\n",
+        ),
+        ("src/other.rs", "pub fn new(x: u8) {}\npub fn genf<T>() {}\n"),
+        (
+            "src/io.rs",
+            "pub struct Interest;\nimpl Interest {\n    pub fn to_mio(&self) {\n        \
+             fn mio_add(a: u8) {}\n        mio_add(1);\n    }\n}\n",
+        ),
+        (
+            "src/tr.rs",
+            "pub trait Tr {\n    fn helper() -> u8 { 0 }\n    fn go(&self, a: i32) { Self::helper(); }\n}\n\
+             pub struct S;\nimpl Tr for S {\n    fn go(&self, a: i32) {}\n}\n",
+        ),
+        (
+            "src/use_it.rs",
+            "use crate::rt::Handle;\nuse crate::block::Block;\nuse crate::tr::{S, Tr};\n\
+             fn bare() {\n    spawn(1);\n}\n\
+             fn module() {\n    rt::spawn(1);\n}\n\
+             fn typed() {\n    Handle::spawn(1);\n}\n\
+             fn turbofish() {\n    Block::<u8>::new(0);\n}\n\
+             fn qself(s: S) {\n    <S as Tr>::go(&s, 1);\n}\n\
+             fn generic() {\n    other::genf::<u8>();\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let from = |caller: &str| -> Vec<String> {
+        let prefix = format!("{caller} --calls--> ");
+        edges
+            .iter()
+            .filter_map(|e| e.strip_prefix(&prefix).map(str::to_string))
+            .collect()
+    };
+    assert_eq!(
+        from("src/use_it.rs.bare"),
+        Vec::<String>::new(),
+        "{edges:#?}"
+    );
+    assert_eq!(
+        from("src/use_it.rs.module"),
+        Vec::<String>::new(),
+        "{edges:#?}"
+    );
+    assert_eq!(
+        from("src/use_it.rs.typed"),
+        vec!["src/rt.rs.spawn"],
+        "{edges:#?}"
+    );
+    assert_eq!(
+        from("src/use_it.rs.turbofish"),
+        vec!["src/block.rs.new"],
+        "{edges:#?}"
+    );
+    assert_eq!(
+        from("src/use_it.rs.qself"),
+        vec!["src/tr.rs.go"],
+        "{edges:#?}"
+    );
+    assert_eq!(
+        from("src/use_it.rs.generic"),
+        vec!["src/other.rs.genf"],
+        "{edges:#?}"
+    );
+    assert_eq!(
+        from("src/io.rs.to_mio"),
+        vec!["src/io.rs.mio_add"],
+        "{edges:#?}"
+    );
+    assert_eq!(from("src/tr.rs.go"), vec!["src/tr.rs.helper"], "{edges:#?}");
+}
+
+/// D#119: an integration test, an example, a bench or another package is a
+/// different crate, and reaches only `pub` items of a library: never a
+/// `pub(crate)` one, never a private free function. tokio's `mpsc::channel(n)`
+/// from `tests/` bound `chan.rs`'s `pub(crate) fn channel(semaphore)` beside the
+/// public `bounded.rs` one. Inside the crate both stay reachable, and a trait
+/// impl's method (written without `pub`) stays reachable from outside.
+#[test]
+fn test_rust_call_from_another_crate_reaches_only_pub_items() {
+    let files: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod mpsc;\npub mod util;\npub mod tr;\n"),
+        (
+            "src/mpsc/mod.rs",
+            "mod bounded;\nmod chan;\npub use bounded::channel;\n",
+        ),
+        (
+            "src/mpsc/bounded.rs",
+            "pub fn channel(buffer: usize) {\n    chan::channel(1);\n}\n",
+        ),
+        ("src/mpsc/chan.rs", "pub(crate) fn channel(semaphore: u8) {}\n"),
+        ("src/util.rs", "fn helper(a: u8) {}\n"),
+        (
+            "src/tr.rs",
+            "pub trait Tr {\n    fn go(&self);\n}\npub struct S;\nimpl Tr for S {\n    fn go(&self) {}\n}\n",
+        ),
+        (
+            "tests/t.rs",
+            "use mycrate::tr::Tr;\nfn t(s: mycrate::tr::S) {\n    mycrate::mpsc::channel(1);\n    \
+             helper(1);\n    s.go();\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let from = |caller: &str| -> Vec<String> {
+        let prefix = format!("{caller} --calls--> ");
+        edges
+            .iter()
+            .filter_map(|e| e.strip_prefix(&prefix).map(str::to_string))
+            .collect()
+    };
+    let t = from("tests/t.rs.t");
+    assert!(
+        t.contains(&"src/mpsc/bounded.rs.channel".to_string()),
+        "{edges:#?}"
+    );
+    assert!(
+        !t.contains(&"src/mpsc/chan.rs.channel".to_string()),
+        "{edges:#?}"
+    );
+    assert!(!t.contains(&"src/util.rs.helper".to_string()), "{edges:#?}");
+    assert!(t.contains(&"src/tr.rs.go".to_string()), "{edges:#?}");
+    // In the crate, `pub(crate)` is reachable (control).
+    assert_eq!(
+        from("src/mpsc/bounded.rs.channel"),
+        vec!["src/mpsc/chan.rs.channel"],
+        "{edges:#?}"
+    );
+}
+
+/// The restore path applies crate visibility as a fresh resolution does: when
+/// a library function goes from `pub` to `pub(crate)`, the integration test's
+/// edge to it is not carried over onto the new node (rebuild drops it too).
+#[test]
+fn test_rust_crate_visibility_holds_when_an_edge_is_restored() {
+    let files = |vis: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "Cargo.toml".into(),
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n".into(),
+            ),
+            ("src/lib.rs".into(), "pub mod chan;\n".into()),
+            (
+                "src/chan.rs".into(),
+                format!("{vis} fn channel(s: u8) {{}}\n"),
+            ),
+            (
+                "tests/t.rs".into(),
+                "fn t() {\n    mycrate::chan::channel(1);\n}\n".into(),
+            ),
+        ]
+    };
+    fn borrow(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    }
+    let before = files("pub");
+    let (project, _d, db) = fresh_index_of(&borrow(&before));
+    let edge = "tests/t.rs.t --calls--> src/chan.rs.channel".to_string();
+    assert!(
+        edge_set(&db).contains(&edge),
+        "control: {:#?}",
+        edge_set(&db)
+    );
+    let after = files("pub(crate)");
+    fs::write(project.path().join("src/chan.rs"), &after[2].1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&borrow(&after));
+    assert!(!edge_set(&fresh).contains(&edge), "{:#?}", edge_set(&fresh));
+    assert_eq!(edge_set(&db), edge_set(&fresh));
+}
+
+/// `module::Type::f()` names the module by its file and the type by the
+/// method's owner: the path filter matched the whole chain against one or the
+/// other, so `runtime::Builder::new()` and tokio's
+/// `task::Notified::<T>::from_raw(ptr)` bound nothing.
+#[test]
+fn test_rust_module_then_type_path_reaches_the_method() {
+    let files: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod runtime;\npub mod other;\n"),
+        (
+            "src/runtime/mod.rs",
+            "mod builder;\npub use builder::Builder;\n",
+        ),
+        (
+            "src/runtime/builder.rs",
+            "pub struct Builder;\nimpl Builder {\n    pub fn new() -> Builder { Builder }\n}\n",
+        ),
+        (
+            "src/other.rs",
+            "pub struct Builder;\nimpl Builder {\n    pub fn new() -> Builder { Builder }\n}\n",
+        ),
+        (
+            "tests/t.rs",
+            "fn t() {\n    mycrate::runtime::Builder::new();\n}\n\
+             fn u() {\n    mycrate::runtime::Builder::<u8>::new();\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    for caller in ["tests/t.rs.t", "tests/t.rs.u"] {
+        let prefix = format!("{caller} --calls--> ");
+        let got: Vec<&str> = edges
+            .iter()
+            .filter_map(|e| e.strip_prefix(&prefix))
+            .collect();
+        assert_eq!(
+            got,
+            vec!["src/runtime/builder.rs.new"],
+            "{caller}: {edges:#?}"
+        );
+    }
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs

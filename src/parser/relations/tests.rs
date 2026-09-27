@@ -7338,3 +7338,110 @@ fn a_cpp_files_walk_starts_with_an_empty_receiver_cache() {
     .join()
     .unwrap();
 }
+
+/// D#119 / D#124 F8: the Rust call shapes a turbofish or a qualified self hid.
+/// `Block::<u8>::new(0)` and `<S as Tr>::go(&s, 1)` were recorded as bare calls,
+/// and a `generic_function` callee (`f::<T>()`, `m::f::<T>()`, `x.f::<T>()`)
+/// recorded no call at all. Each row: source call, callee, expected metadata.
+#[test]
+fn test_rust_callee_turbofish_and_qualified_self_shapes() {
+    let rows: &[(&str, &str, Option<&str>)] = &[
+        (
+            "Block::<u8>::new(0)",
+            "new",
+            Some(r#"{"n":1,"q":"path","v":"Block"}"#),
+        ),
+        (
+            "a::Block::<u8>::new(0)",
+            "new",
+            Some(r#"{"n":1,"q":"path","v":"a::Block"}"#),
+        ),
+        (
+            "crate::a::Block::<u8>::new()",
+            "new",
+            Some(r#"{"n":0,"q":"path","v":"a::Block"}"#),
+        ),
+        (
+            "<S as Tr>::go(&s, 1)",
+            "go",
+            Some(r#"{"n":2,"q":"path","v":"S"}"#),
+        ),
+        (
+            "<a::S as Tr>::go(&s, 1)",
+            "go",
+            Some(r#"{"n":2,"q":"path","v":"a::S"}"#),
+        ),
+        (
+            "<Vec<T> as Tr>::init(1)",
+            "init",
+            Some(r#"{"n":1,"q":"path","v":"Vec"}"#),
+        ),
+        ("<S>::mk()", "mk", Some(r#"{"n":0,"q":"path","v":"S"}"#)),
+        (
+            "<&S as Tr>::go(&s, 1)",
+            "go",
+            Some(r#"{"n":2,"q":"path","v":"Tr"}"#),
+        ),
+        ("genf::<u8>()", "genf", None),
+        (
+            "m::genf2::<u8>(1)",
+            "genf2",
+            Some(r#"{"n":1,"q":"path","v":"m"}"#),
+        ),
+        (
+            "crate::m::genf2::<i32>()",
+            "genf2",
+            Some(r#"{"n":0,"q":"path","v":"m"}"#),
+        ),
+        (
+            "x.collect::<Vec<u8>>()",
+            "collect",
+            Some(r#"{"n":0,"q":"recv","v":"x"}"#),
+        ),
+        (
+            "Vec::<u8>::with_capacity(4)",
+            "with_capacity",
+            Some(r#"{"n":1,"q":"path","v":"Vec"}"#),
+        ),
+    ];
+    for (call, callee, expected) in rows {
+        let code = format!("fn caller(s: S, x: X) {{ {call}; }}");
+        let relations = extract_relations(&code, "rust").unwrap();
+        let found: Vec<_> = relations
+            .iter()
+            .filter(|r| r.relation == REL_CALLS && r.target_name == *callee)
+            .collect();
+        let all: Vec<_> = relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name, &r.metadata))
+            .collect();
+        assert_eq!(found.len(), 1, "{call}: {all:?}");
+        assert_eq!(found[0].metadata.as_deref(), *expected, "{call}");
+    }
+}
+
+/// `Self::f()` in a trait's default method names the trait: as a bare call it
+/// could reach no associated function at all (D#119).
+#[test]
+fn test_rust_self_path_in_a_trait_default_method_names_the_trait() {
+    let code = "trait Tr {\n    fn helper() -> u8;\n    fn go(&self) { Self::helper(); }\n}\n\
+                impl S { fn f(&self) { Self::helper(); } }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let metas: Vec<_> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS && r.target_name == "helper")
+        .map(|r| r.metadata.as_deref())
+        .collect();
+    let all: Vec<_> = relations
+        .iter()
+        .map(|r| (&r.relation, &r.target_name, &r.metadata))
+        .collect();
+    assert_eq!(
+        metas,
+        vec![
+            Some(r#"{"n":0,"q":"stype","v":"Tr"}"#),
+            Some(r#"{"n":0,"q":"stype","v":"S"}"#)
+        ],
+        "{all:?}"
+    );
+}

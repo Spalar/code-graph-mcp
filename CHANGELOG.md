@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Rust call resolution, measured on tokio
+
+This repo's Rust precision did not carry over to tokio-1.41.1, the first
+outside Rust corpus: the SCIP oracle judged 639 of 2,851 `inferred` edges
+wrong. Five rules, each a fact of the language:
+
+- A bare `f()` or a module path `m::f()` never calls a function of an `impl`
+  or `trait` block, whether it takes `self` or not. 92 bare `spawn(fut)` calls
+  bound `Handle::spawn(me: &Arc<Self>, ..)`, whose first parameter is not
+  `self`. A `fn` nested in a method is still a free function of its body.
+- An integration test, an example, a bench or another package is another
+  crate: it reaches only `pub` items of a library. `mpsc::channel(n)` from
+  `tests/` bound `chan.rs`'s `pub(crate) fn channel(semaphore)`.
+- A turbofish or a qualified self no longer hides the path:
+  `Block::<u8>::new(0)` and `<S as Tr>::go(&s, 1)` were bare calls, and a
+  turbofish call (`f::<T>()`, `m::f::<T>()`, `x.collect::<Vec<_>>()`) was no
+  call at all.
+- `Self::f()` in a trait's default method names the trait.
+- `module::Type::f()` matches the module against the file and the type
+  against the method's owner: `runtime::Builder::new()` bound nothing.
+
+On tokio (gold 7,908 call pairs): `inferred` precision 2,212/2,851 (77.6%) →
+2,477/2,910 (85.1%), recall at the default floor 3,787 → 4,088, wrong
+`extracted` edges 386 → 366, wrong `ambiguous` 1,758 → 1,626; 391 correct
+call pairs gained and none lost. On this repo (gold 7,142): wrong edges unchanged
+(16 extracted, 7 inferred), recall at the default floor 6,854 → 6,961.
+
 ### A Rust call through a lowercase type reaches the method again
 
 0.160.0 read a lowercase last path segment as a module, which cannot pass
