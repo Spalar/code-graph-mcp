@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.160.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 79 → 82 because the three Rust fixes below change which
-`calls` and `imports` edges a file produces. An older binary leaves a v82 index
-intact and warns instead of rebuilding it; delete `.code-graph/index.db*` after
-pinning back.
+`INDEX_VERSION` goes 79 → 87 because the Rust fixes below change which `calls`
+and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
+@sdsrs/code-graph@0.159.0`, or `cargo install code-graph-mcp --version
+0.159.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v87 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning back to get its graph back.
 
 ### A Rust call binds only a function its syntax can reach
 
@@ -16,7 +18,9 @@ A bare `f()` never calls a function that takes `self`, and a method call
 `out.status.success()` bound `JsonRpcResponse::success(id, result)`, and a
 builder's `.spawn()` bound a test helper `McpClient::spawn(root)`. A method
 call on a field, an index or a literal (`ctx.db.conn()`, `v[0].len()`) was
-resolved as a bare call; it is now a member call.
+resolved as a bare call; it is now a member call, and so is `self.f()` in a
+trait's default method (`Greeter::greet`'s `self.label()` had lost
+`Greeter::label` for another file's free `label()`).
 
 Measured against rust-analyzer on this repo (SCIP oracle, same snapshot, gold
 7,101 call pairs): wrong edges 107 → 44 (extracted 46 → 16, inferred 38 → 18,
@@ -53,7 +57,10 @@ path call (`T::f()`, `self.f()`, `x.f()`, `a.b().f()`) now carries its
 argument count and binds only a function taking that many, less `self` for a
 method call; a path call `T::f(x, a)` passes `self` itself. A bare `f(a)` is
 not checked, and neither is a function whose parameter count its signature
-does not fix (a `#[cfg]`'d parameter, C variadics).
+does not fix (a `#[cfg]`'d parameter, C variadics, a comment in the list). A
+path through a crate or module (`tokio::spawn(fut)`) names no type, so it
+never reaches a function taking `self`: only `Type::f(x)` passes `self` that
+way.
 
 On the oracle snapshot of the commit before this one (gold 7,126 call pairs):
 wrong edges 35 → 24 (ambiguous 11 → 1, inferred 7 → 6), correct edges 6,844
@@ -62,18 +69,18 @@ before and after, no edge added.
 ### Measured on outside projects
 
 Against 0.159.0, both built without embedding, 3 full-index runs each
-(ms, v0.159.0 → this release): django 12,408/9,555/9,609 →
-12,469/9,602/9,531; hono 542/555/571 → 556/540/548; tokio 2,658/2,732/2,689
-→ 2,575/2,543/2,557; leveldb 445/437/443 → 456/430/430. Re-indexing one
-edited file then matches a rebuild edge for edge on all four, with either
-binary.
+(ms, 0.159.0 → 0.160.0): django 9,572/9,554/9,517 → 9,639/9,564/9,646; hono
+588/568/563 → 556/583/571; tokio 2,808/2,635/2,628 → 2,683/2,497/2,544;
+leveldb 461/444/444 → 444/457/431. Re-indexing one edited file then matches
+a rebuild edge for edge on all four, with either binary.
 
 tokio is the first outside Rust project the Rust fixes above were scored on
 (rust-analyzer SCIP, gold 7,908 call pairs): precision at the extracted tier
-71.4% → 80.6% and at the inferred tier 48.3% → 74.8% (wrong edges 2,242 →
-745); recall at the default floor 3,660 → 3,787. Its index holds 4,014 fewer
-edges. The inferred-tier precision is still far below this repo's 99.8%: see
-Not covered.
+71.4% → 80.3% and at the inferred tier 48.3% → 77.6% (wrong edges 2,242 →
+639); recall at the default floor 3,660 → 3,787. On this repo (gold 7,140):
+wrong edges 107 → 24 over all tiers, recall at the default floor 6,848 →
+6,852. tokio's inferred-tier precision is still far below this repo's 99.8%:
+see Not covered.
 
 ### The grep rewrite runs the search the grep asked for
 
@@ -113,7 +120,8 @@ found nothing. It now reads that command closer to the way the shell does:
   path from the project root, even after `cd backend &&` or from a
   subdirectory shell. It now follows commands that cannot move the shell and
   a `cd` to a literal path that must have run for the grep to run (not
-  `false && cd x;`, not `cd x | cat`), and answers only when the grep's
+  `false && cd x;`, not `true || cd x &&`, not `cd x | cat`), and answers
+  only when the grep's
   operand names the same directory from there. After any other command
   (`cd "$D"`, a function, `source`) it stays silent.
 - **Comments, here-strings and shifts.** A `#` comment ends at its line, and
@@ -143,17 +151,27 @@ counts as the flag.
   parameter binds a project enum's `as_str`, and `tx.commit()` on a
   `rusqlite` transaction binds the project's savepoint `commit`. The other
   two are a `#[cfg]` twin and a caller whose stored body is truncated.
-- On tokio, 745 inferred-tier Rust edges are still wrong. The largest groups:
+- On tokio, 639 inferred-tier Rust edges are still wrong. The largest groups:
   `Semaphore::new()` binding a same-named type in another module (a `use`
   rooted at the crate's own name, `use tokio::sync::Semaphore`, is not
-  anchored), and `tokio::spawn()` / `spawn()` binding an associated function
-  `Command::spawn(&mut self)` / `Handle::spawn(me, future, id)` that no such
-  call can reach.
+  anchored), and a bare `spawn()` binding the associated function
+  `Handle::spawn(me, future, id)`, which no bare call can reach.
+- A Rust `x.f()` that finds no function when its file is indexed does not bind
+  one a later incremental run adds; a rebuild binds it. Adding `widget` to
+  `a.rs` after `use crate::a::widget` bound another file's `widget` also keeps
+  the old edge until a rebuild. `<S as Tr>::go(s)` binds nothing.
+- A call through a renamed JavaScript import (`import { a as b }`,
+  `const { a: b } = require()`) still binds nothing.
 - A grep that may not have run (`true || grep …`) is still answered by the
   inject when its output is empty.
 - The inject does not apply the `--include`-with-a-file rule, and forwards no
   `-x`; the rewrite declines both.
 - `\b` and `[[:alpha:]]` on non-ASCII text can differ between the dialects.
+- Older rewrite gaps found by this release's review, not yet fixed: a quoted
+  pattern holding the project root path is rewritten without it; a grep
+  answered by `show` ignores its path and context flags; a grep without `-r`
+  on a directory is rewritten as recursive; a `$` inside a basic-regex
+  alternation (`getUser\|$user_id`) is copied as an anchor.
 
 ## 0.159.0
 
