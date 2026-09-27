@@ -1838,8 +1838,12 @@ pub(super) fn rust_signature_takes_self(signature: &str) -> bool {
 /// How many parameters a Rust function's signature declares, `self` included:
 /// commas at the top level of the parameter list, a trailing one not counted.
 /// None when the count is not fixed by the text — a `#[cfg]`'d parameter, C
-/// variadics (`...`), a list that does not close.
+/// variadics (`...`), a list that does not close — or a comment in it could hide
+/// or fake a comma.
 pub(super) fn rust_signature_param_count(signature: &str) -> Option<usize> {
+    if signature.contains("//") || signature.contains("/*") {
+        return None;
+    }
     let rest = signature.trim_start().strip_prefix('(')?;
     let (mut depth, mut commas, mut prev) = (0usize, 0usize, '(');
     let mut last_non_space = '(';
@@ -2802,6 +2806,12 @@ mod tests {
         assert_eq!(count("(g: Box<dyn Fn(&str) -> Vec<u8>>)"), Some(1));
         assert_eq!(count("(a: i32, #[cfg(unix)] b: i32)"), None);
         assert_eq!(count("(fmt: *const c_char, ...)"), None);
+        // A comma inside a comment is no parameter separator (review F7).
+        assert_eq!(
+            count("(&mut self, key: u32, // the key, as u32\n val: u32,)"),
+            None
+        );
+        assert_eq!(count("(a: u8 /* x, y */)"), None);
         assert_eq!(count("(a: i32, b: Vec<"), None);
         assert_eq!(count("fn"), None);
     }
