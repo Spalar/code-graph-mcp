@@ -202,10 +202,12 @@ fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
         }
         &source[i..e]
     };
-    // The byte just past a balanced `( ... )` starting at `i`, or None.
+    // The byte just past a balanced `( ... )` starting at `i`, within 4 KiB (an
+    // unclosed `REQUIRES(` repeated would rescan to EOF each time), or None.
     let parens_end = |mut i: usize| {
         let mut depth = 0usize;
-        while i < b.len() {
+        let stop = b.len().min(i + 4096);
+        while i < stop {
             match b[i] {
                 b'(' => depth += 1,
                 b')' => {

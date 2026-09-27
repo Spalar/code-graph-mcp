@@ -55,7 +55,9 @@ it untyped, as before. Editing the header that declares a field or a return
 type on the chain re-resolves the callers in other files, and so does renaming
 a class to the type an untyped chain ends in. Not covered: a library type is
 matched by its last name, so `absl::Status st_; st_.ok()` binds a project
-`Status::ok`, the rule locals already follow.
+`Status::ok`, the rule locals already follow. A chain call that stays untyped
+records the type it ends in, so two chains to one method ending in different
+library types (`std::string`, `std::vector`) keep one edge each.
 
 On leveldb, scored against SCIP, the `inferred` tier goes from 2513/2550 to
 2605/2642 (98.6%). Recall rises from 2738 to 2789 of 3470. Same-file precision
@@ -131,10 +133,15 @@ A field followed by a Clang thread-safety annotation
 EXCLUSIVE_LOCKS_REQUIRED(mutex_);`) did not parse: tree-sitter read the
 annotation as a function and lost the field's name. These annotations are now
 blanked before parsing, as class export macros already were, when they follow
-a declarator, a lambda's parameters or an `operator`. A function whose own
-name only ends like one is left alone when it starts its line or returns a
-built-in type (`static void OBJ_RELEASE(void* p)`), and so is such a call
-after `if (…)`, `while (…)` or a cast (`FT_ATOMIC_LOAD_PTR_ACQUIRE(x)`).
+a declarator, a lambda's parameters or an `operator` (other than `new`,
+`delete` and `,`). A function whose own name only ends like one is left alone
+when it returns a built-in type (`static void OBJ_RELEASE(void* p)`), and so
+is such a call after `if (…)`, `while (…)` or a cast
+(`FT_ATOMIC_LOAD_PTR_ACQUIRE(x)`). Not covered: such a function returning a
+project type (`static Status DO_RELEASE(…)`) is still blanked, and an
+annotation after a built-in trailing return type (`auto f() -> int
+REQUIRES(mu);`) is not; none of leveldb, abseil, grpc, rocksdb or cpython has
+either.
 
 On leveldb, scored against SCIP, same-file precision goes from 1484/1559 to
 1500/1548 (95.2% → 96.9%) and the `inferred` tier from 1361/1401 to 1528/1565
@@ -209,7 +216,8 @@ directory out. When the split leaves less than 400 bytes per answer (from
 seven short-named directories at once), every directory gets the one-line
 advice instead of an overview. Past what those lines fit, one closing line
 names the remaining directories, so every directory marked as hinted is
-named in the envelope.
+named in the envelope, unless the names themselves overflow the cap (several
+directories named with 150 or more CJK characters).
 
 That envelope also no longer carries `permissionDecision: "allow"`. It was the
 Read hook's envelope, written from inside the tracker the Bash hook shares, and

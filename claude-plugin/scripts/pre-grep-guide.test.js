@@ -2760,7 +2760,7 @@ test('sed-range fanout: every dir marked delivered is named in the envelope', ()
       assert.equal(res.status, 0, res.stderr);
       const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
       for (const d of dirs) assert.ok(ctx.includes(`${d}/`), `${n}x${len}: ${d} is named`);
-      assert.doesNotMatch(ctx, /truncated at \\d+ bytes/, `${n}x${len}: nothing is cut`);
+      assert.doesNotMatch(ctx, /truncated at \d+ bytes/, `${n}x${len}: nothing is cut`);
     }
   } finally {
     fsE2e.rmSync(fixture.dir, { recursive: true, force: true });

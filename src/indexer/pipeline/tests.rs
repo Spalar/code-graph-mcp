@@ -2498,25 +2498,27 @@ fn test_class_renamed_to_a_chain_s_final_type_re_resolves_untouched_callers() {
         ],
         &[("b.hpp", Some("class B {\n public:\n  void run() {}\n};\n"))],
     );
-}
-
-/// Chains ending in two `std::` types resolve alike: the untyped call keeps one
-/// edge per target, not one per library type.
-#[test]
-fn test_cpp_chains_ending_in_std_types_share_one_edge_per_target() {
-    let (_p, _d, db) = fresh_index_of(&[(
-        "h.hpp",
-        "#include <string>\n#include <vector>\n\
-         class Holder {\n public:\n  std::string* s() { return nullptr; }\n  std::vector<int>* v() { return nullptr; }\n};\n\
-         class Sized {\n public:\n  int size() { return 0; }\n};\n\
-         class User {\n  void Go();\n  Holder* h_;\n};\n\
-         void User::Go() {\n  h_->s()->size();\n  h_->v()->size();\n}\n",
-    )]);
-    let to_size: Vec<String> = call_edges_with_confidence(&db)
-        .into_iter()
-        .filter(|e| e.contains("Sized.size"))
-        .collect();
-    assert_eq!(to_size.len(), 1, "{to_size:#?}");
+    // Even a library type: a project class named `string` makes a rebuild type
+    // `std::string` by its last name.
+    let a =
+        "#include <string>\nclass A {\n public:\n  std::string* get() { return nullptr; }\n};\n";
+    let x = "class X {\n public:\n  int size() { return 0; }\n};\n";
+    let c = "#include \"a.hpp\"\nvoid f(A* a) {\n  a->get()->size();\n}\n";
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.hpp", a),
+            (
+                "b.hpp",
+                "class stringx {\n public:\n  int size() { return 0; }\n};\n",
+            ),
+            ("x.hpp", x),
+            ("c.cc", c),
+        ],
+        &[(
+            "b.hpp",
+            Some("class string {\n public:\n  int size() { return 0; }\n};\n"),
+        )],
+    );
 }
 
 /// A method returning its template's parameter returns whatever instantiates
@@ -2621,7 +2623,8 @@ fn test_inherits_never_targets_a_function_or_method() {
             "table_test.cc",
             "class Constructor {\n public:\n  explicit Constructor(int n) {}\n};\n\
              class BlockConstructor : public Constructor {\n public:\n  BlockConstructor() : Constructor(1) {}\n};\n\
-             class Harness {\n public:\n  void Test(int n) {}\n};\n",
+             class Harness {\n public:\n  void Test(int n) {}\n};\n\
+             void Reporter() {}\nclass Logger : public Reporter {};\n",
         ),
         (
             "db_test.cc",
