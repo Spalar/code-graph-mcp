@@ -3411,6 +3411,10 @@ test('segmentCwd: a conditional or piped cd is not followed', () => {
   assert.equal(cwdOf('cd /a || exit 1; grep x src/'), '/a', 'an exit that ran would have stopped the grep');
   assert.equal(cwdOf('cd xtask; false && cd /a; grep x src/'), null);
   assert.equal(cwdOf('true || cd /a; grep x src/'), null);
+  // `A || cd X && grep` is `(A || cd X) && grep`: the grep runs when A
+  // succeeded and the cd never did (pre-release review #4).
+  assert.equal(cwdOf('true || cd /a && grep x src/'), null);
+  assert.equal(cwdOf('cd /b || cd /a && grep x src/'), null);
   assert.equal(cwdOf('cd /a | cat; grep x src/'), null, 'a pipeline runs cd in a subshell');
   assert.equal(cwdOf('if true; then cd /a; fi; grep x src/'), null);
 });

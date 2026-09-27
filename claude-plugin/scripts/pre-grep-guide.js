@@ -1346,13 +1346,15 @@ const CD_LITERAL = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*cd\s+('[^']*'|"[^"$`\\
  * `cd` under a set CDPATH is not literal. A `cd` is followed only when it is
  * certain to have run if the grep did: it is unconditional (its `seps` entry,
  * from segmentSeparators, is '', `;` or a newline) or every separator from it
- * to the grep is `&&`. `false && cd x; grep` and `cd x | cat` did not move the
- * shell. Without `seps` every segment counts as unconditional.
+ * to the grep is `&&`, the one before it included: `true || cd x && grep` is
+ * `(true || cd x) && grep`, which runs the grep without the cd. `false && cd x;
+ * grep` and `cd x | cat` did not move the shell. Without `seps` every segment
+ * counts as unconditional.
  */
 function segmentCwd(segments, idx, shellCwd, { isDir = isDirectory, seps } = {}) {
   let cwd = shellCwd;
   const ran = (k) => !seps || SEP_RANK[seps[k]] <= 1
-    || seps.slice(k + 1, idx + 1).every((x) => x === '&&');
+    || seps.slice(k, idx + 1).every((x) => x === '&&');
   for (let k = 0; k < idx; k++) {
     const seg = segments[k];
     if (/^\s*#/.test(seg) || PURE_ASSIGNMENTS.test(seg)) continue;
