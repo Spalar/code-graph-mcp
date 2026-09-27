@@ -1720,6 +1720,39 @@ fn resolve_batch_relations(
                     Some(CalleeMeta::Module(module)) if !py_modules.contains(&module) => {
                         continue;
                     }
+                    // `b()` through `import { a as b } from './x'`: the `a` in
+                    // x's file, deferred while that file's nodes are in a later
+                    // batch; nothing for a package's export (D#113).
+                    Some(CalleeMeta::Import(spec)) => {
+                        let Some(module_file) =
+                            resolve_js_specifier_path(&spec, &pf.rel_path, all_file_paths)
+                        else {
+                            continue;
+                        };
+                        let targets: Vec<i64> = name_to_ids
+                            .get(&rel.target_name)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|id| node_id_to_path.get(id) == Some(&module_file))
+                            .collect();
+                        if targets.is_empty() {
+                            let mut d =
+                                DeferredRelation::of(&source_ids, rel, &pf.rel_path, &pf.language);
+                            d.ns_file = Some(module_file);
+                            deferred.push(d);
+                        } else {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &targets,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
+                        }
+                        continue;
+                    }
                     Some(CalleeMeta::Receiver(recv))
                         if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
                     {
@@ -3575,6 +3608,14 @@ fn resolve_deferred_relations(
                         d.metadata.as_deref(),
                         false,
                     )?;
+                    continue;
+                }
+                // A renamed import's export is not there (a re-export, a
+                // deleted function): bind nothing, as at batch time.
+                if matches!(
+                    parse_callee_metadata(d.metadata.as_deref()),
+                    Some(CalleeMeta::Import(_))
+                ) {
                     continue;
                 }
                 // Method not in the bound file even with the full pool —

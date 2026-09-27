@@ -3,8 +3,8 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 79 → 82 because the three Rust fixes below change which
-`calls` and `imports` edges a file produces. An older binary leaves a v82 index
+`INDEX_VERSION` goes 79 → 83 because the fixes below change which `calls` and
+`imports` edges a file produces. An older binary leaves a v83 index
 intact and warns instead of rebuilding it; delete `.code-graph/index.db*` after
 pinning back.
 
@@ -58,6 +58,23 @@ does not fix (a `#[cfg]`'d parameter, C variadics).
 On the oracle snapshot of the commit before this one (gold 7,126 call pairs):
 wrong edges 35 → 24 (ambiguous 11 → 1, inferred 7 → 6), correct edges 6,844
 before and after, no edge added.
+
+### A call through a renamed JavaScript import binds the export
+
+`import { load as loadModel } from './model'` and
+`const { clearCache: clearBinaryCache } = require('./find-binary')` bind a
+local name the exporting file never defines, so a call `loadModel()` bound
+nothing — or another file's function of that name. It now binds the export
+(`load`, `clearCache`) in the file the specifier names, and nothing else: not
+a same-file function of the export's name, which is usually why the import
+was renamed, and nothing at all for a package's export
+(`import { resolve as resolvePath } from 'path'` no longer binds a project
+`resolvePath`).
+
+SCIP oracle on this repo's JavaScript (same snapshot, gold 1,337 call pairs):
+recall at the default floor 1,331 → 1,335, inferred precision 100% before and
+after; the four calls it adds are the four this repo had
+(`doctor.js` ×3, `auto-update.js`). Rust and Python scores are unchanged.
 
 ### The grep rewrite runs the search the grep asked for
 
@@ -127,6 +144,9 @@ counts as the flag.
   parameter binds a project enum's `as_str`, and `tx.commit()` on a
   `rusqlite` transaction binds the project's savepoint `commit`. The other
   two are a `#[cfg]` twin and a caller whose stored body is truncated.
+- A renamed import of a re-export (`import { a as b } from './index'`, where
+  `index.js` re-exports `a` from another file) binds nothing, and neither does
+  `new B()` through `import { A as B }`.
 - A grep that may not have run (`true || grep …`) is still answered by the
   inject when its output is empty.
 - The inject does not apply the `--include`-with-a-file rule, and forwards no

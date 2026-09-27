@@ -55,6 +55,12 @@ pub(super) enum CalleeMeta {
     /// (`r->index_block.Add()`, `versions_->current()->Ref()`; parser
     /// `receiver::cpp_chain_receiver`). Rewritten like [`Self::Field`].
     Via,
+    /// JS/TS `b()` through a renamed import `import { a as b } from 's'` /
+    /// `const { a: b } = require('s')`, recorded as a call of `a` (parser
+    /// `calls::js_renamed_import`). Payload is the specifier `s`: the call binds
+    /// only the `a` in the file it names, else nothing — a rename usually avoids
+    /// a same-file `a`, which a by-name fallback would bind.
+    Import(String),
     /// Python `m.f()` where `m` is bound by an absolute import of module `v`
     /// (`relations/member.rs`): no project code runs unless `v` is a project
     /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
@@ -110,6 +116,10 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .get("v")?
             .as_str()
             .map(|r| CalleeMeta::Receiver(r.to_string())),
+        crate::domain::CALL_Q_IMPORT => v
+            .get("js_module")?
+            .as_str()
+            .map(|m| CalleeMeta::Import(m.to_string())),
         _ => None,
     }
 }

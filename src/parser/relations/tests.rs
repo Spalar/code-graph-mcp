@@ -3978,6 +3978,33 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
     assert_eq!(qux.metadata.as_deref(), Some(r#"{"q":"member"}"#));
 }
 
+/// D#113: a bare call through a renamed import is recorded as a call of the
+/// export, stamped with the import's specifier. A plain import, a property of a
+/// destructured property, and a local name the file does not import keep a bare
+/// call.
+#[test]
+fn test_js_renamed_import_call_names_the_export() {
+    let code = "import { load as loadModel, keep } from './model';\n\
+                const { clearCache: clearBinaryCache, deep: { inner: alias } } = require('./cache');\n\
+                function go() { loadModel(); clearBinaryCache(); keep(); alias(); local(); }\n";
+    let relations = extract_relations(code, "javascript").unwrap();
+    let calls: Vec<(&str, Option<&str>)> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS && r.target_name != "require")
+        .map(|r| (r.target_name.as_str(), r.metadata.as_deref()))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            ("load", Some(r#"{"js_module":"./model","q":"imp"}"#)),
+            ("clearCache", Some(r#"{"js_module":"./cache","q":"imp"}"#)),
+            ("keep", None),
+            ("alias", None),
+            ("local", None),
+        ]
+    );
+}
+
 #[test]
 fn test_python_receiver_type_propagation_from_ctor_assignment() {
     // Issue #32 cause 2: `recv.method()` whose receiver is fixed by a single
