@@ -4,13 +4,19 @@
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 74 → 78 because the fixes below change which `calls` and
-`inherits` edges a file produces.
+`inherits` edges a file produces, and an existing index keeps the wrong ones
+until each file's content changes. Nothing to run; the rebuild itself is faster
+than 0.158.0's full index (below). To pin back: `npm i -g
+@sdsrs/code-graph@0.158.0`, or `cargo install code-graph-mcp --version 0.158.0`;
+plugin users can set the version in the marketplace entry. An older binary
+leaves a v78 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning to get its graph back.
 
 ### A full index is faster than 0.157.0 again
 
-0.158.0 made a full index 7% slower on django, 11% on hono and 21% on leveldb,
-and the typing fixes below added more. Timers on each phase put most of the
-time in reading each file's calls and imports from its syntax tree: 3.6 s of
+0.158.0 and the typing fixes below made a full index slower than 0.157.0: by
+6% on django, 16% on hono and 25% on leveldb (the table below). Timers on each
+phase put most of the time in reading each file's calls and imports from its syntax tree: 3.6 s of
 django's 12.5 s, 400 of hono's 905 ms and 220 of leveldb's 640 ms. That step
 ran one file at a time, after the file's symbols were stored. It now runs on
 the parser's worker threads beside symbol extraction. The worker threads get
@@ -180,9 +186,13 @@ wrote two JSON envelopes to the Bash hook's stdout. Claude Code parses a hook's
 output as one JSON value, rejected the pair ("Unexpected non-whitespace
 character after JSON ... line 2 column 1"), and the model saw neither hint —
 while the tracker recorded both as delivered, so neither fired again for five
-minutes. Seen 4 times in two weeks of claude-mem-lite sessions. The hints now
-share one envelope, each overview answer taking an equal share of the 4000-byte
-context cap so a large first answer cannot cut the second directory out.
+minutes. Seen 4 times between September 6 and 26 in claude-mem-lite sessions.
+The hints now share one envelope. Each directory first reserves room for its
+own header and footer, sized by its name, and the overview answers split what
+is left of the 4000-byte context cap, so a large first answer cannot cut a
+later directory out. When the split leaves less than 400 bytes per answer
+(from seven short-named directories at once), every directory gets the
+one-line advice instead of an overview; about 19 such lines fit the cap.
 
 That envelope also no longer carries `permissionDecision: "allow"`. It was the
 Read hook's envelope, written from inside the tracker the Bash hook shares, and

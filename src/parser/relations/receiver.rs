@@ -343,6 +343,13 @@ pub(super) fn reset() {
     CPP_RECEIVERS.with(|c| c.borrow_mut().clear());
 }
 
+/// Entries in this thread's C++ receiver cache (tests: a C++ function node's id
+/// is not reused across small parses, so a leak cannot be shown by output alone).
+#[cfg(test)]
+pub(super) fn cpp_receiver_cache_len() -> usize {
+    CPP_RECEIVERS.with(|c| c.borrow().len())
+}
+
 /// Whether `name` is a type parameter of a template enclosing `node`.
 fn is_template_parameter(node: tree_sitter::Node, name: &str, source: &str) -> bool {
     let mut cur = node.parent();

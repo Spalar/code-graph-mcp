@@ -93,9 +93,12 @@ pub(super) const BATCH_SIZE: usize = 500;
 /// Measured (2026-09-08) on a generated TypeScript corpus of 500 KiB files,
 /// each half the 1 MiB per-file cap, indexed by the release binary: peak RSS ran
 /// at ~70x the batch's source bytes and scaled linearly with it — 29 MB source
-/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB. The amplification is the
+/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB. The amplification was the
 /// trees plus `ParsedNode::code_content`, which stores each node's own text, so
-/// nested declarations carry their bodies more than once.
+/// nested declarations carry their bodies more than once. Since Phase 1a
+/// extracts relations and drops each tree in its worker, a batch holds its
+/// nodes and relations instead of its trees, and peak RSS fell on every corpus
+/// measured (2026-09-27, generated TypeScript: 1,496 -> 1,131 MiB).
 ///
 /// 16 MiB leaves the common case untouched: this repo indexes ~6 MiB of source
 /// across 333 tracked files (mean 26.6 KiB), so an ordinary run still forms one
@@ -240,7 +243,9 @@ struct FilePreParsed {
     /// The file's relations, extracted here beside its nodes: a pure function
     /// of the tree, and the costliest one (django: 3.6 s of a 12.5 s full index
     /// while it ran sequentially in Phase 2). The tree is dropped with the
-    /// worker's closure instead of being held through Phase 2.
+    /// worker's closure instead of being held through Phase 2. Kept in walk
+    /// order: resolution depends on it (reversing it changed 32–86 edges per
+    /// corpus), so nothing between here and Phase 2 may reorder it.
     relations: Vec<ParsedRelation>,
     /// C++ only: each class body's typed fields (`record_cpp_fields`).
     cpp_fields: Vec<CppField>,
@@ -2458,7 +2463,7 @@ Restart every code-graph server on this project so they run one version.",
         }
         global_name_map.retain(|_, entries| !entries.is_empty());
 
-        // Convert to lightweight records — drops Tree and source string
+        // Convert to lightweight records — drops the relations and node vectors
         for pf in batch_parsed {
             // Add newly committed nodes to the global map
             let pf_lang = Some(pf.language.clone());

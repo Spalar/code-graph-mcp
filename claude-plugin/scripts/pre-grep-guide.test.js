@@ -2690,6 +2690,59 @@ test('sed-range fanout: a full-size first overview cannot crowd the second dir o
   }
 });
 
+test('sed-range fanout: long dir names still fit both hints uncut', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture(
+    'const d = process.argv[3]; for (let i = 0; i < 200; i++) process.stdout.write(d + " symbol_" + i + " (src/some/long/path.rs)\\n");');
+  try {
+    const root = resolveProjectRoot(fixture.dir);
+    const a = 'a'.repeat(150);
+    const b = 'b'.repeat(150);
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) {
+      readGuide.recordRead(state, a);
+      readGuide.recordRead(state, b);
+    }
+    readGuide.saveState(root, state);
+
+    const res = runHook(`sed -n 1,10p ${a}/core.js; sed -n 1,6p ${b}/core.test.js`, fixture);
+    assert.equal(res.status, 0, res.stderr);
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, new RegExp(`5\\+ Reads into ${a}/ — module overview`));
+    assert.match(ctx, new RegExp(`5\\+ Reads into ${b}/ — module overview`));
+    assert.match(ctx, new RegExp(`^${b} symbol_0 `, 'm'), 'the second dir keeps part of its answer');
+    assert.doesNotMatch(ctx, /truncated at \d+ bytes/, 'the reservation covers long names');
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('sed-range fanout: fourteen dirs at once each keep their hint', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture(
+    'const d = process.argv[3]; for (let i = 0; i < 200; i++) process.stdout.write(d + " symbol_" + i + " (src/some/long/path.rs)\\n");');
+  try {
+    const root = resolveProjectRoot(fixture.dir);
+    const dirs = Array.from({ length: 14 }, (_, i) => `d${i}`);
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) {
+      for (const d of dirs) readGuide.recordRead(state, d);
+    }
+    readGuide.saveState(root, state);
+
+    const res = runHook(dirs.map((d) => `sed -n 1,5p ${d}/f.js`).join('; '), fixture);
+    assert.equal(res.status, 0, res.stderr);
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    for (const d of dirs) {
+      assert.match(ctx, new RegExp(`5\\+ Reads into ${d}/ `), `${d} keeps its hint`);
+    }
+    assert.doesNotMatch(ctx, /truncated at \d+ bytes/, 'every hint fits the envelope');
+    assert.doesNotMatch(ctx, /symbol_0/, 'no share is big enough for an answer, so none ran');
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test('sed-range fanout: one dir crossing still emits its single envelope', () => {
   const readGuide = require('./pre-read-guide');
   const fixture = e2eFixture('process.stdout.write("overview stub\\n");');

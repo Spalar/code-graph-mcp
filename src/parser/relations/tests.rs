@@ -7130,3 +7130,78 @@ fn calls_axis_emits_an_edge_for_every_call_bearing_language() {
         missing.join("\n")
     );
 }
+
+/// The relation caches are thread-local and reset per file, and Phase 1a walks
+/// many files on each of its long-lived worker threads: a file's relations must
+/// not depend on which file its thread walked before it. Each pair is two files
+/// of the same shape, so a recycled tree node id meets the first file's cache
+/// entry, with different answers (the receiver's class; whether `g` names a
+/// parameter or the function it references).
+#[test]
+fn a_files_relations_do_not_depend_on_the_file_its_thread_walked_before() {
+    type Rel = (String, String, String, Option<String>);
+    fn walk(src: &str, lang: &str) -> Vec<Rel> {
+        extract_relations(src, lang)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.source_name, r.target_name, r.relation, r.metadata))
+            .collect()
+    }
+    let pairs: [(&str, &str, &str); 3] = [
+        (
+            "javascript",
+            "function f() {\n  const s = new Map();\n  s.add(1);\n}\n",
+            "function f() {\n  const s = new Set();\n  s.add(1);\n}\n",
+        ),
+        (
+            "cpp",
+            "struct M { void Put(); };\nvoid f() {\n  M x;\n  x.Put();\n}\n",
+            "struct S { void Put(); };\nvoid f() {\n  S x;\n  x.Put();\n}\n",
+        ),
+        (
+            "rust",
+            "fn f(g: i32) {\n    h(g);\n}\n",
+            "fn f(k: i32) {\n    h(g);\n}\n",
+        ),
+    ];
+    for (lang, first, second) in pairs {
+        let fresh = std::thread::spawn(move || walk(second, lang))
+            .join()
+            .unwrap();
+        let after = std::thread::spawn(move || {
+            walk(first, lang);
+            walk(second, lang)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            after, fresh,
+            "{lang}: the previous file leaked into this one"
+        );
+    }
+}
+
+/// The C++ receiver cache, which the pairs above cannot reach: its key is a
+/// function node id, and tree-sitter-cpp did not reuse one across small parses.
+#[test]
+fn a_cpp_files_walk_starts_with_an_empty_receiver_cache() {
+    std::thread::spawn(|| {
+        extract_relations(
+            "struct M { void Put(); };\nvoid f() {\n  M x;\n  x.Put();\n}\n",
+            "cpp",
+        )
+        .unwrap();
+        assert!(
+            receiver::cpp_receiver_cache_len() > 0,
+            "the walk caches the receiver"
+        );
+        extract_relations("int n;\n", "cpp").unwrap();
+        assert_eq!(
+            receiver::cpp_receiver_cache_len(),
+            0,
+            "the next file starts empty"
+        );
+    })
+    .join()
+    .unwrap();
+}

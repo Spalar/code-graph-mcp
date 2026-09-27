@@ -189,7 +189,10 @@ function trackRead(root, rel, now = Date.now()) {
 /// splits one envelope's budget between several dirs.
 function buildFanoutHint(root, dir, { maxBytes } = {}) {
   let answer = { status: 'unavailable' };
-  if (!isAnswerDisabled()) {
+  if (maxBytes === 0) {
+    // No room left in a shared envelope: the advice line, and no CLI run.
+    answer = { status: 'unavailable', reason: 'budget' };
+  } else if (!isAnswerDisabled()) {
     answer = runOverviewAnswer({ cwd: root, dir, ...(maxBytes ? { maxBytes } : {}) });
   }
   const answered = answer.status === 'hits';

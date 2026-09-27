@@ -2471,6 +2471,17 @@ fn test_cpp_out_of_line_member_binds_its_field_type() {
     );
 }
 
+/// The same in a `.h` header, the most common C++ layout: detected as C by its
+/// extension and re-parsed as C++ by its content, its fields must still be recorded.
+#[test]
+fn test_cpp_field_in_a_dot_h_header_is_typed() {
+    let (_p, _d, db) = fresh_index_of(&[("db_impl.h", DB_IMPL_HPP), ("db_impl.cc", DB_IMPL_CC)]);
+    assert_eq!(
+        callees_of(&db, "Release"),
+        vec!["db_impl.h.SnapshotList.Delete".to_string()]
+    );
+}
+
 #[test]
 fn test_cpp_field_declared_in_a_base_class_is_typed() {
     let (_p, _d, db) = fresh_index_of(&[

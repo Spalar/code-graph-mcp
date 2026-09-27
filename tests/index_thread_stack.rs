@@ -120,10 +120,11 @@ fn startup_index_thread_declares_its_stack_size() {
 
 /// Phase 1a extracts relations on its worker threads, not on the index thread.
 /// The index here runs on a thread sized like the startup one, so the parse
-/// workers are the only threads this input can overflow. Measured need of this
-/// walk in an unoptimized build: between 512 KiB and 1 MiB, so it would also
-/// pass on rayon's 2 MiB default today; the budget itself is pinned by
-/// `parse_workers_declare_their_stack_size` below.
+/// workers are the only threads this input can overflow: a 1 MiB pool aborts
+/// here in an unoptimized build. Measured need there (2026-09-27, parse plus
+/// walk): about 1.4 MiB for this input and 2.5 MiB for nested Ruby bare calls,
+/// so the budget is pinned by `parse_workers_declare_their_stack_size` below
+/// rather than left to rayon's 2 MiB default.
 #[test]
 fn relation_walk_survives_depth_cap_in_the_parse_workers() {
     use code_graph_mcp::indexer::pipeline::run_full_index;
