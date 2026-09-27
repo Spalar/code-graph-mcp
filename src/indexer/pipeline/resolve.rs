@@ -1910,6 +1910,16 @@ pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: RustFnShape
     if method_call && !callee.takes_self {
         return false;
     }
+    // A path through a crate or module (`tokio::spawn(f)`, `rt::run()`) names no
+    // type, so it cannot pass `self`: only `Type::f(x)` calls a method that way.
+    // With the arity rule leaving `Command::spawn(&mut self)` the only
+    // one-parameter `spawn`, tokio's `tokio::spawn(fut)` calls all bound it.
+    if callee.takes_self
+        && matches!(&meta, Some(CalleeMeta::Path(segments))
+            if segments.last().is_some_and(|s| s.starts_with(|c: char| c.is_ascii_lowercase())))
+    {
+        return false;
+    }
     let receiver =
         callee.takes_self && (method_call || matches!(meta, Some(CalleeMeta::SelfRecv(_))));
     match (rust_call_arity(metadata), callee.params) {
@@ -2808,7 +2818,11 @@ mod tests {
         let path3 = Some(r#"{"n":3,"q":"path","v":"resolve"}"#);
         assert!(!rust_call_shape_admits(recv1, method));
         assert!(rust_call_shape_admits(recv2, method));
-        assert!(rust_call_shape_admits(path3, method));
+        // UFCS through the type passes `self` itself.
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":3,"q":"path","v":"Classes"}"#),
+            method
+        ));
         assert!(rust_call_shape_admits(path3, free));
         assert!(!rust_call_shape_admits(
             Some(r#"{"n":3,"q":"path","v":"Names"}"#),
@@ -2817,6 +2831,19 @@ mod tests {
         assert!(rust_call_shape_admits(
             Some(r#"{"n":1,"q":"self","v":"Db"}"#),
             f("(&self, k: u8)")
+        ));
+        // A module path cannot pass `self`; a type path can (F3).
+        assert!(!rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
+            f("(&mut self)")
+        ));
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"path","v":"process::Command"}"#),
+            f("(&mut self)")
+        ));
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
+            f("(f: F)")
         ));
         // No count on either side: nothing to check.
         assert!(rust_call_shape_admits(

@@ -3263,6 +3263,46 @@ fn test_rust_call_arity_decides_which_function_a_call_reaches() {
     );
 }
 
+/// Pre-release review F3: a path through a crate or module (`tokio::spawn(f)`)
+/// names no type, so it cannot pass `self` — only `Type::f(x)` calls a method
+/// that way. Once the arity rule left `Command::spawn(&mut self)` as the only
+/// one-parameter `spawn`, 137 tokio test calls bound it at `inferred`.
+#[test]
+fn test_rust_module_path_call_never_reaches_a_method() {
+    let files: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod process;\npub mod rt;\npub use rt::spawn;\n",
+        ),
+        (
+            "src/process.rs",
+            "pub struct Command;\nimpl Command {\n    pub fn spawn(&mut self) {}\n}\n",
+        ),
+        ("src/rt.rs", "pub fn spawn<F>(f: F, id: u64) {}\n"),
+        (
+            "tests/t.rs",
+            "fn t() {\n    mycrate::spawn(async {});\n    mycrate::rt::spawn(1, 2);\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let spawn_edges: Vec<&String> = edges
+        .iter()
+        .filter(|e| e.starts_with("tests/t.rs.t --calls-->"))
+        .collect();
+    // `rt::spawn(1, 2)` reaches the free function (control); the one-argument
+    // module call reaches nothing.
+    assert_eq!(
+        spawn_edges,
+        vec!["tests/t.rs.t --calls--> src/rt.rs.spawn"],
+        "{edges:#?}"
+    );
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs
