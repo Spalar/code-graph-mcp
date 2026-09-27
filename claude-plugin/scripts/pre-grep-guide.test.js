@@ -56,6 +56,7 @@ const {
   rewritePlan,
   rewriteMatchesBlock,
   segmentCwd,
+  segmentSeparators,
   extractSedReadTargets,
   extractUnansweredTail,
   extractPatterns,
@@ -3373,4 +3374,73 @@ test('rebaseRelativePaths: words inside a quoted pattern are not rebased', () =>
     'grep -rn "fn main utils here" src/.');
   assert.equal(rebaseRelativePaths(`grep -rn 'a b' utils`, 'src', '/proj', exists),
     `grep -rn 'a b' src/utils`);
+});
+
+// ── Review round 1 of the D#66/D#76 batch ─────────────────────────────────
+
+// R1 — the heredoc detector must fire only on a heredoc, or it swallows the
+// rest of the command (and with it a `cd` the shell ran).
+test('splitTopLevelSegments: here-strings, arithmetic and comments start no heredoc', () => {
+  const g = 'grep -rn "FooBar" src/';
+  assert.deepEqual(splitTopLevelSegments(`cat <<< "x"\n${g}`), ['cat <<< "x"', g]);
+  assert.deepEqual(splitTopLevelSegments(`cat <<<EOF\ncd xtask\nEOF\n${g}`), ['cat <<<EOF', 'cd xtask', 'EOF', g]);
+  assert.deepEqual(splitTopLevelSegments(`echo $(( 1 << 2 ))\n${g}`), ['echo $(( 1 << 2 ))', g]);
+  assert.deepEqual(splitTopLevelSegments(`(( y = 1 << 2 ))\n${g}`), ['(( y = 1 << 2 ))', g]);
+  assert.deepEqual(splitTopLevelSegments(`echo hi # see <<EOF\n${g}`), ['echo hi', g]);
+  assert.deepEqual(splitTopLevelSegments(`echo hi # ; ${g}`), ['echo hi'], 'a comment runs to the end of the line');
+  assert.deepEqual(splitTopLevelSegments(`echo a#b; ${g}`), ['echo a#b', g], '# inside a word is text');
+});
+
+test('splitTopLevelSegments: a heredoc delimiter is a whole word, quotes removed', () => {
+  const g = 'grep -rn "FooBar" src/';
+  assert.deepEqual(splitTopLevelSegments(`cat <<E"O"F\n${g}\nEOF\necho ok`), ['cat <<E"O"F', 'echo ok']);
+  assert.deepEqual(splitTopLevelSegments(`cat <<$'EOF'\n${g}\nEOF\necho ok`), [`cat <<$'EOF'`, 'echo ok']);
+  assert.deepEqual(splitTopLevelSegments(`cat <<\\EOF\n${g}\nEOF\necho ok`), ['cat <<\\EOF', 'echo ok']);
+});
+
+// R2 — a `cd` counts only when the grep could not have run without it.
+test('segmentCwd: a conditional or piped cd is not followed', () => {
+  const isDir = () => true;
+  const cwdOf = (cmd) => {
+    const segs = splitTopLevelSegments(cmd);
+    return segmentCwd(segs, segs.length - 1, '/r', { isDir, seps: segmentSeparators(cmd) });
+  };
+  assert.equal(cwdOf('cd /a && grep x src/'), '/a');
+  assert.equal(cwdOf('cd /a; grep x src/'), '/a');
+  assert.equal(cwdOf('echo x && cd /a && grep x src/'), '/a', 'every step to the grep is &&');
+  assert.equal(cwdOf('cd /a || exit 1; grep x src/'), '/a', 'an exit that ran would have stopped the grep');
+  assert.equal(cwdOf('cd xtask; false && cd /a; grep x src/'), null);
+  assert.equal(cwdOf('true || cd /a; grep x src/'), null);
+  assert.equal(cwdOf('cd /a | cat; grep x src/'), null, 'a pipeline runs cd in a subshell');
+  assert.equal(cwdOf('if true; then cd /a; fi; grep x src/'), null);
+});
+
+// R3 — GNU grep's --include does not expand braces; cg's -g does.
+test('rewritePlan: an --include glob with braces is not reproducible', () => {
+  const isDir = () => true;
+  assert.equal(rewritePlan(`grep -rn --include='*.{rs,py}' "FooBar" src/`, { isDir }), null);
+  assert.equal(rewritePlan(`grep -rn --include '*.{rs,py}' "FooBar" src/`, { isDir }), null);
+  assert.notEqual(rewritePlan(`rg -g '*.{rs,py}' "FooBar" src/`, { isDir }), null, "rg's own -g expands them");
+});
+
+// R4 — the dialect flags are read from words, not from the pattern's text.
+test('translateBreToRg: an -E inside the quoted pattern is not the dialect flag', () => {
+  assert.equal(translateBreToRg(`grep -rn 'Foo|x -E y' src/`, 'Foo|x -E y'), 'Foo\\|x -E y');
+  assert.equal(translateBreToRg(`grep -rnE 'Foo|x' src/`, 'Foo|x'), 'Foo|x');
+  assert.equal(translateBreToRg(`grep --extended-regexp 'Foo|x' src/`, 'Foo|x'), 'Foo|x');
+});
+
+// R5 — brackets and escapes the two dialects read differently.
+test('translateBreToRg: brackets and escapes the dialects disagree on are untranslatable', () => {
+  const t = (p) => translateBreToRg(`grep -rn "${p}" src/`, p);
+  assert.equal(t('Foo[[:foo:]]'), null, 'an unknown class is an error in grep');
+  assert.equal(t('Foo[]-a]'), null, 'a leading ] is a range start in grep');
+  assert.equal(t('Foo\\(\\)'), null, 'an empty group is an error in grep');
+  for (const p of ['Foo\\z', 'Foo\\=', 'Foo\\_', 'Foo\\1', 'Foo\\d']) assert.equal(t(p), null, p);
+  assert.equal(t('Foo[[:digit:]]\\.\\*\\bx\\w'), 'Foo[[:digit:]]\\.\\*\\bx\\w');
+});
+
+// R6 — never a throw on input no caller should send.
+test('rewritePlan: blank input is no plan', () => {
+  assert.equal(rewritePlan(' '), null);
 });

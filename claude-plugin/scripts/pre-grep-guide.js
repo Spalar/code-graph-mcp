@@ -879,41 +879,96 @@ function pickBlockPattern(cmd) {
 // quote parity for the rest of the command, and a `grep` line in a script body
 // was folded as if the shell had run it. The `<<WORD` stays in its segment;
 // the lines after that segment's newline, through the terminator line, go.
-const HEREDOC_START = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.@%+:/-]+))/;
-function splitTopLevelSegments(cmd) {
+//
+// Also read as the shell reads them, because each misreading drops or invents
+// commands: a comment (`#` at the start of a word) runs to the end of its line;
+// `<<<` is a here-string and `<<` inside `((…))` a shift, neither a heredoc;
+// the heredoc delimiter is a whole word with its quoting removed (`E"O"F`,
+// `$'EOF'`, `\EOF` all end at a line `EOF`).
+function readHeredocDelim(cmd, i) {
+  let j = i;
+  let delim = '';
+  while (j < cmd.length && !/[\s;&|<>()]/.test(cmd[j])) {
+    const c = cmd[j];
+    if (c === '$' && (cmd[j + 1] === "'" || cmd[j + 1] === '"')) { j++; continue; }
+    if (c === "'" || c === '"') {
+      const close = cmd.indexOf(c, j + 1);
+      if (close === -1) return null;
+      delim += cmd.slice(j + 1, close);
+      j = close + 1;
+      continue;
+    }
+    if (c === '\\' && j + 1 < cmd.length) { delim += cmd[j + 1]; j += 2; continue; }
+    delim += c;
+    j++;
+  }
+  return delim ? { delim, end: j } : null;
+}
+
+// Stronger of two separators joining the same pair of segments (an empty
+// segment between them collapses): anything conditional beats `;`/newline.
+const SEP_RANK = { '': 0, ';': 1, '\n': 1, '&&': 2, '||': 2, ctrl: 3 };
+function joinSep(a, b) {
+  if (a === undefined) return b;
+  if (SEP_RANK[a] === 2 && SEP_RANK[b] === 2 && a !== b) return 'ctrl';
+  return SEP_RANK[b] > SEP_RANK[a] ? b : a;
+}
+
+/**
+ * Top-level segments with the separator before each: '' (the first), ';',
+ * '\n', '&&', '||', or 'ctrl' (after a `do`/`then`/… control word, where
+ * whether the segment runs is not a matter of the previous one).
+ * @returns {{text: string, sep: string}[]}
+ */
+function splitTopLevelSegmentsWithSeps(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
   const segs = [];
   let cur = '';
+  let sep = '';
   let quote = null;
+  let arith = 0;      // depth of `((` … `))`
   let heredocs = [];  // [{delim, stripTabs}] started on the current line
+  const cut = (next) => { segs.push({ text: cur, sep }); cur = ''; sep = next; };
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
-    if (!quote && c === '<' && cmd[i + 1] === '<' && cmd[i + 2] !== '<') {
-      const m = HEREDOC_START.exec(cmd.slice(i));
-      // `$((1<<2))` is an arithmetic shift: its "word" runs into a `)`.
-      if (m && cmd[i + m[0].length] !== ')') {
-        heredocs.push({ delim: m[2] ?? m[3] ?? m[4], stripTabs: m[1] === '-' });
-        cur += m[0];
-        i += m[0].length - 1;
+    if (!quote) {
+      if (c === '#' && /(?:^|[\s|(])$/.test(cur)) {
+        const nl = cmd.indexOf('\n', i);
+        i = (nl === -1 ? cmd.length : nl) - 1;
         continue;
       }
-    }
-    if (!quote && c === '\n' && heredocs.length > 0) {
-      segs.push(cur);
-      cur = '';
-      let j = i + 1;
-      for (const { delim, stripTabs } of heredocs) {
-        while (j < cmd.length) {
-          const nl = cmd.indexOf('\n', j);
-          const end = nl === -1 ? cmd.length : nl;
-          const line = cmd.slice(j, end);
-          j = end + 1;
-          if ((stripTabs ? line.replace(/^\t+/, '') : line) === delim) break;
+      if (c === '(' && cmd[i + 1] === '(') { arith++; cur += '(('; i++; continue; }
+      if (c === ')' && cmd[i + 1] === ')' && arith > 0) { arith--; cur += '))'; i++; continue; }
+      if (c === '<' && cmd[i + 1] === '<' && cmd[i + 2] === '<') { cur += '<<<'; i += 2; continue; }
+      if (c === '<' && cmd[i + 1] === '<' && arith === 0) {
+        let j = i + 2;
+        const stripTabs = cmd[j] === '-';
+        if (stripTabs) j++;
+        while (cmd[j] === ' ' || cmd[j] === '\t') j++;
+        const d = readHeredocDelim(cmd, j);
+        if (d) {
+          heredocs.push({ delim: d.delim, stripTabs });
+          cur += cmd.slice(i, d.end);
+          i = d.end - 1;
+          continue;
         }
       }
-      heredocs = [];
-      i = j - 1;
-      continue;
+      if (c === '\n' && heredocs.length > 0) {
+        cut('\n');
+        let j = i + 1;
+        for (const { delim, stripTabs } of heredocs) {
+          while (j < cmd.length) {
+            const nl = cmd.indexOf('\n', j);
+            const end = nl === -1 ? cmd.length : nl;
+            const line = cmd.slice(j, end);
+            j = end + 1;
+            if ((stripTabs ? line.replace(/^\t+/, '') : line) === delim) break;
+          }
+        }
+        heredocs = [];
+        i = j - 1;
+        continue;
+      }
     }
     if (quote) {
       cur += c;
@@ -943,12 +998,12 @@ function splitTopLevelSegments(cmd) {
     // `&&` and `||` (a single `&`/`|` is NOT a split — `|` is an output-filter
     // pipe, lone `&` is background and rare in tool calls).
     if ((c === '&' && cmd[i + 1] === '&') || (c === '|' && cmd[i + 1] === '|')) {
-      segs.push(cur); cur = ''; i++; continue;
+      cut(c + c); i++; continue;
     }
-    if (c === ';' || c === '\n') { segs.push(cur); cur = ''; continue; }
+    if (c === ';' || c === '\n') { cut(c); continue; }
     cur += c;
   }
-  segs.push(cur);
+  cut(undefined);
   // Split out `for … in` / `do` / `done` control words as their own boundaries
   // so a loop body grep is isolated (the head of `for s in …; do grep …` is the
   // `for` keyword, which would otherwise mask the grep). Quote-safety already
@@ -956,27 +1011,37 @@ function splitTopLevelSegments(cmd) {
   // control words only. A `for` header takes its word list with it: the list
   // is data, and left behind as a segment it read as a command that segmentCwd
   // cannot place (D#76).
-  const out = [];
+  const pieces = [];
   const CTRL = /(?:^|\s)(for\s+\S+\s+in\b[\s\S]*$|do\b|done\b|then\b|fi\b)(?=\s|$)/g;
-  for (const raw of segs) {
+  for (const { text: raw, sep: rawSep } of segs) {
     let last = 0;
     let m;
+    let pieceSep = rawSep;
     CTRL.lastIndex = 0;
-    let pushed = false;
     while ((m = CTRL.exec(raw)) !== null) {
-      const before = raw.slice(last, m.index);
-      if (before.trim()) out.push(before);
+      pieces.push({ text: raw.slice(last, m.index), sep: pieceSep });
       last = CTRL.lastIndex;
-      pushed = true;
+      pieceSep = 'ctrl';
     }
-    if (pushed) {
-      const tail = raw.slice(last);
-      if (tail.trim()) out.push(tail);
-    } else {
-      out.push(raw);
-    }
+    pieces.push({ text: raw.slice(last), sep: pieceSep });
   }
-  return out.map(s => s.trim()).filter(Boolean);
+  const out = [];
+  let carried;
+  for (const { text, sep: s } of pieces) {
+    carried = joinSep(carried, s);
+    if (!text.trim()) continue;
+    out.push({ text: text.trim(), sep: out.length === 0 ? '' : carried });
+    carried = undefined;
+  }
+  return out;
+}
+
+function splitTopLevelSegments(cmd) {
+  return splitTopLevelSegmentsWithSeps(cmd).map((s) => s.text);
+}
+
+function segmentSeparators(cmd) {
+  return splitTopLevelSegmentsWithSeps(cmd).map((s) => s.sep);
 }
 
 // One implementation of the cooldown quartet, in tmp-dir.js (ARC-02/ARC-06);
@@ -1158,7 +1223,7 @@ const looksLikeDir = (t) => t.endsWith('/') || !/\.[A-Za-z0-9]{1,6}$/.test(t);
 function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   if (!cmd || typeof cmd !== 'string' || cmd.length > 1000) return null;
   const words = shellWords(cmd);
-  if (!words || words.some((w) => w.op)) return null;
+  if (!words || words.length === 0 || words.some((w) => w.op)) return null;
   let i = 0;
   let verb = !words[0].anyQuoted ? words[0].text : '';
   if (verb === 'git') {
@@ -1187,8 +1252,9 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
       // (`--include='*.rs'`, rg `-g'*.rs'`); an unquoted `<>&` is shell syntax.
       const attachedFilter = /^--(?:include|glob|type)=/.test(w.text) || (verb === 'rg' && /^-[gt]./.test(w.text));
       if (!attachedFilter || w.bareOp) return null;
-      // GNU grep's --include has no `!` negation; cg's -g does (round 4 L2).
-      if (/^--include=!/.test(w.text)) return null;
+      // GNU grep's --include has no `!` negation and no `{a,b}` alternatives;
+      // cg's -g has both (round 4 L2; review of D#78).
+      if (/^--include=(?:!|.*\{)/.test(w.text)) return null;
     }
     if (w.text === '--') { endOfFlags = true; continue; }
     if (w.text.startsWith('--')) {
@@ -1198,7 +1264,7 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
       if (name === 'include') include = true;
       if (VALUE_LONG.has(name) && eq === -1) {
         const v = words[++i];
-        if (!valueWordOk(v, false) || (name === 'include' && v.text.startsWith('!'))) return null;
+        if (!valueWordOk(v, false) || (name === 'include' && /^!|\{/.test(v.text))) return null;
       }
       if (name === 'ignore-case' || name === 'case-sensitive') caseFlag = true;
       continue;
@@ -1265,25 +1331,35 @@ const CWD_NEUTRAL = new Set([
   'dirname', 'perl', 'gh', 'curl', 'make', 'bash', 'sh', 'timeout', 'tar', 'sqlite3',
   'code-graph-mcp', 'nproc', 'rustc', 'go', 'wait', 'column', 'md5sum', 'sha256sum',
   'od', 'xxd', 'seq', 'paste', 'comm', 'uname', 'id', 'printenv',
+  // If an `exit` before the grep had run, the grep would not have.
+  'exit', 'return',
 ]);
 // `X=1 Y=$(mktemp -d)`: a command substitution runs in a subshell.
 const PURE_ASSIGNMENTS =
   /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:\$\([^()]*\)|"[^"]*"|'[^']*'|[^\s;|&<>()'"]*)\s*)+$/;
-const CD_LITERAL = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*cd\s+('[^']*'|"[^"$`\\]*"|[^\s'"$`\\~*?[{]+)\s*$/;
+const CD_LITERAL = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*cd\s+('[^']*'|"[^"$`\\]*"|[^\s'"$`\\~*?[{|;&<>()]+)\s*$/;
 
 /**
  * The directory `segments[idx]` runs in, or null when the segments before it
  * could have moved the shell somewhere we cannot name (D#76). Follows
  * cwd-neutral commands and `cd` to one literal path that exists; a relative
- * `cd` under a set CDPATH is not literal.
+ * `cd` under a set CDPATH is not literal. A `cd` is followed only when it is
+ * certain to have run if the grep did: it is unconditional (its `seps` entry,
+ * from segmentSeparators, is '', `;` or a newline) or every separator from it
+ * to the grep is `&&`. `false && cd x; grep` and `cd x | cat` did not move the
+ * shell. Without `seps` every segment counts as unconditional.
  */
-function segmentCwd(segments, idx, shellCwd, { isDir = isDirectory } = {}) {
+function segmentCwd(segments, idx, shellCwd, { isDir = isDirectory, seps } = {}) {
   let cwd = shellCwd;
-  for (const seg of segments.slice(0, idx)) {
+  const ran = (k) => !seps || SEP_RANK[seps[k]] <= 1
+    || seps.slice(k + 1, idx + 1).every((x) => x === '&&');
+  for (let k = 0; k < idx; k++) {
+    const seg = segments[k];
     if (/^\s*#/.test(seg) || PURE_ASSIGNMENTS.test(seg)) continue;
     const clause = firstShellClause(seg);
-    const cd = CD_LITERAL.exec(clause);
+    const cd = CD_LITERAL.exec(seg);
     if (cd) {
+      if (!ran(k)) return null;
       const arg = /^['"]/.test(cd[1]) ? cd[1].slice(1, -1) : cd[1];
       if (!arg || arg === '-' || (!path.isAbsolute(arg) && process.env.CDPATH)) return null;
       const next = path.resolve(cwd, arg);
@@ -1342,10 +1418,12 @@ function translateBreToRg(cmd, pattern) {
   // the two hooks, because post-grep-inject passes a SEGMENT here while the deny
   // path passes the whole command — the same pattern then filed under two
   // spellings and the funnel scored a verbatim re-grep as neutral.
-  const clause = firstShellClause(cmd);
-  if (/(?:^|\s)-[a-zA-Z]*[EP][a-zA-Z]*(?:\s|=|\d|$)|--(?:extended-regexp|perl-regexp)\b/.test(clause)) {
-    return pattern;
-  }
+  // Read from the clause's words, like extractCgFlags: a pattern holding ` -E `
+  // is not the flag (review of D#62).
+  const words = clauseWords(firstShellClause(cmd).replace(VERB_STRIP, '')) || [];
+  const extended = words.some((w) => w.quotedFrom === -1
+    && (/^-[a-zA-Z]*[EP][a-zA-Z]*(?:=|\d|$)/.test(w.text) || /^--(?:extended-regexp|perl-regexp)$/.test(w.text)));
+  if (extended) return pattern;
   return breToRustRegex(pattern);
 }
 
@@ -1361,14 +1439,26 @@ function translateBreToRg(cmd, pattern) {
 // bracket holding any of those means different things in the two; that pattern
 // is untranslatable and the result is null — the caller lets the grep run.
 // (`[:alpha:]` is a POSIX class in both and is kept.)
+//
+// Escapes: only the ones both read alike pass — the swapped operators, the
+// word/space/boundary classes, and an escaped metacharacter. `\1`, `\d`, `\z`,
+// `\_`, `\=` mean something else (or are an error) in one of the two, and so
+// do an empty group `\(\)`, an unknown `[:class:]` and a leading `]` in a
+// bracket (review of D#65).
 const BRE_SWAPPED = '(){}+?|';
+const BRE_SAME_ESCAPE = 'wWsSbB<>.*[]^$\\/';
+const POSIX_CLASSES = new Set(['alpha', 'digit', 'alnum', 'upper', 'lower', 'space',
+  'punct', 'xdigit', 'blank', 'cntrl', 'graph', 'print']);
 function breToRustRegex(pattern) {
   let out = '';
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
     if (c === '\\' && i + 1 < pattern.length) {
       const n = pattern[++i];
-      out += BRE_SWAPPED.includes(n) ? n : c + n;
+      if (n === '(' && pattern.startsWith('\\)', i + 1)) return null;
+      if (BRE_SWAPPED.includes(n)) out += n;
+      else if (BRE_SAME_ESCAPE.includes(n)) out += c + n;
+      else return null;
       continue;
     }
     if (BRE_SWAPPED.includes(c)) { out += '\\' + c; continue; }
@@ -1376,11 +1466,11 @@ function breToRustRegex(pattern) {
     // `]` right after `[` or `[^` is a member, not the end.
     let j = i + 1;
     if (pattern[j] === '^') j++;
-    if (pattern[j] === ']') j++;
+    if (pattern[j] === ']') return null;
     for (; j < pattern.length && pattern[j] !== ']'; j++) {
       if (pattern[j] === '[' && pattern[j + 1] === ':') {
         const close = pattern.indexOf(':]', j + 2);
-        if (close === -1) return null;
+        if (close === -1 || !POSIX_CLASSES.has(pattern.slice(j + 2, close))) return null;
         j = close + 1;
         continue;
       }
@@ -1755,6 +1845,7 @@ module.exports = {
   rewriteMatchesBlock,   // rewrite — does that plan describe the search classifyBlock chose
   operandMatches,        // D#76 — does a root-relative target name the path the command searched
   segmentCwd,            // D#76 — the directory a compound command's segment runs in
+  segmentSeparators,     // D#76 — the separator before each top-level segment
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests

@@ -48,6 +48,7 @@ const {
   extractSearchPath,
   bareSourceTarget,
   segmentCwd,
+  segmentSeparators,
   operandMatches,
   firstShellClause,
   normalizeCommandPaths,
@@ -283,7 +284,7 @@ function runMain() {
   const rawSegs = splitTopLevelSegments(rawCmd);
   const idx = segs.indexOf(segment);
   if (rawSegs.length !== segs.length) return;
-  const segCwd = segmentCwd(rawSegs, idx, shellCwd);
+  const segCwd = segmentCwd(rawSegs, idx, shellCwd, { seps: segmentSeparators(rawCmd) });
   if (segCwd === null) return;
   if ((segCwd !== root || relPrefix)
       && !operandMatches(firstShellClause(rawSegs[idx]), extractSearchPath(segment), root, segCwd)) return;

@@ -39,19 +39,37 @@ found nothing. It now reads that command closer to the way the shell does:
 - **The directory the grep ran in.** The answer searched the root-relative
   path from the project root, even after `cd backend &&` or from a
   subdirectory shell. It now follows commands that cannot move the shell and
-  `cd` to a literal path, and answers only when the grep's operand names the
-  same directory from there. After any other command (`cd "$D"`, a function,
-  `source`) it stays silent.
+  a `cd` to a literal path that must have run for the grep to run (not
+  `false && cd x;`, not `cd x | cat`), and answers only when the grep's
+  operand names the same directory from there. After any other command
+  (`cd "$D"`, a function, `source`) it stays silent.
+- **Comments, here-strings and shifts.** A `#` comment ends at its line, and
+  `<<<` or a `<<` inside `((…))` starts no heredoc.
 - **The pattern as the shell passes it.** `"Foo"'Bar'` is one pattern
   `FooBar`; a quoted pattern the shell expands (`"$MAX"`, `` "`date`" ``) or an
   unterminated quote has no readable pattern; words inside a quoted pattern are
   no longer rebased as paths from a subdirectory.
 
-On the same 16,352 commands the inject folds 1,732 commands instead of 1,807:
+On the same 16,352 commands the inject folds 1,734 commands instead of 1,807:
 32 real greps after a heredoc are now found, 7 heredoc-body greps and 23
-greps after a `cd` elsewhere are no longer answered, and 77 follow a command
+greps after a `cd` elsewhere are no longer answered, and 75 follow a command
 whose directory the hook cannot name. The PreToolUse rewrite decisions are
 unchanged.
+
+The basic-regex bridge also declines what it cannot translate faithfully: an
+escape other than `\( \) \{ \} \+ \? \|`, `\w \s \b` (and their capitals)
+or an escaped metacharacter; an empty group; an unknown `[:class:]`; a
+bracket starting with `]`. An `--include` glob with `{a,b}` is not rewritten
+(GNU grep does not expand it), and `-E` inside a quoted pattern no longer
+counts as the flag.
+
+### Not covered
+
+- A grep that may not have run (`true || grep …`) is still answered by the
+  inject when its output is empty.
+- The inject does not apply the `--include`-with-a-file rule, and forwards no
+  `-x`; the rewrite declines both.
+- `\b` and `[[:alpha:]]` on non-ASCII text can differ between the dialects.
 
 ## 0.159.0
 
