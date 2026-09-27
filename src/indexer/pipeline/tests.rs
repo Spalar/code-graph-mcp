@@ -3686,6 +3686,41 @@ fn test_rust_buffered_receiver_call_binds_no_ambiguous_method() {
     assert_eq!(edge_set(&db), edge_set(&fresh));
 }
 
+/// D#124 F9: `use crate::a::widget` with `widget` defined only in `c.rs` binds
+/// `c.rs` by name; when `a.rs` later gains `widget`, a rebuild binds the named
+/// module's item and an incremental run kept the `c.rs` edges (D#45 fixed only
+/// the other direction).
+#[test]
+fn test_rust_use_rebinds_when_the_named_module_gains_the_item() {
+    let files = |a: &'static str| -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "mod a;\nmod c;\nmod user;\n"),
+            ("src/a.rs", a),
+            ("src/c.rs", "pub fn widget() {}\n"),
+            (
+                "src/user.rs",
+                "use crate::a::widget;\nfn go() {\n    widget();\n}\n",
+            ),
+        ]
+    };
+    let before = "pub fn other() {}\n";
+    let after = "pub fn other() {}\npub fn widget() {}\n";
+    let (project, _d, db) = fresh_index_of(&files(before));
+    fs::write(project.path().join("src/a.rs"), after).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&files(after));
+    let want = edge_set(&fresh);
+    assert!(
+        want.contains(&"src/user.rs.go --calls--> src/a.rs.widget".to_string()),
+        "rebuild control: {want:#?}"
+    );
+    assert_eq!(edge_set(&db), want);
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs

@@ -10,6 +10,12 @@ method, an incremental run never bound the call, while a rebuild did. The
 call now waits in the pending-call buffer like a bare call, and the run that
 adds the method binds it.
 
+The same drift hit a Rust `use`: `use crate::a::widget` with `widget` only in
+`c.rs` bound `c.rs` by name, and when `a.rs` later gained `widget` the
+incremental run kept the `c.rs` import and calls while a rebuild moved them to
+`a.rs`. A new definition now re-extracts an importer whose `use` points
+outside the module file its path names.
+
 ### The grep hook answers only the search the grep ran
 
 Four shapes where the rewritten answer searched something else, all listed

@@ -1096,7 +1096,7 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
 pub(super) fn bare_name_callers_of_new_duplicates(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<String>> {
-    use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_REFERENCES};
+    use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
 
     // `(nm, lang)` all the way through, never `nm` alone. The pairs are already
     // unique — `cg_fanout_after` groups by both — so no DISTINCT is needed here,
@@ -1154,13 +1154,49 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CROSS JOIN files f ON f.id = src.file_id
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
     );
+    // A Rust `use crate::a::widget` bound by name to another file's `widget`,
+    // because `a` had none (D#124 F9): the import edge is no `calls` edge and
+    // is not `ambiguous`, so the half above misses it, and its call follows the
+    // import. When `widget` gains a definition, re-extract the importer if its
+    // import points outside the module file its path names — a rebuild binds
+    // the named module's new item.
+    let stale_use_sql = format!(
+        "SELECT DISTINCT f.path, tf.path, e.metadata
+         FROM cg_fanout_up u
+         CROSS JOIN nodes tgt ON tgt.name = u.nm
+         CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
+         CROSS JOIN edges e ON e.target_id = tgt.id
+                           AND e.relation = '{REL_IMPORTS}'
+                           AND e.metadata LIKE '%\"ru\"%'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
+    );
     // Collected into a Result first so the temps are dropped on the error path
     // too, not only on success — `?` here would leak all four.
     let collected = (|| -> Result<Vec<String>> {
         let mut stmt = conn.prepare(&sql)?;
-        let paths: Vec<String> = stmt
+        let mut paths: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let uses: Vec<(String, String, String)> = conn
+            .prepare(&stale_use_sql)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !uses.is_empty() {
+            let all_file_paths: HashSet<String> = conn
+                .prepare("SELECT path FROM files")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            for (importer, target_file, metadata) in uses {
+                let named = serde_json::from_str::<serde_json::Value>(&metadata)
+                    .ok()
+                    .and_then(|meta| rust_use_files(&meta, &importer, &all_file_paths));
+                if named.is_some_and(|files| !files.contains(&target_file)) {
+                    paths.push(importer);
+                }
+            }
+        }
         Ok(paths)
     })();
     drop_fanout_temps(conn)?;
