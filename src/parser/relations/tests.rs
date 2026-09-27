@@ -1493,6 +1493,70 @@ fn main() {}
     }
 }
 
+/// D#71: a project `use` carries the module its item lives in, relative to the
+/// crate root (`crate::`) or to the file's module (`self::` / `super::`, net of
+/// the inline `mod` blocks around the `use`). Other roots carry nothing.
+#[test]
+fn test_rust_use_records_the_module_path() {
+    let source = r#"
+use crate::a::b::f1;
+use crate::f2;
+use crate::c::{d::f3, f4, self};
+use crate::e::f5 as renamed;
+use {crate::g::f6, std::io::Write};
+use super::f7;
+use super::super::h::f8;
+use self::i::f9;
+use somecrate::j::f10;
+use crate::k::*;
+mod tests {
+    use super::f11;
+    use super::super::f12;
+    mod inner {
+        use super::l::f13;
+    }
+}
+"#;
+    let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let meta = |n: &str| {
+        relations
+            .iter()
+            .find(|r| r.relation == REL_IMPORTS && r.target_name == n)
+            .unwrap_or_else(|| panic!("no import of {n}"))
+            .metadata
+            .clone()
+    };
+    let expect = [
+        ("f1", Some(r#"{"m":["a","b"],"ru":"crate"}"#)),
+        ("f2", Some(r#"{"m":[],"ru":"crate"}"#)),
+        ("f3", Some(r#"{"m":["c","d"],"ru":"crate"}"#)),
+        ("f4", Some(r#"{"m":["c"],"ru":"crate"}"#)),
+        ("f5", Some(r#"{"m":["e"],"ru":"crate"}"#)),
+        ("f6", Some(r#"{"m":["g"],"ru":"crate"}"#)),
+        ("Write", Some(crate::domain::IMPORT_EXTERNAL_META)),
+        ("f7", Some(r#"{"m":[],"ru":"file","up":1}"#)),
+        ("f8", Some(r#"{"m":["h"],"ru":"file","up":2}"#)),
+        ("f9", Some(r#"{"m":["i"],"ru":"file"}"#)),
+        ("f10", None),
+        ("f11", Some(r#"{"m":[],"ru":"file"}"#)),
+        ("f12", Some(r#"{"m":[],"ru":"file","up":1}"#)),
+        ("f13", Some(r#"{"m":["tests","l"],"ru":"file"}"#)),
+    ];
+    let wrong: Vec<String> = expect
+        .iter()
+        .filter(|(n, want)| meta(n).as_deref() != *want)
+        .map(|(n, want)| format!("{n}: want {want:?}, got {:?}", meta(n)))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(
+        !relations
+            .iter()
+            .any(|r| r.relation == REL_IMPORTS && r.target_name == "renamed"),
+        "an alias is not the imported item's name"
+    );
+}
+
 #[test]
 fn test_extract_go_import_relations() {
     let source = r#"

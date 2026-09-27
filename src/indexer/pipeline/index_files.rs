@@ -3491,6 +3491,35 @@ fn resolve_deferred_relations(
             }
         }
 
+        // 4b. Rust `use crate::a::b::name` / `use super::name`: the module path
+        //     names the item's file (D#71). No such item there (a re-export, a
+        //     macro-made item) → the name-based chain below, as before.
+        if let Some(files) = import_meta
+            .as_ref()
+            .and_then(|meta| super::resolve::rust_use_files(meta, &d.rel_path, all_file_paths))
+        {
+            let targets: Vec<i64> = name_to_ids
+                .get(&d.target_name)
+                .map(|ids| {
+                    ids.iter()
+                        .copied()
+                        .filter(|id| node_id_to_path.get(id).is_some_and(|p| files.contains(p)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !targets.is_empty() {
+                edges_created += insert_relation_edges(
+                    db,
+                    &source_ids,
+                    &targets,
+                    &d.relation,
+                    d.metadata.as_deref(),
+                    false,
+                )?;
+                continue;
+            }
+        }
+
         // 5. Rust trait-impl method edges (q:"impl_method").
         if d.relation == REL_IMPLEMENTS {
             if let Some(ref meta_str) = d.metadata {

@@ -3,9 +3,10 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 79 → 80 because the Rust fix below changes which `calls`
-edges a file produces. An older binary leaves a v80 index intact and warns
-instead of rebuilding it; delete `.code-graph/index.db*` after pinning back.
+`INDEX_VERSION` goes 79 → 81 because the two Rust fixes below change which
+`calls` and `imports` edges a file produces. An older binary leaves a v81 index
+intact and warns instead of rebuilding it; delete `.code-graph/index.db*` after
+pinning back.
 
 ### A Rust call binds only a function its syntax can reach
 
@@ -22,6 +23,23 @@ Measured against rust-analyzer on this repo (SCIP oracle, same snapshot, gold
 ambiguous 23 → 10), recall at the default floor 6,809 → 6,810. Two edges moved
 from unjudged to wrong at the ambiguous tier: an atomic's `.load(Ordering)`
 now reaches only the one project `load` that takes `self`.
+
+### A Rust `use` binds the item in the module it names
+
+`use crate::storage::queries::helpers::test_db` was resolved by the name
+`test_db` alone, then narrowed to the closest paths: in `graph/routes.rs` it
+bound three `test_db`s in `graph/` and dropped the imported one, and every
+call to `test_db()` followed. A full rebuild also bound `use crate::a::widget`
+to a same-named `c::widget` added later, which an incremental run did not
+(D#45). The import now carries its module path (`crate::`, `self::`,
+`super::`, counted from the inline `mod` blocks around it) and binds the item
+in that module's file. A path whose file has no such item (a `pub use`
+re-export, a macro-made item) resolves by name as before, as do paths rooted
+at a crate name.
+
+On the same oracle snapshot, after the fix above: inferred-tier wrong edges
+18 → 8, recall at the default floor 6,810 → 6,813. JavaScript and Python
+scores are unchanged.
 
 ### The grep rewrite runs the search the grep asked for
 

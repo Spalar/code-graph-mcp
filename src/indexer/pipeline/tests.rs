@@ -1685,7 +1685,9 @@ fn fresh_index_of(files: &[(&str, &str)]) -> (TempDir, TempDir, Database) {
     let db_dir = TempDir::new().unwrap();
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     for (name, body) in files {
-        fs::write(project_dir.path().join(name), body).unwrap();
+        let path = project_dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
     }
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     (project_dir, db_dir, db)
@@ -3153,6 +3155,108 @@ fn test_rust_call_shape_holds_on_incremental_paths() {
     .filter(|w| edges.iter().any(|e| e == w))
     .collect();
     assert!(bound.is_empty(), "{bound:#?}\n{edges:#?}");
+}
+
+/// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
+/// the import by the item's name alone bound every same-named item in the
+/// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs
+/// bound three `test_db`s in graph/ (the closest paths) and not the imported
+/// one; a rebuild bound `use crate::a::widget` to a same-named `c::widget`
+/// too. The module path now picks the file; a path that names no item there
+/// (a re-export) falls back to the name, as before.
+#[test]
+fn test_rust_use_binds_the_item_its_module_path_names() {
+    let files: &[(&str, &str)] = &[
+        ("src/a.rs", "pub fn widget() {}\n"),
+        ("src/c.rs", "pub fn widget() {}\n"),
+        (
+            "src/b.rs",
+            "use crate::a::widget;\npub fn f() {\n    widget();\n}\n",
+        ),
+        ("src/storage/queries/helpers.rs", "pub fn test_db() {}\n"),
+        ("src/graph/query.rs", "pub fn test_db() {}\n"),
+        (
+            "src/graph/routes.rs",
+            "#[cfg(test)]\nmod tests {\n    use crate::storage::queries::helpers::test_db;\n    \
+             fn t() {\n        test_db();\n    }\n}\n",
+        ),
+        ("src/x/mod.rs", "pub fn helper() {}\n"),
+        ("src/x/w.rs", "pub fn helper() {}\n"),
+        (
+            "src/x/y.rs",
+            "use super::helper;\npub fn g() {\n    helper();\n}\n",
+        ),
+        ("src/re.rs", "pub use crate::a::widget;\n"),
+        (
+            "src/d.rs",
+            "use crate::re::widget;\npub fn h() {\n    widget();\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    let bound: Vec<&str> = [
+        "src/b.rs.f --calls--> src/c.rs.widget",
+        "src/b.rs.<module> --imports--> src/c.rs.widget",
+        "src/graph/routes.rs.t --calls--> src/graph/query.rs.test_db",
+        "src/x/y.rs.g --calls--> src/x/w.rs.helper",
+    ]
+    .into_iter()
+    .filter(|e| has(e))
+    .collect();
+    let lost: Vec<&str> = [
+        "src/b.rs.f --calls--> src/a.rs.widget",
+        "src/b.rs.<module> --imports--> src/a.rs.widget",
+        "src/graph/routes.rs.t --calls--> src/storage/queries/helpers.rs.test_db",
+        "src/x/y.rs.g --calls--> src/x/mod.rs.helper",
+    ]
+    .into_iter()
+    .filter(|e| !has(e))
+    .collect();
+    assert!(
+        bound.is_empty() && lost.is_empty(),
+        "bound past the module path: {bound:#?}\nlost: {lost:#?}\n{edges:#?}"
+    );
+    // A re-export names no item in its module: the name still resolves.
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.starts_with("src/d.rs.h --calls--> ") && e.ends_with(".widget")),
+        "{edges:#?}"
+    );
+}
+
+/// D#45's incremental half: adding a same-named item elsewhere leaves the
+/// imported one bound, and the graph equals a fresh index of the same tree.
+#[test]
+fn test_rust_use_binding_survives_a_new_same_named_item() {
+    let a = ("src/a.rs", "pub fn widget() {}\n");
+    let b = (
+        "src/b.rs",
+        "use crate::a::widget;\npub fn f() {\n    widget();\n}\n",
+    );
+    let c = ("src/c.rs", "pub fn widget() {}\n");
+    let (project, _d, db) = fresh_index_of(&[a, b]);
+    fs::write(project.path().join(c.0), c.1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&[a, b, c]);
+    assert_eq!(edge_set(&db), edge_set(&fresh));
+    assert!(
+        !edge_set(&fresh)
+            .iter()
+            .any(|e| e == "src/b.rs.f --calls--> src/c.rs.widget"),
+        "{:#?}",
+        edge_set(&fresh)
+    );
+    // Re-parsing the importer alone resolves its `use` against the whole tree.
+    let b2 = (
+        b.0,
+        "use crate::a::widget;\n\npub fn f() {\n    widget();\n}\n",
+    );
+    fs::write(project.path().join(b2.0), b2.1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p3, _d3, fresh2) = fresh_index_of(&[a, b2, c]);
+    assert_eq!(edge_set(&db), edge_set(&fresh2));
 }
 
 /// The same exclusion on the pending-call sweep: a member call buffered because

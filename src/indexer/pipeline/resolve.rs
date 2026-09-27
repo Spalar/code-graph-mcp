@@ -1726,6 +1726,89 @@ pub(super) fn self_filter_candidates(
     filter_method_ids(db.conn(), candidates, Some(impl_type))
 }
 
+/// Where a Rust file sits in its crate: the directory module files hang off, the
+/// crate root file(s), and the file's own module path. `src/a/b.rs` →
+/// (`src/`, [lib.rs, main.rs], [a, b]); `src/a/mod.rs` → [a]; a test/bench/
+/// example target `tests/t.rs` is its own root, (`tests/`, [tests/t.rs], []).
+/// None where the layout says nothing sure (`src/bin/`, `tests/common/…`).
+fn rust_crate_layout(path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+    let src_at = if path.starts_with("src/") {
+        Some(0)
+    } else {
+        path.rfind("/src/").map(|i| i + 1)
+    };
+    if let Some(at) = src_at {
+        let dir = &path[..at + 4];
+        let rel = path[at + 4..].strip_suffix(".rs")?;
+        if rel.starts_with("bin/") {
+            return None;
+        }
+        let mut module: Vec<String> = rel.split('/').map(String::from).collect();
+        if matches!(rel, "lib" | "main") {
+            module.clear();
+        } else if module.last().is_some_and(|m| m == "mod") {
+            module.pop();
+        }
+        return Some((
+            dir.to_string(),
+            vec![format!("{dir}lib.rs"), format!("{dir}main.rs")],
+            module,
+        ));
+    }
+    let (dir, file) = path.rsplit_once('/')?;
+    let target_dir = dir.rsplit('/').next().unwrap_or(dir);
+    if matches!(target_dir, "tests" | "benches" | "examples") && file.ends_with(".rs") {
+        return Some((format!("{dir}/"), vec![path.to_string()], Vec::new()));
+    }
+    None
+}
+
+/// The files a project `use` path's module can be in (D#71), from the
+/// `{"ru","m","up"}` import metadata (`parser::relations::rust::use_module_metadata`).
+/// The longest leading part of the module path that is a file wins; the rest
+/// are inline `mod` blocks inside it. None when the metadata is not a Rust
+/// module path or no file matches: the caller falls back to the name.
+pub(super) fn rust_use_files(
+    meta: &serde_json::Value,
+    importer: &str,
+    all_file_paths: &HashSet<String>,
+) -> Option<Vec<String>> {
+    let root = meta.get("ru")?.as_str()?;
+    let written: Vec<String> = meta
+        .get("m")?
+        .as_array()?
+        .iter()
+        .map(|s| s.as_str().map(String::from))
+        .collect::<Option<_>>()?;
+    let (dir, root_files, file_module) = rust_crate_layout(importer)?;
+    let module: Vec<String> = match root {
+        "crate" => written,
+        "file" => {
+            let up = meta.get("up").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let mut module = file_module[..file_module.len().checked_sub(up)?].to_vec();
+            module.extend(written);
+            module
+        }
+        _ => return None,
+    };
+    for len in (0..=module.len()).rev() {
+        let candidates = if len == 0 {
+            root_files.clone()
+        } else {
+            let stem = format!("{dir}{}", module[..len].join("/"));
+            vec![format!("{stem}.rs"), format!("{stem}/mod.rs")]
+        };
+        let files: Vec<String> = candidates
+            .into_iter()
+            .filter(|f| all_file_paths.contains(f))
+            .collect();
+        if !files.is_empty() {
+            return Some(files);
+        }
+    }
+    None
+}
+
 /// Whether a Rust function's signature (`(&mut self, x: T) -> R`, as the parser
 /// stores it) takes `self` first: `self`, `mut self`, `&self`, `&'a mut self`,
 /// `self: Box<Self>`.
