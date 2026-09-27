@@ -375,16 +375,16 @@ function runShowAnswer(opts = {}) {
     cwd,
     symbols,
     // A grep path the answer must stay inside (D#125 #2): `show` prints every
-    // same-named definition in the project. Each symbol then re-runs as a plain
-    // `show` when all its definitions lie inside, as `show --file F` when the
-    // ones inside are all in F, and not at all when none are; definitions
-    // inside several files with more outside have no scoped equivalent, and
-    // the whole answer is refused. undefined: unscoped, as before.
+    // same-named definition in the project. With `within`, a symbol is answered
+    // only when EVERY definition `show` prints lies inside the path and is one
+    // the grep's declaration keyword matches (`kinds`: symbol → the label and
+    // file-extension shapes it matches); a symbol with no definition inside is
+    // skipped (the grep finds none either), and any other mix refuses the whole
+    // answer. Narrowing with `show --file` was tried and removed: the label is
+    // coarser than the keyword, so a narrowed answer dropped real matches, and
+    // the inject printed the unnarrowed text (review of D#125, round 2).
+    // undefined: unscoped, as before.
     within,
-    // Symbol → the show kind labels the grep's keyword finds (`fn foo` → fn).
-    // With `within`, a definition of another kind counts as one the grep does
-    // not match: `show foo --file F` must not print a `struct foo` beside the
-    // `fn foo` (review of D#125). A symbol with no entry takes every kind.
     kinds,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxBytes = DEFAULT_MAX_BYTES,
@@ -420,21 +420,16 @@ function runShowAnswer(opts = {}) {
       if (classifyRun(res, { exitOneIsNoHits: false }) !== 'ok') continue;
       const out = (res.stdout || '').trim();
       if (isEmptyAnswer(out)) continue;
-      let argv = ['show', sym];
+      const argv = ['show', sym];
       if (within !== undefined) {
         const defs = showDefinitionFiles(out);
         if (!defs) return { status: 'unavailable', reason: 'scope' };
-        const allowed = kinds && kinds[sym];
-        const matches = (d) => pathWithin(d.file, within) && (!allowed || allowed.includes(d.kind));
-        const inside = [...new Set(defs.filter(matches).map((d) => d.file))];
-        if (inside.length === 0) continue;
-        const others = defs.filter((d) => !matches(d));
-        if (others.length > 0) {
-          if (inside.length !== 1 || others.some((d) => d.file === inside[0])) {
-            return { status: 'unavailable', reason: 'scope' };
-          }
-          argv = ['show', sym, '--file', inside[0]];
-        }
+        if (!defs.some((d) => pathWithin(d.file, within))) continue;
+        const shapes = (kinds && kinds[sym]) || [];
+        const ext = (f) => (f.match(/\.([A-Za-z0-9]+)$/) || [])[1];
+        const matches = (d) => pathWithin(d.file, within)
+          && shapes.some((k) => k.labels.includes(d.kind) && k.exts.includes(ext(d.file)));
+        if (!defs.every(matches)) return { status: 'unavailable', reason: 'scope' };
       }
       parts.push(`$ code-graph-mcp ${argv.join(' ')}\n${out}`);
       resolved.push(sym);

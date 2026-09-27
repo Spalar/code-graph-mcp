@@ -1116,3 +1116,26 @@ test('e2e: the inject scopes show to the grep path and skips a non-recursive dir
     cleanupFixture(fixture, flat);
   }
 });
+
+// Review of D#125, round 2: F1 (a root-holding pattern spelled like a path was
+// answered) and F2 (the inject printed show output from outside the grep path).
+test('e2e: the inject answers neither a root-holding pattern nor show output outside the path', (t) => {
+  const uniq = `InjR2${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `if (process.argv[2] === 'show') { for (const f of ['lib/d.rs', 'src/a.rs']) process.stdout.write('fn ' + process.argv[3] + '  ' + f + ':1-3  ()\\n  body\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/foo_mod/m.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  fs.mkdirSync(path.join(fixture.dir, 'lib'));
+  fs.mkdirSync(path.join(fixture.dir, 'src', 'foo_mod'), { recursive: true });
+  const root = fs.realpathSync(fixture.dir);
+  const rootPat = `echo x; grep -rn "${root}/src/foo_mod" lib/`;
+  const scoped = `grep -rn -A3 "fn ${uniq}" src/a.rs; echo done`;
+  try {
+    assert.equal(runHook(rootPat, fixture, {}, root, '').stdout.trim(), '', 'root-holding pattern');
+    const out = runHook(scoped, fixture, {}, root, '').stdout.trim();
+    if (out) assert.doesNotMatch(JSON.parse(out).hookSpecificOutput.additionalContext, /lib\/d\.rs/);
+  } finally {
+    cleanupFixture(fixture, rootPat);
+    cleanupFixture(fixture, scoped);
+  }
+});

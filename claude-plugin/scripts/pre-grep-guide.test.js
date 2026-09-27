@@ -3509,19 +3509,17 @@ function showStub(defs) {
     `  process.stdout.write('fn ' + process.argv[3] + '  ' + f + ':1-3  ()\\n  fn body() {}\\n'); }`;
 }
 
-test('e2e: a show rewrite is scoped to the grep path: one in-scope file → --file', () => {
+test('e2e: a show rewrite with a definition outside the grep path runs as typed (no --file narrowing)', () => {
+  // Round 2 of review: narrowing with `show --file` dropped real matches when
+  // the kind label disagreed with the keyword, and the inject printed the
+  // unnarrowed text. Any definition outside the path now declines.
   const uniq = `StubShowScope${Date.now()}`;
   const fixture = e2eFixture(showStub(['src/b.rs', 'lib/a.rs']));
   fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
   const cmd = `grep -rn -A3 "fn ${uniq}" lib/`;
   try {
-    const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` show ${uniq} --file lib/a\\.rs$`), rw.command);
-    const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) {
-      assert.match(ran, /lib\/a\.rs:1-3/);
-      assert.doesNotMatch(ran, /src\/b\.rs/);
-    }
+    const out = runHook(cmd, fixture).stdout.trim();
+    assert.ok(!out.startsWith('{'), `must run as typed, got ${out}`);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -3661,8 +3659,14 @@ test('e2e: a show answer counts only definitions of the kind the grep searched',
     [[['fn', 'src/a/x.rs'], ['struct', 'lib/z.rs']], `grep -rn -A3 "fn ${uniq}" lib/`, null],
     // a struct beside the fn in the one file: `--file` would print both
     [[['fn', 'lib/z.rs'], ['struct', 'lib/z.rs'], ['fn', 'src/a.rs']], `grep -rn -A3 "fn ${uniq}B" lib/`, null],
-    // the struct lies elsewhere: narrowed to the fn's file
-    [[['fn', 'lib/z.rs'], ['struct', 'lib/w.rs']], `grep -rn -A3 "fn ${uniq}C" lib/`, `--file lib/z.rs`],
+    // a struct inside the path the grep's `fn` does not match: declined
+    [[['fn', 'lib/z.rs'], ['struct', 'lib/w.rs']], `grep -rn -A3 "fn ${uniq}C" lib/`, null],
+    // a Swift `struct` is labelled `class`: declined, not narrowed away
+    [[['struct', 'lib/g.rs'], ['class', 'lib/e.swift']], `grep -rn -A3 "struct ${uniq}E" lib/`, null],
+    // `fn` is Rust's keyword: a Python `def` labelled fn is no match
+    [[['fn', 'lib/a.rs'], ['fn', 'lib/b.py']], `grep -rn -A3 "fn ${uniq}F" lib/`, null],
+    // every definition inside and matched: plain show
+    [[['fn', 'lib/a.rs'], ['fn', 'lib/c.rs']], `grep -rn -A3 "fn ${uniq}G" lib/`, 'plain'],
     // `trait` answers a Rust trait (iface)
     [[['iface', 'lib/t.rs']], `grep -rn -A3 "trait ${uniq}D" lib/`, 'plain'],
   ];
@@ -3675,8 +3679,8 @@ test('e2e: a show answer counts only definitions of the kind the grep searched',
         assert.ok(!out.startsWith('{'), `${cmd} over ${JSON.stringify(defs)}: must run as typed, got ${out}`);
       } else {
         const rw = rewriteOf({ status: 0, stdout: out, stderr: '' });
-        if (want === 'plain') assert.match(rw.command, / show \S+$/, rw.command);
-        else assert.match(rw.command, new RegExp(` show \\S+ ${want}$`), rw.command);
+        assert.equal(want, 'plain');
+        assert.match(rw.command, / show \S+$/, rw.command);
       }
     } finally {
       cleanupFixture(fixture, cmd);
@@ -3694,4 +3698,30 @@ test('translateBreToRg: a * in a leading position has no translation', () => {
   assert.equal(t('x\\|*y'), null);
   assert.equal(t('fo*o'), 'fo*o');
   assert.equal(t('^a*'), '^a*');
+});
+
+// Review of D#125, round 2 F1: one root-holding word was accepted when its
+// stripped text equalled the path — also when that word was the PATTERN.
+test('e2e: a root-holding pattern spelled like the path runs as typed', () => {
+  const uniq = `StubRootEq${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'show') process.exit(1);\n` +
+    `process.stdout.write('src/foo_mod/m.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src', 'foo_mod'), { recursive: true });
+  const root = fsE2e.realpathSync(fixture.dir);
+  const cmds = [
+    `grep -rn "${root}/src/foo_mod" src/foo_mod`,
+    `grep -rn "${root}/src/foo_mod" ./src/foo_mod/`,
+    `rg -n "${root}/src/foo_mod" src/foo_mod`,
+  ];
+  const control = `grep -rn "${uniq}" ${root}/src/`;
+  try {
+    for (const cmd of cmds) {
+      const out = runHook(cmd, fixture, root).stdout.trim();
+      assert.ok(!out.startsWith('{'), `${cmd}: must run as typed, got ${out}`);
+    }
+    assert.match(rewriteOf(runHook(control, fixture, root)).command, new RegExp(`grep -m 0 ${uniq} src/`));
+  } finally {
+    for (const cmd of [...cmds, control]) cleanupFixture(fixture, cmd);
+  }
 });

@@ -376,21 +376,33 @@ function clauseWords(s) {
 // name the exact symbols the model wants to READ — extract them for `show`.
 const DECL_SYMBOL = /(?:fn|def|class|function|struct|impl|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
 
-// The `show` kind labels (src/cli/symbols.rs format_node_compact) each
-// declaration keyword finds. `impl` names no definition of its own.
-const DECL_KIND_LABELS = {
-  fn: ['fn'], def: ['fn'], function: ['fn'], class: ['class'], struct: ['struct'],
-  trait: ['trait', 'iface'], impl: [],
+// What a `show` definition must be for the grep's declaration keyword to match
+// its line: the kind label `show` prints (src/cli/symbols.rs
+// format_node_compact) AND a file of a language that spells the declaration
+// with that keyword. The label alone is coarser than the keyword — `fn` is also
+// a Python `def` and a TS method, and a Swift `struct` is labelled `class`
+// (review of D#125, round 2). `impl` names no definition of its own.
+const DECL_KEYWORD_SHAPES = {
+  fn: { labels: ['fn'], exts: ['rs'] },
+  def: { labels: ['fn'], exts: ['py', 'rb'] },
+  function: { labels: ['fn'], exts: ['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'php', 'sh', 'bash'] },
+  class: {
+    labels: ['class'],
+    exts: ['py', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'java', 'kt', 'cs', 'php', 'rb', 'dart',
+      'cpp', 'cc', 'hpp', 'h', 'scala'],
+  },
+  struct: { labels: ['struct'], exts: ['rs', 'go', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs'] },
+  trait: { labels: ['trait', 'iface'], exts: ['rs', 'php', 'scala'] },
+  impl: { labels: [], exts: [] },
 };
 
-// Symbol → the kind labels the grep's declaration keywords can find for it
-// (`fn foo\|struct foo` → foo: fn, struct), so a `show` answer counts only
-// definitions the grep matches (review of D#125).
+// Symbol → the (label, extension) shapes its declaration keywords match
+// (`fn foo\|def foo` → foo: Rust fn, Python/Ruby def).
 function declKindsBySymbol(patterns) {
   const out = {};
   for (const p of patterns) {
     for (const m of p.matchAll(/\b(fn|def|class|function|struct|impl|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
-      out[m[2]] = [...new Set([...(out[m[2]] || []), ...DECL_KIND_LABELS[m[1]]])];
+      (out[m[2]] = out[m[2]] || []).push(DECL_KEYWORD_SHAPES[m[1]]);
     }
   }
   return out;
@@ -688,14 +700,16 @@ function rootOnlyInSearchPath(cmd, cwd, target) {
   if (!cwd || typeof cwd !== 'string' || cwd === '/') return true;
   const prefix = cwd.endsWith('/') ? cwd : cwd + '/';
   if (!cmd.includes(prefix)) return true;
-  const words = shellWords(cmd);
-  if (!words || target === undefined) return false;
+  // Round 2: counting words was not enough — a lone root-holding PATTERN whose
+  // stripped text equals the path (`grep -rn "<root>/src/x" src/x`) passed. The
+  // rewrite grammar names which word is the path operand: accept only a command
+  // it reads, with the root once, in that operand, and nowhere in the pattern.
+  if (cmd.split(prefix).length !== 2) return false;
+  const plan = rewritePlan(firstShellClause(cmd), { isDir: () => true });
+  if (!plan || plan.target === undefined || plan.pattern.includes(prefix)) return false;
+  if (!plan.target.startsWith(prefix)) return false;
   const norm = (p) => p.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
-  const holding = words.filter((w) => !w.op && w.text.includes(prefix));
-  // One word only: a pattern spelled exactly like the path (`grep -rn
-  // "<root>/src" <root>/src`) holds the root too.
-  return holding.length === 1 && holding[0].text.startsWith(prefix)
-    && norm(holding[0].text.slice(prefix.length)) === norm(target);
+  return target !== undefined && norm(plan.target.slice(prefix.length)) === norm(target);
 }
 
 // v0.48 — subdir-cwd fix; v0.49 — extracted to project-root.js so the read

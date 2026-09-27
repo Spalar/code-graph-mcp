@@ -26,15 +26,17 @@ rest came from this release's review):
 - A command naming the project path anywhere but its search path
   (`grep -rn "/home/me/proj/Foo" src/`) was answered for `Foo`: the hook strips
   the project path from path operands and could not tell a pattern from one.
-  Such a command now runs as typed, and the PostToolUse inject skips it.
+  The path is now accepted only where the rewrite grammar reads the search path
+  operand, once; anything else runs as typed, and the PostToolUse inject skips
+  it.
 - A declaration grep with context (`grep -rn -A3 "fn load" lib/`) was answered
   by `show load` over the whole project and every kind of definition. The
-  answer now counts only definitions inside the grep's path and of the kind
-  its keyword finds (`fn` finds no `struct load`): `show load --file lib/a.rs`
-  when that one file holds all of them and nothing else, nothing (the grep
-  runs) when they span several files with others outside. A grep with a file
-  filter (`--include`, `-g`, `-t`) gets no `show` answer, which cannot filter.
-  The PostToolUse inject scopes its `show` the same way.
+  answer is now given only when every definition `show` prints lies inside the
+  grep's path and is one its keyword matches (`fn` is Rust's: a `struct load`
+  or a Python `def load` is no match); otherwise the grep runs as typed. A grep
+  with a file filter (`--include`, `-g`, `-t`) gets no `show` answer, which
+  cannot filter. The PostToolUse inject scopes its `show` the same way and
+  falls back to a grep answer over the same path.
 - `grep -n Foo src/` without `-r` searches no directory under GNU grep, and
   `grep -n Foo` with no path reads its input; neither is answered with a
   recursive search (ugrep, which some shells run as `grep`, does descend: the
