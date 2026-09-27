@@ -1008,11 +1008,19 @@ pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Ve
     Ok(kept)
 }
 
-/// Every function and method node: what an `inherits` / `implements` edge can
-/// never point at (a C++ constructor shares its class's name; a method may be
-/// named like a library base, `testing::Test` vs a `Test()` method).
+/// Every function and method node an `inherits` / `implements` edge can never
+/// point at (a C++ constructor shares its class's name; a method may be named
+/// like a library base, `testing::Test` vs a `Test()` method). A JavaScript or
+/// TypeScript `function` is exempt: an ES5 constructor function is a class, and
+/// `class Sub extends Base` may extend one. Mirrors
+/// `index_files::never_a_supertype`, which the restore path applies.
 pub fn callable_node_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE type IN ('function', 'method')")?;
+    let mut stmt = conn.prepare(
+        "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
+         WHERE n.type = 'method'
+            OR (n.type = 'function'
+                AND f.language NOT IN ('javascript', 'typescript', 'tsx'))",
+    )?;
     let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

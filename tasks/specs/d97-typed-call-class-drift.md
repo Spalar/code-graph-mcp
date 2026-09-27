@@ -1,6 +1,6 @@
 ---
 status: implemented
-revision: 2
+revision: 3
 ---
 
 # D#97 M-N3 — 类结构变化后，未改动文件里的 typed 调用要按 rebuild 重解析
@@ -76,7 +76,15 @@ typed 调用只在 deferred pass 一处解析。它的输入变了，就把调�
 | 忽略 `c` / `i` / `m` 行 | methodless_delete / changed_base、grandchild_changed_base / new_override_method、free_function_turned_method |
 | 关闭唯一性过滤 | override_of_a_shared_class_name（效率守卫） |
 | 不并入移动的类本身 | methodless（改名成同名） |
-| owner 本身也要求唯一 | free_function_turned_method |
+| owner 本身也要求唯一 | ~~free_function_turned_method~~：发布前评审在 fbed158 上复测，未被杀死（见下） |
+
+发布前评审（2026-09-27）另做的变异中，下列会改变行为，但全套测试都通过，目前没有测试钉住：
+- `per_method` 要求 owner 本身唯一（上表最后一行）；
+- `inherited_or_overridden` 追 override 时不要求类名唯一；
+- 链改写去掉"项目类"判断；
+- 漂移的 `field_keys` 不含 `linked`（基类边变动）。
+
+已补测试钉住的有：两个基类都定义方法时判为 ambiguous；注解后跟 `override` / `final` / `noexcept`。
 
 ## 实测
 

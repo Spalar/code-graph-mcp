@@ -48,10 +48,14 @@ access or another call. Each such call was untyped and bound every `Add`,
 `Ref` or `GetChildren` in reach. The chain is now typed one step at a time,
 through the recorded field types and the methods' declared return types,
 following base classes where a class inherits the member. The call is typed
-only when the chain ends in a project class. A subscript, a free function's
-result, or a primitive or library type leaves it untyped, as before. Editing
-the header that declares a field or a return type on the chain re-resolves
-the callers in other files.
+only when the chain ends in a class the project defines. A subscript, a free
+function's result, a primitive or `std::` type, or a method returning its
+template's parameter (`template <class Iterator> … Iterator* inner()`) leaves
+it untyped, as before. Editing the header that declares a field or a return
+type on the chain re-resolves the callers in other files, and so does renaming
+a class to the type an untyped chain ends in. Not covered: a library type is
+matched by its last name, so `absl::Status st_; st_.ok()` binds a project
+`Status::ok`, the rule locals already follow.
 
 On leveldb, scored against SCIP, the `inferred` tier goes from 2513/2550 to
 2605/2642 (98.6%). Recall rises from 2738 to 2789 of 3470. Same-file precision
@@ -82,7 +86,8 @@ Two errors in `inherits` edges fed this and are fixed with it:
   testing::Test`, a project method called `Test`. leveldb had 93 such edges,
   which made unrelated classes subclasses of each other. A supertype is now
   always a type, both when the subclass's file is indexed and when the base's
-  file is edited.
+  file is edited. In JavaScript and TypeScript a `function` stays a possible
+  supertype: `class Sub extends Base` may extend an ES5 constructor function.
 - A C++ base written `log::Reader::Reporter` or `ns::Tmpl<int>` was recorded as
   `Reader::Reporter` or `Tmpl<int>`, names no node has, so those subclasses
   had no base. The last segment is recorded now.
@@ -101,7 +106,11 @@ A class that inherits the method depends on its bases, so an incremental run
 that changes a base re-resolves the typed calls of every class below it. That
 covers a base gaining or losing the method, a class changing its bases, and a
 base being renamed out from under a subclass in another file. In each case the
-incremental graph equals a rebuild's.
+incremental graph equals a rebuild's. Not covered: the reverse, a class
+renamed to the base name an untouched subclass already writes (`class Basex`
+→ `class Base` under `class Sub(Base)`). As in 0.158.0, only `rebuild-index`
+adds that `inherits` edge, and until then the subclass's typed calls resolve
+without the base.
 
 ### A C++ call through a field declared in another file is typed
 
@@ -119,7 +128,10 @@ A field followed by a Clang thread-safety annotation
 (`SnapshotList snapshots_ GUARDED_BY(mutex_);`, `void F()
 EXCLUSIVE_LOCKS_REQUIRED(mutex_);`) did not parse: tree-sitter read the
 annotation as a function and lost the field's name. These annotations are now
-blanked before parsing, as class export macros already were.
+blanked before parsing, as class export macros already were, when they follow
+a declarator. A function or call whose own name only ends like one
+(`void OBJ_RELEASE(void* p)`, `if (p) OBJ_RELEASE(p);`, a cast's
+`FT_ATOMIC_LOAD_PTR_ACQUIRE(x)`) is left alone.
 
 On leveldb, scored against SCIP, same-file precision goes from 1484/1559 to
 1500/1548 (95.2% → 96.9%) and the `inferred` tier from 1361/1401 to 1528/1565

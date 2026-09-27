@@ -1159,17 +1159,6 @@ struct BatchRelations {
     unresolved_externals: Vec<(i64, String, String)>,
 }
 
-/// Phase 2 for ONE batch: extract every relation from the batch's parsed
-/// trees and insert the edges it can resolve, deferring the rest.
-///
-/// Extracted from `index_files` (audit 2026-08-22 P2-15), which was 1,242
-/// lines with this as 770 of them. It runs INSIDE the caller's batch savepoint
-/// and writes through `db`, so it is a step of that transaction, not a
-/// transaction of its own — moving it did not change where the commit is.
-///
-/// Returns the edge count plus the two unresolved-target lists the caller
-/// feeds to `mint_external_sentinels` immediately afterwards.
-#[allow(clippy::too_many_arguments)]
 /// Record the typed fields of a C++ file's class bodies against their class
 /// nodes (`cpp_fields`), for calls through them from files that never see the
 /// class body. A class specifier's node is the innermost same-named class-like
@@ -1198,6 +1187,17 @@ fn record_cpp_fields(db: &Database, pf: &FileParsed) -> Result<()> {
     crate::storage::queries::insert_cpp_fields(db.conn(), &rows)
 }
 
+/// Phase 2 for ONE batch: resolve every relation Phase 1a extracted from the
+/// batch's files and insert the edges it can resolve, deferring the rest.
+///
+/// Extracted from `index_files` (audit 2026-08-22 P2-15), which was 1,242
+/// lines with this as 770 of them. It runs INSIDE the caller's batch savepoint
+/// and writes through `db`, so it is a step of that transaction, not a
+/// transaction of its own — moving it did not change where the commit is.
+///
+/// Returns the edge count plus the two unresolved-target lists the caller
+/// feeds to `mint_external_sentinels` immediately afterwards.
+#[allow(clippy::too_many_arguments)]
 fn resolve_batch_relations(
     db: &Database,
     batch_parsed: &[FileParsed],
@@ -2018,6 +2018,13 @@ fn resolve_batch_relations(
         unresolved_externals,
     })
 }
+/// A node an `inherits` / `implements` edge never points at: the in-memory
+/// form of `queries::callable_node_ids`, for the restore path.
+fn never_a_supertype(node_type: &str, language: &str) -> bool {
+    node_type == "method"
+        || node_type == "function" && !matches!(language, "javascript" | "typescript" | "tsx")
+}
+
 /// C++ name lookup: a bare `f()` inside a member function (`Cls::m`, scope
 /// `Cls.m`, or a gtest `TEST_F(Suite, Case)` body, scope `Suite.Case`, which is a
 /// member of a class derived from `Suite`) finds the class's own `f` before any
@@ -3022,7 +3029,7 @@ fn restore_inbound_edges(
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
         #[allow(clippy::type_complexity)]
-        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>, &str)>> =
+        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>, bool)>> =
             HashMap::new();
         for pf in batch_parsed {
             for (((id, name), q), ty) in pf
@@ -3035,7 +3042,7 @@ fn restore_inbound_edges(
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
-                    .push((*id, q.as_deref(), ty.as_str()));
+                    .push((*id, q.as_deref(), never_a_supertype(ty, &pf.language)));
             }
         }
 
@@ -3079,7 +3086,7 @@ fn restore_inbound_edges(
                     found
                         .iter()
                         .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
-                        .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
+                        .filter(|(_, _, callable)| !supertype || !*callable)
                         .map(|(id, _, _)| *id)
                         .collect::<Vec<i64>>()
                 })

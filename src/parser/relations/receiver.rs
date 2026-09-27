@@ -207,7 +207,8 @@ pub struct CppField {
 
 /// Every typed field of every class or struct body in a C++ file. A field whose
 /// type is a template parameter of its class is left out: it is whatever
-/// instantiates it.
+/// instantiates it. A method returning a template parameter is recorded as
+/// `name()` with no type, which stops a chain through it.
 pub fn cpp_class_fields(tree: &tree_sitter::Tree, source: &str) -> Vec<CppField> {
     let mut out = Vec::new();
     collect_class_fields(tree.root_node(), source, &mut out, 0);
@@ -237,7 +238,8 @@ fn collect_class_fields(
                 let Some(decl) = body.named_child(i) else {
                     continue;
                 };
-                if decl.kind() != "field_declaration" {
+                let kind = decl.kind();
+                if !matches!(kind, "field_declaration" | "function_definition") {
                     continue;
                 }
                 let Some(ty) = decl.child_by_field_name("type") else {
@@ -246,6 +248,24 @@ fn collect_class_fields(
                 let text = node_text(&ty, source);
                 let head = text.split(['<', ':']).next().unwrap_or(text).trim();
                 if is_template_parameter(node, head, source) {
+                    // A method returning a template parameter returns whatever
+                    // instantiates it: marked `name()`, a spelling no field has,
+                    // so a chain through it stays untyped.
+                    let mut cursor = decl.walk();
+                    for d in decl.children_by_field_name("declarator", &mut cursor) {
+                        if let Some(method) = method_declarator_name(d, source, 0) {
+                            out.push(CppField {
+                                class_name: name.clone(),
+                                class_lines: lines,
+                                field: format!("{method}()"),
+                                dot: None,
+                                arrow: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                if kind != "field_declaration" {
                     continue;
                 }
                 let mut cursor = decl.walk();
@@ -269,6 +289,25 @@ fn collect_class_fields(
         if let Some(c) = node.named_child(i) {
             collect_class_fields(c, source, out, depth + 1);
         }
+    }
+}
+
+/// The name a method declarator declares (`f` in `T* f(int)`), else None.
+fn method_declarator_name(d: tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+    if depth > MAX_SUBTREE_DEPTH {
+        return None;
+    }
+    match d.kind() {
+        "function_declarator" => {
+            let name = d.child_by_field_name("declarator")?;
+            matches!(name.kind(), "field_identifier" | "identifier")
+                .then(|| node_text(&name, source).to_string())
+        }
+        "pointer_declarator" => {
+            method_declarator_name(d.child_by_field_name("declarator")?, source, depth + 1)
+        }
+        "reference_declarator" => method_declarator_name(d.named_child(0)?, source, depth + 1),
+        _ => None,
     }
 }
 

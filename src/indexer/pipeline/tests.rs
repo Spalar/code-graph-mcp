@@ -2482,6 +2482,44 @@ fn test_cpp_field_in_a_dot_h_header_is_typed() {
     );
 }
 
+/// A chain whose final type is no project class yet stays untyped; renaming a
+/// class to that name must reach the untouched caller, as a rebuild types it.
+#[test]
+fn test_class_renamed_to_a_chain_s_final_type_re_resolves_untouched_callers() {
+    let a = "class B;\nclass A {\n public:\n  B* get() { return nullptr; }\n};\n";
+    let x = "class X {\n public:\n  void run() {}\n};\n";
+    let c = "#include \"a.hpp\"\nvoid f(A* a) {\n  a->get()->run();\n}\n";
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.hpp", a),
+            ("b.hpp", "class Bx {\n public:\n  void run() {}\n};\n"),
+            ("x.hpp", x),
+            ("c.cc", c),
+        ],
+        &[("b.hpp", Some("class B {\n public:\n  void run() {}\n};\n"))],
+    );
+}
+
+/// A method returning its template's parameter returns whatever instantiates
+/// it, even when the parameter is named like a project class.
+#[test]
+fn test_cpp_chain_through_a_template_parameter_return_stays_untyped() {
+    let (_p, _d, db) = fresh_index_of(&[(
+        "w.hpp",
+        "class Iterator {\n public:\n  virtual void Next() {}\n};\n\
+         class Other {\n public:\n  void Next() {}\n};\n\
+         template <typename Iterator>\n\
+         class Wrapper {\n public:\n  Iterator* inner() { return nullptr; }\n};\n\
+         class User {\n  void Go();\n  Wrapper<Other>* w_;\n};\n\
+         void User::Go() {\n  w_->inner()->Next();\n}\n",
+    )]);
+    let callees = callees_of(&db, "Go");
+    assert!(
+        callees.contains(&"w.hpp.Other.Next".to_string()),
+        "the instantiating class stays a candidate: {callees:?}"
+    );
+}
+
 #[test]
 fn test_cpp_field_declared_in_a_base_class_is_typed() {
     let (_p, _d, db) = fresh_index_of(&[
@@ -2520,6 +2558,48 @@ fn test_cpp_gtest_body_types_the_fixture_field() {
 /// A supertype is a type. A C++ class shares its name with its constructor, and
 /// `testing::Test` with any project method named `Test`: leveldb had 93 `inherits`
 /// edges into methods, which made unrelated classes each other's subclasses.
+/// JavaScript's exception: an ES5 constructor function is a class, and
+/// `class Sub extends Base` may extend one, in a full index and after the
+/// base's file is re-indexed alone (the restore path).
+#[test]
+fn test_js_class_extends_an_es5_constructor_function() {
+    let inherits = |db: &Database| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT s.name || ' -> ' || t.type || ' ' || t.name FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relation = 'inherits'",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let (_p, _d, db) = fresh_index_of(&[
+        ("base.js", "function Base() {}\nmodule.exports = Base;\n"),
+        (
+            "sub.js",
+            "const Base = require('./base');\nclass Sub extends Base {}\n",
+        ),
+    ]);
+    assert_eq!(inherits(&db), vec!["Sub -> function Base".to_string()]);
+    assert_incremental_matches_rebuild(
+        &[
+            ("base.js", "function Base() {}\nmodule.exports = Base;\n"),
+            (
+                "sub.js",
+                "const Base = require('./base');\nclass Sub extends Base {}\n",
+            ),
+        ],
+        &[(
+            "base.js",
+            Some("function Base() { this.x = 1; }\nmodule.exports = Base;\n"),
+        )],
+    );
+}
+
 #[test]
 fn test_inherits_never_targets_a_function_or_method() {
     let (_p, _d, db) = fresh_index_of(&[
@@ -2722,6 +2802,31 @@ fn test_typed_call_binds_the_inherited_method() {
     assert_eq!(
         edges,
         vec![r#"sub.py.run -> base.py.Base.helper {"q":"rtype","v":"Sub"} inferred"#.to_string()]
+    );
+}
+
+/// Two bases both defining the method: either may be the one that runs, so
+/// both are candidates and neither is decided (`amb`; same-file edges keep the
+/// `extracted` tier).
+#[test]
+fn test_typed_call_inheriting_the_method_from_two_bases_is_ambiguous() {
+    let (_p, _d, db) = fresh_index_of(&[(
+        "m.py",
+        "class A:\n    def helper(self):\n        pass\n\n\
+         class B:\n    def helper(self):\n        pass\n\n\
+         class C(A, B):\n    pass\n\n\
+         def run():\n    c = C()\n    c.helper()\n",
+    )]);
+    let edges: Vec<String> = call_edges_with_confidence(&db)
+        .into_iter()
+        .filter(|e| e.starts_with("m.py.run") && e.contains(".helper "))
+        .collect();
+    assert_eq!(
+        edges,
+        vec![
+            r#"m.py.run -> m.py.A.helper {"amb":1,"q":"rtype","v":"C"} extracted"#.to_string(),
+            r#"m.py.run -> m.py.B.helper {"amb":1,"q":"rtype","v":"C"} extracted"#.to_string(),
+        ]
     );
 }
 

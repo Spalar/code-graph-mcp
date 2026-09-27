@@ -124,6 +124,49 @@ fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
     ];
     let b = source.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let skip_ws_back = |mut p: usize| {
+        while p > 0 && b[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        p
+    };
+    // The start of the word ending at `e`.
+    let ident_start = |e: usize| {
+        let mut s = e;
+        while s > 0 && ident(b[s - 1]) {
+            s -= 1;
+        }
+        s
+    };
+    // A word that can name a declarator or a function: no keyword, number or
+    // preprocessor directive.
+    let plain_word = |s: usize, e: usize| {
+        let w = &source[s..e];
+        !w.is_empty()
+            && !KEYWORDS.contains(&w)
+            && !b[s].is_ascii_digit()
+            && (s == 0 || b[s - 1] != b'#')
+    };
+    // The `(` matching the `)` at `close`, within one statement, or None.
+    let parens_start = |close: usize| {
+        let mut depth = 0usize;
+        let mut i = close + 1;
+        while i > 0 {
+            i -= 1;
+            match b[i] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b';' | b'{' | b'}' => return None,
+                _ => {}
+            }
+        }
+        None
+    };
     let is_annotation = |w: &str| {
         w.bytes()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
@@ -189,22 +232,27 @@ fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
             continue;
         };
         // What precedes: a declarator's end, or an annotation already taken.
-        let mut p = i;
-        while p > 0 && b[p - 1].is_ascii_whitespace() {
-            p -= 1;
-        }
+        // A `)` must close a parameter list (the word before its `(` names a
+        // function or an annotation), not `if (…)`, `while (…)` or a cast; a
+        // word must be a declarator's name, itself after a type or a
+        // qualifier, not the return type before a function's own name.
+        let p = skip_ws_back(i);
         let after_declarator = p > 0
-            && (matches!(b[p - 1], b')' | b']')
-                || ident(b[p - 1]) && {
-                    let mut s = p;
-                    while s > 0 && ident(b[s - 1]) {
-                        s -= 1;
-                    }
-                    let prev = &source[s..p];
-                    !KEYWORDS.contains(&prev)
-                        && !prev.bytes().next().is_some_and(|c| c.is_ascii_digit())
-                        && (s == 0 || b[s - 1] != b'#')
-                });
+            && match b[p - 1] {
+                b']' => true,
+                b')' => parens_start(p - 1).is_some_and(|open| {
+                    let q = skip_ws_back(open);
+                    q > 0 && ident(b[q - 1]) && plain_word(ident_start(q), q)
+                }),
+                c if ident(c) => {
+                    let s = ident_start(p);
+                    let q = skip_ws_back(s);
+                    plain_word(s, p)
+                        && q > 0
+                        && (ident(b[q - 1]) || matches!(b[q - 1], b'*' | b'&' | b'>' | b')'))
+                }
+                _ => false,
+            };
         let next = skip_ws(macro_end);
         let before_end = match b.get(next) {
             Some(b';' | b'{' | b'=' | b',') => true,
@@ -2640,7 +2688,7 @@ describe('Widget', () => {
 
     #[test]
     fn blank_thread_annotations_only_blanks_an_annotation_after_a_declarator() {
-        let blanked: [(&str, &[&str]); 9] = [
+        let blanked: [(&str, &[&str]); 12] = [
             (
                 "  SnapshotList snapshots_ GUARDED_BY(mutex_);",
                 &["GUARDED_BY(mutex_)"],
@@ -2677,6 +2725,9 @@ describe('Widget', () => {
                 "  Mutex mu_ ACQUIRED_AFTER(a,\n    b);",
                 &["ACQUIRED_AFTER(a,", "b)"],
             ),
+            ("  void F() REQUIRES(mu) override;", &["REQUIRES(mu)"]),
+            ("  void F() REQUIRES(mu) final {", &["REQUIRES(mu)"]),
+            ("  void F() REQUIRES(mu) noexcept;", &["REQUIRES(mu)"]),
         ];
         for (src, macros) in blanked {
             let want = macros.iter().fold(src.to_string(), |s, m| {
@@ -2696,6 +2747,12 @@ describe('Widget', () => {
             "  int n_ GUARDED_BY_X(mu);",
             "  Foo foo_ GUARDED_BY(mu) + 1;",
             "  void Release() { mu_.Unlock(); }",
+            // A function or call whose own name ends like an annotation.
+            "void OBJ_RELEASE(void* p) {}",
+            "  if (p) OBJ_RELEASE(p);",
+            "  while (*l) SPIN_ACQUIRE(l);",
+            "  return (PyDictObject *)FT_ATOMIC_LOAD_PTR_ACQUIRE(d->dict);",
+            "  x = (T*)FT_ATOMIC_LOAD_PTR_ACQUIRE(p);",
         ] {
             assert!(
                 matches!(blank_thread_annotations(src), Cow::Borrowed(_)),

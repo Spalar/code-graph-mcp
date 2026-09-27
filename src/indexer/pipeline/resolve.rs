@@ -1778,6 +1778,8 @@ pub(super) struct CppFieldTypes {
     fields: HashMap<(i64, String), (Option<String>, Option<String>)>,
     /// Class-like nodes by last name segment, with their class path.
     by_last: HashMap<String, Vec<(i64, Vec<String>)>>,
+    /// Class node id → its last name segment (the `by_last` key).
+    last_of: HashMap<i64, String>,
     /// Class node id → direct base class ids (`inherits` edges).
     parents: HashMap<i64, Vec<i64>>,
     /// (owner class last name, method) → recorded return types.
@@ -1800,6 +1802,12 @@ impl CppFieldTypes {
                 by_last.entry(last.clone()).or_default().push((id, path));
             }
         }
+        // Built once: `return_of` runs per chain step, and rebuilding this per
+        // call made a full index quadratic in the class count.
+        let last_of: HashMap<i64, String> = by_last
+            .iter()
+            .flat_map(|(last, nodes)| nodes.iter().map(move |(id, _)| (*id, last.clone())))
+            .collect();
         let mut parents: HashMap<i64, Vec<i64>> = HashMap::new();
         for (sub, sup) in crate::storage::queries::inherits_edges(conn)? {
             parents.entry(sub).or_default().push(sup);
@@ -1825,6 +1833,7 @@ impl CppFieldTypes {
         Ok(Self {
             fields,
             by_last,
+            last_of,
             parents,
             returns,
         })
@@ -1854,11 +1863,6 @@ impl CppFieldTypes {
     /// The return type of `class.method`, as the class declares it or its
     /// nearest base does; None unless every class of that spelling agrees.
     fn return_of(&self, class: &str, method: &str) -> Option<String> {
-        let names: HashMap<i64, &str> = self
-            .by_last
-            .iter()
-            .flat_map(|(last, nodes)| nodes.iter().map(move |(id, _)| (*id, last.as_str())))
-            .collect();
         let mut found: Vec<&String> = Vec::new();
         for start in self.nodes_of(class) {
             let mut seen: HashSet<i64> = HashSet::new();
@@ -1867,8 +1871,12 @@ impl CppFieldTypes {
                 if !seen.insert(c) {
                     continue;
                 }
+                // Returns its template's parameter (`cpp_class_fields`).
+                if self.fields.contains_key(&(c, format!("{method}()"))) {
+                    return None;
+                }
                 let key = (
-                    names.get(&c).copied().unwrap_or_default().to_string(),
+                    self.last_of.get(&c).cloned().unwrap_or_default(),
                     method.to_string(),
                 );
                 match self.returns.get(&key) {
@@ -1965,19 +1973,25 @@ impl CppFieldTypes {
     pub(super) fn rewrite(&self, metadata: Option<&str>) -> Option<String> {
         if let Some(CalleeMeta::Via) = parse_callee_metadata(metadata) {
             let meta: serde_json::Value = serde_json::from_str(metadata?).ok()?;
-            let (ty, through) = self.walk_via(&meta);
-            // Only a project class: a primitive or library return type (or a
-            // template parameter recorded as a type) keeps the untyped call.
-            let known = ty.as_deref().and_then(|t| {
-                class_path(t)
-                    .last()
-                    .filter(|l| self.by_last.contains_key(**l))
-                    .map(|_| t.to_string())
-            });
+            let (ty, mut through) = self.walk_via(&meta);
+            // Only a project class: a primitive or library return type keeps
+            // the untyped call.
+            let last = ty
+                .as_deref()
+                .and_then(|t| class_path(t).last().map(|l| l.to_string()));
+            let known = last.as_ref().is_some_and(|l| self.by_last.contains_key(l));
             return Some(
-                match known {
-                    Some(ty) => serde_json::json!({ "q": "rtype", "v": ty, "vc": through }),
-                    None => serde_json::json!({ "q": "member", "vc": through }),
+                match ty {
+                    Some(ty) if known => {
+                        serde_json::json!({ "q": "rtype", "v": ty, "vc": through })
+                    }
+                    _ => {
+                        // A final type that is no project class yet is still a
+                        // class the call depends on: a class renamed to it must
+                        // re-resolve this caller (`typed_callers_of_class_drift`).
+                        through.extend(last);
+                        serde_json::json!({ "q": "member", "vc": through })
+                    }
                 }
                 .to_string(),
             );
