@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.161.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 87 → 92 because the Rust fixes below change which `calls`
+edges a file produces. Nothing to run. To pin back: `npm i -g
+@sdsrs/code-graph@0.160.0`, or `cargo install code-graph-mcp --version
+0.160.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v92 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning back to get its graph back.
 
 ### An incremental run binds a Rust method added later, as a rebuild does
 
