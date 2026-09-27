@@ -122,6 +122,11 @@ fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
         "for",
         "switch",
     ];
+    // A return type, never a declarator's name: `static void OBJ_RELEASE(…)`.
+    const BUILTIN_TYPES: &[&str] = &[
+        "void", "bool", "char", "short", "int", "long", "float", "double", "signed", "unsigned",
+        "auto",
+    ];
     let b = source.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let skip_ws_back = |mut p: usize| {
@@ -147,11 +152,21 @@ fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
             && !b[s].is_ascii_digit()
             && (s == 0 || b[s - 1] != b'#')
     };
-    // The `(` matching the `)` at `close`, within one statement, or None.
+    // Whether `operator<sym>` ends at `q` (`operator<<`, `operator=`, `operator()`).
+    let after_operator = |q: usize| {
+        let mut k = q;
+        while k > 0 && b"<>=!+-*/%^&|~[]()".contains(&b[k - 1]) {
+            k -= 1;
+        }
+        let k = skip_ws_back(k);
+        k < q && &source[ident_start(k)..k] == "operator"
+    };
+    // The `(` matching the `)` at `close`, within one statement and 4 KiB (so
+    // deeply nested input stays linear), or None.
     let parens_start = |close: usize| {
         let mut depth = 0usize;
         let mut i = close + 1;
-        while i > 0 {
+        while i > 0 && close + 1 - i < 4096 {
             i -= 1;
             match b[i] {
                 b')' => depth += 1,
@@ -242,14 +257,18 @@ fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
                 b']' => true,
                 b')' => parens_start(p - 1).is_some_and(|open| {
                     let q = skip_ws_back(open);
-                    q > 0 && ident(b[q - 1]) && plain_word(ident_start(q), q)
+                    q > 0
+                        && (b[q - 1] == b']' // a lambda's `[captures](params)`
+                            || ident(b[q - 1]) && plain_word(ident_start(q), q)
+                            || after_operator(q))
                 }),
                 c if ident(c) => {
                     let s = ident_start(p);
                     let q = skip_ws_back(s);
                     plain_word(s, p)
+                        && !BUILTIN_TYPES.contains(&&source[s..p])
                         && q > 0
-                        && (ident(b[q - 1]) || matches!(b[q - 1], b'*' | b'&' | b'>' | b')'))
+                        && (ident(b[q - 1]) || matches!(b[q - 1], b'*' | b'&' | b'>' | b')' | b','))
                 }
                 _ => false,
             };
@@ -2688,7 +2707,7 @@ describe('Widget', () => {
 
     #[test]
     fn blank_thread_annotations_only_blanks_an_annotation_after_a_declarator() {
-        let blanked: [(&str, &[&str]); 12] = [
+        let blanked: [(&str, &[&str]); 17] = [
             (
                 "  SnapshotList snapshots_ GUARDED_BY(mutex_);",
                 &["GUARDED_BY(mutex_)"],
@@ -2728,6 +2747,23 @@ describe('Widget', () => {
             ("  void F() REQUIRES(mu) override;", &["REQUIRES(mu)"]),
             ("  void F() REQUIRES(mu) final {", &["REQUIRES(mu)"]),
             ("  void F() REQUIRES(mu) noexcept;", &["REQUIRES(mu)"]),
+            (
+                "  bool changed = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(&Lb::mu_) {",
+                &["ABSL_EXCLUSIVE_LOCKS_REQUIRED(&Lb::mu_)"],
+            ),
+            (
+                "  friend std::ostream& operator<<(std::ostream& o, const X& x) REQUIRES(mu);",
+                &["REQUIRES(mu)"],
+            ),
+            ("  void operator()() REQUIRES(mu);", &["REQUIRES(mu)"]),
+            (
+                "  X& operator=(const X& o) REQUIRES(mu);",
+                &["REQUIRES(mu)"],
+            ),
+            (
+                "  int a_ GUARDED_BY(mu), b_ GUARDED_BY(mu);",
+                &["GUARDED_BY(mu)", "GUARDED_BY(mu)"],
+            ),
         ];
         for (src, macros) in blanked {
             let want = macros.iter().fold(src.to_string(), |s, m| {
@@ -2753,6 +2789,11 @@ describe('Widget', () => {
             "  while (*l) SPIN_ACQUIRE(l);",
             "  return (PyDictObject *)FT_ATOMIC_LOAD_PTR_ACQUIRE(d->dict);",
             "  x = (T*)FT_ATOMIC_LOAD_PTR_ACQUIRE(p);",
+            "static void OBJ_RELEASE(void* p) {}",
+            "static inline int SPIN_ACQUIRE(int* l);",
+            "  virtual void DO_RELEASE();",
+            "extern void FOO_RELEASE(void* p);",
+            "unsigned long BAR_ACQUIRE(void);",
         ] {
             assert!(
                 matches!(blank_thread_annotations(src), Cow::Borrowed(_)),

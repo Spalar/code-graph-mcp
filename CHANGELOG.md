@@ -3,13 +3,13 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 74 → 78 because the fixes below change which `calls` and
+`INDEX_VERSION` goes 74 → 79 because the fixes below change which `calls` and
 `inherits` edges a file produces, and an existing index keeps the wrong ones
 until each file's content changes. Nothing to run; the rebuild itself is faster
 than 0.158.0's full index (below). To pin back: `npm i -g
 @sdsrs/code-graph@0.158.0`, or `cargo install code-graph-mcp --version 0.158.0`;
 plugin users can set the version in the marketplace entry. An older binary
-leaves a v78 index intact and warns instead of rebuilding it; delete
+leaves a v79 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning to get its graph back.
 
 ### A full index is faster than 0.157.0 again
@@ -86,8 +86,10 @@ Two errors in `inherits` edges fed this and are fixed with it:
   testing::Test`, a project method called `Test`. leveldb had 93 such edges,
   which made unrelated classes subclasses of each other. A supertype is now
   always a type, both when the subclass's file is indexed and when the base's
-  file is edited. In JavaScript and TypeScript a `function` stays a possible
-  supertype: `class Sub extends Base` may extend an ES5 constructor function.
+  file is edited. Not covered: a JavaScript `class Sub extends Base` whose
+  `Base` is an ES5 constructor function (`function Base() {}`) gets no
+  `inherits` edge. Exempting functions there made classes extend unrelated
+  same-named functions instead.
 - A C++ base written `log::Reader::Reporter` or `ns::Tmpl<int>` was recorded as
   `Reader::Reporter` or `Tmpl<int>`, names no node has, so those subclasses
   had no base. The last segment is recorded now.
@@ -129,9 +131,10 @@ A field followed by a Clang thread-safety annotation
 EXCLUSIVE_LOCKS_REQUIRED(mutex_);`) did not parse: tree-sitter read the
 annotation as a function and lost the field's name. These annotations are now
 blanked before parsing, as class export macros already were, when they follow
-a declarator. A function or call whose own name only ends like one
-(`void OBJ_RELEASE(void* p)`, `if (p) OBJ_RELEASE(p);`, a cast's
-`FT_ATOMIC_LOAD_PTR_ACQUIRE(x)`) is left alone.
+a declarator, a lambda's parameters or an `operator`. A function whose own
+name only ends like one is left alone when it starts its line or returns a
+built-in type (`static void OBJ_RELEASE(void* p)`), and so is such a call
+after `if (…)`, `while (…)` or a cast (`FT_ATOMIC_LOAD_PTR_ACQUIRE(x)`).
 
 On leveldb, scored against SCIP, same-file precision goes from 1484/1559 to
 1500/1548 (95.2% → 96.9%) and the `inferred` tier from 1361/1401 to 1528/1565
@@ -200,11 +203,13 @@ character after JSON ... line 2 column 1"), and the model saw neither hint —
 while the tracker recorded both as delivered, so neither fired again for five
 minutes. Seen 4 times between September 6 and 26 in claude-mem-lite sessions.
 The hints now share one envelope. Each directory first reserves room for its
-own header and footer, sized by its name, and the overview answers split what
-is left of the 4000-byte context cap, so a large first answer cannot cut a
-later directory out. When the split leaves less than 400 bytes per answer
-(from seven short-named directories at once), every directory gets the
-one-line advice instead of an overview; about 19 such lines fit the cap.
+own lines, sized by its name, and the overview answers split what is left of
+the 4000-byte context cap, so a large first answer cannot cut a later
+directory out. When the split leaves less than 400 bytes per answer (from
+seven short-named directories at once), every directory gets the one-line
+advice instead of an overview. Past what those lines fit, one closing line
+names the remaining directories, so every directory marked as hinted is
+named in the envelope.
 
 That envelope also no longer carries `permissionDecision: "allow"`. It was the
 Read hook's envelope, written from inside the tracker the Bash hook shares, and

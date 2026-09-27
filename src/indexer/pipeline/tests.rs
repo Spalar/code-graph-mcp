@@ -2500,6 +2500,25 @@ fn test_class_renamed_to_a_chain_s_final_type_re_resolves_untouched_callers() {
     );
 }
 
+/// Chains ending in two `std::` types resolve alike: the untyped call keeps one
+/// edge per target, not one per library type.
+#[test]
+fn test_cpp_chains_ending_in_std_types_share_one_edge_per_target() {
+    let (_p, _d, db) = fresh_index_of(&[(
+        "h.hpp",
+        "#include <string>\n#include <vector>\n\
+         class Holder {\n public:\n  std::string* s() { return nullptr; }\n  std::vector<int>* v() { return nullptr; }\n};\n\
+         class Sized {\n public:\n  int size() { return 0; }\n};\n\
+         class User {\n  void Go();\n  Holder* h_;\n};\n\
+         void User::Go() {\n  h_->s()->size();\n  h_->v()->size();\n}\n",
+    )]);
+    let to_size: Vec<String> = call_edges_with_confidence(&db)
+        .into_iter()
+        .filter(|e| e.contains("Sized.size"))
+        .collect();
+    assert_eq!(to_size.len(), 1, "{to_size:#?}");
+}
+
 /// A method returning its template's parameter returns whatever instantiates
 /// it, even when the parameter is named like a project class.
 #[test]
@@ -2517,6 +2536,43 @@ fn test_cpp_chain_through_a_template_parameter_return_stays_untyped() {
     assert!(
         callees.contains(&"w.hpp.Other.Next".to_string()),
         "the instantiating class stays a candidate: {callees:?}"
+    );
+}
+
+/// The same through a reference return, and through a template base class the
+/// chain's class inherits the method from.
+#[test]
+fn test_cpp_template_parameter_return_via_reference_or_base_stays_untyped() {
+    let classes = "class Iterator {\n public:\n  virtual void Next() {}\n};\n\
+                   class Other {\n public:\n  void Next() {}\n};\n";
+    let (_p, _d, db) = fresh_index_of(&[(
+        "r.hpp",
+        &format!(
+            "{classes}template <typename Iterator>\n\
+             class Wrapper {{\n public:\n  const Iterator& inner() {{ return *p_; }}\n  Iterator* p_;\n}};\n\
+             class User {{\n  void Go();\n  Wrapper<Other>* w_;\n}};\n\
+             void User::Go() {{\n  w_->inner().Next();\n}}\n"
+        ),
+    )]);
+    let callees = callees_of(&db, "Go");
+    assert!(
+        callees.contains(&"r.hpp.Other.Next".to_string()),
+        "reference: {callees:?}"
+    );
+    let (_p, _d, db) = fresh_index_of(&[(
+        "b.hpp",
+        &format!(
+            "{classes}template <typename Iterator>\n\
+             class Base {{\n public:\n  Iterator* inner() {{ return nullptr; }}\n}};\n\
+             class Wrapper : public Base<Other> {{}};\n\
+             class User {{\n  void Go();\n  Wrapper* w_;\n}};\n\
+             void User::Go() {{\n  w_->inner()->Next();\n}}\n"
+        ),
+    )]);
+    let callees = callees_of(&db, "Go");
+    assert!(
+        callees.contains(&"b.hpp.Other.Next".to_string()),
+        "base: {callees:?}"
     );
 }
 
@@ -2558,48 +2614,6 @@ fn test_cpp_gtest_body_types_the_fixture_field() {
 /// A supertype is a type. A C++ class shares its name with its constructor, and
 /// `testing::Test` with any project method named `Test`: leveldb had 93 `inherits`
 /// edges into methods, which made unrelated classes each other's subclasses.
-/// JavaScript's exception: an ES5 constructor function is a class, and
-/// `class Sub extends Base` may extend one, in a full index and after the
-/// base's file is re-indexed alone (the restore path).
-#[test]
-fn test_js_class_extends_an_es5_constructor_function() {
-    let inherits = |db: &Database| -> Vec<String> {
-        let mut stmt = db
-            .conn()
-            .prepare(
-                "SELECT s.name || ' -> ' || t.type || ' ' || t.name FROM edges e \
-                 JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
-                 WHERE e.relation = 'inherits'",
-            )
-            .unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
-    let (_p, _d, db) = fresh_index_of(&[
-        ("base.js", "function Base() {}\nmodule.exports = Base;\n"),
-        (
-            "sub.js",
-            "const Base = require('./base');\nclass Sub extends Base {}\n",
-        ),
-    ]);
-    assert_eq!(inherits(&db), vec!["Sub -> function Base".to_string()]);
-    assert_incremental_matches_rebuild(
-        &[
-            ("base.js", "function Base() {}\nmodule.exports = Base;\n"),
-            (
-                "sub.js",
-                "const Base = require('./base');\nclass Sub extends Base {}\n",
-            ),
-        ],
-        &[(
-            "base.js",
-            Some("function Base() { this.x = 1; }\nmodule.exports = Base;\n"),
-        )],
-    );
-}
-
 #[test]
 fn test_inherits_never_targets_a_function_or_method() {
     let (_p, _d, db) = fresh_index_of(&[

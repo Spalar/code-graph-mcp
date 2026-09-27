@@ -2743,6 +2743,30 @@ test('sed-range fanout: fourteen dirs at once each keep their hint', () => {
   }
 });
 
+test('sed-range fanout: every dir marked delivered is named in the envelope', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture('process.stdout.write("overview stub\\n");');
+  try {
+    const root = resolveProjectRoot(fixture.dir);
+    for (const [n, len] of [[9, 100], [23, 5]]) {
+      const dirs = Array.from({ length: n }, (_, i) => `${'x'.repeat(len - String(i).length)}${i}`);
+      const state = readGuide.loadState(root);
+      for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) {
+        for (const d of dirs) readGuide.recordRead(state, d);
+      }
+      readGuide.saveState(root, state);
+
+      const res = runHook(dirs.map((d) => `sed -n 1,5p ${d}/f.js`).join('; '), fixture);
+      assert.equal(res.status, 0, res.stderr);
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      for (const d of dirs) assert.ok(ctx.includes(`${d}/`), `${n}x${len}: ${d} is named`);
+      assert.doesNotMatch(ctx, /truncated at \\d+ bytes/, `${n}x${len}: nothing is cut`);
+    }
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test('sed-range fanout: one dir crossing still emits its single envelope', () => {
   const readGuide = require('./pre-read-guide');
   const fixture = e2eFixture('process.stdout.write("overview stub\\n");');

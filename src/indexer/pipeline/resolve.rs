@@ -1989,7 +1989,14 @@ impl CppFieldTypes {
                         // A final type that is no project class yet is still a
                         // class the call depends on: a class renamed to it must
                         // re-resolve this caller (`typed_callers_of_class_drift`).
-                        through.extend(last);
+                        // A `std::` type never becomes the project's, and would
+                        // only split one call's edges by metadata.
+                        let std = ty
+                            .as_deref()
+                            .is_some_and(|t| class_path(t).first() == Some(&"std"));
+                        if !std {
+                            through.extend(last);
+                        }
                         serde_json::json!({ "q": "member", "vc": through })
                     }
                 }

@@ -1182,17 +1182,36 @@ const MIN_FANOUT_ANSWER_BYTES = 400;
 
 /// Byte budget for each overview answer when several dirs fire in one command
 /// (undefined for one dir: the answer keeps its own default). Every hint first
-/// pays for its header, truncation footer and separator — about 170 bytes plus
-/// the dir name twice, reserved as 200 plus the name twice — and the answers
-/// share what is left of the cap. A share under MIN_FANOUT_ANSWER_BYTES returns
-/// 0: every dir then gets the one-line advice, which fits in its reservation,
-/// so no dir's hint is cut out of the envelope while the reservations fit the
-/// cap (up to ~19 short dir names).
+/// pays for its own lines — an answer's header, footer and separator are about
+/// 175 bytes plus the dir name twice, the one-line advice about 165 plus the
+/// name three times — reserved as 200 plus the name three times, and the
+/// answers share what is left of the cap. A share under MIN_FANOUT_ANSWER_BYTES
+/// returns 0: every dir then gets the one-line advice instead.
 function fanoutAnswerBudget(dirs) {
   if (dirs.length < 2) return undefined;
-  const reserved = dirs.reduce((sum, d) => sum + 200 + 2 * Buffer.byteLength(d, 'utf8'), 0);
+  const reserved = dirs.reduce((sum, d) => sum + 200 + 3 * Buffer.byteLength(d, 'utf8'), 0);
   const share = Math.floor((MAX_INJECTED_BYTES - reserved) / dirs.length);
   return share >= MIN_FANOUT_ANSWER_BYTES ? share : 0;
+}
+
+/// The fired dirs' hints as one context text. Every dir was marked delivered,
+/// so each must be named in it: once the next hint would leave no room for a
+/// line naming the dirs still to come, that line replaces the remaining hints.
+function joinFanoutHints(dirs, hints) {
+  const rest = (from) => `[code-graph] 5+ Reads also into ${dirs.slice(from).map((d) => `${d}/`).join(', ')} — \`code-graph-mcp overview <dir>/\` gives each dir's symbols+callers in one call.`;
+  const out = [];
+  let used = 0;
+  for (let i = 0; i < hints.length; i++) {
+    const need = Buffer.byteLength(hints[i], 'utf8') + (out.length ? 2 : 0);
+    const tail = i + 1 < hints.length ? Buffer.byteLength(rest(i + 1), 'utf8') + 2 : 0;
+    if (used + need + tail > MAX_INJECTED_BYTES) {
+      out.push(rest(i));
+      break;
+    }
+    out.push(hints[i]);
+    used += need;
+  }
+  return out.join('\n\n');
 }
 
 function runMain() {
@@ -1241,7 +1260,7 @@ function runMain() {
     if (firedDirs.length > 0) {
       const maxBytes = fanoutAnswerBudget(firedDirs);
       const hints = firedDirs.map((dir) => readGuide.buildFanoutHint(root, dir, { maxBytes }));
-      process.stdout.write(emitPreToolContext(hints.join('\n\n')) + '\n');
+      process.stdout.write(emitPreToolContext(joinFanoutHints(firedDirs, hints)) + '\n');
       return;
     }
   }

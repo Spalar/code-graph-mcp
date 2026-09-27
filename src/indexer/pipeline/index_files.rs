@@ -2018,13 +2018,6 @@ fn resolve_batch_relations(
         unresolved_externals,
     })
 }
-/// A node an `inherits` / `implements` edge never points at: the in-memory
-/// form of `queries::callable_node_ids`, for the restore path.
-fn never_a_supertype(node_type: &str, language: &str) -> bool {
-    node_type == "method"
-        || node_type == "function" && !matches!(language, "javascript" | "typescript" | "tsx")
-}
-
 /// C++ name lookup: a bare `f()` inside a member function (`Cls::m`, scope
 /// `Cls.m`, or a gtest `TEST_F(Suite, Case)` body, scope `Suite.Case`, which is a
 /// member of a class derived from `Suite`) finds the class's own `f` before any
@@ -3029,7 +3022,7 @@ fn restore_inbound_edges(
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
         #[allow(clippy::type_complexity)]
-        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>, bool)>> =
+        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>, &str)>> =
             HashMap::new();
         for pf in batch_parsed {
             for (((id, name), q), ty) in pf
@@ -3042,7 +3035,7 @@ fn restore_inbound_edges(
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
-                    .push((*id, q.as_deref(), never_a_supertype(ty, &pf.language)));
+                    .push((*id, q.as_deref(), ty.as_str()));
             }
         }
 
@@ -3086,7 +3079,7 @@ fn restore_inbound_edges(
                     found
                         .iter()
                         .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
-                        .filter(|(_, _, callable)| !supertype || !*callable)
+                        .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
                         .map(|(id, _, _)| *id)
                         .collect::<Vec<i64>>()
                 })
