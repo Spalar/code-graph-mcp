@@ -305,6 +305,12 @@ pub(super) fn resolve_pending_calls_touching(
             })
             .unwrap_or_default();
 
+        let candidates = classes.rust_call_shape_candidates(
+            db,
+            &row.source_language,
+            row.metadata.as_deref(),
+            candidates,
+        )?;
         if candidates.is_empty() {
             continue; // still unresolvable — leave buffered
         }
@@ -1720,6 +1726,48 @@ pub(super) fn self_filter_candidates(
     filter_method_ids(db.conn(), candidates, Some(impl_type))
 }
 
+/// Whether a Rust function's signature (`(&mut self, x: T) -> R`, as the parser
+/// stores it) takes `self` first: `self`, `mut self`, `&self`, `&'a mut self`,
+/// `self: Box<Self>`.
+pub(super) fn rust_signature_takes_self(signature: &str) -> bool {
+    let Some(rest) = signature.trim_start().strip_prefix('(') else {
+        return false;
+    };
+    let mut rest = rest.trim_start();
+    if let Some(r) = rest.strip_prefix('&') {
+        rest = r.trim_start();
+        if let Some(r) = rest.strip_prefix('\'') {
+            let end = r
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(r.len());
+            rest = r[end..].trim_start();
+        }
+    }
+    if let Some(r) = rest.strip_prefix("mut") {
+        if r.starts_with(char::is_whitespace) {
+            rest = r.trim_start();
+        }
+    }
+    rest.strip_prefix("self")
+        .is_some_and(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// Whether a Rust call can reach a function that does (`takes_self`) or does not
+/// take `self`, by the call's syntax alone (D#71). A bare `f()` never calls a
+/// method: `drop(guard)` bound the project's own `impl Drop::drop`. A method
+/// call `x.f()` (`recv`, `chain`, `member`) only calls a function that takes
+/// `self`: `status.success()` bound `JsonRpcResponse::success(id, v)`. Paths
+/// (`T::f()` reaches both) and `self.`/`Self::` calls are decided elsewhere.
+pub(super) fn rust_call_shape_admits(metadata: Option<&str>, takes_self: bool) -> bool {
+    if metadata.is_none_or(str::is_empty) {
+        return !takes_self;
+    }
+    match parse_callee_metadata(metadata) {
+        Some(CalleeMeta::Receiver(_) | CalleeMeta::Chain | CalleeMeta::Member) => takes_self,
+        _ => true,
+    }
+}
+
 /// Candidates a call can reach given its metadata: a member call on an object
 /// (`CalleeMeta::Member`, or `RecvType` — a receiver of known class) cannot reach
 /// a free function; every other call keeps them all. One helper so the batch,
@@ -2114,9 +2162,52 @@ pub(super) struct ProjectClassNames {
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
+    /// Rust function id → whether it takes `self` ([`rust_call_shape_admits`]);
+    /// None until loaded.
+    rust_takes_self: Option<HashMap<i64, bool>>,
 }
 
 impl ProjectClassNames {
+    /// The candidates a Rust call's syntax can reach ([`rust_call_shape_admits`]),
+    /// from one read of every Rust function's signature. Other languages' calls
+    /// pass through untouched.
+    pub(super) fn rust_call_shape_candidates(
+        &mut self,
+        db: &crate::storage::db::Database,
+        language: &str,
+        metadata: Option<&str>,
+        mut candidates: Vec<i64>,
+    ) -> anyhow::Result<Vec<i64>> {
+        if language != "rust" {
+            return Ok(candidates);
+        }
+        if self.rust_takes_self.is_none() {
+            let mut stmt = db.conn().prepare(
+                "SELECT n.id, n.signature FROM nodes n JOIN files f ON f.id = n.file_id
+                 WHERE f.language = 'rust' AND n.type = 'function'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (id, signature) = row?;
+                map.insert(
+                    id,
+                    signature.as_deref().is_some_and(rust_signature_takes_self),
+                );
+            }
+            self.rust_takes_self = Some(map);
+        }
+        let takes_self = self.rust_takes_self.as_ref().expect("loaded above");
+        candidates.retain(|id| {
+            takes_self
+                .get(id)
+                .is_none_or(|&t| rust_call_shape_admits(metadata, t))
+        });
+        Ok(candidates)
+    }
+
     /// [`member_call_candidates`] from memory: the deferred pass and the pending
     /// sweep run after every node of the run exists, so the set of free
     /// functions is read once instead of once per call (a query of up to

@@ -3769,6 +3769,31 @@ fn test_rust_callee_builder_chain_qualifier() {
     assert_eq!(open_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
 }
 
+/// D#71: a method call whose receiver is a field, an index or a literal is a
+/// member call (its callee takes `self`), not a bare call.
+#[test]
+fn test_rust_callee_member_receiver_qualifier() {
+    let code = r#"fn caller(ctx: &Ctx, v: &[S]) {
+        ctx.db.conn();
+        v[0].len();
+        "x".to_string();
+        drop(ctx);
+    }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let meta = |name: &str| {
+        relations
+            .iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == name)
+            .unwrap_or_else(|| panic!("missing call to {name}"))
+            .metadata
+            .clone()
+    };
+    assert_eq!(meta("conn").as_deref(), Some(r#"{"q":"member"}"#));
+    assert_eq!(meta("len").as_deref(), Some(r#"{"q":"member"}"#));
+    assert_eq!(meta("to_string").as_deref(), Some(r#"{"q":"member"}"#));
+    assert_eq!(meta("drop"), None);
+}
+
 #[test]
 fn test_rust_callee_self_recv_within_impl() {
     let code = r#"

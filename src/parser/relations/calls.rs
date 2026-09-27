@@ -333,10 +333,10 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             //
             // "Bare" must be decided STRUCTURALLY (the `function` field is
             // an `identifier`), NOT from `CalleeQualifier::Bare`: that
-            // variant is also `extract_rust_field`'s fallback arm for a
+            // variant was once `extract_rust_field`'s fallback arm for a
             // method call whose receiver is not self / a plain identifier /
             // a call. `ctx.db.conn()` has a `field_expression` receiver and
-            // so reports Bare — gating on the enum dropped 14 real
+            // so reported Bare — gating on the enum dropped 14 real
             // `Database::conn` edges in this repo alone, every `cmd_*` that
             // writes `let conn = ctx.db.conn();`, because the method name
             // matched the local it is assigned to.

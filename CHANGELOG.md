@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 79 → 80 because the Rust fix below changes which `calls`
+edges a file produces. An older binary leaves a v80 index intact and warns
+instead of rebuilding it; delete `.code-graph/index.db*` after pinning back.
+
+### A Rust call binds only a function its syntax can reach
+
+A bare `f()` never calls a function that takes `self`, and a method call
+`x.f()` only calls one that does. Resolution by name ignored both rules:
+`drop(guard)` bound the project's own `impl Drop for Guard`,
+`out.status.success()` bound `JsonRpcResponse::success(id, result)`, and a
+builder's `.spawn()` bound a test helper `McpClient::spawn(root)`. A method
+call on a field, an index or a literal (`ctx.db.conn()`, `v[0].len()`) was
+resolved as a bare call; it is now a member call.
+
+Measured against rust-analyzer on this repo (SCIP oracle, same snapshot, gold
+7,101 call pairs): wrong edges 107 → 44 (extracted 46 → 16, inferred 38 → 18,
+ambiguous 23 → 10), recall at the default floor 6,809 → 6,810. Two edges moved
+from unjudged to wrong at the ambiguous tier: an atomic's `.load(Ordering)`
+now reaches only the one project `load` that takes `self`.
+
 ### The grep rewrite runs the search the grep asked for
 
 The PreToolUse hook replaces an answerable `grep` with `code-graph-mcp grep`

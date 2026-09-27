@@ -3060,6 +3060,101 @@ fn test_member_call_reaches_a_function_its_factory_returns() {
     assert!(!has("use.js.go --calls--> stub.js.renamed"), "{edges:#?}");
 }
 
+/// D#71: a Rust call's syntax fixes whether its callee takes `self`. A bare
+/// `f()` never runs a method (`drop(guard)` bound the project's own
+/// `impl Drop::drop` 27 times in this repo), and `x.f()` only runs a method
+/// that takes `self` (`status.success()` bound `JsonRpcResponse::success(id, v)`,
+/// `.spawn()` a test's `McpClient::spawn(root)`). Same-file (batch) and
+/// cross-file (deferred) resolution both apply it.
+#[test]
+fn test_rust_call_shape_decides_whether_the_callee_takes_self() {
+    let lib = "pub struct Guard;\nimpl Drop for Guard {\n    fn drop(&mut self) {}\n}\n\
+               impl Guard {\n    pub fn seal(&mut self) {}\n}\n\
+               pub struct Resp;\nimpl Resp {\n    pub fn success(v: i32) -> Self { Resp }\n    \
+               pub fn status(&self) -> i32 { 0 }\n}\n\
+               pub struct Client;\nimpl Client {\n    pub fn spawn(root: &str) -> Self { Client }\n}\n\
+               pub fn release(g: Guard) { drop(g); }\n\
+               pub fn check(o: &std::process::Output) -> bool { o.status.success() }\n\
+               pub fn build(c: &mut std::process::Command) { c.arg(\"x\").spawn(); }\n\
+               pub fn ask(r: &Resp) -> i32 { r.status() }\n\
+               pub fn nested(h: &Holder) -> i32 { h.resp.status() }\n\
+               pub fn make() -> Resp { Resp::success(1) }\n\
+               pub struct Holder { pub resp: Resp }\n";
+    let other = "pub fn release_elsewhere(g: crate::Guard) { seal(g); }\n\
+                 pub fn check_elsewhere(o: &std::process::Output) -> bool { o.status.success() }\n\
+                 pub fn spawn_elsewhere() { std::process::Command::new(\"x\").spawn(); }\n\
+                 pub fn ask_elsewhere(h: &crate::Holder) -> i32 { h.resp.status() }\n";
+    let (_p, _d, db) = fresh_index_of(&[("lib.rs", lib), ("other.rs", other)]);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    let bound: Vec<&str> = [
+        "lib.rs.release --calls--> lib.rs.drop",
+        "lib.rs.check --calls--> lib.rs.success",
+        "lib.rs.build --calls--> lib.rs.spawn",
+        "other.rs.release_elsewhere --calls--> lib.rs.seal",
+        "other.rs.check_elsewhere --calls--> lib.rs.success",
+        "other.rs.spawn_elsewhere --calls--> lib.rs.spawn",
+    ]
+    .into_iter()
+    .filter(|e| has(e))
+    .collect();
+    let lost: Vec<&str> = [
+        "lib.rs.ask --calls--> lib.rs.status",
+        "lib.rs.nested --calls--> lib.rs.status",
+        "lib.rs.make --calls--> lib.rs.success",
+        "other.rs.ask_elsewhere --calls--> lib.rs.status",
+    ]
+    .into_iter()
+    .filter(|e| !has(e))
+    .collect();
+    assert!(
+        bound.is_empty() && lost.is_empty(),
+        "call shape ignored: {bound:#?}\nlost: {lost:#?}\n{edges:#?}"
+    );
+}
+
+/// The same rule on the incremental paths: a bare call buffered because nothing
+/// matched must not bind a method a later run adds (pending sweep), and an edge
+/// into a re-indexed file must not be restored onto a same-named method that a
+/// fresh index would never bind (Phase 2c restore).
+#[test]
+fn test_rust_call_shape_holds_on_incremental_paths() {
+    let (project, _d, db) = fresh_index_of(&[
+        (
+            "a.rs",
+            "pub fn release(g: G) { seal(g); }\npub fn go() { helper(); }\n",
+        ),
+        ("b.rs", "pub fn helper() {}\n"),
+    ]);
+    assert!(
+        edge_set(&db)
+            .iter()
+            .any(|e| e == "a.rs.go --calls--> b.rs.helper"),
+        "control: {:#?}",
+        edge_set(&db)
+    );
+    fs::write(
+        project.path().join("g.rs"),
+        "pub struct G;\nimpl G {\n    pub fn seal(&mut self) {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("b.rs"),
+        "pub struct H;\nimpl H {\n    pub fn helper(&self) {}\n}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let edges = edge_set(&db);
+    let bound: Vec<&str> = [
+        "a.rs.release --calls--> g.rs.seal",
+        "a.rs.go --calls--> b.rs.helper",
+    ]
+    .into_iter()
+    .filter(|w| edges.iter().any(|e| e == w))
+    .collect();
+    assert!(bound.is_empty(), "{bound:#?}\n{edges:#?}");
+}
+
 /// The same exclusion on the pending-call sweep: a member call buffered because
 /// no candidate existed yet must not bind a free function that a LATER run adds.
 #[test]

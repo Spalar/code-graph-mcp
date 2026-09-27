@@ -282,6 +282,26 @@ struct FileParsed {
     // 1-based (start, end) lines parallel to node_ids: a relation's source_line
     // picks among same-named source nodes by containment.
     node_lines: Vec<(u32, u32)>,
+    // Rust function id → whether it takes `self`, for this file's functions:
+    // the batch-time half of `resolve::rust_call_shape_admits`.
+    rust_takes_self: HashMap<i64, bool>,
+}
+
+impl FileParsed {
+    /// Drop the candidates this file's Rust call cannot reach by its syntax
+    /// (`resolve::rust_call_shape_admits`). Only this file's functions are known
+    /// here, and only same-file binds are decided at batch time; the deferred
+    /// pass applies the rule to the whole pool.
+    fn retain_rust_call_shape(&self, rel: &ParsedRelation, candidates: &mut Vec<i64>) {
+        if self.language != "rust" {
+            return;
+        }
+        candidates.retain(|id| {
+            self.rust_takes_self
+                .get(id)
+                .is_none_or(|&t| super::resolve::rust_call_shape_admits(rel.metadata.as_deref(), t))
+        });
+    }
 }
 
 /// The counters Phase 1a bumps from rayon worker threads, so they are atomics
@@ -681,6 +701,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
+        let mut rust_takes_self: HashMap<i64, bool> = HashMap::new();
 
         let module_node_id = insert_node_cached(
             db.conn(),
@@ -735,6 +756,14 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_qualified_names.push(pn.qualified_name.clone());
             node_types.push(pn.node_type.clone());
             node_lines.push((pn.start_line, pn.end_line));
+            if pp.language == "rust" && pn.node_type == "function" {
+                rust_takes_self.insert(
+                    node_id,
+                    pn.signature
+                        .as_deref()
+                        .is_some_and(super::resolve::rust_signature_takes_self),
+                );
+            }
             nodes_created += 1;
         }
 
@@ -749,6 +778,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_qualified_names,
             node_types,
             node_lines,
+            rust_takes_self,
         });
     }
 
@@ -1757,10 +1787,11 @@ fn resolve_batch_relations(
                         if is_cross_file_call_noise(&rel.target_name, pf.language.as_str()) {
                             continue;
                         }
-                        let all = name_to_ids
+                        let mut all = name_to_ids
                             .get(&rel.target_name)
                             .cloned()
                             .unwrap_or_default();
+                        pf.retain_rust_call_shape(rel, &mut all);
                         let same_lang: Vec<i64> = all
                             .iter()
                             .filter(|id| {
@@ -1904,6 +1935,7 @@ fn resolve_batch_relations(
                     all_target_ids,
                     db,
                 )?;
+                pf.retain_rust_call_shape(rel, &mut all_target_ids);
             }
             // A supertype is a type: never a same-named constructor or method
             // (`class DBTest : public testing::Test` bound a `Harness::Test()`).
@@ -3039,6 +3071,13 @@ fn restore_inbound_edges(
             }
         }
 
+        // A call is restored only onto a function its syntax can reach, as a
+        // fresh resolution would bind it (`resolve::rust_call_shape_admits`).
+        let rust_takes_self: HashMap<i64, bool> = batch_parsed
+            .iter()
+            .flat_map(|pf| pf.rust_takes_self.iter().map(|(id, t)| (*id, *t)))
+            .collect();
+
         // Memoized source-file lookup for the requeue path below.
         let mut src_file_info: HashMap<i64, (String, String)> = HashMap::new();
 
@@ -3080,6 +3119,12 @@ fn restore_inbound_edges(
                         .iter()
                         .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
                         .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
+                        .filter(|(id, _, _)| {
+                            relation.as_str() != REL_CALLS
+                                || rust_takes_self.get(id).is_none_or(|&t| {
+                                    super::resolve::rust_call_shape_admits(metadata.as_deref(), t)
+                                })
+                        })
                         .map(|(id, _, _)| *id)
                         .collect::<Vec<i64>>()
                 })
@@ -3474,6 +3519,8 @@ fn resolve_deferred_relations(
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+            let all =
+                classes.rust_call_shape_candidates(db, &d.language, d.metadata.as_deref(), all)?;
             let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
 
             // 6a. JS namespace-receiver constraint captured at batch time

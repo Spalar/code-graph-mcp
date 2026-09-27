@@ -82,6 +82,7 @@ fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
         SelfRecv(t) => Some(serde_json::json!({ "q": "self", "v": t }).to_string()),
         Receiver(r) => Some(serde_json::json!({ "q": "recv", "v": r }).to_string()),
         Chain => Some(serde_json::json!({ "q": "chain" }).to_string()),
+        Member => Some(member::MEMBER_META.to_string()),
     }
 }
 

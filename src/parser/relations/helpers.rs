@@ -95,6 +95,10 @@ pub(crate) enum CalleeQualifier {
     /// `OpenOptions::new().create(true)` — receiver is a call_expression
     /// (any chain).
     Chain,
+    /// `ctx.db.conn()` / `v[0].len()` — a method call whose receiver is any
+    /// other expression (a field, an index, a literal). Serialized as the
+    /// shared `{"q":"member"}`: its callee takes `self`, whatever the receiver.
+    Member,
 }
 
 /// Like `extract_callee_name` but also returns the qualifier shape.
@@ -227,7 +231,7 @@ fn extract_rust_field(
             CalleeQualifier::Receiver(node_text(&value.unwrap(), source).to_string())
         }
         Some("call_expression") => CalleeQualifier::Chain,
-        _ => CalleeQualifier::Bare,
+        _ => CalleeQualifier::Member,
     };
     Some((name, qualifier))
 }
