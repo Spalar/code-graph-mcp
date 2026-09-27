@@ -3721,6 +3721,83 @@ fn test_rust_use_rebinds_when_the_named_module_gains_the_item() {
     assert_eq!(edge_set(&db), want);
 }
 
+/// Review of D#119 F1: a path call from another crate to a `pub(crate)` item is
+/// dropped; when the item becomes `pub`, a rebuild binds it, so the incremental
+/// run must too — the dropped call was not buffered.
+#[test]
+fn test_rust_call_hidden_by_crate_visibility_binds_once_the_item_is_pub() {
+    let files = |vis: &'static str| -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n".into(),
+            ),
+            ("src/lib.rs", "pub mod a;\n".into()),
+            ("src/a.rs", format!("{vis} fn helper_zz(x: u8) {{}}\n")),
+            (
+                "tests/it.rs",
+                "fn t() {\n    mylib::a::helper_zz(1);\n}\n".into(),
+            ),
+        ]
+    };
+    fn borrow<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
+        v.iter().map(|(a, b)| (*a, b.as_str())).collect()
+    }
+    let before = files("pub(crate)");
+    let (project, _d, db) = fresh_index_of(&borrow(&before));
+    let after = files("pub");
+    fs::write(project.path().join("src/a.rs"), &after[2].1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&borrow(&after));
+    let want = edge_set(&fresh);
+    assert!(
+        want.contains(&"tests/it.rs.t --calls--> src/a.rs.helper_zz".to_string()),
+        "rebuild control: {want:#?}"
+    );
+    assert_eq!(edge_set(&db), want);
+}
+
+/// Review of D#119 F2: `module::Type::f()` split into a file part and an owner
+/// part bound `io::Error::new(..)` — std's, through `use std::io` — to the
+/// project's own `io/error.rs` `Error::new`. A leading segment that names a std
+/// module is not split; a project module name still is.
+#[test]
+fn test_rust_std_module_path_is_not_split_onto_a_project_type() {
+    let files: &[(&str, &str)] = &[
+        ("Cargo.toml", "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n"),
+        ("src/lib.rs", "pub mod io;\npub mod net;\npub mod runtime;\n"),
+        ("src/io/mod.rs", "mod error;\n"),
+        (
+            "src/io/error.rs",
+            "pub struct Error;\nimpl Error {\n    pub fn new(k: u8, m: &str) -> Error { Error }\n}\n",
+        ),
+        ("src/runtime/mod.rs", "mod builder;\n"),
+        (
+            "src/runtime/builder.rs",
+            "pub struct Builder;\nimpl Builder {\n    pub fn build(a: u8, b: u8) {}\n}\n",
+        ),
+        (
+            "src/net/mod.rs",
+            "use std::io;\nfn uses_std_io() {\n    io::Error::new(io::ErrorKind::Other, \"x\");\n}\n\
+             fn uses_own() {\n    runtime::Builder::build(1, 2);\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.starts_with("src/net/mod.rs.uses_std_io --calls-->")),
+        "{edges:#?}"
+    );
+    assert!(
+        edges.contains(
+            &"src/net/mod.rs.uses_own --calls--> src/runtime/builder.rs.build".to_string()
+        ),
+        "control: {edges:#?}"
+    );
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs

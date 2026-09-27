@@ -1196,6 +1196,8 @@ pub(super) fn bare_name_callers_of_new_duplicates(
                     paths.push(importer);
                 }
             }
+            paths.sort_unstable();
+            paths.dedup();
         }
         Ok(paths)
     })();
@@ -1697,6 +1699,58 @@ pub(super) fn path_filter_candidates(
     filter_by_segment_chain(rest, candidates, node_id_to_path, db)
 }
 
+/// Top-level modules of `std`/`core`/`alloc`. A path that opens with one
+/// (`io::Error::new`, `sync::Mutex::new`) is usually std's through a `use`, which
+/// the resolver does not read (D#132), so it is not split onto a project module
+/// of the same name plus a type there (review of D#119: `io::Error::new(..)`
+/// bound the project's `io/error.rs`).
+const RUST_STD_MODULES: &[&str] = &[
+    "alloc",
+    "any",
+    "array",
+    "ascii",
+    "borrow",
+    "boxed",
+    "cell",
+    "char",
+    "cmp",
+    "collections",
+    "convert",
+    "default",
+    "env",
+    "error",
+    "ffi",
+    "fmt",
+    "fs",
+    "future",
+    "hash",
+    "hint",
+    "io",
+    "iter",
+    "marker",
+    "mem",
+    "net",
+    "num",
+    "ops",
+    "option",
+    "os",
+    "panic",
+    "path",
+    "pin",
+    "process",
+    "ptr",
+    "rc",
+    "result",
+    "slice",
+    "str",
+    "string",
+    "sync",
+    "task",
+    "thread",
+    "time",
+    "vec",
+];
+
 /// Keep the candidates whose file path or `qualified_name` carries `segments`
 /// as a contiguous chain. Split out of [`path_filter_candidates`] so the
 /// qualifier can be tried twice: once as written, once with an own-crate root
@@ -1743,10 +1797,11 @@ fn filter_by_segment_chain(
             // (`runtime::Builder::new()`: `runtime/`, `Builder.new`).
             path_match(path, segments)
                 || qn_match(qn, segments)
-                || (1..segments.len()).any(|k| {
-                    path_match(path, &segments[..k])
-                        && qn.starts_with(&format!("{}.", segments[k..].join(".")))
-                })
+                || (!RUST_STD_MODULES.contains(&segments[0].as_str())
+                    && (1..segments.len()).any(|k| {
+                        path_match(path, &segments[..k])
+                            && qn.starts_with(&format!("{}.", segments[k..].join(".")))
+                    }))
         })
         .collect();
     Ok(kept)
@@ -1774,11 +1829,11 @@ pub(super) fn self_filter_candidates(
 /// example target `tests/t.rs` is its own root, (`tests/`, [tests/t.rs], []).
 /// None where the layout says nothing sure (`src/bin/`, `tests/common/…`).
 fn rust_crate_layout(path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
-    let src_at = if path.starts_with("src/") {
-        Some(0)
-    } else {
-        path.rfind("/src/").map(|i| i + 1)
-    };
+    // The innermost `src/`, as [`rust_lib_dir`] reads it.
+    let src_at = path
+        .rfind("/src/")
+        .map(|i| i + 1)
+        .or_else(|| path.starts_with("src/").then_some(0));
     if let Some(at) = src_at {
         let dir = &path[..at + 4];
         let rel = path[at + 4..].strip_suffix(".rs")?;
@@ -1961,10 +2016,10 @@ pub(super) fn rust_fn_shape(signature: Option<&str>, qualified_name: Option<&str
 /// None outside one: an integration test, example or bench target, or a
 /// `src/bin/` binary, is a crate of its own.
 pub(super) fn rust_lib_dir(path: &str) -> Option<&str> {
-    let at = if path.starts_with("src/") {
-        0
-    } else {
-        path.rfind("/src/")? + 1
+    let at = match path.rfind("/src/") {
+        Some(i) => i + 1,
+        None if path.starts_with("src/") => 0,
+        None => return None,
     };
     (!path[at + 4..].starts_with("bin/")).then(|| &path[..at + 4])
 }
@@ -2049,13 +2104,6 @@ pub(super) fn rust_fn_shapes_of_file(path: &str, rows: &[RustFnRow]) -> Vec<(i64
         .collect()
 }
 
-/// Rust's primitive types: a path through one (`u32::encode_to(&v, buf)`) names a
-/// type although it is lowercase, whatever generic `impl` supplied the method.
-const RUST_PRIMITIVE_TYPES: &[&str] = &[
-    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8", "u16",
-    "u32", "u64", "u128", "usize",
-];
-
 /// Whether a Rust call can reach a function, by the call's syntax alone.
 ///
 /// Self-ness (D#71): a bare `f()` never calls a method: `drop(guard)` bound the
@@ -2088,14 +2136,14 @@ pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: &RustFnShap
     // type, so it cannot pass `self`: only `Type::f(x)` calls a method that way.
     // With the arity rule leaving `Command::spawn(&mut self)` the only
     // one-parameter `spawn`, tokio's `tokio::spawn(fut)` calls all bound it.
-    // A lowercase segment still names a type when it is a primitive or the
-    // method's own lowercase type (D#126: `u32::encode_to(&v, buf)`). Nor does a
-    // module path reach an associated function without `self` (D#119).
+    // A lowercase segment still names a type when it is the method's own
+    // lowercase type (D#126: `u32::encode_to(&v, buf)` through `impl Encode for
+    // u32`). Nor does a module path reach an associated function without
+    // `self` (D#119).
     if callee.associated
         && matches!(&meta, Some(CalleeMeta::Path(segments))
         if segments.last().is_some_and(|s| {
             s.starts_with(|c: char| c.is_ascii_lowercase())
-                && !RUST_PRIMITIVE_TYPES.contains(&s.as_str())
                 && callee.lowercase_owner.as_deref() != Some(s.as_str())
         }))
     {
@@ -3065,9 +3113,9 @@ mod tests {
             recv1,
             &f("(&self, a: i32, #[cfg(x)] b: i32)")
         ));
-        // A lowercase path names a type when it is a primitive or the method's own
-        // lowercase type (D#126), and a module otherwise.
-        let enc = rust_fn_shape(Some("(&self, buf: &mut Vec<u8>)"), Some("T.encode_to"));
+        // A lowercase path names a type when it is the method's own lowercase
+        // type (D#126), and a module otherwise.
+        let enc = rust_fn_shape(Some("(&self, buf: &mut Vec<u8>)"), Some("u32.encode_to"));
         let u32_path = Some(r#"{"n":2,"q":"path","v":"u32"}"#);
         assert!(rust_call_shape_admits(u32_path, &enc));
         let close = rust_fn_shape(Some("(&mut self)"), Some("sqlite3_db.close_db"));
@@ -3105,6 +3153,17 @@ mod tests {
             Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
             &free
         ));
+    }
+
+    /// A crate's `src/` is the LAST `/src/` of the path, also under a top-level
+    /// `src/` (review of D#119 F5).
+    #[test]
+    fn rust_lib_dir_takes_the_innermost_src() {
+        assert_eq!(rust_lib_dir("src/a.rs"), Some("src/"));
+        assert_eq!(rust_lib_dir("src/sub/src/x.rs"), Some("src/sub/src/"));
+        assert_eq!(rust_lib_dir("tokio/src/a/b.rs"), Some("tokio/src/"));
+        assert_eq!(rust_lib_dir("src/bin/tool.rs"), None);
+        assert_eq!(rust_lib_dir("tests/t.rs"), None);
     }
 
     /// A `fn` nested in a method of the same owner is a free function of that

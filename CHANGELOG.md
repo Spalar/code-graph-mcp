@@ -13,8 +13,9 @@ adds the method binds it.
 The same drift hit a Rust `use`: `use crate::a::widget` with `widget` only in
 `c.rs` bound `c.rs` by name, and when `a.rs` later gained `widget` the
 incremental run kept the `c.rs` import and calls while a rebuild moved them to
-`a.rs`. A new definition now re-extracts an importer whose `use` points
-outside the module file its path names.
+`a.rs`. A new definition now re-extracts an importer whose `use crate::` /
+`self::` / `super::` path points outside the module file it names. (A
+`use mycrate::a::widget` from another crate of the workspace is not covered.)
 
 ### The grep hook answers only the search the grep ran
 
@@ -61,13 +62,19 @@ wrong. Five rules, each a fact of the language:
   call at all.
 - `Self::f()` in a trait's default method names the trait.
 - `module::Type::f()` matches the module against the file and the type
-  against the method's owner: `runtime::Builder::new()` bound nothing.
+  against the method's owner: `runtime::Builder::new()` bound nothing. A path
+  opening with a std module name (`io::Error::new`, `sync::Mutex::new`) is
+  left as it was: without reading the file's `use`, it is usually std's.
 
 On tokio (gold 7,908 call pairs): `inferred` precision 2,212/2,851 (77.6%) →
-2,477/2,910 (85.1%), recall at the default floor 3,787 → 4,088, wrong
-`extracted` edges 386 → 366, wrong `ambiguous` 1,758 → 1,626; 391 correct
-call pairs gained and none lost. On this repo (gold 7,142): wrong edges unchanged
-(16 extracted, 7 inferred), recall at the default floor 6,854 → 6,961.
+2,461/2,889 (85.2%), recall at the default floor 3,787 → 4,072, wrong
+`extracted` edges 386 → 366, wrong `ambiguous` 1,758 → 1,626; of the call
+pairs the oracle can judge, 376 correct ones gained and one lost
+(`task::Notified::<T>::from_raw`, through a module named like std's `task`).
+On this repo (a snapshot with gold 7,142): wrong edges unchanged (16
+extracted, 7 inferred), recall at the default floor 6,854 → 6,961. A call
+from another crate to a `pub(crate)` item waits in the pending-call buffer,
+so making the item `pub` binds it incrementally too.
 
 ### A Rust call through a lowercase type reaches the method again
 
@@ -76,8 +83,9 @@ call pairs gained and none lost. On this repo (gold 7,142): wrong edges unchange
 A primitive and a `#[allow(non_camel_case_types)]` struct are lowercase types
 too: `u32::encode_to(&v, buf)` and `sqlite3_db::close_db(&mut d)` lost the
 edges 0.159.0 gave them (listed under 0.160.0's Not covered). A lowercase
-segment now names a type when it is a Rust primitive or the method's own
-type. On tokio-1.41.1 the SCIP oracle judges the same 7,099 edges the same
+segment now names a type when it is the method's own type (`impl Encode for
+u32`); a method a blanket `impl<T> Encode for T` supplies still binds
+nothing, as in every earlier release. On tokio-1.41.1 the SCIP oracle judges the same 7,099 edges the same
 way before and after, so the `tokio::spawn` fix stands.
 
 ## 0.160.0
