@@ -656,6 +656,20 @@ function normalizeCommandPaths(cmd, cwd) {
   return cmd.split(cwd.endsWith('/') ? cwd : cwd + '/').join('');
 }
 
+// D#125 #1 — the strip above cannot tell a path operand from a PATTERN, and
+// strips both: `grep -rn "<root>/Foo" src/` searches the literal text
+// `<root>/Foo`, but was answered for `Foo`. Mark the root instead of removing
+// it and pick the pattern again: a pattern that holds the mark held the root,
+// and no answer searches what the grep searched.
+function patternHoldsRoot(cmd, cwd) {
+  if (!cmd || typeof cmd !== 'string') return false;
+  if (!cwd || typeof cwd !== 'string' || cwd === '/') return false;
+  const marked = cmd.split(cwd.endsWith('/') ? cwd : cwd + '/').join('\u0001');
+  if (marked === cmd) return false;
+  const picked = pickBlockPattern(marked);
+  return typeof picked === 'string' && picked.includes('\u0001');
+}
+
 // v0.48 — subdir-cwd fix; v0.49 — extracted to project-root.js so the read
 // hook shares it. Re-exported below for test/back-compat.
 const { resolveProjectRoot } = require('./project-root');
@@ -1245,6 +1259,7 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   let context = false;
   let endOfFlags = false;
   let include = false;
+  let recursive = false;
   for (; i < words.length; i++) {
     const w = words[i];
     if (!w.anyQuoted && (w.text === '2>&1' || w.text === '2>/dev/null')) continue;
@@ -1267,6 +1282,7 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
       const name = w.text.slice(2, eq === -1 ? undefined : eq);
       if (!ALLOWED_LONG[verb].has(name)) return null;
       if (name === 'include') include = true;
+      if (name === 'recursive') recursive = true;
       if (VALUE_LONG.has(name) && eq === -1) {
         const v = words[++i];
         if (!valueWordOk(v, false) || (name === 'include' && /^!|\{/.test(v.text))) return null;
@@ -1290,6 +1306,7 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
       }
       if (!allowed.includes(ch)) return null;
       if (ch === 'i' || ch === 's') caseFlag = true;
+      if (ch === 'r' || ch === 'R') recursive = true;
     }
   }
   if (operands.length === 0 || operands.length > 2) return null;
@@ -1307,6 +1324,10 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   // `grep --include='*.py' X src/a.rs` finds nothing; rg — and so cg — searches
   // a named file whatever its -g says (D#78). Equivalent only for a directory.
   if (include && target && !isDir(target.text)) return null;
+  // Plain grep without -r reads no directory ("Is a directory") and, with no
+  // path, reads stdin; the answer would search the tree (D#125 #3). rg and ag
+  // recurse by default, and git grep searches the tracked tree.
+  if (verb === 'grep' && !recursive && (!target || isDir(target.text))) return null;
   // ag is smart-case by default: an all-lowercase pattern matches any case,
   // and cg's search is case-sensitive, so the answer would find less.
   if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(pattern.text)) return null;
@@ -1456,18 +1477,30 @@ const BRE_SWAPPED = '(){}+?|';
 const BRE_SAME_ESCAPE = 'wWsSbB<>.*[]^$\\/';
 const POSIX_CLASSES = new Set(['alpha', 'digit', 'alnum', 'upper', 'lower', 'space',
   'punct', 'xdigit', 'blank', 'cntrl', 'graph', 'print']);
+// An unescaped `^` is an anchor only where an alternative starts (the pattern's
+// start, after `\(` or `\|`), and `$` only where one ends (the pattern's end,
+// before `\)` or `\|`); elsewhere BRE reads them as literals and rust regex as
+// anchors — `getUser\|$user_id` searched the text `$user_id` (D#125 #6). No
+// translation: the grep runs.
 function breToRustRegex(pattern) {
   let out = '';
+  let altStart = true;
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
+    const wasAltStart = altStart;
+    altStart = false;
     if (c === '\\' && i + 1 < pattern.length) {
       const n = pattern[++i];
       if (n === '(' && pattern.startsWith('\\)', i + 1)) return null;
       if (BRE_SWAPPED.includes(n)) out += n;
       else if (BRE_SAME_ESCAPE.includes(n)) out += c + n;
       else return null;
+      altStart = n === '(' || n === '|';
       continue;
     }
+    if (c === '^' && !wasAltStart) return null;
+    if (c === '$' && i + 1 < pattern.length
+      && !pattern.startsWith('\\)', i + 1) && !pattern.startsWith('\\|', i + 1)) return null;
     if (BRE_SWAPPED.includes(c)) { out += '\\' + c; continue; }
     if (c !== '[') { out += c; continue; }
     // `]` right after `[` or `[^` is a member, not the end.
@@ -1650,6 +1683,7 @@ function runMain() {
   // forwarding `-F` without this guard would make it search the wrong text.
   const cgFlags = extractCgFlags(cmd);
   const rawGrepPattern = pickBlockPattern(cmd);
+  if (patternHoldsRoot(rawCmd, root)) return;
   const grepPattern = cgFlagSet(cgFlags).has('-F')
     ? rawGrepPattern
     : translateBreToRg(cmd, rawGrepPattern);
@@ -1728,7 +1762,9 @@ function runMain() {
         // No fallback to a grep answer: a context grep (`-A5`) asked for the
         // body, and the grep rewrite would drop the context silently (pre-ship
         // review round 2). A show miss lets the raw grep run.
-        answer = runShowAnswer({ cwd: root, symbols: block.symbols });
+        // Scoped to the grep's path: `show` alone answers the whole project
+        // (D#125 #2 — `grep -A3 "fn f" lib/` was answered from src/).
+        answer = runShowAnswer({ cwd: root, symbols: block.symbols, within: searchPath ?? '' });
       } else if (pattern) {
         answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
       }
@@ -1800,7 +1836,7 @@ function runMain() {
     // stderr; the grep being replaced has no cap (round 3 M4). Only here, not
     // in the in-hook answer, which is a has-hits probe.
     const argvList = answeredMode === 'show'
-      ? answer.symbols.map((sym) => ['show', sym])
+      ? answer.argvs
       : [[...args.slice(0, 1), '-m', '0', ...args.slice(1)]];
     const command = buildRewriteCommand(argvList, {
       invocation: shellQuoteArg(resolveAnswerBinary({})),
@@ -1861,6 +1897,7 @@ module.exports = {
   isRevisionScopedGitGrep, // v0.71 — git grep --cached/treeish exclusion
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
+  patternHoldsRoot, // D#125 #1
   resolveProjectRoot,    // v0.48 — subdir-cwd dark fix
   rebaseRelativePaths,   // v0.48 — subdir-cwd dark fix
   commandHasBypass,      // v0.48 — bypass funnel visibility

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### The grep hook answers only the search the grep ran
+
+Four shapes where the rewritten answer searched something else, all listed
+under 0.160.0's Not covered, now run as typed or are answered exactly:
+
+- A pattern holding the project path (`grep -rn "/home/me/proj/Foo" src/`)
+  was answered for `Foo`: the hook strips the project path from path operands
+  and could not tell the pattern from one. It now runs as typed, and the
+  PostToolUse inject skips it.
+- A declaration grep with context (`grep -rn -A3 "fn load" lib/`) was
+  answered by `show load` over the whole project. The answer now stays inside
+  the grep's path: `show load --file lib/a.rs` when that one file holds every
+  definition inside it, nothing (the grep runs) when several files inside do
+  and more lie outside.
+- `grep -n Foo src/` without `-r` searches no directory, and `grep -n Foo`
+  with no path reads its input; both were answered with a recursive search.
+- A `^` or `$` in the middle of a basic regex (`getUser\|$user_id`) is a
+  literal to grep and an anchor to the answer; such a pattern runs as typed.
+
 ### Rust call resolution, measured on tokio
 
 This repo's Rust precision did not carry over to tokio-1.41.1, the first

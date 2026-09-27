@@ -347,10 +347,40 @@ function runGrepAnswer(opts = {}) {
  *   `no-binary` distinguishes a missing/unlocatable binary from a runtime
  *   `unavailable`, so the deny funnel can see a dark flagship answer-in-deny.
  */
+/**
+ * The files of the definitions a `show` printed: each definition opens with an
+ * unindented header `<kind> <name>  <path>:<start>-<end>  <signature>`, its body
+ * indented below. null when an unindented line is not such a header, so a
+ * caller that must account for every definition can refuse.
+ */
+function showDefinitionFiles(out) {
+  const files = [];
+  for (const line of out.split('\n')) {
+    if (line === '' || /^\s/.test(line)) continue;
+    const m = /^\S+ \S+ {2}(\S+):\d+-\d+(?: |$)/.exec(line);
+    if (!m) return null;
+    files.push(m[1]);
+  }
+  return files.length ? files : null;
+}
+
+/** Whether a root-relative file lies under a grep path ('' = the whole root). */
+function pathWithin(file, within) {
+  const w = within.replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+  return w === '' || w === '.' || file === w || file.startsWith(w + '/');
+}
+
 function runShowAnswer(opts = {}) {
   const {
     cwd,
     symbols,
+    // A grep path the answer must stay inside (D#125 #2): `show` prints every
+    // same-named definition in the project. Each symbol then re-runs as a plain
+    // `show` when all its definitions lie inside, as `show --file F` when the
+    // ones inside are all in F, and not at all when none are; definitions
+    // inside several files with more outside have no scoped equivalent, and
+    // the whole answer is refused. undefined: unscoped, as before.
+    within,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxBytes = DEFAULT_MAX_BYTES,
   } = opts;
@@ -365,6 +395,8 @@ function runShowAnswer(opts = {}) {
     // Which symbols actually resolved — the rewrite re-runs exactly these, so a
     // symbol that printed nothing here cannot turn into an exit-1 in the Bash call.
     const resolved = [];
+    // The argv that re-runs each resolved symbol, scoped when `within` is set.
+    const argvs = [];
     for (const sym of symbols.slice(0, 3)) {
       if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
       const res = runCg(binary, ['show', sym], { cwd, timeoutMs });
@@ -383,12 +415,24 @@ function runShowAnswer(opts = {}) {
       if (classifyRun(res, { exitOneIsNoHits: false }) !== 'ok') continue;
       const out = (res.stdout || '').trim();
       if (isEmptyAnswer(out)) continue;
-      parts.push(`$ code-graph-mcp show ${sym}\n${out}`);
+      let argv = ['show', sym];
+      if (within !== undefined) {
+        const files = showDefinitionFiles(out);
+        if (!files) return { status: 'unavailable', reason: 'scope' };
+        const inside = [...new Set(files.filter((f) => pathWithin(f, within)))];
+        if (inside.length === 0) continue;
+        if (files.some((f) => !pathWithin(f, within))) {
+          if (inside.length !== 1) return { status: 'unavailable', reason: 'scope' };
+          argv = ['show', sym, '--file', inside[0]];
+        }
+      }
+      parts.push(`$ code-graph-mcp ${argv.join(' ')}\n${out}`);
       resolved.push(sym);
+      argvs.push(argv);
     }
     if (parts.length === 0) return { status: 'no-hits' };
     const { text, truncated } = truncateAtLine(parts.join('\n\n'), maxBytes);
-    return { status: 'hits', text, truncated, symbols: resolved };
+    return { status: 'hits', text, truncated, symbols: resolved, argvs };
   } catch {
     return { status: 'unavailable' };
   }

@@ -52,6 +52,7 @@ const {
   operandMatches,
   firstShellClause,
   normalizeCommandPaths,
+  patternHoldsRoot,
   rebaseRelativePaths,
   resolveProjectRoot,
 } = require('./pre-grep-guide');
@@ -288,6 +289,8 @@ function runMain() {
   if (segCwd === null) return;
   if ((segCwd !== root || relPrefix)
       && !operandMatches(firstShellClause(rawSegs[idx]), extractSearchPath(segment), root, segCwd)) return;
+  // D#125 #1 — the root strip rewrote a pattern that held the root.
+  if (patternHoldsRoot(rawSegs[idx], root)) return;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
   // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they

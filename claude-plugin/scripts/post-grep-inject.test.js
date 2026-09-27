@@ -1057,3 +1057,24 @@ test('e2e D#66: a grep after a heredoc is found, whatever the body quotes', () =
     cleanupFixture(fixture, cmd);
   }
 });
+
+// D#125 #1: the root strip rewrote a pattern holding the project root, and the
+// inject answered the stripped pattern.
+test('e2e: a pattern holding the project root is not answered', (t) => {
+  const uniq = `InjRootPat${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:1  hit\\n');`);
+  const root = fs.realpathSync(fixture.dir);
+  const cmd = `echo x && grep -rn "${root}/${uniq}" src/`;
+  const control = `echo x && grep -rn "${uniq}" "${root}/src/"`;
+  try {
+    const res = runHook(cmd, fixture, {}, root, '');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), '', `must not inject: ${res.stdout}`);
+    // Control: a quoted path under the root is still answered.
+    const ok = runHook(control, fixture, {}, root, '');
+    assert.match(JSON.parse(ok.stdout).hookSpecificOutput.additionalContext, /src\/foo\.rs/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+    cleanupFixture(fixture, control);
+  }
+});

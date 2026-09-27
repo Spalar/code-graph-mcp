@@ -3013,7 +3013,9 @@ const BARE_DIR_SHAPES = [
   // L2: a bare prefix word as a flag VALUE must not steal the scope from `src/`
   { cmd: 'rg -t cmd "Foo_bar" src/', hint: true, rewrite: 'src/' },
   { cmd: 'rg -g tests "Foo_bar" src/', hint: true, rewrite: 'src/' },
-  { cmd: 'grep --include lib "Foo_bar" src/', hint: true, rewrite: 'src/' },
+  { cmd: 'grep -r --include lib "Foo_bar" src/', hint: true, rewrite: 'src/' },
+  // D#125 #3: without -r a plain grep searches no directory ("Is a directory")
+  { cmd: 'grep --include lib "Foo_bar" src/', hint: true, rewrite: null },
   // round 2: a config-file filter peels off, and the bare dir must still count
   { cmd: 'grep -rn --include=*.json "Foo_bar" src', hint: true, rewrite: 'src' },
   // round 2 C: main answered this with the PATTERN as the scope; now two paths → hint only
@@ -3464,4 +3466,127 @@ test('splitTopLevelSegments: a long command full of mid-word # stays linear', ()
   // A line continuation joins `a` and `#b` into one word: no comment.
   assert.deepEqual(splitTopLevelSegments('echo a\\\n#b; grep x src/'), ['echo a#b', 'grep x src/']);
   assert.deepEqual(splitTopLevelSegments('echo a \\\n#b; grep x src/'), ['echo a']);
+});
+
+// ── D#125 #1: the root strip must not rewrite the PATTERN ────────────
+test('e2e: a pattern holding the project root runs as typed, not as the stripped pattern', () => {
+  // normalizeCommandPaths strips `<root>/` everywhere. `grep -rn "<root>/Foo" src/`
+  // searches the literal text `<root>/Foo`; the rewrite searched `Foo`.
+  const uniq = `StubRootPat${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const root = fsE2e.realpathSync(fixture.dir);
+  const cmd = `grep -rn "${root}/${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture, root);
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), '', `must run as typed: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: a quoted path under the root is still stripped and answered (control)', () => {
+  const uniq = `StubRootPath${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const root = fsE2e.realpathSync(fixture.dir);
+  const cmd = `grep -rn "${uniq}" "${root}/src/"`;
+  try {
+    const rw = rewriteOf(runHook(cmd, fixture, root));
+    assert.match(rw.command, new RegExp(`grep .*${uniq}`));
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── D#125 #2: a show rewrite answers the grep's path, not the project ──
+function showStub(defs) {
+  // Prints one header + body per `file` in defs for any symbol, like `show`.
+  return `if (process.argv[2] !== 'show') process.exit(1);\n` +
+    `const defs = ${JSON.stringify(defs)};\n` +
+    `const i = process.argv.indexOf('--file');\n` +
+    `const only = i > 0 ? process.argv[i + 1] : null;\n` +
+    `for (const f of defs) { if (only && f !== only) continue;\n` +
+    `  process.stdout.write('fn ' + process.argv[3] + '  ' + f + ':1-3  ()\\n  fn body() {}\\n'); }`;
+}
+
+test('e2e: a show rewrite is scoped to the grep path: one in-scope file → --file', () => {
+  const uniq = `StubShowScope${Date.now()}`;
+  const fixture = e2eFixture(showStub(['src/b.rs', 'lib/a.rs']));
+  fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
+  const cmd = `grep -rn -A3 "fn ${uniq}" lib/`;
+  try {
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(` show ${uniq} --file lib/a\\.rs$`), rw.command);
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.match(ran, /lib\/a\.rs:1-3/);
+      assert.doesNotMatch(ran, /src\/b\.rs/);
+    }
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: a show rewrite is declined when the grep path holds none, or several files and more outside', () => {
+  const uniq = `StubShowOut${Date.now()}`;
+  const cases = [
+    [['src/b.rs'], `grep -rn -A3 "fn ${uniq}" lib/`],
+    [['lib/a.rs', 'lib/c.rs', 'src/b.rs'], `grep -rn -A3 "fn ${uniq}X" lib/`],
+  ];
+  for (const [defs, cmd] of cases) {
+    const fixture = e2eFixture(showStub(defs));
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
+    try {
+      const res = runHook(cmd, fixture);
+      assert.equal(res.status, 0, res.stderr);
+      const out = res.stdout.trim();
+      // Declined: nothing, or the plain-text FYI a fallthrough prints; never a
+      // rewrite decision.
+      assert.ok(!out.startsWith('{'), `${cmd} over ${defs}: must run as typed, got ${out}`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  }
+});
+
+test('e2e: a show rewrite whose definitions all sit in the grep path stays a plain show (control)', () => {
+  const uniq = `StubShowIn${Date.now()}`;
+  const fixture = e2eFixture(showStub(['lib/a.rs', 'lib/c.rs']));
+  fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
+  const cmd = `grep -rn -A3 "fn ${uniq}" lib/`;
+  try {
+    const rw = rewriteOf(runHook(cmd, fixture));
+    assert.match(rw.command, new RegExp(` show ${uniq}$`), rw.command);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── D#125 #6: a mid-pattern `^`/`$` is literal in BRE, an anchor in rust ──
+test('translateBreToRg: ^ and $ outside anchor positions have no translation', () => {
+  const t = (p) => translateBreToRg(`grep -rn "${p}" src/`, p);
+  assert.equal(t('getUser\\|$user_id'), null);
+  assert.equal(t('a$b'), null);
+  assert.equal(t('a^b'), null);
+  // Anchors: pattern start/end, and around a group or an alternative.
+  assert.equal(t('^foo$'), '^foo$');
+  assert.equal(t('foo$\\|^bar'), 'foo$|^bar');
+  assert.equal(t('\\(^a$\\)'), '(^a$)');
+  // Inside a bracket `^` negates and `$` is a member, as before.
+  assert.equal(t('[^$]x'), '[^$]x');
+});
+
+// ── D#125 #3: plain grep without -r does not descend into a directory ──
+test('rewritePlan: a non-recursive plain grep of a directory, or of stdin, is not reproduced', () => {
+  const dir = { isDir: () => true };
+  const file = { isDir: () => false };
+  assert.equal(rewritePlan('grep -n "Foo" src/', dir), null);
+  assert.equal(rewritePlan('grep -n "Foo"', dir), null);
+  assert.notEqual(rewritePlan('grep -rn "Foo" src/', dir), null);
+  assert.notEqual(rewritePlan('grep -Rn "Foo" src/', dir), null);
+  assert.notEqual(rewritePlan('grep --recursive -n "Foo" src/', dir), null);
+  assert.notEqual(rewritePlan('grep -n "Foo" src/a.rs', file), null);
+  // rg and ag recurse by default; git grep searches the tracked tree.
+  assert.notEqual(rewritePlan('rg -n "Foo" src/', dir), null);
+  assert.notEqual(rewritePlan('git grep -n "Foo" src/', dir), null);
 });
