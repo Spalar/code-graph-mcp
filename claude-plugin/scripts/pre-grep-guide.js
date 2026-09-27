@@ -299,6 +299,51 @@ function quotedSpans(s) {
   return spans;
 }
 
+/**
+ * The words of a shell clause, split and unquoted the way quotedSpans reads
+ * quotes: whitespace separates words only outside quotes, and adjacent quoted
+ * and bare parts join into one word (`-r"l"` is `-rl`). `startsQuoted` marks a
+ * word whose first character was a quote — an argument, never a flag, so
+ * `"-l"` searches for the string `-l`. An unterminated quote ends the scan;
+ * its text is dropped, since the shell would not run the command at all.
+ *
+ * A whitespace split read `-l` out of `grep -rn "FooBar -l x" src/` and the
+ * rewrite answered with a file list (D#62).
+ * @returns {{text: string, startsQuoted: boolean}[]}
+ */
+function clauseWords(s) {
+  const words = [];
+  if (typeof s !== 'string') return words;
+  let cur = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === ' ' || c === '\t' || c === '\n') {
+      if (cur) words.push(cur);
+      cur = null;
+      continue;
+    }
+    if (!cur) cur = { text: '', startsQuoted: c === '"' || c === "'" };
+    if (c === '\\') {
+      if (i + 1 < s.length && s[i + 1] !== '\n') cur.text += s[i + 1];
+      i++;
+      continue;
+    }
+    if (c !== '"' && c !== "'") { cur.text += c; continue; }
+    let j = i + 1;
+    for (; j < s.length && s[j] !== c; j++) {
+      if (c === '"' && s[j] === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) {
+        j++;
+        if (s[j] === '\n') continue;
+      }
+      cur.text += s[j];
+    }
+    if (j >= s.length) return words;
+    i = j;
+  }
+  if (cur) words.push(cur);
+  return words;
+}
+
 // Declaration anchors inside a pattern (`def cascade_failure|class TaskState`)
 // name the exact symbols the model wants to READ — extract them for `show`.
 const DECL_SYMBOL = /(?:fn|def|class|function|struct|impl|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
@@ -475,17 +520,20 @@ const CG_FLAG_ORDER = ['-i', '-w', '-F', '-l', '-c'];
  * file list was asked for (field report 2026-09-08).
  *
  * Scanning rules that matter: only the grep's OWN clause (a tail command's
- * `-l` is not this grep's), and a token that STARTS quoted is an argument, not
- * a flag — `grep "-l" src/` searches for the string `-l`.
+ * `-l` is not this grep's), words as the shell splits them (clauseWords — a
+ * quoted pattern holding ` -l ` is one word), and a word that STARTS quoted is
+ * an argument, not a flag — `grep "-l" src/` searches for the string `-l`.
  */
 function extractCgFlags(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
   const clause = firstShellClause(cmd);
   const isRg = RG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '');
-  const toks = clause.replace(VERB_STRIP, '').trim().split(/\s+/);
+  const words = clauseWords(clause.replace(VERB_STRIP, ''));
+  const toks = words.map((w) => (w.startsQuoted ? '' : w.text));
   const found = new Set();
   const filters = [];  // [cgFlag, value] pairs, in the order the user wrote them
-  const unquote = (s) => (s || '').replace(/^["']|["']$/g, '');
+  // A value is read from the word, whatever its quoting: `--include '*.rs'`.
+  const valueAt = (k) => (words[k] ? words[k].text : '');
   const addFilter = (flag, value) => {
     if (!value) return;
     // `-g '*.rs' -g '*.rs'` is one filter written twice; cg would honour both
@@ -494,12 +542,12 @@ function extractCgFlags(cmd) {
   };
   for (let i = 0; i < toks.length; i++) {
     const tok = toks[i];
-    if (!tok || tok[0] === '"' || tok[0] === "'" || tok[0] !== '-') continue;
+    if (!tok || tok[0] !== '-') continue;
     if (tok.startsWith('--')) {
       const eq = tok.indexOf('=');
       const name = eq === -1 ? tok : tok.slice(0, eq);
       if (CG_VALUE_FLAGS[name]) {
-        addFilter(CG_VALUE_FLAGS[name], unquote(eq === -1 ? toks[i + 1] : tok.slice(eq + 1)));
+        addFilter(CG_VALUE_FLAGS[name], eq === -1 ? valueAt(i + 1) : tok.slice(eq + 1));
         if (eq === -1) i++;  // the value was a separate token — do not rescan it
         continue;
       }
@@ -515,8 +563,8 @@ function extractCgFlags(cmd) {
       const ch = letters[k];
       if (isRg && CG_VALUE_SHORT[ch]) {
         const attached = letters.slice(k + 1);
-        addFilter(CG_VALUE_SHORT[ch], attached ? unquote(attached) : unquote(toks[i + 1]));
-        // Consume the value token so the next pass cannot read it as a flag
+        addFilter(CG_VALUE_SHORT[ch], attached || valueAt(i + 1));
+        // Consume the value word so the next pass cannot read it as a flag
         // cluster: `rg -g -i 'sym' src/` must be `-g` with value `-i`, not `-g`
         // plus a phantom `-i` (round 2 of pre-ship review — the test that named
         // this property used a quoted value, which the quote guard already
@@ -937,6 +985,9 @@ function buildRewriteContext(mode, cmdShown) {
 // `-`, and anything the tokenizer does not know — newline, `;`, `&`, `\`, `$`,
 // a backtick, parentheses, braces, `~`. Returns a plan or null.
 const WORD_CHAR = /[A-Za-z0-9_.,:@%+=/*?<>&-]/;
+function isDirectory(p) {
+  try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
 function shellWords(s) {
   const words = [];
   let cur = null;
@@ -1000,7 +1051,12 @@ function valueWordOk(w, isCount) {
   return !(w.bareSpecial);
 }
 
-function rewritePlan(cmd) {
+// `isDir(target)` answers whether the path operand is a directory. runMain asks
+// the filesystem, resolved against the root its command is relative to; the
+// default is the spelling alone (a trailing `/`, or a last segment with no
+// extension), which keeps the classifiers that call this pure.
+const looksLikeDir = (t) => t.endsWith('/') || !/\.[A-Za-z0-9]{1,6}$/.test(t);
+function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   if (!cmd || typeof cmd !== 'string' || cmd.length > 1000) return null;
   const words = shellWords(cmd);
   if (!words || words.some((w) => w.op)) return null;
@@ -1019,6 +1075,7 @@ function rewritePlan(cmd) {
   let caseFlag = false;
   let context = false;
   let endOfFlags = false;
+  let include = false;
   for (; i < words.length; i++) {
     const w = words[i];
     if (!w.anyQuoted && (w.text === '2>&1' || w.text === '2>/dev/null')) continue;
@@ -1039,6 +1096,7 @@ function rewritePlan(cmd) {
       const eq = w.text.indexOf('=');
       const name = w.text.slice(2, eq === -1 ? undefined : eq);
       if (!ALLOWED_LONG[verb].has(name)) return null;
+      if (name === 'include') include = true;
       if (VALUE_LONG.has(name) && eq === -1) {
         const v = words[++i];
         if (!valueWordOk(v, false) || (name === 'include' && v.text.startsWith('!'))) return null;
@@ -1075,10 +1133,23 @@ function rewritePlan(cmd) {
   // A `..` segment: extractSearchPath refuses to scope it, so the answer would
   // search the whole repo (round 4 M2).
   if (target && /(?:^|\/)\.\.(?:\/|$)/.test(target.text)) return null;
+  // GNU grep applies --include to a file named on the command line too, so
+  // `grep --include='*.py' X src/a.rs` finds nothing; rg — and so cg — searches
+  // a named file whatever its -g says (D#78). Equivalent only for a directory.
+  if (include && target && !isDir(target.text)) return null;
   // ag is smart-case by default: an all-lowercase pattern matches any case,
   // and cg's search is case-sensitive, so the answer would find less.
   if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(pattern.text)) return null;
   return { pattern: pattern.text, target: target ? target.text : undefined, context };
+}
+
+// Does the plan's target, run from the root, name the directory the command's
+// own operand names from the shell's cwd? The raw command is parsed with the
+// same grammar; an absolute operand resolves the same from anywhere.
+function sameScopeFromShell(rawCmd, plan, root, shellCwd) {
+  const raw = rewritePlan(rawCmd, { isDir: (t) => isDirectory(path.resolve(shellCwd, t)) });
+  if (!raw || raw.target === undefined || plan.target === undefined) return false;
+  return path.resolve(shellCwd, raw.target) === path.resolve(root, plan.target);
 }
 
 // The plan must describe the same search classifyBlock decided on. The pattern
@@ -1128,7 +1199,52 @@ function translateBreToRg(cmd, pattern) {
   if (/(?:^|\s)-[a-zA-Z]*[EP][a-zA-Z]*(?:\s|=|\d|$)|--(?:extended-regexp|perl-regexp)\b/.test(clause)) {
     return pattern;
   }
-  return pattern.replace(/\\([|(){}+?])/g, '$1');
+  return breToRustRegex(pattern);
+}
+
+// The two dialects swap these characters' roles: in a basic regex `( ) { } + ?
+// |` are literals and `\(` … `\|` the operators, in rust regex the reverse. Only
+// unescaping the operators (the translation until D#65) left the literals as
+// operators, so `tombstoneActive()` searched `tombstoneActive` and the rewrite
+// returned a superset of grep's lines. Checked against the grep Claude Code's
+// shell runs (ugrep -G): `f()`, `a+b`, `a|b`, `{x}`, `a?` match only literally.
+//
+// A bracket expression is copied as written. Inside one, BRE has no escapes and
+// rust has escapes, `[` nesting and the `&&` `--` `~~` set operators, so a
+// bracket holding any of those means different things in the two; that pattern
+// is untranslatable and the result is null — the caller lets the grep run.
+// (`[:alpha:]` is a POSIX class in both and is kept.)
+const BRE_SWAPPED = '(){}+?|';
+function breToRustRegex(pattern) {
+  let out = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '\\' && i + 1 < pattern.length) {
+      const n = pattern[++i];
+      out += BRE_SWAPPED.includes(n) ? n : c + n;
+      continue;
+    }
+    if (BRE_SWAPPED.includes(c)) { out += '\\' + c; continue; }
+    if (c !== '[') { out += c; continue; }
+    // `]` right after `[` or `[^` is a member, not the end.
+    let j = i + 1;
+    if (pattern[j] === '^') j++;
+    if (pattern[j] === ']') j++;
+    for (; j < pattern.length && pattern[j] !== ']'; j++) {
+      if (pattern[j] === '[' && pattern[j + 1] === ':') {
+        const close = pattern.indexOf(':]', j + 2);
+        if (close === -1) return null;
+        j = close + 1;
+        continue;
+      }
+      if (pattern[j] === '\\' || pattern[j] === '[') return null;
+      if ('&-~'.includes(pattern[j]) && pattern[j + 1] === pattern[j]) return null;
+    }
+    if (j >= pattern.length) return null;  // unterminated: grep reports an error
+    out += pattern.slice(i, j + 1);
+    i = j;
+  }
+  return out;
 }
 
 // v0.47.0 — cg grep found nothing. Regex-dialect differences (BRE `\|` vs
@@ -1334,8 +1450,17 @@ function runMain() {
   // The rewrite replaces the WHOLE command. One it cannot reproduce runs as
   // typed (see rewritePlan) — decided before the answer is spent on it. The
   // opt-in static deny keeps its own, older scope.
-  const plan = block && !isAnswerDisabled() ? rewritePlan(cmd) : null;
+  const plan = block && !isAnswerDisabled()
+    ? rewritePlan(cmd, { isDir: (t) => isDirectory(path.resolve(root, t)) })
+    : null;
   if (block && !isAnswerDisabled() && !rewriteMatchesBlock(plan, block, cmd, rawGrepPattern)) return;
+  // A pattern the dialect bridge cannot translate (null) has no equivalent search.
+  if (block && !isAnswerDisabled() && block.mode === 'grep' && grepPattern === null) return;
+  // D#76 — the rewrite searches its root-relative target from the root; the
+  // command searched its own operand from the shell's cwd. From a subdirectory
+  // the rebase moves only operands that exist there, so an operand it left
+  // alone (`src/` from `xtask/`, `tests/` from `src/`) names another directory.
+  if (plan && relPrefix && !sameScopeFromShell(rawCmd, plan, root, shellCwd)) return;
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the

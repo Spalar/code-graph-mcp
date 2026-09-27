@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### The grep rewrite runs the search the grep asked for
+
+The PreToolUse hook replaces an answerable `grep` with `code-graph-mcp grep`
+and reports it as a success. Four shapes were rewritten to a different
+search:
+
+- **A flag inside a quoted pattern.** `grep -rn "FooBar -l x" src/` was
+  rewritten with `-l` and answered with a file list: flags were read from a
+  whitespace split. Words are now split the way the shell splits them. In this
+  machine's session logs, 10 of 1,829 commands the PostToolUse inject folds
+  carried such a phantom flag (`"…running as root"` read as `-i`).
+- **Bare `( ) { } + ? |` in a basic regex.** grep reads them as literals and
+  rust regex as operators, so `grep "tombstoneActive()"` matched every
+  `tombstoneActive`. They are now escaped. A bracket expression the two
+  dialects read differently (`[\(]`, `[a&&b]`) is not rewritten.
+- **`--include` with a file operand.** GNU grep filters a named file by the
+  glob; cg searches it anyway. Rewritten only for a directory now.
+- **A relative path from a subdirectory shell that the rebase left alone.**
+  From `xtask/`, `grep -rn X src/` was rewritten to search the root's `src/`.
+  The rewrite now requires the operand to name the same directory from the
+  shell as its root-relative form names from the root.
+
+Each shape now runs as typed. Over 16,352 grep commands from this machine's
+session logs, the old and new hook rewrite the same 42 commands; 9 of those
+now search a literal paren or brace.
+
 ## 0.159.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

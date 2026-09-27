@@ -1852,6 +1852,8 @@ test('e2e: a `-F` sitting in a VALUE position does not trigger the literal guard
   const fixture = e2eFixture(ARGV_STUB);
   const cmd = `grep -rn --include -F "${uniq}\\|other_symbol" src/`;
   try {
+    // A filename filter is equivalent only for a directory target (D#78).
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
     const rw = rewriteOf(runHook(cmd, fixture));
     // -F is --include's value here, so the BRE unescape MUST still run.
     assert.ok(rw.command.endsWith(` grep -m 0 -g -F '${uniq}|other_symbol' src/`),
@@ -3109,5 +3111,186 @@ test('e2e D#73: a bare dir from the project root is rewritten to the same dir', 
     if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 ${uniq} src`);
   } finally {
     cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── Rewrite equivalence leftovers (D#62, D#65, D#78, D#76) ────────────────
+// Each shape below was a rewrite that reported success while the replacement
+// did not search what the command asked for.
+
+// D#62 — a flag spelled inside a quoted pattern is part of the pattern. The
+// whitespace split read `-l` out of `"FooBar -l x"`, so the rewrite answered
+// with a file list.
+test('extractCgFlags: a flag-shaped word inside a quoted pattern is not a flag', () => {
+  assert.deepEqual(extractCgFlags('grep -rn "FooBar -l x" src/'), []);
+  assert.deepEqual(extractCgFlags("grep -rn 'FooBar -c --include=x' src/"), []);
+  assert.deepEqual(extractCgFlags('grep -rni "FooBar -l x" src/'), ['-i'], 'the real flag survives');
+  // A quoted value that holds a space is still ONE value.
+  assert.deepEqual(extractCgFlags(`rg -g 'a b/*.rs' "some_symbol" src/`), ['-g', 'a b/*.rs']);
+  // Concatenated quoting spells one word, as the shell reads it.
+  assert.deepEqual(extractCgFlags(`grep -r"l" "some_symbol" src/`), ['-l']);
+});
+
+test('e2e D#62: the rewrite of a pattern holding " -l " runs no -l', () => {
+  const uniq = `flag_in_pat_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write(JSON.stringify(process.argv.slice(2)) + '\\n');`);
+  const cmd = `grep -rn "${uniq}Foo -l x" src/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    const rw = rewriteOf(runHook(cmd, fixture));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.deepEqual(JSON.parse(ran.trim()), ['grep', '-m', '0', `${uniq}Foo -l x`, 'src/']);
+    }
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#65 — in a basic regex `( ) { } + ? |` are literal characters and only
+// their backslashed forms are operators; rust regex reads them the other way
+// round. Checked against the grep Claude Code's shell runs (ugrep -G): `f()`,
+// `a+b`, `a|b`, `{x}`, `a?` each match only their literal text.
+test('translateBreToRg: bare BRE metacharacters are escaped, escaped ones unescaped', () => {
+  const t = (p) => translateBreToRg(`grep -rn "${p}" src/`, p);
+  assert.equal(t('tombstoneActive()'), 'tombstoneActive\\(\\)');
+  assert.equal(t('a+b'), 'a\\+b');
+  assert.equal(t('a|b'), 'a\\|b');
+  assert.equal(t('{x}'), '\\{x\\}');
+  assert.equal(t('a?'), 'a\\?');
+  assert.equal(t('a\\|b'), 'a|b');
+  assert.equal(t('fn \\(x\\)\\+'), 'fn (x)+');
+  assert.equal(t('x\\{2\\}'), 'x{2}');
+  // Other escapes are the same in both dialects and pass through.
+  assert.equal(t('\\bFoo\\.bar'), '\\bFoo\\.bar');
+  // A bracket expression is literal in both dialects for these characters.
+  assert.equal(t('[(|)]Foo'), '[(|)]Foo');
+});
+
+test('translateBreToRg: a bracket expression rust would read differently is untranslatable', () => {
+  const t = (p) => translateBreToRg(`grep -rn "${p}" src/`, p);
+  // BRE: `[\(]` is `\` or `(`; rust: `(` alone. BRE `[a&&b]` is a set of three;
+  // rust reads `&&` as intersection.
+  assert.equal(t('Foo[\\(]'), null);
+  assert.equal(t('Foo[a&&b]'), null);
+  assert.equal(t('Foo[a~~b]'), null);
+  assert.equal(t('Foo[[x]'), null);
+  assert.equal(t('Foo[[:alpha:]]'), 'Foo[[:alpha:]]', 'a POSIX class means the same in both');
+  // The extended dialects are not translated at all.
+  assert.equal(translateBreToRg('grep -rnE "Foo[\\(]" src/', 'Foo[\\(]'), 'Foo[\\(]');
+});
+
+test('e2e D#65: a BRE pattern with bare parens is searched literally', () => {
+  const uniq = `bre_paren_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write(JSON.stringify(process.argv.slice(2)) + '\\n');`);
+  const cmd = `grep -rn "${uniq}Active()" src/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    const rw = rewriteOf(runHook(cmd, fixture));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) {
+      assert.deepEqual(JSON.parse(ran.trim()), ['grep', '-m', '0', `${uniq}Active\\(\\)`, 'src/']);
+    }
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#65: an untranslatable bracket runs as typed', () => {
+  const uniq = `bre_bracket_${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('never called\\n');`);
+  const cmd = `grep -rn "${uniq}Foo[\\(]" src/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0, res.stderr);
+    assert.doesNotMatch(res.stdout, /updatedInput/, `must not be rewritten: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#78 — GNU grep applies --include to a file named on the command line; rg
+// (and so cg) searches a named file whatever -g says. Equivalent only when the
+// target is a directory.
+test('rewritePlan: --include with a FILE target is not reproducible', () => {
+  const isDir = (t) => t.replace(/\/$/, '') === 'src';
+  assert.equal(rewritePlan(`grep -rn --include='*.py' "FooBar" ./src/a.rs`, { isDir }), null);
+  assert.equal(rewritePlan(`grep -rn --include '*.py' "FooBar" src/a.rs`, { isDir }), null);
+  assert.notEqual(rewritePlan(`grep -rn --include='*.py' "FooBar" src/`, { isDir }), null);
+  assert.notEqual(rewritePlan(`grep -rn --include='*.py' "FooBar" src`, { isDir }), null);
+  // No filter: a file target is fine.
+  assert.notEqual(rewritePlan(`grep -rn "FooBar" ./src/a.rs`, { isDir }), null);
+  // rg ignores -g for a named file exactly as cg does.
+  assert.notEqual(rewritePlan(`rg -g '*.py' "FooBar" ./src/a.rs`, { isDir }), null);
+});
+
+test('e2e D#78: --include with a file target runs as typed', () => {
+  const uniq = `incl_file_${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('never called\\n');`);
+  const cmd = `grep -rn --include='*.py' "${uniq}Foo" src/a.rs`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'a.rs'), '');
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0, res.stderr);
+    assert.doesNotMatch(res.stdout, /updatedInput/, `must not be rewritten: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#76 — from a subdirectory shell a relative operand the rebase did not move
+// names `<cwd>/src/`, and the root-relative rewrite would search the root's.
+test('e2e D#76: a slash-form dir the rebase left alone in a subdir shell runs as typed', () => {
+  const uniq = `slash_sub_${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('never called\\n');`);
+  const cmd = `grep -rn "${uniq}Foo" src/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+    const res = runHook(cmd, fixture, pathE2e.join(fixture.dir, 'xtask'));
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout, '', `a subdir src/ must not be rewritten to the root's: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: from a source subdir, an operand that does not exist there is not the root\'s', () => {
+  const uniq = `slash_src_${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('never called\\n');`);
+  const cmd = `grep -rn "${uniq}Foo" tests/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'tests'), { recursive: true });
+    const res = runHook(cmd, fixture, pathE2e.join(fixture.dir, 'src'));
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout, '', `src/tests does not exist; the root's tests/ is another dir: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: an absolute path from a subdir shell still rewrites to that path', () => {
+  const uniq = `slash_abs_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('args=' + process.argv.slice(2).join(' ') + '\\n');`);
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+    const real = fsE2e.realpathSync(fixture.dir);
+    const cmd = `grep -rn "${uniq}Foo" ${real}/src/`;
+    try {
+      const rw = rewriteOf(runHook(cmd, fixture, pathE2e.join(real, 'xtask')));
+      const ran = runRewrite(rw, pathE2e.join(real, 'xtask'));
+      if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 ${uniq}Foo src/`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
