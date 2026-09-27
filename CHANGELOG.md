@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.159.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 74 → 79 because the fixes below change which `calls` and
