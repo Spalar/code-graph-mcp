@@ -417,20 +417,6 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 } else {
                     metadata
                 };
-                // `b()` through `import { a as b }` calls the export `a`.
-                let (callee, metadata) = match js_renamed_import(node, source, ctx.config.name) {
-                    Some((export, spec)) => (
-                        export,
-                        Some(
-                            serde_json::json!({
-                                "q": crate::domain::CALL_Q_IMPORT,
-                                "js_module": spec,
-                            })
-                            .to_string(),
-                        ),
-                    ),
-                    None => (callee, metadata),
-                };
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,
@@ -442,22 +428,6 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             }
         }
     }
-}
-
-/// The export and specifier of a JS/TS bare call's renamed import, if its
-/// callee is one ([`super::member::js_import_alias`]).
-fn js_renamed_import(
-    call: tree_sitter::Node,
-    source: &str,
-    family: &str,
-) -> Option<(String, String)> {
-    if !matches!(family, "javascript" | "typescript" | "tsx") {
-        return None;
-    }
-    let function = call.child_by_field_name("function")?;
-    (function.kind() == "identifier")
-        .then(|| super::member::js_import_alias(node_text(&function, source)))
-        .flatten()
 }
 
 /// `metadata` with `"n"`: the arguments `call` passes. Comments and attributes

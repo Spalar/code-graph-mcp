@@ -30,27 +30,15 @@ thread_local! {
     /// a JS import / `require` names (`'express'`, `'./x'`); None for a Python
     /// relative import.
     static IMPORT_BOUND: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
-    /// JS/TS names the current file binds to another name's export:
-    /// `import { a as b } from 's'` and `const { a: b } = require('s')` map `b`
-    /// to (`a`, `s`). Per file, with `IMPORT_BOUND`.
-    static IMPORT_ALIAS: RefCell<HashMap<String, (String, String)>> = RefCell::new(HashMap::new());
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
 pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: &str) {
     let mut names = HashMap::new();
-    let mut aliases = HashMap::new();
     if matches!(family, "python" | "javascript" | "typescript" | "tsx") {
-        collect(root, source, family, &mut names, &mut aliases, 0);
+        collect(root, source, family, &mut names, 0);
     }
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
-    IMPORT_ALIAS.with(|a| *a.borrow_mut() = aliases);
-}
-
-/// The export and module specifier a JS/TS local name is a renamed import of
-/// (`b` in `import { a as b } from './x'` → (`a`, `./x`)).
-pub(super) fn js_import_alias(name: &str) -> Option<(String, String)> {
-    IMPORT_ALIAS.with(|a| a.borrow().get(name).cloned())
 }
 
 fn collect(
@@ -58,7 +46,6 @@ fn collect(
     source: &str,
     family: &str,
     out: &mut HashMap<String, Option<String>>,
-    aliases: &mut HashMap<String, (String, String)>,
     depth: usize,
 ) {
     if depth > 256 {
@@ -108,17 +95,11 @@ fn collect(
             }
         }
         (_, "import_specifier") => {
-            let spec = js_import_specifier(node, source);
-            let name = node.child_by_field_name("name");
-            if let Some(n) = node.child_by_field_name("alias").or(name) {
-                out.insert(text(n), spec.clone());
-            }
-            if let (Some(alias), Some(name), Some(spec)) =
-                (node.child_by_field_name("alias"), name, spec)
+            if let Some(n) = node
+                .child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
             {
-                if name.kind() == "identifier" && text(name) != text(alias) {
-                    aliases.insert(text(alias), (text(name), spec));
-                }
+                out.insert(text(n), js_import_specifier(node, source));
             }
             return;
         }
@@ -139,9 +120,6 @@ fn collect(
                                 .to_string()
                         });
                     bind_pattern(name, source, &spec, out);
-                    if let Some(spec) = spec.as_deref() {
-                        collect_require_aliases(name, source, spec, aliases);
-                    }
                 }
             }
         }
@@ -149,41 +127,7 @@ fn collect(
     }
     for i in 0..node.named_child_count() {
         if let Some(c) = node.named_child(i) {
-            collect(c, source, family, out, aliases, depth + 1);
-        }
-    }
-}
-
-/// The renamed properties of `const { a: b } = require('s')`: `b` → (`a`, `s`).
-/// Only the top level of the pattern: `{ a: { c } }` binds `c` from a property
-/// of `a`, not an export.
-fn collect_require_aliases(
-    pattern: tree_sitter::Node,
-    source: &str,
-    spec: &str,
-    aliases: &mut HashMap<String, (String, String)>,
-) {
-    if pattern.kind() != "object_pattern" {
-        return;
-    }
-    for i in 0..pattern.named_child_count() {
-        let Some(pair) = pattern
-            .named_child(i)
-            .filter(|c| c.kind() == "pair_pattern")
-        else {
-            continue;
-        };
-        let (Some(key), Some(value)) = (
-            pair.child_by_field_name("key"),
-            pair.child_by_field_name("value"),
-        ) else {
-            continue;
-        };
-        if key.kind() == "property_identifier" && value.kind() == "identifier" {
-            let (key, value) = (node_text(&key, source), node_text(&value, source));
-            if key != value {
-                aliases.insert(value.to_string(), (key.to_string(), spec.to_string()));
-            }
+            collect(c, source, family, out, depth + 1);
         }
     }
 }

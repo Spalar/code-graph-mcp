@@ -123,11 +123,6 @@ pub fn is_external_import_meta(metadata: Option<&str>) -> bool {
 /// untyped member resolution — so the edge is classified like one.
 pub const CALL_META_MEMBER: &str = r#"{"q":"member"}"#;
 
-/// Call `q` of a JS/TS call through a renamed import (`import { a as b }`,
-/// `const { a: b } = require()`): the call is recorded as `a` with the import's
-/// `js_module`, and binds only the `a` in the file that specifier names.
-pub const CALL_Q_IMPORT: &str = "imp";
-
 // -- Import `q` markers --
 //
 // Stamped onto an import relation's metadata by the parser and read back in
@@ -373,7 +368,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 83; // v83 (2026-09-27, D#113): a JS/TS call through a renamed import (`import { a as b }`, `const { a: b } = require()`) is recorded as a call of the export `a` stamped `{"q":"imp","js_module":spec}` and binds only the `a` in the file that specifier names — before, `b()` named no node and bound nothing, or another file's `b`. // v82 (2026-09-27, D#112): a qualified Rust call records its argument count (`"n"` in its metadata) and binds only a function taking that many, less `self` for a method call — Rust has no overloading, default or variadic parameters, and an atomic's `.load(Ordering::Acquire)` bound `ProjectClassNames::load(&mut self, db, candidates)`. // Older entries (v81 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 84; // v84 (2026-09-27): withdraws v83 (D#113, a JS/TS call through a renamed import bound as a call of the export): the pre-release review found it binding by name on the pending sweep and diverging incremental vs rebuild, so those calls are extracted as before (bare, unbound) and an index a v83 dev build wrote is rebuilt. // v82 (2026-09-27, D#112): a qualified Rust call records its argument count (`"n"` in its metadata) and binds only a function taking that many, less `self` for a method call — Rust has no overloading, default or variadic parameters, and an atomic's `.load(Ordering::Acquire)` bound `ProjectClassNames::load(&mut self, db, candidates)`. // Older entries (v81 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before

@@ -3,8 +3,8 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 79 → 83 because the fixes below change which `calls` and
-`imports` edges a file produces. An older binary leaves a v83 index
+`INDEX_VERSION` goes 79 → 82 because the three Rust fixes below change which
+`calls` and `imports` edges a file produces. An older binary leaves a v82 index
 intact and warns instead of rebuilding it; delete `.code-graph/index.db*` after
 pinning back.
 
@@ -74,23 +74,6 @@ tokio is the first outside Rust project the Rust fixes above were scored on
 745); recall at the default floor 3,660 → 3,787. Its index holds 4,014 fewer
 edges. The inferred-tier precision is still far below this repo's 99.8%: see
 Not covered.
-
-### A call through a renamed JavaScript import binds the export
-
-`import { load as loadModel } from './model'` and
-`const { clearCache: clearBinaryCache } = require('./find-binary')` bind a
-local name the exporting file never defines, so a call `loadModel()` bound
-nothing — or another file's function of that name. It now binds the export
-(`load`, `clearCache`) in the file the specifier names, and nothing else: not
-a same-file function of the export's name, which is usually why the import
-was renamed, and nothing at all for a package's export
-(`import { resolve as resolvePath } from 'path'` no longer binds a project
-`resolvePath`).
-
-SCIP oracle on this repo's JavaScript (same snapshot, gold 1,337 call pairs):
-recall at the default floor 1,331 → 1,335, inferred precision 100% before and
-after; the four calls it adds are the four this repo had
-(`doctor.js` ×3, `auto-update.js`). Rust and Python scores are unchanged.
 
 ### The grep rewrite runs the search the grep asked for
 
@@ -166,9 +149,6 @@ counts as the flag.
   anchored), and `tokio::spawn()` / `spawn()` binding an associated function
   `Command::spawn(&mut self)` / `Handle::spawn(me, future, id)` that no such
   call can reach.
-- A renamed import of a re-export (`import { a as b } from './index'`, where
-  `index.js` re-exports `a` from another file) binds nothing, and neither does
-  `new B()` through `import { A as B }`.
 - A grep that may not have run (`true || grep …`) is still answered by the
   inject when its output is empty.
 - The inject does not apply the `--include`-with-a-file rule, and forwards no
