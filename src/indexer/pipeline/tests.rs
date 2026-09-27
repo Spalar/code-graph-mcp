@@ -3303,6 +3303,33 @@ fn test_rust_module_path_call_never_reaches_a_method() {
     );
 }
 
+/// Pre-release review F4: `self.f()` in a trait's default method is a method
+/// call. Outside an `impl` it was downgraded to a bare call, which the D#71
+/// rule then let bind only functions NOT taking `self` — the correct
+/// `Greeter::label` was dropped for another file's free `label()`.
+#[test]
+fn test_rust_self_call_in_a_trait_default_method_binds_the_method() {
+    let files: &[(&str, &str)] = &[
+        (
+            "greet.rs",
+            "pub trait Greeter {\n    fn label(&self) -> String { String::new() }\n    \
+             fn greet(&self) -> String { self.label() }\n}\n",
+        ),
+        ("free.rs", "pub fn label() -> String { String::new() }\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let from_greet: Vec<&String> = edges
+        .iter()
+        .filter(|e| e.starts_with("greet.rs.greet --calls-->"))
+        .collect();
+    assert_eq!(
+        from_greet,
+        vec!["greet.rs.greet --calls--> greet.rs.label"],
+        "{edges:#?}"
+    );
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs

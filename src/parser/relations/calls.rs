@@ -359,8 +359,13 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         | helpers::CalleeQualifier::SelfType(t) => {
                             if let Some(impl_type) = ctx.current_rust_impl {
                                 *t = impl_type.to_string();
+                            } else if matches!(qualifier, helpers::CalleeQualifier::SelfRecv(_)) {
+                                // `self.f()` outside an impl (a trait's default
+                                // method) is still a method call: as a bare call it
+                                // could bind only a function not taking `self`.
+                                qualifier = helpers::CalleeQualifier::Member;
                             } else {
-                                // self/Self called outside an impl block — drop qualifier (Bare).
+                                // `Self::f()` outside an impl block — drop qualifier (Bare).
                                 qualifier = helpers::CalleeQualifier::Bare;
                             }
                         }
