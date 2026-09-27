@@ -282,9 +282,9 @@ struct FileParsed {
     // 1-based (start, end) lines parallel to node_ids: a relation's source_line
     // picks among same-named source nodes by containment.
     node_lines: Vec<(u32, u32)>,
-    // Rust function id → whether it takes `self`, for this file's functions:
-    // the batch-time half of `resolve::rust_call_shape_admits`.
-    rust_takes_self: HashMap<i64, bool>,
+    // Rust function id → its parameters, for this file's functions: the
+    // batch-time half of `resolve::rust_call_shape_admits`.
+    rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape>,
 }
 
 impl FileParsed {
@@ -297,9 +297,9 @@ impl FileParsed {
             return;
         }
         candidates.retain(|id| {
-            self.rust_takes_self
-                .get(id)
-                .is_none_or(|&t| super::resolve::rust_call_shape_admits(rel.metadata.as_deref(), t))
+            self.rust_fn_shapes.get(id).is_none_or(|&shape| {
+                super::resolve::rust_call_shape_admits(rel.metadata.as_deref(), shape)
+            })
         });
     }
 }
@@ -701,7 +701,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
-        let mut rust_takes_self: HashMap<i64, bool> = HashMap::new();
+        let mut rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape> = HashMap::new();
 
         let module_node_id = insert_node_cached(
             db.conn(),
@@ -757,11 +757,9 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_types.push(pn.node_type.clone());
             node_lines.push((pn.start_line, pn.end_line));
             if pp.language == "rust" && pn.node_type == "function" {
-                rust_takes_self.insert(
+                rust_fn_shapes.insert(
                     node_id,
-                    pn.signature
-                        .as_deref()
-                        .is_some_and(super::resolve::rust_signature_takes_self),
+                    super::resolve::rust_fn_shape(pn.signature.as_deref()),
                 );
             }
             nodes_created += 1;
@@ -778,7 +776,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_qualified_names,
             node_types,
             node_lines,
-            rust_takes_self,
+            rust_fn_shapes,
         });
     }
 
@@ -3073,9 +3071,9 @@ fn restore_inbound_edges(
 
         // A call is restored only onto a function its syntax can reach, as a
         // fresh resolution would bind it (`resolve::rust_call_shape_admits`).
-        let rust_takes_self: HashMap<i64, bool> = batch_parsed
+        let rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape> = batch_parsed
             .iter()
-            .flat_map(|pf| pf.rust_takes_self.iter().map(|(id, t)| (*id, *t)))
+            .flat_map(|pf| pf.rust_fn_shapes.iter().map(|(id, t)| (*id, *t)))
             .collect();
 
         // Memoized source-file lookup for the requeue path below.
@@ -3121,8 +3119,11 @@ fn restore_inbound_edges(
                         .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
                         .filter(|(id, _, _)| {
                             relation.as_str() != REL_CALLS
-                                || rust_takes_self.get(id).is_none_or(|&t| {
-                                    super::resolve::rust_call_shape_admits(metadata.as_deref(), t)
+                                || rust_fn_shapes.get(id).is_none_or(|&shape| {
+                                    super::resolve::rust_call_shape_admits(
+                                        metadata.as_deref(),
+                                        shape,
+                                    )
                                 })
                         })
                         .map(|(id, _, _)| *id)

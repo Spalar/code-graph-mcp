@@ -3,8 +3,8 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 79 → 81 because the two Rust fixes below change which
-`calls` and `imports` edges a file produces. An older binary leaves a v81 index
+`INDEX_VERSION` goes 79 → 82 because the three Rust fixes below change which
+`calls` and `imports` edges a file produces. An older binary leaves a v82 index
 intact and warns instead of rebuilding it; delete `.code-graph/index.db*` after
 pinning back.
 
@@ -40,6 +40,24 @@ at a crate name.
 On the same oracle snapshot, after the fix above: inferred-tier wrong edges
 18 → 8, recall at the default floor 6,810 → 6,813. JavaScript and Python
 scores are unchanged.
+
+### A Rust call binds only a function taking as many arguments as it passes
+
+Rust has no overloading, default or variadic parameters, so a call passing two
+arguments cannot run a function taking three. Resolution by name did not
+check: an atomic's `.load(Ordering::Acquire)` bound the project's
+`ProjectClassNames::load(&mut self, db, candidates)` from ten callers, and
+`super::resolve::member_call_candidates(meta, ids, db)` also bound the
+same-named method, which takes `self` besides those three. A method call or a
+path call (`T::f()`, `self.f()`, `x.f()`, `a.b().f()`) now carries its
+argument count and binds only a function taking that many, less `self` for a
+method call; a path call `T::f(x, a)` passes `self` itself. A bare `f(a)` is
+not checked, and neither is a function whose parameter count its signature
+does not fix (a `#[cfg]`'d parameter, C variadics).
+
+On the oracle snapshot of the commit before this one (gold 7,126 call pairs):
+wrong edges 35 → 24 (ambiguous 11 → 1, inferred 7 → 6), correct edges 6,844
+before and after, no edge added.
 
 ### The grep rewrite runs the search the grep asked for
 
@@ -104,6 +122,11 @@ counts as the flag.
 
 ### Not covered
 
+- 22 of the 24 Rust wrong edges left on that snapshot need the receiver's
+  type, which the source does not write down: `n.name.as_str()` on a closure
+  parameter binds a project enum's `as_str`, and `tx.commit()` on a
+  `rusqlite` transaction binds the project's savepoint `commit`. The other
+  two are a `#[cfg]` twin and a caller whose stored body is truncated.
 - A grep that may not have run (`true || grep …`) is still answered by the
   inject when its output is empty.
 - The inject does not apply the `--include`-with-a-file rule, and forwards no

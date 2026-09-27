@@ -409,6 +409,14 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 } else {
                     serialize_callee_qualifier(&qualifier)
                 };
+                // A qualified Rust call carries its argument count: with no
+                // overloading, default or variadic parameters, it reaches only a
+                // function taking that many (`resolve::rust_call_shape_admits`).
+                let metadata = if ctx.language == "rust" {
+                    metadata.map(|m| with_rust_arity(m, node))
+                } else {
+                    metadata
+                };
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,
@@ -420,6 +428,23 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             }
         }
     }
+}
+
+/// `metadata` with `"n"`: the arguments `call` passes. Comments and attributes
+/// in the list are not arguments.
+fn with_rust_arity(metadata: String, call: tree_sitter::Node) -> String {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return metadata;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    let n = (0..args.named_child_count())
+        .filter_map(|i| args.named_child(i))
+        .filter(|a| !a.is_extra() && a.kind() != "attribute_item")
+        .count();
+    map.insert("n".into(), n.into());
+    serde_json::Value::Object(map).to_string()
 }
 
 /// Metadata of a C++ call through a scope (`DB::Put()`, `ns::f<T>()`).

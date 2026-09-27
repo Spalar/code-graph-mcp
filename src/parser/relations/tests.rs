@@ -3704,7 +3704,7 @@ fn test_rust_callee_path_qualifier_strips_crate() {
         .expect("missing call to create");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"snapshot"}"#),
+        Some(r#"{"n":0,"q":"path","v":"snapshot"}"#),
         "metadata should encode Path qualifier with crate stripped"
     );
 }
@@ -3720,7 +3720,7 @@ fn test_rust_callee_type_method_call_path() {
         .expect("missing call to create");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"File"}"#),
+        Some(r#"{"n":1,"q":"path","v":"File"}"#),
         "single-segment Path with non-reserved name should be preserved"
     );
 }
@@ -3752,7 +3752,7 @@ fn test_rust_callee_super_prefix_stripped() {
         .expect("missing call to foo");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"sibling"}"#),
+        Some(r#"{"n":0,"q":"path","v":"sibling"}"#),
     );
 }
 
@@ -3766,7 +3766,7 @@ fn test_rust_callee_multi_segment_path_preserved() {
         .expect("missing call to deep");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"a::b::c"}"#),
+        Some(r#"{"n":0,"q":"path","v":"a::b::c"}"#),
     );
 }
 
@@ -3796,7 +3796,7 @@ fn test_rust_callee_obj_method_receiver_qualifier() {
         .expect("missing call to exists");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"recv","v":"p"}"#),
+        Some(r#"{"n":0,"q":"recv","v":"p"}"#),
         "obj.method() where obj is a plain identifier emits Receiver qualifier"
     );
 }
@@ -3815,7 +3815,7 @@ fn test_rust_callee_builder_chain_qualifier() {
         .expect("missing call to new");
     assert_eq!(
         new_call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"OpenOptions"}"#),
+        Some(r#"{"n":0,"q":"path","v":"OpenOptions"}"#),
     );
 
     // .create(true) — receiver is call_expression → Chain
@@ -3823,14 +3823,20 @@ fn test_rust_callee_builder_chain_qualifier() {
         .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "create")
         .expect("missing call to create");
-    assert_eq!(create_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
+    assert_eq!(
+        create_call.metadata.as_deref(),
+        Some(r#"{"n":1,"q":"chain"}"#),
+    );
 
     // .open(...) — receiver is also call_expression → Chain
     let open_call = relations
         .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "open")
         .expect("missing call to open");
-    assert_eq!(open_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
+    assert_eq!(
+        open_call.metadata.as_deref(),
+        Some(r#"{"n":1,"q":"chain"}"#),
+    );
 }
 
 /// D#71: a method call whose receiver is a field, an index or a literal is a
@@ -3852,10 +3858,48 @@ fn test_rust_callee_member_receiver_qualifier() {
             .metadata
             .clone()
     };
-    assert_eq!(meta("conn").as_deref(), Some(r#"{"q":"member"}"#));
-    assert_eq!(meta("len").as_deref(), Some(r#"{"q":"member"}"#));
-    assert_eq!(meta("to_string").as_deref(), Some(r#"{"q":"member"}"#));
+    assert_eq!(meta("conn").as_deref(), Some(r#"{"n":0,"q":"member"}"#));
+    assert_eq!(meta("len").as_deref(), Some(r#"{"n":0,"q":"member"}"#));
+    assert_eq!(
+        meta("to_string").as_deref(),
+        Some(r#"{"n":0,"q":"member"}"#)
+    );
     assert_eq!(meta("drop"), None);
+}
+
+/// D#112: a qualified Rust call records how many arguments it passes; comments
+/// and attributes in the argument list are not arguments. A bare call keeps no
+/// metadata.
+#[test]
+fn test_rust_call_records_its_argument_count() {
+    let code = r#"fn caller(flag: &AtomicBool, c: &mut Classes) {
+        flag.load(Ordering::Acquire);
+        c.fill(1, /* two */ &[], #[allow(unused)] 3,);
+        super::resolve::pick(None, vec![], 1);
+        self_less();
+    }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let meta = |name: &str| {
+        relations
+            .iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == name)
+            .unwrap_or_else(|| panic!("missing call to {name}"))
+            .metadata
+            .clone()
+    };
+    assert_eq!(
+        meta("load").as_deref(),
+        Some(r#"{"n":1,"q":"recv","v":"flag"}"#)
+    );
+    assert_eq!(
+        meta("fill").as_deref(),
+        Some(r#"{"n":3,"q":"recv","v":"c"}"#)
+    );
+    assert_eq!(
+        meta("pick").as_deref(),
+        Some(r#"{"n":3,"q":"path","v":"resolve"}"#)
+    );
+    assert_eq!(meta("self_less"), None);
 }
 
 #[test]
@@ -3874,7 +3918,7 @@ fn test_rust_callee_self_recv_within_impl() {
         .expect("missing call to helper");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"self","v":"Db"}"#),
+        Some(r#"{"n":0,"q":"self","v":"Db"}"#),
         "self.method() inside impl Db emits SelfRecv with type name"
     );
 }
@@ -3897,7 +3941,7 @@ fn test_rust_callee_self_type_within_impl() {
         .expect("missing call to default from make");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"stype","v":"Db"}"#),
+        Some(r#"{"n":0,"q":"stype","v":"Db"}"#),
         "Self::method() inside impl Db emits SelfType with type name"
     );
 }

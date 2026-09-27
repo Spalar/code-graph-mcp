@@ -1835,20 +1835,93 @@ pub(super) fn rust_signature_takes_self(signature: &str) -> bool {
         .is_some_and(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
 }
 
-/// Whether a Rust call can reach a function that does (`takes_self`) or does not
-/// take `self`, by the call's syntax alone (D#71). A bare `f()` never calls a
-/// method: `drop(guard)` bound the project's own `impl Drop::drop`. A method
-/// call `x.f()` (`recv`, `chain`, `member`) only calls a function that takes
-/// `self`: `status.success()` bound `JsonRpcResponse::success(id, v)`. Paths
-/// (`T::f()` reaches both) and `self.`/`Self::` calls are decided elsewhere.
-pub(super) fn rust_call_shape_admits(metadata: Option<&str>, takes_self: bool) -> bool {
-    if metadata.is_none_or(str::is_empty) {
-        return !takes_self;
+/// How many parameters a Rust function's signature declares, `self` included:
+/// commas at the top level of the parameter list, a trailing one not counted.
+/// None when the count is not fixed by the text — a `#[cfg]`'d parameter, C
+/// variadics (`...`), a list that does not close.
+pub(super) fn rust_signature_param_count(signature: &str) -> Option<usize> {
+    let rest = signature.trim_start().strip_prefix('(')?;
+    let (mut depth, mut commas, mut prev) = (0usize, 0usize, '(');
+    let mut last_non_space = '(';
+    for c in rest.chars() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            // `->` in `Fn(A) -> B` closes nothing.
+            '>' if prev == '-' => {}
+            ')' | ']' | '}' | '>' if depth > 0 => depth -= 1,
+            ')' => {
+                let empty = last_non_space == '(';
+                return Some(if empty {
+                    0
+                } else {
+                    commas + usize::from(last_non_space != ',')
+                });
+            }
+            ',' if depth == 0 => commas += 1,
+            '#' | '.' if depth == 0 => return None,
+            _ => {}
+        }
+        prev = c;
+        if !c.is_whitespace() {
+            last_non_space = c;
+        }
     }
-    match parse_callee_metadata(metadata) {
-        Some(CalleeMeta::Receiver(_) | CalleeMeta::Chain | CalleeMeta::Member) => takes_self,
+    None
+}
+
+/// What the resolver knows of a Rust function's parameters from its signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RustFnShape {
+    pub(super) takes_self: bool,
+    /// Parameters, `self` included; None when the signature does not fix it.
+    pub(super) params: Option<usize>,
+}
+
+pub(super) fn rust_fn_shape(signature: Option<&str>) -> RustFnShape {
+    RustFnShape {
+        takes_self: signature.is_some_and(rust_signature_takes_self),
+        params: signature.and_then(rust_signature_param_count),
+    }
+}
+
+/// Whether a Rust call can reach a function, by the call's syntax alone.
+///
+/// Self-ness (D#71): a bare `f()` never calls a method: `drop(guard)` bound the
+/// project's own `impl Drop::drop`. A method call `x.f()` (`recv`, `chain`,
+/// `member`) only calls a function that takes `self`: `status.success()` bound
+/// `JsonRpcResponse::success(id, v)`. Paths (`T::f()` reaches both) and
+/// `self.`/`Self::` calls are decided elsewhere.
+///
+/// Arity (D#112): Rust has no overloading, default or variadic parameters, so a
+/// call passing `n` arguments (the parser's `"n"`) reaches only a function
+/// taking `n`, besides `self` for a method call; a path call (`T::f(x, a)`)
+/// passes `self` itself. An atomic's `.load(Ordering::Acquire)` bound
+/// `ProjectClassNames::load(&mut self, db, candidates)`. A bare call carries no
+/// metadata, so no count.
+pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: RustFnShape) -> bool {
+    if metadata.is_none_or(str::is_empty) {
+        return !callee.takes_self;
+    }
+    let meta = parse_callee_metadata(metadata);
+    let method_call = matches!(
+        meta,
+        Some(CalleeMeta::Receiver(_) | CalleeMeta::Chain | CalleeMeta::Member)
+    );
+    if method_call && !callee.takes_self {
+        return false;
+    }
+    let receiver =
+        callee.takes_self && (method_call || matches!(meta, Some(CalleeMeta::SelfRecv(_))));
+    match (rust_call_arity(metadata), callee.params) {
+        (Some(n), Some(params)) => n + usize::from(receiver) == params,
         _ => true,
     }
+}
+
+/// The `"n"` argument count a Rust call's metadata carries, if any.
+fn rust_call_arity(metadata: Option<&str>) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(metadata?).ok()?;
+    usize::try_from(v.get("n")?.as_u64()?).ok()
 }
 
 /// Candidates a call can reach given its metadata: a member call on an object
@@ -2245,9 +2318,9 @@ pub(super) struct ProjectClassNames {
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
-    /// Rust function id → whether it takes `self` ([`rust_call_shape_admits`]);
-    /// None until loaded.
-    rust_takes_self: Option<HashMap<i64, bool>>,
+    /// Rust function id → its parameters ([`rust_call_shape_admits`]); None
+    /// until loaded.
+    rust_fn_shapes: Option<HashMap<i64, RustFnShape>>,
 }
 
 impl ProjectClassNames {
@@ -2264,7 +2337,7 @@ impl ProjectClassNames {
         if language != "rust" {
             return Ok(candidates);
         }
-        if self.rust_takes_self.is_none() {
+        if self.rust_fn_shapes.is_none() {
             let mut stmt = db.conn().prepare(
                 "SELECT n.id, n.signature FROM nodes n JOIN files f ON f.id = n.file_id
                  WHERE f.language = 'rust' AND n.type = 'function'",
@@ -2275,18 +2348,15 @@ impl ProjectClassNames {
             let mut map = HashMap::new();
             for row in rows {
                 let (id, signature) = row?;
-                map.insert(
-                    id,
-                    signature.as_deref().is_some_and(rust_signature_takes_self),
-                );
+                map.insert(id, rust_fn_shape(signature.as_deref()));
             }
-            self.rust_takes_self = Some(map);
+            self.rust_fn_shapes = Some(map);
         }
-        let takes_self = self.rust_takes_self.as_ref().expect("loaded above");
+        let shapes = self.rust_fn_shapes.as_ref().expect("loaded above");
         candidates.retain(|id| {
-            takes_self
+            shapes
                 .get(id)
-                .is_none_or(|&t| rust_call_shape_admits(metadata, t))
+                .is_none_or(|&shape| rust_call_shape_admits(metadata, shape))
         });
         Ok(candidates)
     }
@@ -2697,6 +2767,66 @@ mod tests {
     #[test]
     fn parse_metadata_bare_returns_none() {
         assert!(parse_callee_metadata(None).is_none());
+    }
+
+    /// D#112: parameters are counted at the top level of the parameter list,
+    /// `self` included; a list whose count can differ by build or call (a
+    /// `#[cfg]` parameter, C variadics) or that does not close counts as unknown.
+    #[test]
+    fn rust_signature_param_count_counts_top_level_parameters() {
+        let count = rust_signature_param_count;
+        assert_eq!(count("() -> Result<Option<Self>>"), Some(0));
+        assert_eq!(count("(&self) -> &'static str"), Some(1));
+        assert_eq!(
+            count("(\n    &mut self,\n    db: &Db,\n    c: &[i64],\n) -> R"),
+            Some(3)
+        );
+        assert_eq!(
+            count("(f: impl Fn(i32, i32) -> i32, m: HashMap<K, V>, t: (u8, u8))"),
+            Some(3)
+        );
+        assert_eq!(
+            count("(&self, (a, b): (i32, i32), [x, y]: [u8; 2])"),
+            Some(3)
+        );
+        assert_eq!(count("(g: Box<dyn Fn(&str) -> Vec<u8>>)"), Some(1));
+        assert_eq!(count("(a: i32, #[cfg(unix)] b: i32)"), None);
+        assert_eq!(count("(fmt: *const c_char, ...)"), None);
+        assert_eq!(count("(a: i32, b: Vec<"), None);
+        assert_eq!(count("fn"), None);
+    }
+
+    /// D#112: the call's argument count must equal the callee's parameters, less
+    /// `self` for a method call; a path call passes `self` itself.
+    #[test]
+    fn rust_call_shape_admits_checks_arity() {
+        let f = |sig: &str| rust_fn_shape(Some(sig));
+        let method = f("(&mut self, db: i32, c: &[i64])");
+        let free = f("(m: Option<&str>, c: Vec<i64>, db: i32)");
+        let recv1 = Some(r#"{"n":1,"q":"recv","v":"flag"}"#);
+        let recv2 = Some(r#"{"n":2,"q":"recv","v":"c"}"#);
+        let path3 = Some(r#"{"n":3,"q":"path","v":"resolve"}"#);
+        assert!(!rust_call_shape_admits(recv1, method));
+        assert!(rust_call_shape_admits(recv2, method));
+        assert!(rust_call_shape_admits(path3, method));
+        assert!(rust_call_shape_admits(path3, free));
+        assert!(!rust_call_shape_admits(
+            Some(r#"{"n":3,"q":"path","v":"Names"}"#),
+            f("(&mut self, m: Option<&str>, c: Vec<i64>, db: i32)")
+        ));
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"self","v":"Db"}"#),
+            f("(&self, k: u8)")
+        ));
+        // No count on either side: nothing to check.
+        assert!(rust_call_shape_admits(
+            Some(r#"{"q":"recv","v":"c"}"#),
+            method
+        ));
+        assert!(rust_call_shape_admits(
+            recv1,
+            f("(&self, a: i32, #[cfg(x)] b: i32)")
+        ));
     }
 
     mod crate_roots {

@@ -3157,6 +3157,112 @@ fn test_rust_call_shape_holds_on_incremental_paths() {
     assert!(bound.is_empty(), "{bound:#?}\n{edges:#?}");
 }
 
+/// D#112: Rust has no overloading, default or variadic parameters, so a call
+/// passing N arguments reaches only a function taking N (a method: N besides
+/// `self`; a path call `T::f(x, a)` passes `self` itself). An atomic's
+/// `.load(Ordering::Acquire)` bound the project's
+/// `ProjectClassNames::load(&mut self, db, candidates)` 11 times in this repo,
+/// and `super::resolve::member_call_candidates(a, b, c)` its same-named method
+/// twin, which takes four. Same-file, cross-file and incremental paths all
+/// apply it.
+#[test]
+fn test_rust_call_arity_decides_which_function_a_call_reaches() {
+    let lib = "pub struct Classes;\nimpl Classes {\n    \
+               pub fn load(&mut self, db: i32, candidates: &[i64]) {}\n}\n\
+               pub fn wait(flag: &std::sync::atomic::AtomicBool) -> bool {\n    \
+               flag.load(std::sync::atomic::Ordering::Acquire)\n}\n\
+               pub fn fill(c: &mut Classes) { c.load(1, &[]); }\n\
+               pub fn ufcs(c: &mut Classes) { Classes::load(c, 1, &[]); }\n";
+    let other = "pub fn watch(flag: &std::sync::atomic::AtomicBool) -> bool {\n    \
+                 flag.load(std::sync::atomic::Ordering::Relaxed)\n}\n\
+                 pub fn refill(c: &mut crate::lib::Classes) { c.load(2, &[]); }\n";
+    let resolve = "pub fn pick(m: Option<&str>, c: Vec<i64>, db: i32) {}\n\
+                   pub struct Names;\nimpl Names {\n    \
+                   pub fn pick(&mut self, m: Option<&str>, c: Vec<i64>, db: i32) {}\n}\n";
+    let index = "pub fn choose() { super::resolve::pick(None, vec![], 1); }\n";
+    let (project, _d, db) = fresh_index_of(&[
+        ("lib.rs", lib),
+        ("other.rs", other),
+        ("pipeline/resolve.rs", resolve),
+        ("pipeline/index.rs", index),
+    ]);
+    // Targets by qualified name: the method twin and the free `pick` share a name.
+    let calls = |db: &Database| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT fs.path || '.' || ns.name || ' --calls--> ' \
+                     || ft.path || '.' || COALESCE(nt.qualified_name, nt.name) \
+                 FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+                 JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' ORDER BY 1",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+    let check = |edges: &[String], when: &str| {
+        let has = |e: &str| edges.iter().any(|x| x == e);
+        let bound: Vec<&str> = [
+            "lib.rs.wait --calls--> lib.rs.Classes.load",
+            "other.rs.watch --calls--> lib.rs.Classes.load",
+            // The method twin takes `self` besides the three arguments.
+            "pipeline/index.rs.choose --calls--> pipeline/resolve.rs.Names.pick",
+        ]
+        .into_iter()
+        .filter(|e| has(e))
+        .collect();
+        let lost: Vec<&str> = [
+            "lib.rs.fill --calls--> lib.rs.Classes.load",
+            "lib.rs.ufcs --calls--> lib.rs.Classes.load",
+            "other.rs.refill --calls--> lib.rs.Classes.load",
+            "pipeline/index.rs.choose --calls--> pipeline/resolve.rs.pick",
+        ]
+        .into_iter()
+        .filter(|e| !has(e))
+        .collect();
+        assert!(
+            bound.is_empty() && lost.is_empty(),
+            "{when}: arity ignored: {bound:#?}\nlost: {lost:#?}\n{edges:#?}"
+        );
+    };
+    check(&calls(&db), "full index");
+    // Re-index lib.rs: other.rs's edges into it are restored (Phase 2c), and
+    // other.rs's calls resolve again through the deferred pass.
+    fs::write(project.path().join("lib.rs"), format!("{lib}\n")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    check(&calls(&db), "after lib.rs changed");
+    fs::write(project.path().join("other.rs"), format!("{other}\n")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    check(&calls(&db), "after other.rs changed");
+    // Pending sweep: calls buffered because nothing matched bind only a method
+    // of their arity when a later run adds one.
+    fs::write(
+        project.path().join("early.rs"),
+        "pub fn early(x: &X) { x.inner.lonely(1); x.inner.alone(1); }\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    fs::write(
+        project.path().join("late.rs"),
+        "pub struct Late;\nimpl Late {\n    pub fn lonely(&self, a: i32, b: i32) {}\n    \
+         pub fn alone(&self, a: i32) {}\n}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let edges = calls(&db);
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e == "early.rs.early --calls--> late.rs.Late.lonely")
+            && edges
+                .iter()
+                .any(|e| e == "early.rs.early --calls--> late.rs.Late.alone"),
+        "pending sweep: {edges:#?}"
+    );
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs
