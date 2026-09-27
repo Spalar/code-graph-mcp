@@ -928,18 +928,23 @@ function splitTopLevelSegmentsWithSeps(cmd) {
   let quote = null;
   let arith = 0;      // depth of `((` … `))`
   let heredocs = [];  // [{delim, stripTabs}] started on the current line
-  const cut = (next) => { segs.push({ text: cur, sep }); cur = ''; sep = next; };
+  // The last char appended to `cur`, kept apart: reading `cur` itself flattens
+  // the string `+=` built, once per `#` — a 300 KB `echo a#a#…` took 7.9 s in
+  // a 5 s hook (pre-release review #11).
+  let last = '';
+  const add = (s) => { cur += s; last = s[s.length - 1]; };
+  const cut = (next) => { segs.push({ text: cur, sep }); cur = ''; last = ''; sep = next; };
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
     if (!quote) {
-      if (c === '#' && /(?:^|[\s|(])$/.test(cur)) {
+      if (c === '#' && (last === '' || /[\s|(]/.test(last))) {
         const nl = cmd.indexOf('\n', i);
         i = (nl === -1 ? cmd.length : nl) - 1;
         continue;
       }
-      if (c === '(' && cmd[i + 1] === '(') { arith++; cur += '(('; i++; continue; }
-      if (c === ')' && cmd[i + 1] === ')' && arith > 0) { arith--; cur += '))'; i++; continue; }
-      if (c === '<' && cmd[i + 1] === '<' && cmd[i + 2] === '<') { cur += '<<<'; i += 2; continue; }
+      if (c === '(' && cmd[i + 1] === '(') { arith++; add('(('); i++; continue; }
+      if (c === ')' && cmd[i + 1] === ')' && arith > 0) { arith--; add('))'); i++; continue; }
+      if (c === '<' && cmd[i + 1] === '<' && cmd[i + 2] === '<') { add('<<<'); i += 2; continue; }
       if (c === '<' && cmd[i + 1] === '<' && arith === 0) {
         let j = i + 2;
         const stripTabs = cmd[j] === '-';
@@ -948,7 +953,7 @@ function splitTopLevelSegmentsWithSeps(cmd) {
         const d = readHeredocDelim(cmd, j);
         if (d) {
           heredocs.push({ delim: d.delim, stripTabs });
-          cur += cmd.slice(i, d.end);
+          add(cmd.slice(i, d.end));
           i = d.end - 1;
           continue;
         }
@@ -971,14 +976,14 @@ function splitTopLevelSegmentsWithSeps(cmd) {
       }
     }
     if (quote) {
-      cur += c;
+      add(c);
       // Inside DOUBLE quotes a backslash escapes the next char, so `\"` does NOT
       // close the quote (POSIX). Single quotes do no escaping — `\` is literal
       // and `'` always closes — so this only applies to `"`. Without it,
       // `echo "x\" && grep \"Y\" src/"` (one literal echo arg) mis-closes at
       // `\"`, splits on `&&`, and yields a phantom foldable grep segment.
       if (quote === '"' && c === '\\' && i + 1 < cmd.length) {
-        cur += cmd[i + 1];
+        add(cmd[i + 1]);
         i++;
         continue;
       }
@@ -990,18 +995,18 @@ function splitTopLevelSegmentsWithSeps(cmd) {
     // removes both. Keeping them left `&& \⏎ grep …` a segment that starts
     // with `\`, which GREP_HEAD rejects (pre-ship review round 2 F1).
     if (c === '\\' && i + 1 < cmd.length) {
-      if (cmd[i + 1] !== '\n') cur += c + cmd[i + 1];
+      if (cmd[i + 1] !== '\n') add(c + cmd[i + 1]);
       i++;
       continue;
     }
-    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    if (c === '"' || c === "'") { quote = c; add(c); continue; }
     // `&&` and `||` (a single `&`/`|` is NOT a split — `|` is an output-filter
     // pipe, lone `&` is background and rare in tool calls).
     if ((c === '&' && cmd[i + 1] === '&') || (c === '|' && cmd[i + 1] === '|')) {
       cut(c + c); i++; continue;
     }
     if (c === ';' || c === '\n') { cut(c); continue; }
-    cur += c;
+    add(c);
   }
   cut(undefined);
   // Split out `for … in` / `do` / `done` control words as their own boundaries

@@ -3448,3 +3448,20 @@ test('translateBreToRg: brackets and escapes the dialects disagree on are untran
 test('rewritePlan: blank input is no plan', () => {
   assert.equal(rewritePlan(' '), null);
 });
+
+// Pre-release review #11: reading the `+=`-built segment at every `#` flattened
+// it each time — a 300 KB `echo a#a#…` took 7.9 s of a 5 s hook budget. CPU
+// time, not wall time, so a loaded machine does not fail it.
+test('splitTopLevelSegments: a long command full of mid-word # stays linear', () => {
+  const cmd = 'grep -rn "FooBar" src/; echo ' + 'a#'.repeat(150000);
+  const t = process.cpuUsage();
+  const segs = splitTopLevelSegments(cmd);
+  const u = process.cpuUsage(t);
+  assert.equal(segs.length, 2);
+  assert.ok((u.user + u.system) / 1000 < 1000, `took ${(u.user + u.system) / 1000} ms of CPU`);
+  // The comment rule itself is unchanged: word-initial `#` only.
+  assert.deepEqual(splitTopLevelSegments('echo a#b; grep x src/ # tail'), ['echo a#b', 'grep x src/']);
+  // A line continuation joins `a` and `#b` into one word: no comment.
+  assert.deepEqual(splitTopLevelSegments('echo a\\\n#b; grep x src/'), ['echo a#b', 'grep x src/']);
+  assert.deepEqual(splitTopLevelSegments('echo a \\\n#b; grep x src/'), ['echo a']);
+});
