@@ -131,9 +131,7 @@ export function handleLogin(req: Request, res: Response) {
     assert!(result["code_content"].as_str().unwrap().contains("verify"));
 
     // Rebuild index
-    let rebuild = tool_call_json("rebuild_index", serde_json::json!({"confirm": true}));
-    let resp = server.handle_message(&rebuild).unwrap();
-    let result = parse_tool_result(&resp);
+    let result = common::rebuild_until_done(&server);
     assert_eq!(result["status"], "rebuilt");
     assert!(result["files_indexed"].as_i64().unwrap() >= 2);
 
@@ -289,8 +287,7 @@ fn test_e2e_incremental_reindex() {
     fs::write(project.path().join("app.ts"), "function modified() {}").unwrap();
 
     // Explicit rebuild to sync before search (avoids timing-dependent incremental detection)
-    let rebuild = tool_call_json("rebuild_index", serde_json::json!({"confirm": true}));
-    let _ = server.handle_message(&rebuild).unwrap();
+    assert_eq!(common::rebuild_until_done(&server)["status"], "rebuilt");
 
     // Search again
     let search = tool_call_json(
