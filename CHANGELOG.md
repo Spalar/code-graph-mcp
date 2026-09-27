@@ -59,6 +59,22 @@ On the oracle snapshot of the commit before this one (gold 7,126 call pairs):
 wrong edges 35 → 24 (ambiguous 11 → 1, inferred 7 → 6), correct edges 6,844
 before and after, no edge added.
 
+### Measured on outside projects
+
+Against 0.159.0, both built without embedding, 3 full-index runs each
+(ms, v0.159.0 → this release): django 12,408/9,555/9,609 →
+12,469/9,602/9,531; hono 542/555/571 → 556/540/548; tokio 2,658/2,732/2,689
+→ 2,575/2,543/2,557; leveldb 445/437/443 → 456/430/430. Re-indexing one
+edited file then matches a rebuild edge for edge on all four, with either
+binary.
+
+tokio is the first outside Rust project the Rust fixes above were scored on
+(rust-analyzer SCIP, gold 7,908 call pairs): precision at the extracted tier
+71.4% → 80.6% and at the inferred tier 48.3% → 74.8% (wrong edges 2,242 →
+745); recall at the default floor 3,660 → 3,787. Its index holds 4,014 fewer
+edges. The inferred-tier precision is still far below this repo's 99.8%: see
+Not covered.
+
 ### A call through a renamed JavaScript import binds the export
 
 `import { load as loadModel } from './model'` and
@@ -144,6 +160,12 @@ counts as the flag.
   parameter binds a project enum's `as_str`, and `tx.commit()` on a
   `rusqlite` transaction binds the project's savepoint `commit`. The other
   two are a `#[cfg]` twin and a caller whose stored body is truncated.
+- On tokio, 745 inferred-tier Rust edges are still wrong. The largest groups:
+  `Semaphore::new()` binding a same-named type in another module (a `use`
+  rooted at the crate's own name, `use tokio::sync::Semaphore`, is not
+  anchored), and `tokio::spawn()` / `spawn()` binding an associated function
+  `Command::spawn(&mut self)` / `Handle::spawn(me, future, id)` that no such
+  call can reach.
 - A renamed import of a re-export (`import { a as b } from './index'`, where
   `index.js` re-exports `a` from another file) binds nothing, and neither does
   `new B()` through `import { A as B }`.
