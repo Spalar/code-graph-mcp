@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### A Rust call through a lowercase type reaches the method again
+
+0.160.0 read a lowercase last path segment as a module, which cannot pass
+`self`, so `tokio::spawn(fut)` stopped binding `Command::spawn(&mut self)`.
+A primitive and a `#[allow(non_camel_case_types)]` struct are lowercase types
+too: `u32::encode_to(&v, buf)` and `sqlite3_db::close_db(&mut d)` lost the
+edges 0.159.0 gave them (listed under 0.160.0's Not covered). A lowercase
+segment now names a type when it is a Rust primitive or the method's own
+type. On tokio-1.41.1 the SCIP oracle judges the same 7,099 edges the same
+way before and after, so the `tokio::spawn` fix stands.
+
 ## 0.160.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

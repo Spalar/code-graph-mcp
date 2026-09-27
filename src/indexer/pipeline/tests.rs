@@ -3330,6 +3330,61 @@ fn test_rust_self_call_in_a_trait_default_method_binds_the_method() {
     );
 }
 
+/// D#126: the module-path rule above read a lowercase last segment as a module,
+/// but a primitive (`u32`) and a `#[allow(non_camel_case_types)]` struct are
+/// types, and `Type::f(&x)` passes `self` through them. 0.159.0 bound both
+/// calls; 0.160.0 dropped them.
+#[test]
+fn test_rust_ufcs_through_a_lowercase_type_reaches_the_method() {
+    let files: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod codec;\npub mod db;\npub mod rt;\n"),
+        (
+            "src/codec.rs",
+            "pub trait Encode {\n    fn encode_to(&self, buf: &mut Vec<u8>);\n}\n\
+             impl Encode for u32 {\n    fn encode_to(&self, buf: &mut Vec<u8>) {}\n}\n",
+        ),
+        (
+            "src/db.rs",
+            "#[allow(non_camel_case_types)]\npub struct sqlite3_db;\n\
+             impl sqlite3_db {\n    pub fn close_db(&mut self) {}\n}\n",
+        ),
+        (
+            "src/rt.rs",
+            "pub struct Handle;\nimpl Handle {\n    pub fn close_db(&mut self) {}\n}\n",
+        ),
+        (
+            "src/use_it.rs",
+            "use crate::codec::Encode;\nuse crate::db::sqlite3_db;\n\
+             fn t(v: u32, d: &mut sqlite3_db, b: &mut Vec<u8>) {\n    \
+             u32::encode_to(&v, b);\n    sqlite3_db::close_db(d);\n    rt::close_db(d);\n}\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let calls: Vec<&String> = edges
+        .iter()
+        .filter(|e| e.starts_with("src/use_it.rs.t --calls-->"))
+        .collect();
+    // The two UFCS calls reach their methods; `rt::close_db(d)` names a module,
+    // so it still reaches no method (control for the rule D#126 narrows).
+    assert!(
+        calls.contains(&&"src/use_it.rs.t --calls--> src/codec.rs.encode_to".to_string()),
+        "{edges:#?}"
+    );
+    assert!(
+        calls.contains(&&"src/use_it.rs.t --calls--> src/db.rs.close_db".to_string()),
+        "{edges:#?}"
+    );
+    assert!(
+        !calls.iter().any(|e| e.ends_with("src/rt.rs.close_db")),
+        "{edges:#?}"
+    );
+}
+
 /// D#71 / D#45: a Rust `use` names the module its item lives in, and resolving
 /// the import by the item's name alone bound every same-named item in the
 /// crate. `use crate::storage::queries::helpers::test_db` in graph/routes.rs

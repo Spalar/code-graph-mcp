@@ -1874,19 +1874,37 @@ pub(super) fn rust_signature_param_count(signature: &str) -> Option<usize> {
 }
 
 /// What the resolver knows of a Rust function's parameters from its signature.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RustFnShape {
     pub(super) takes_self: bool,
     /// Parameters, `self` included; None when the signature does not fix it.
     pub(super) params: Option<usize>,
+    /// The `impl`/`trait` type a method belongs to, kept only when it starts
+    /// lowercase (`impl Encode for u32`, a `non_camel_case_types` struct): the
+    /// one case where a lowercase path segment names a type, not a module.
+    pub(super) lowercase_owner: Option<Box<str>>,
 }
 
-pub(super) fn rust_fn_shape(signature: Option<&str>) -> RustFnShape {
+pub(super) fn rust_fn_shape(signature: Option<&str>, qualified_name: Option<&str>) -> RustFnShape {
+    let takes_self = signature.is_some_and(rust_signature_takes_self);
     RustFnShape {
-        takes_self: signature.is_some_and(rust_signature_takes_self),
+        takes_self,
         params: signature.and_then(rust_signature_param_count),
+        lowercase_owner: qualified_name
+            .filter(|_| takes_self)
+            .and_then(|q| q.rsplit_once('.'))
+            .map(|(owner, _)| owner.rsplit('.').next().unwrap_or(owner))
+            .filter(|owner| owner.starts_with(|c: char| c.is_ascii_lowercase()))
+            .map(Box::from),
     }
 }
+
+/// Rust's primitive types: a path through one (`u32::encode_to(&v, buf)`) names a
+/// type although it is lowercase, whatever generic `impl` supplied the method.
+const RUST_PRIMITIVE_TYPES: &[&str] = &[
+    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8", "u16",
+    "u32", "u64", "u128", "usize",
+];
 
 /// Whether a Rust call can reach a function, by the call's syntax alone.
 ///
@@ -1902,7 +1920,7 @@ pub(super) fn rust_fn_shape(signature: Option<&str>) -> RustFnShape {
 /// passes `self` itself. An atomic's `.load(Ordering::Acquire)` bound
 /// `ProjectClassNames::load(&mut self, db, candidates)`. A bare call carries no
 /// metadata, so no count.
-pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: RustFnShape) -> bool {
+pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: &RustFnShape) -> bool {
     if metadata.is_none_or(str::is_empty) {
         return !callee.takes_self;
     }
@@ -1918,9 +1936,15 @@ pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: RustFnShape
     // type, so it cannot pass `self`: only `Type::f(x)` calls a method that way.
     // With the arity rule leaving `Command::spawn(&mut self)` the only
     // one-parameter `spawn`, tokio's `tokio::spawn(fut)` calls all bound it.
+    // A lowercase segment still names a type when it is a primitive or the
+    // method's own lowercase type (D#126: `u32::encode_to(&v, buf)`).
     if callee.takes_self
         && matches!(&meta, Some(CalleeMeta::Path(segments))
-            if segments.last().is_some_and(|s| s.starts_with(|c: char| c.is_ascii_lowercase())))
+        if segments.last().is_some_and(|s| {
+            s.starts_with(|c: char| c.is_ascii_lowercase())
+                && !RUST_PRIMITIVE_TYPES.contains(&s.as_str())
+                && callee.lowercase_owner.as_deref() != Some(s.as_str())
+        }))
     {
         return false;
     }
@@ -2353,16 +2377,24 @@ impl ProjectClassNames {
         }
         if self.rust_fn_shapes.is_none() {
             let mut stmt = db.conn().prepare(
-                "SELECT n.id, n.signature FROM nodes n JOIN files f ON f.id = n.file_id
+                "SELECT n.id, n.signature, n.qualified_name FROM nodes n
+                 JOIN files f ON f.id = n.file_id
                  WHERE f.language = 'rust' AND n.type = 'function'",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             let mut map = HashMap::new();
             for row in rows {
-                let (id, signature) = row?;
-                map.insert(id, rust_fn_shape(signature.as_deref()));
+                let (id, signature, qualified_name) = row?;
+                map.insert(
+                    id,
+                    rust_fn_shape(signature.as_deref(), qualified_name.as_deref()),
+                );
             }
             self.rust_fn_shapes = Some(map);
         }
@@ -2370,7 +2402,7 @@ impl ProjectClassNames {
         candidates.retain(|id| {
             shapes
                 .get(id)
-                .is_none_or(|&shape| rust_call_shape_admits(metadata, shape))
+                .is_none_or(|shape| rust_call_shape_admits(metadata, shape))
         });
         Ok(candidates)
     }
@@ -2820,50 +2852,74 @@ mod tests {
     /// `self` for a method call; a path call passes `self` itself.
     #[test]
     fn rust_call_shape_admits_checks_arity() {
-        let f = |sig: &str| rust_fn_shape(Some(sig));
+        let f = |sig: &str| rust_fn_shape(Some(sig), None);
         let method = f("(&mut self, db: i32, c: &[i64])");
         let free = f("(m: Option<&str>, c: Vec<i64>, db: i32)");
         let recv1 = Some(r#"{"n":1,"q":"recv","v":"flag"}"#);
         let recv2 = Some(r#"{"n":2,"q":"recv","v":"c"}"#);
         let path3 = Some(r#"{"n":3,"q":"path","v":"resolve"}"#);
-        assert!(!rust_call_shape_admits(recv1, method));
-        assert!(rust_call_shape_admits(recv2, method));
+        assert!(!rust_call_shape_admits(recv1, &method));
+        assert!(rust_call_shape_admits(recv2, &method));
         // UFCS through the type passes `self` itself.
         assert!(rust_call_shape_admits(
             Some(r#"{"n":3,"q":"path","v":"Classes"}"#),
-            method
+            &method
         ));
-        assert!(rust_call_shape_admits(path3, free));
+        assert!(rust_call_shape_admits(path3, &free));
         assert!(!rust_call_shape_admits(
             Some(r#"{"n":3,"q":"path","v":"Names"}"#),
-            f("(&mut self, m: Option<&str>, c: Vec<i64>, db: i32)")
+            &f("(&mut self, m: Option<&str>, c: Vec<i64>, db: i32)")
         ));
         assert!(rust_call_shape_admits(
             Some(r#"{"n":1,"q":"self","v":"Db"}"#),
-            f("(&self, k: u8)")
+            &f("(&self, k: u8)")
         ));
         // A module path cannot pass `self`; a type path can (F3).
         assert!(!rust_call_shape_admits(
             Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
-            f("(&mut self)")
+            &f("(&mut self)")
         ));
         assert!(rust_call_shape_admits(
             Some(r#"{"n":1,"q":"path","v":"process::Command"}"#),
-            f("(&mut self)")
+            &f("(&mut self)")
         ));
         assert!(rust_call_shape_admits(
             Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
-            f("(f: F)")
+            &f("(f: F)")
         ));
         // No count on either side: nothing to check.
         assert!(rust_call_shape_admits(
             Some(r#"{"q":"recv","v":"c"}"#),
-            method
+            &method
         ));
         assert!(rust_call_shape_admits(
             recv1,
-            f("(&self, a: i32, #[cfg(x)] b: i32)")
+            &f("(&self, a: i32, #[cfg(x)] b: i32)")
         ));
+        // A lowercase path names a type when it is a primitive or the method's own
+        // lowercase type (D#126), and a module otherwise.
+        let enc = rust_fn_shape(Some("(&self, buf: &mut Vec<u8>)"), Some("T.encode_to"));
+        let u32_path = Some(r#"{"n":2,"q":"path","v":"u32"}"#);
+        assert!(rust_call_shape_admits(u32_path, &enc));
+        let close = rust_fn_shape(Some("(&mut self)"), Some("sqlite3_db.close_db"));
+        assert_eq!(close.lowercase_owner.as_deref(), Some("sqlite3_db"));
+        assert!(rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"path","v":"db::sqlite3_db"}"#),
+            &close
+        ));
+        assert!(!rust_call_shape_admits(
+            Some(r#"{"n":1,"q":"path","v":"rt"}"#),
+            &close
+        ));
+        // An uppercase owner or a free function records none.
+        assert_eq!(
+            rust_fn_shape(Some("(&mut self)"), Some("Command.spawn")).lowercase_owner,
+            None
+        );
+        assert_eq!(
+            rust_fn_shape(Some("(x: u8)"), Some("t.f")).lowercase_owner,
+            None
+        );
     }
 
     mod crate_roots {
