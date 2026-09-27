@@ -3562,36 +3562,13 @@ fn resolve_deferred_relations(
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
-            let shaped = classes.rust_call_shape_candidates(
-                db,
-                &d.language,
-                d.metadata.as_deref(),
-                None,
-                all,
-            )?;
             let all = classes.rust_call_shape_candidates(
                 db,
                 &d.language,
                 d.metadata.as_deref(),
                 Some(&d.rel_path),
-                shaped.clone(),
+                all,
             )?;
-            // Every candidate the call's shape admits is private to another
-            // crate: buffer the call, so the run that makes one `pub` binds it
-            // as a rebuild would (review of D#119). The pending sweep applies
-            // the same visibility rule and keeps it buffered until then.
-            if all.is_empty() && !shaped.is_empty() {
-                for &src_id in &source_ids {
-                    crate::storage::queries::insert_pending_unresolved_call(
-                        db.conn(),
-                        src_id,
-                        &d.target_name,
-                        &d.language,
-                        d.metadata.as_deref(),
-                    )?;
-                }
-                continue;
-            }
             let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
 
             // 6a. JS namespace-receiver constraint captured at batch time

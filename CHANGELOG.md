@@ -65,8 +65,11 @@ wrong. Five rules, each a fact of the language:
 - `Self::f()` in a trait's default method names the trait.
 - `module::Type::f()` matches the module against the file and the type
   against the method's owner: `runtime::Builder::new()` bound nothing. A path
-  opening with a std module name (`io::Error::new`, `sync::Mutex::new`) is
-  left as it was: without reading the file's `use`, it is usually std's.
+  through `std::`/`core::`/`alloc::`, or opening with a std module name
+  (`io::Error::new`, `sync::Mutex::new`), is left as it was: without reading
+  the file's `use`, it is usually std's. That also leaves a project module
+  named like std's unsplit, even written `crate::sync::Mutex::new` or
+  `mycrate::sync::Mutex::new`.
 
 On tokio (gold 7,908 call pairs): `inferred` precision 2,212/2,851 (77.6%) →
 2,461/2,889 (85.2%), recall at the default floor 3,787 → 4,072, wrong
@@ -74,9 +77,7 @@ On tokio (gold 7,908 call pairs): `inferred` precision 2,212/2,851 (77.6%) →
 pairs the oracle can judge, 376 correct ones gained and one lost
 (`task::Notified::<T>::from_raw`, through a module named like std's `task`).
 On this repo (a snapshot with gold 7,142): wrong edges unchanged (16
-extracted, 7 inferred), recall at the default floor 6,854 → 6,961. A call
-from another crate to a `pub(crate)` item waits in the pending-call buffer,
-so making the item `pub` binds it incrementally too.
+extracted, 7 inferred), recall at the default floor 6,854 → 6,961.
 
 ### A Rust call through a lowercase type reaches the method again
 
@@ -89,6 +90,21 @@ segment now names a type when it is the method's own type (`impl Encode for
 u32`); a method a blanket `impl<T> Encode for T` supplies still binds
 nothing, as in every earlier release. On tokio-1.41.1 the SCIP oracle judges the same 7,099 edges the same
 way before and after, so the `tokio::spawn` fix stands.
+
+### Not covered
+
+- A call from another crate (an integration test, an example) to a
+  `pub(crate)` library function binds nothing, as it should; when the function
+  later becomes `pub`, an incremental run still binds nothing until the
+  caller's file changes or the index is rebuilt. A buffering repair was tried
+  in review and withdrawn: it displaced other buffered calls.
+- `use mycrate::a::widget` from another crate of the workspace does not
+  follow `widget` to `a.rs` when `a.rs` gains it later (only `crate::`,
+  `self::` and `super::` paths do).
+- A `fn` nested in a one-line method (`fn f(&self) { fn g() {} g(); }`) is
+  read as a method, so the bare `g()` binds nothing.
+- `show` answers exact names: a grep for `fn foo` also matches `fn foobar`,
+  and `-i` matches case variants, which the `show` rewrite never prints.
 
 ## 0.160.0
 

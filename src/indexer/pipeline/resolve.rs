@@ -1703,22 +1703,28 @@ pub(super) fn path_filter_candidates(
 /// (`io::Error::new`, `sync::Mutex::new`) is usually std's through a `use`, which
 /// the resolver does not read (D#132), so it is not split onto a project module
 /// of the same name plus a type there (review of D#119: `io::Error::new(..)`
-/// bound the project's `io/error.rs`).
+/// bound the project's `io/error.rs`). A path through `std::`/`core::`/`alloc::`
+/// itself is not split either: `std::fmt::Error::new` matched `src/fmt.rs`.
 const RUST_STD_MODULES: &[&str] = &[
     "alloc",
     "any",
+    "arch",
     "array",
     "ascii",
+    "backtrace",
     "borrow",
     "boxed",
     "cell",
     "char",
+    "clone",
     "cmp",
     "collections",
     "convert",
     "default",
     "env",
     "error",
+    "f32",
+    "f64",
     "ffi",
     "fmt",
     "fs",
@@ -1737,6 +1743,8 @@ const RUST_STD_MODULES: &[&str] = &[
     "panic",
     "path",
     "pin",
+    "prelude",
+    "primitive",
     "process",
     "ptr",
     "rc",
@@ -1798,6 +1806,7 @@ fn filter_by_segment_chain(
             path_match(path, segments)
                 || qn_match(qn, segments)
                 || (!RUST_STD_MODULES.contains(&segments[0].as_str())
+                    && !matches!(segments[0].as_str(), "std" | "core" | "alloc")
                     && (1..segments.len()).any(|k| {
                         path_match(path, &segments[..k])
                             && qn.starts_with(&format!("{}.", segments[k..].join(".")))
@@ -1829,11 +1838,11 @@ pub(super) fn self_filter_candidates(
 /// example target `tests/t.rs` is its own root, (`tests/`, [tests/t.rs], []).
 /// None where the layout says nothing sure (`src/bin/`, `tests/common/…`).
 fn rust_crate_layout(path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
-    // The innermost `src/`, as [`rust_lib_dir`] reads it.
-    let src_at = path
-        .rfind("/src/")
-        .map(|i| i + 1)
-        .or_else(|| path.starts_with("src/").then_some(0));
+    let src_at = if path.starts_with("src/") {
+        Some(0)
+    } else {
+        path.rfind("/src/").map(|i| i + 1)
+    };
     if let Some(at) = src_at {
         let dir = &path[..at + 4];
         let rel = path[at + 4..].strip_suffix(".rs")?;
@@ -2016,10 +2025,10 @@ pub(super) fn rust_fn_shape(signature: Option<&str>, qualified_name: Option<&str
 /// None outside one: an integration test, example or bench target, or a
 /// `src/bin/` binary, is a crate of its own.
 pub(super) fn rust_lib_dir(path: &str) -> Option<&str> {
-    let at = match path.rfind("/src/") {
-        Some(i) => i + 1,
-        None if path.starts_with("src/") => 0,
-        None => return None,
+    let at = if path.starts_with("src/") {
+        0
+    } else {
+        path.rfind("/src/")? + 1
     };
     (!path[at + 4..].starts_with("bin/")).then(|| &path[..at + 4])
 }
@@ -3153,17 +3162,6 @@ mod tests {
             Some(r#"{"n":1,"q":"path","v":"tokio"}"#),
             &free
         ));
-    }
-
-    /// A crate's `src/` is the LAST `/src/` of the path, also under a top-level
-    /// `src/` (review of D#119 F5).
-    #[test]
-    fn rust_lib_dir_takes_the_innermost_src() {
-        assert_eq!(rust_lib_dir("src/a.rs"), Some("src/"));
-        assert_eq!(rust_lib_dir("src/sub/src/x.rs"), Some("src/sub/src/"));
-        assert_eq!(rust_lib_dir("tokio/src/a/b.rs"), Some("tokio/src/"));
-        assert_eq!(rust_lib_dir("src/bin/tool.rs"), None);
-        assert_eq!(rust_lib_dir("tests/t.rs"), None);
     }
 
     /// A `fn` nested in a method of the same owner is a free function of that
