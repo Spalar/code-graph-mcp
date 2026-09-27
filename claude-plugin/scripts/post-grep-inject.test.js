@@ -958,3 +958,102 @@ test('e2e D#73: a path-shaped pattern is not taken for the inject scope', (t) =>
   }
 });
 
+
+// ── D#76: the inject searches where the grep searched ─────────────────────
+// The answer runs from the root with a root-relative path. A segment after a
+// `cd`, or a subdirectory shell's operand the rebase left alone, searched
+// somewhere else.
+function injectArgs(res) {
+  assert.equal(res.status, 0, res.stderr);
+  if (!res.stdout) return null;
+  const m = JSON.parse(res.stdout).hookSpecificOutput.additionalContext.match(/ARGV\[([^\]]*)\]/);
+  return m ? m[1] : 'no-argv';
+}
+const ARGV_ECHO = `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`;
+
+function withTwoSrcDirs(fn) {
+  const fixture = e2eFixture(ARGV_ECHO);
+  fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+  return fixture;
+}
+
+test('e2e D#76: `cd xtask && grep … src/` is not answered with the root\'s src', () => {
+  const uniq = `InjCd${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `cd xtask && grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), null);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: a subdir shell\'s `src/` the rebase left alone gets no inject', () => {
+  const uniq = `InjSubSlash${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `echo x; grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, path.join(fixture.dir, 'xtask'), '')), null);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: `cd <root> && grep … src/` from a subdir is the root\'s src', () => {
+  const uniq = `InjCdRoot${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const real = fs.realpathSync(fixture.dir);
+  const cmd = `cd ${real} && grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, path.join(real, 'xtask'), '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: an absolute operand after a cd is still that path', () => {
+  const uniq = `InjCdAbs${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const real = fs.realpathSync(fixture.dir);
+  const cmd = `cd xtask && grep -rn "${uniq}" ${real}/src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: cwd-neutral segments before the grep keep the inject', () => {
+  const uniq = `InjNeutral${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `echo "== a"; git status; grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#66 — a grep line inside a heredoc body never ran.
+test('e2e D#66: a grep inside a heredoc body gets no inject', () => {
+  const uniq = `InjHeredoc${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `python3 - <<'PY'\nprint("x")\ngrep -rn "${uniq}" src/\nPY\necho done`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), null);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#66: a grep after a heredoc is found, whatever the body quotes', () => {
+  const uniq = `InjAfterDoc${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `python3 - <<'PY'\nprint('it\\'s')\nPY\ngrep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});

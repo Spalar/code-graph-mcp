@@ -28,6 +28,31 @@ Each shape now runs as typed. Over 16,352 grep commands from this machine's
 session logs, the old and new hook rewrite the same 42 commands; 9 of those
 now search a literal paren or brace.
 
+### The grep inject answers the grep that ran, where it ran
+
+The PostToolUse hook adds a structural answer after a compound command's grep
+found nothing. It now reads that command closer to the way the shell does:
+
+- **Heredoc bodies are data.** A `grep` line inside a `python3 - <<'PY'` body
+  was answered as if the shell had run it, and a `\'` in the body flipped the
+  quote parity so a real grep after the body was missed.
+- **The directory the grep ran in.** The answer searched the root-relative
+  path from the project root, even after `cd backend &&` or from a
+  subdirectory shell. It now follows commands that cannot move the shell and
+  `cd` to a literal path, and answers only when the grep's operand names the
+  same directory from there. After any other command (`cd "$D"`, a function,
+  `source`) it stays silent.
+- **The pattern as the shell passes it.** `"Foo"'Bar'` is one pattern
+  `FooBar`; a quoted pattern the shell expands (`"$MAX"`, `` "`date`" ``) or an
+  unterminated quote has no readable pattern; words inside a quoted pattern are
+  no longer rebased as paths from a subdirectory.
+
+On the same 16,352 commands the inject folds 1,732 commands instead of 1,807:
+32 real greps after a heredoc are now found, 7 heredoc-body greps and 23
+greps after a `cd` elsewhere are no longer answered, and 77 follow a command
+whose directory the hook cannot name. The PreToolUse rewrite decisions are
+unchanged.
+
 ## 0.159.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

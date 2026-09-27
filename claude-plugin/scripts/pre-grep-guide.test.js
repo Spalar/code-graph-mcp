@@ -55,6 +55,7 @@ const {
   shellWords,
   rewritePlan,
   rewriteMatchesBlock,
+  segmentCwd,
   extractSedReadTargets,
   extractUnansweredTail,
   extractPatterns,
@@ -3293,4 +3294,83 @@ test('e2e D#76: an absolute path from a subdir shell still rewrites to that path
   } finally {
     fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
   }
+});
+
+// ── Post-inject readers (D#66, D#76, D#63, D#64) ───────────────────────────
+
+// D#66 — a heredoc body is data for the command that reads it, not commands.
+// Lexed as shell, a Python `\'` flipped the quote parity and a `grep` line in
+// a script body was folded as if the shell had run it.
+test('splitTopLevelSegments: a for header takes its word list with it', () => {
+  assert.deepEqual(splitTopLevelSegments('for f in a.md b.md; do grep -n "FooBar" "$f"; done'),
+    ['grep -n "FooBar" "$f"']);
+});
+
+test('splitTopLevelSegments: heredoc bodies are skipped, not split into commands', () => {
+  assert.deepEqual(
+    splitTopLevelSegments("python3 - <<'PY'\nimport os\ngrep -rn \"FooBar\" src/\nPY\necho ok"),
+    ["python3 - <<'PY'", 'echo ok']);
+  assert.deepEqual(
+    splitTopLevelSegments('cat <<EOF > f\nx; y && z\nEOF\ngrep -rn "FooBar" src/'),
+    ['cat <<EOF > f', 'grep -rn "FooBar" src/']);
+  assert.deepEqual(
+    splitTopLevelSegments('cat <<-"END"\n\tbody\n\tEND\ngrep -rn "FooBar" src/'),
+    ['cat <<-"END"', 'grep -rn "FooBar" src/'], '<<- strips leading tabs from the terminator');
+  assert.deepEqual(
+    splitTopLevelSegments("python3 - <<'PY'\nprint('it\\'s')\nPY\ngrep -rn \"FooBar\" src/"),
+    ["python3 - <<'PY'", 'grep -rn "FooBar" src/'], 'a quote inside the body flips nothing');
+  assert.deepEqual(
+    splitTopLevelSegments('echo $((1<<2)); grep -rn "FooBar" src/'),
+    ['echo $((1<<2))', 'grep -rn "FooBar" src/'], 'an arithmetic shift is not a heredoc');
+  assert.deepEqual(splitTopLevelSegments('cat <<< "x"; grep -rn "FooBar" src/'),
+    ['cat <<< "x"', 'grep -rn "FooBar" src/'], 'a here-string is not a heredoc');
+  assert.deepEqual(splitTopLevelSegments("cat <<'EOF'\nno terminator; grep -rn \"FooBar\" src/"),
+    ["cat <<'EOF'"], 'an unterminated body runs to the end');
+});
+
+// D#76 — where a segment runs. Only a command that cannot move the shell, or
+// a `cd` to a literal path, keeps it knowable; anything else is null.
+test('segmentCwd: literal cd and cwd-neutral commands are followed, anything else is unknown', () => {
+  const at = (segs) => segmentCwd([...segs, 'grep x src/'], segs.length, '/r', { isDir: () => true });
+  assert.equal(at([]), '/r');
+  assert.equal(at(['echo x', 'git diff', 'FOO=1', 'FOO=1 node a.js', '# note',
+    'C=$(mktemp -d /tmp/x.XXXX)', `N=$(grep -c "a b" f) M='x y'`]), '/r');
+  assert.equal(at(['C=$(cd /x && pwd) cd x']), null, 'an assignment prefix does not excuse a command');
+  assert.equal(at(['cd /a/b']), '/a/b');
+  assert.equal(at(['cd sub', 'cd ..']), '/r');
+  assert.equal(at(["cd '/a b'"]), '/a b');
+  for (const seg of ['builtin cd x', 'eval "cd x"', 'cd "$D"', 'cd $D', 'cd -', 'cd', 'cd ~/x',
+    'pushd x', 'popd', 'source env.sh', '. env.sh', 'if cd x', '{ cd x', '\\cd x', 'z proj',
+    'command cd x', 'exec bash', 'cd a b']) {
+    assert.equal(at([seg]), null, seg);
+  }
+  // `cd x; grep` still runs the grep when x is missing — where it was.
+  assert.equal(segmentCwd(['cd /no/such/dir', 'grep x src/'], 1, '/r'), null);
+});
+
+// D#63 F3/F5, D#64 — the pattern as the shell passes it.
+test('extractPatterns: words, not quoted spans', () => {
+  assert.deepEqual(extractPatterns(`grep -rn "Foo"'BarBaz' src/`), ['FooBarBaz'], 'concatenation is one word');
+  assert.deepEqual(extractPatterns(`grep -rn 'a'\\''FooBar' src/`), ["a'FooBar"]);
+  assert.deepEqual(extractPatterns('grep -rn "FooBar" "unterminated src/'), [],
+    'an unterminated quote is a syntax error: nothing ran');
+  assert.deepEqual(extractPatterns('grep -rn "$MAX_SESSIONS" src/'), [], 'the shell expands it');
+  assert.deepEqual(extractPatterns('grep -rn "Foo_$(date)" src/'), []);
+  assert.deepEqual(extractPatterns('grep -rn "Foo_`date`" src/'), []);
+  assert.deepEqual(extractPatterns('grep -rn "FooBar$" src/'), ['FooBar$'], 'a trailing $ stays literal');
+  assert.deepEqual(extractPatterns("grep -rn '$MAX_SESSIONS' src/"), ['$MAX_SESSIONS'], 'single quotes do not expand');
+  assert.deepEqual(extractPatterns('grep -rn "\\$MAX_SESSIONS" src/'), ['$MAX_SESSIONS'], 'an escaped $ is literal');
+  // Unchanged shapes.
+  assert.deepEqual(extractPatterns(`grep -rn --include='*.rs' "FooBar" src/`), ['*.rs', 'FooBar']);
+  assert.deepEqual(extractPatterns(`grep -rn -e"FooBar" src/`), ['FooBar']);
+  assert.deepEqual(extractPatterns('grep -rn "a\\|b" src/'), ['a\\|b']);
+});
+
+// D#63 F6 — a quoted pattern is one word; its inner words are never paths.
+test('rebaseRelativePaths: words inside a quoted pattern are not rebased', () => {
+  const exists = () => true;
+  assert.equal(rebaseRelativePaths('grep -rn "fn main utils here" .', 'src', '/proj', exists),
+    'grep -rn "fn main utils here" src/.');
+  assert.equal(rebaseRelativePaths(`grep -rn 'a b' utils`, 'src', '/proj', exists),
+    `grep -rn 'a b' src/utils`);
 });

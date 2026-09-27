@@ -47,6 +47,8 @@ const {
   cgFlagSet,
   extractSearchPath,
   bareSourceTarget,
+  segmentCwd,
+  operandMatches,
   firstShellClause,
   normalizeCommandPaths,
   rebaseRelativePaths,
@@ -273,6 +275,18 @@ function runMain() {
   // closes, so a bare dir is answered only when the grep is the FIRST segment.
   if (bareSourceTarget(firstShellClause(segment))
       && (relPrefix || splitTopLevelSegments(cmd)[0] !== segment)) return;
+  // D#76 — the answer searches `extractSearchPath(segment)` from the root. The
+  // segment ran where the shell was by then: its own cwd, moved by any `cd`
+  // before it. Segments are read from the RAW command (normalizing strips the
+  // root from `cd <root>/x` too), which splits into the same segments.
+  const segs = splitTopLevelSegments(cmd);
+  const rawSegs = splitTopLevelSegments(rawCmd);
+  const idx = segs.indexOf(segment);
+  if (rawSegs.length !== segs.length) return;
+  const segCwd = segmentCwd(rawSegs, idx, shellCwd);
+  if (segCwd === null) return;
+  if ((segCwd !== root || relPrefix)
+      && !operandMatches(firstShellClause(rawSegs[idx]), extractSearchPath(segment), root, segCwd)) return;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
   // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they

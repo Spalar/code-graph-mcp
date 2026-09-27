@@ -255,8 +255,18 @@ function extractPatterns(cmd) {
   const stripped = firstShellClause(cmd).replace(VERB_STRIP, '');
   // Collect every quoted argument — first one is the pattern in standard grep
   // usage; subsequent ones (e.g. `-e "second"`) are also patterns or filter
-  // expressions and worth screening too.
-  return quotedSpans(stripped).map(s => s.body).filter(Boolean);
+  // expressions and worth screening too. Whole words, as the shell passes them
+  // (D#63): `"Foo"'BarBaz'` is `FooBarBaz`, not two patterns; a flag's attached
+  // quoted value (`-e"Foo"`, `--include='*.rs'`) is the value. A clause the
+  // shell would reject, or whose quoted words it expands (`"$MAX"`, D#64), has
+  // no pattern we can read.
+  const words = clauseWords(stripped);
+  if (!words) return [];
+  const quoted = words.filter((w) => w.quotedFrom !== -1);
+  if (quoted.some((w) => w.expands)) return [];
+  return quoted
+    .map((w) => (!w.startsQuoted && w.text[0] === '-' ? w.text.slice(w.quotedFrom) : w.text))
+    .filter(Boolean);
 }
 
 /**
@@ -302,19 +312,30 @@ function quotedSpans(s) {
 /**
  * The words of a shell clause, split and unquoted the way quotedSpans reads
  * quotes: whitespace separates words only outside quotes, and adjacent quoted
- * and bare parts join into one word (`-r"l"` is `-rl`). `startsQuoted` marks a
- * word whose first character was a quote — an argument, never a flag, so
- * `"-l"` searches for the string `-l`. An unterminated quote ends the scan;
- * its text is dropped, since the shell would not run the command at all.
+ * and bare parts join into one word (`-r"l"` is `-rl`, `"Foo"'Bar'` is
+ * `FooBar`). Per word:
+ *   - `startsQuoted`: the first character was a quote — an argument, never a
+ *     flag, so `"-l"` searches for the string `-l`;
+ *   - `quotedFrom`: where in `text` the first quoted part begins (-1 if none),
+ *     so `-e"Foo"` yields the value `Foo`;
+ *   - `expands`: the shell substitutes something into it — `$NAME`, `${…}`,
+ *     `$(…)`, a backtick, or `$'…'`/`$"…"` quoting — outside single quotes,
+ *     so `text` is not what the command received.
+ * Returns null for an unterminated quote: the shell would not run it at all.
  *
  * A whitespace split read `-l` out of `grep -rn "FooBar -l x" src/` and the
  * rewrite answered with a file list (D#62).
- * @returns {{text: string, startsQuoted: boolean}[]}
+ * @returns {{text: string, startsQuoted: boolean, quotedFrom: number, expands: boolean}[]|null}
  */
 function clauseWords(s) {
   const words = [];
   if (typeof s !== 'string') return words;
   let cur = null;
+  // Inside double quotes `$"` is a literal `$` before the closing quote
+  // (`"FooBar$"`); bare, `$'…'` and `$"…"` are quoting forms that translate.
+  const expandsAt = (k, inDouble) => s[k] === '`'
+    || (s[k] === '$' && k + 1 < s.length
+      && (inDouble ? /[A-Za-z0-9_{(@*#?$!-]/ : /[A-Za-z0-9_{(@*#?$!'"-]/).test(s[k + 1]));
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === ' ' || c === '\t' || c === '\n') {
@@ -322,22 +343,29 @@ function clauseWords(s) {
       cur = null;
       continue;
     }
-    if (!cur) cur = { text: '', startsQuoted: c === '"' || c === "'" };
+    if (!cur) cur = { text: '', startsQuoted: c === '"' || c === "'", quotedFrom: -1, expands: false };
     if (c === '\\') {
       if (i + 1 < s.length && s[i + 1] !== '\n') cur.text += s[i + 1];
       i++;
       continue;
     }
-    if (c !== '"' && c !== "'") { cur.text += c; continue; }
+    if (c !== '"' && c !== "'") {
+      if (expandsAt(i, false)) cur.expands = true;
+      cur.text += c;
+      continue;
+    }
+    if (cur.quotedFrom === -1) cur.quotedFrom = cur.text.length;
     let j = i + 1;
     for (; j < s.length && s[j] !== c; j++) {
       if (c === '"' && s[j] === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) {
         j++;
         if (s[j] === '\n') continue;
+      } else if (c === '"' && expandsAt(j, true)) {
+        cur.expands = true;
       }
       cur.text += s[j];
     }
-    if (j >= s.length) return words;
+    if (j >= s.length) return null;
     i = j;
   }
   if (cur) words.push(cur);
@@ -529,6 +557,7 @@ function extractCgFlags(cmd) {
   const clause = firstShellClause(cmd);
   const isRg = RG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '');
   const words = clauseWords(clause.replace(VERB_STRIP, ''));
+  if (!words) return [];
   const toks = words.map((w) => (w.startsQuoted ? '' : w.text));
   const found = new Set();
   const filters = [];  // [cgFlag, value] pairs, in the order the user wrote them
@@ -659,7 +688,10 @@ function rebaseRelativePaths(cmd, relPrefix, rootDir, exists = fs.existsSync) {
   // Shell sits outside any known source dir (docs/, target/, …) — don't guess.
   if (!SRC_PATH_TOKEN.test(prefix + '/')) return cmd;
   let verbSeen = false;
-  return cmd.split(/(\s+)/).map((tok) => {
+  // Split on whitespace outside quotes only: a quoted pattern is one token and
+  // its inner words are never paths (D#63 — `"fn main utils here"` from src/
+  // became `"fn main src/utils here"`).
+  return splitKeepingQuotes(cmd).map((tok) => {
     if (!tok || /^\s+$/.test(tok)) return tok;
     if (!verbSeen) {
       if (/^(?:env|[A-Za-z_][A-Za-z0-9_]*=\S*)$/.test(tok)) return tok;
@@ -681,6 +713,36 @@ function rebaseRelativePaths(cmd, relPrefix, rootDir, exists = fs.existsSync) {
     } catch { return tok; }
     return candidate;
   }).join('');
+}
+
+// Words and the whitespace between them, text unchanged, splitting on
+// whitespace outside quotes only (the quotedSpans rules).
+function splitKeepingQuotes(s) {
+  const out = [];
+  let cur = '';
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      cur += c;
+      if (quote === '"' && c === '\\' && i + 1 < s.length) { cur += s[++i]; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '\\' && i + 1 < s.length) { cur += c + s[++i]; continue; }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    if (/\s/.test(c)) {
+      if (cur) out.push(cur);
+      cur = c;
+      while (i + 1 < s.length && /\s/.test(s[i + 1])) cur += s[++i];
+      out.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
 }
 
 // v0.48 — bypass detection on the RAW command. (The deny copy stopped teaching
@@ -811,13 +873,48 @@ function pickBlockPattern(cmd) {
 // inside single/double quotes are literal command text, never split points.
 // Returns trimmed, non-empty segments. Shared by post-grep-inject so the
 // PostToolUse path reuses this splitter instead of copying it.
+//
+// A heredoc body is skipped (D#66): it is data on the reading command's stdin,
+// not commands. Lexed as shell, a Python `\'` in a `<<'PY'` body flipped the
+// quote parity for the rest of the command, and a `grep` line in a script body
+// was folded as if the shell had run it. The `<<WORD` stays in its segment;
+// the lines after that segment's newline, through the terminator line, go.
+const HEREDOC_START = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.@%+:/-]+))/;
 function splitTopLevelSegments(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
   const segs = [];
   let cur = '';
   let quote = null;
+  let heredocs = [];  // [{delim, stripTabs}] started on the current line
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
+    if (!quote && c === '<' && cmd[i + 1] === '<' && cmd[i + 2] !== '<') {
+      const m = HEREDOC_START.exec(cmd.slice(i));
+      // `$((1<<2))` is an arithmetic shift: its "word" runs into a `)`.
+      if (m && cmd[i + m[0].length] !== ')') {
+        heredocs.push({ delim: m[2] ?? m[3] ?? m[4], stripTabs: m[1] === '-' });
+        cur += m[0];
+        i += m[0].length - 1;
+        continue;
+      }
+    }
+    if (!quote && c === '\n' && heredocs.length > 0) {
+      segs.push(cur);
+      cur = '';
+      let j = i + 1;
+      for (const { delim, stripTabs } of heredocs) {
+        while (j < cmd.length) {
+          const nl = cmd.indexOf('\n', j);
+          const end = nl === -1 ? cmd.length : nl;
+          const line = cmd.slice(j, end);
+          j = end + 1;
+          if ((stripTabs ? line.replace(/^\t+/, '') : line) === delim) break;
+        }
+      }
+      heredocs = [];
+      i = j - 1;
+      continue;
+    }
     if (quote) {
       cur += c;
       // Inside DOUBLE quotes a backslash escapes the next char, so `\"` does NOT
@@ -856,9 +953,11 @@ function splitTopLevelSegments(cmd) {
   // so a loop body grep is isolated (the head of `for s in …; do grep …` is the
   // `for` keyword, which would otherwise mask the grep). Quote-safety already
   // handled above — these run per already-split segment on whitespace-delimited
-  // control words only.
+  // control words only. A `for` header takes its word list with it: the list
+  // is data, and left behind as a segment it read as a command that segmentCwd
+  // cannot place (D#76).
   const out = [];
-  const CTRL = /(?:^|\s)(for\s+\S+\s+in\b|do\b|done\b|then\b|fi\b)(?=\s|$)/g;
+  const CTRL = /(?:^|\s)(for\s+\S+\s+in\b[\s\S]*$|do\b|done\b|then\b|fi\b)(?=\s|$)/g;
   for (const raw of segs) {
     let last = 0;
     let m;
@@ -1143,13 +1242,61 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   return { pattern: pattern.text, target: target ? target.text : undefined, context };
 }
 
-// Does the plan's target, run from the root, name the directory the command's
-// own operand names from the shell's cwd? The raw command is parsed with the
-// same grammar; an absolute operand resolves the same from anywhere.
-function sameScopeFromShell(rawCmd, plan, root, shellCwd) {
-  const raw = rewritePlan(rawCmd, { isDir: (t) => isDirectory(path.resolve(shellCwd, t)) });
-  if (!raw || raw.target === undefined || plan.target === undefined) return false;
-  return path.resolve(shellCwd, raw.target) === path.resolve(root, plan.target);
+// Does `rootTarget`, run from the root, name the path the grep clause's own
+// operand names from `cwd` — the directory the clause ran in? The raw clause is
+// parsed with the rewrite grammar; an absolute operand resolves the same from
+// anywhere. A clause the grammar cannot read proves nothing.
+function operandMatches(rawClause, rootTarget, root, cwd) {
+  const raw = rewritePlan(rawClause, { isDir: (t) => isDirectory(path.resolve(cwd, t)) });
+  if (!raw || raw.target === undefined || rootTarget === undefined) return false;
+  return path.resolve(cwd, raw.target) === path.resolve(root, rootTarget);
+}
+
+// Commands that cannot move the shell: external programs run in a child, and
+// these builtins leave the cwd alone. An allowlist, because the commands that
+// DO move it are open-ended — `builtin cd`, `if cd`, `{ cd …; }`, `eval`,
+// `source`, `popd`, any function (D#73 round 3 reproduced 19 forms).
+const CWD_NEUTRAL = new Set([
+  'echo', 'printf', 'grep', 'rg', 'ag', 'git', 'sed', 'awk', 'cat', 'head', 'tail', 'wc',
+  'ls', 'find', 'sort', 'uniq', 'cut', 'tr', 'diff', 'cmp', 'test', '[', 'true', 'false',
+  ':', 'node', 'python', 'python3', 'cargo', 'npm', 'npx', 'jq', 'xargs', 'tee', 'stat',
+  'file', 'du', 'df', 'date', 'sleep', 'which', 'env', 'export', 'set', 'unset', 'nl',
+  'rm', 'mkdir', 'cp', 'mv', 'touch', 'chmod', 'ln', 'readlink', 'realpath', 'basename',
+  'dirname', 'perl', 'gh', 'curl', 'make', 'bash', 'sh', 'timeout', 'tar', 'sqlite3',
+  'code-graph-mcp', 'nproc', 'rustc', 'go', 'wait', 'column', 'md5sum', 'sha256sum',
+  'od', 'xxd', 'seq', 'paste', 'comm', 'uname', 'id', 'printenv',
+]);
+// `X=1 Y=$(mktemp -d)`: a command substitution runs in a subshell.
+const PURE_ASSIGNMENTS =
+  /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:\$\([^()]*\)|"[^"]*"|'[^']*'|[^\s;|&<>()'"]*)\s*)+$/;
+const CD_LITERAL = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*cd\s+('[^']*'|"[^"$`\\]*"|[^\s'"$`\\~*?[{]+)\s*$/;
+
+/**
+ * The directory `segments[idx]` runs in, or null when the segments before it
+ * could have moved the shell somewhere we cannot name (D#76). Follows
+ * cwd-neutral commands and `cd` to one literal path that exists; a relative
+ * `cd` under a set CDPATH is not literal.
+ */
+function segmentCwd(segments, idx, shellCwd, { isDir = isDirectory } = {}) {
+  let cwd = shellCwd;
+  for (const seg of segments.slice(0, idx)) {
+    if (/^\s*#/.test(seg) || PURE_ASSIGNMENTS.test(seg)) continue;
+    const clause = firstShellClause(seg);
+    const cd = CD_LITERAL.exec(clause);
+    if (cd) {
+      const arg = /^['"]/.test(cd[1]) ? cd[1].slice(1, -1) : cd[1];
+      if (!arg || arg === '-' || (!path.isAbsolute(arg) && process.env.CDPATH)) return null;
+      const next = path.resolve(cwd, arg);
+      if (!isDir(next)) return null;  // `cd x; grep` runs the grep where it was
+      try { cwd = fs.realpathSync(next); } catch { cwd = next; }
+      continue;
+    }
+    const words = clauseWords(clause);
+    if (!words) return null;
+    const head = words.find((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w.text));
+    if (head && !(head.quotedFrom === -1 && CWD_NEUTRAL.has(head.text))) return null;
+  }
+  return cwd;
 }
 
 // The plan must describe the same search classifyBlock decided on. The pattern
@@ -1460,7 +1607,7 @@ function runMain() {
   // command searched its own operand from the shell's cwd. From a subdirectory
   // the rebase moves only operands that exist there, so an operand it left
   // alone (`src/` from `xtask/`, `tests/` from `src/`) names another directory.
-  if (plan && relPrefix && !sameScopeFromShell(rawCmd, plan, root, shellCwd)) return;
+  if (plan && relPrefix && !operandMatches(rawCmd, plan.target, root, shellCwd)) return;
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the
@@ -1606,6 +1753,8 @@ module.exports = {
   shellWords,            // rewrite — the tokenizer rewritePlan's grammar reads
   rewritePlan,           // rewrite — does the whole command parse as one the rewrite reproduces
   rewriteMatchesBlock,   // rewrite — does that plan describe the search classifyBlock chose
+  operandMatches,        // D#76 — does a root-relative target name the path the command searched
+  segmentCwd,            // D#76 — the directory a compound command's segment runs in
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
