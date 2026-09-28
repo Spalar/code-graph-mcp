@@ -2857,8 +2857,9 @@ fn filter_by_segment_chain(
 /// trait impl may sit outside its type's crate (`impl Show for a::Foo` in `b`,
 /// whose `self.name()` is `a`'s). A call in an inherent impl (`"inh"`) stops at
 /// its crate: the impl lives in its type's crate, and so does every impl that
-/// crate can call on the type — past the crate it looks only at files no crate
-/// layout places (`tests/common/…`), which a `mod` of the crate may include. When the caller's file defines the type's method
+/// crate can call on the type — a test / bench / example target's call also
+/// looks at the files under its directory no crate layout places
+/// (`tests/common/…`), which its `mod` may include. When the caller's file defines the type's method
 /// only in trait impls (`"wide"`), the file is skipped: an inherent method of
 /// that name in another file outranks a trait's. The callers themselves are no evidence of
 /// where the method lives: `Self::poll_accept(self)` inside the trait impl's
@@ -2907,11 +2908,15 @@ pub(super) fn self_filter_candidates(
                 nearest(&|p| rust_crate_layout(p).is_some_and(|(dir, _, _)| dir == *crate_dir));
         }
     }
-    if chosen.is_empty() && inherent && crate_dir.is_some() {
-        // A file no crate layout names (`tests/common/…`, `src/bin/…`) may be a
-        // module of the caller's crate (`mod common;` in a test target): the
-        // next nearest place an inherent impl's type keeps its methods.
-        chosen = nearest(&|p| rust_crate_layout(p).is_none());
+    if chosen.is_empty() && inherent {
+        // A test, bench or example target's own modules (`tests/common/…` under
+        // its `mod common;`) are files no crate layout names, under the
+        // target's directory: the next nearest place its type keeps methods.
+        // A `src/` crate owns no such file (`src/bin/…` are crates of their
+        // own), so its calls never look there.
+        if let Some(dir) = crate_dir.as_deref().filter(|d| !d.ends_with("src/")) {
+            chosen = nearest(&|p| p.starts_with(dir) && rust_crate_layout(p).is_none());
+        }
     }
     if chosen.is_empty() && !(inherent && crate_dir.is_some()) {
         chosen = of_type;

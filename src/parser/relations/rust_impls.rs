@@ -35,8 +35,6 @@ struct ImplBlock {
     /// Methods defined directly in the block: name, 1-based start line (the
     /// line their node is stored with), and whether a `#[cfg(…)]` gates it.
     methods: Vec<(String, u32, bool)>,
-    /// A `#[cfg(…)]` gates the whole block.
-    cfg: bool,
     /// The innermost inline `mod` holding the block (its node id), None at the
     /// file's top level.
     module: Option<usize>,
@@ -47,10 +45,11 @@ impl ImplBlock {
         self.methods.iter().any(|(m, _, _)| m == method)
     }
 
-    /// Defines `method` in every build this block is in: neither the block nor
-    /// that definition is behind a `#[cfg(…)]`.
+    /// Defines `method` wherever a caller in this block exists: that
+    /// definition carries no `#[cfg(…)]` of its own. One on the whole block
+    /// gates the caller with it, so it does not count.
     fn always_defines(&self, method: &str) -> bool {
-        !self.cfg && self.methods.iter().any(|(m, _, cfg)| m == method && !cfg)
+        self.methods.iter().any(|(m, _, cfg)| m == method && !cfg)
     }
 }
 
@@ -131,7 +130,6 @@ fn build(root: tree_sitter::Node, source: &str) -> HashMap<usize, ImplBlock> {
                         ty: crate::parser::rust_impl_type_name(node_text(&ty, source)),
                         of_trait,
                         methods,
-                        cfg: cfg_gated(node, source),
                         module: enclosing_module(node),
                     },
                 );
@@ -210,9 +208,12 @@ pub(super) fn self_call_facts(
             return SelfCallFacts::default();
         };
         // E0592 keeps another inherent `m` apart only when the caller's own
-        // is there in every build the call is: a `#[cfg]` on it, or on its
-        // block, may leave the other one the only `m` (pre-tag review).
+        // is there in every build the call is: a `#[cfg]` on that `m` may
+        // leave the other one the only `m` (pre-tag review).
         let apart = mine.of_trait.is_some() || mine.always_defines(method);
+        // The caller's own inherent impl defining `m` is the target (E0592),
+        // whatever else the file holds.
+        let own_decides = mine.of_trait.is_none() && mine.always_defines(method);
         let mut excluded = Vec::new();
         let (mut inherent_here, mut trait_here) = (false, false);
         // Blocks of the type's name in another inline `mod` may be another
@@ -220,7 +221,7 @@ pub(super) fn self_call_facts(
         // types of one name, and its own methods are no proof of the target.
         let mut other_module = false;
         for (id, other) in blocks.iter().filter(|(_, b)| b.ty == mine.ty) {
-            if other.module != mine.module && other.defines(method) {
+            if !own_decides && other.module != mine.module && other.defines(method) {
                 other_module = true;
             }
             for (_, line, _) in other.methods.iter().filter(|(m, _, _)| m == method) {

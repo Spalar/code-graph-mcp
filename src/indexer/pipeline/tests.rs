@@ -7357,6 +7357,59 @@ fn a_self_call_follows_its_types_method_into_and_out_of_a_nearer_file() {
 }
 
 #[test]
+fn a_self_type_path_call_follows_its_types_method_into_a_nearer_file() {
+    // The `Self::m(self)` spelling (`"stype"`) of the case above: its answer
+    // moves the same way when the crate gains `Foo::m` (pre-tag review round
+    // 2: dropping `stype` from the re-extraction survived the suite).
+    let project_dir = TempDir::new().unwrap();
+    let root = project_dir.path();
+    let w = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    };
+    w("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    for pkg in ["a", "b"] {
+        w(
+            &format!("{pkg}/Cargo.toml"),
+            &format!("[package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+    }
+    w(
+        "b/src/lib.rs",
+        "pub struct Foo;\nimpl Foo {\n    pub fn m(&self) {}\n}\n",
+    );
+    w(
+        "a/src/lib.rs",
+        "pub mod x;\npub mod y;\npub trait Tr { fn go(&self); }\n",
+    );
+    w(
+        "a/src/x.rs",
+        "pub struct Foo;\nimpl crate::Tr for Foo {\n    fn go(&self) { Self::m(self) }\n}\n",
+    );
+    w("a/src/y.rs", "pub fn unrelated() {}\n");
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    w(
+        "a/src/y.rs",
+        "pub fn unrelated() {}\nimpl crate::x::Foo {\n    pub fn m(&self) {}\n}\n",
+    );
+    run_incremental_index(&db, root, None, None).unwrap();
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, root, None, None).unwrap();
+    let full = graph_projection_with_confidence(&control);
+    assert!(
+        full.iter()
+            .any(|(s, r, t, _)| s == "a/src/x.rs:go" && r == REL_CALLS && t == "a/src/y.rs:m"),
+        "control: {full:?}"
+    );
+    assert_eq!(graph_projection_with_confidence(&db), full);
+    assert_eq!(pending_projection(&db), pending_projection(&control));
+}
+
+#[test]
 fn a_rust_untyped_same_file_method_call_is_labelled_by_its_name_count() {
     // D#162. `self.0.poll()` names only `poll`: a tuple field is untyped, so the
     // resolver binds the file's own `poll` — here another type's, the wrapper

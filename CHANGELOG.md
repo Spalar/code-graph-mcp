@@ -3,7 +3,7 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 99 → 102 because the Rust fixes below change which
+`INDEX_VERSION` goes 99 → 103 because the Rust fixes below change which
 `calls` and `implements` edges a file produces, the names of some Rust
 methods, and the confidence label of one class of Rust call. Nothing to run.
 **`callgraph` and `impact` on Rust code show fewer callers by default:** a
@@ -13,7 +13,7 @@ still in the graph; both commands say how many they hid, and
 `--min-confidence ambiguous` (MCP `min_confidence: "ambiguous"`) shows them.
 To pin back: `npm i -g @sdsrs/code-graph@0.162.0`, or `cargo install
 code-graph-mcp --version 0.162.0`; plugin users can set the version in the
-marketplace entry. An older binary leaves a v102 index intact and warns
+marketplace entry. An older binary leaves a v103 index intact and warns
 instead of rebuilding it; delete `.code-graph/index.db*` after pinning back to
 get its graph back.
 
@@ -51,14 +51,14 @@ workspace. It now binds the nearest methods of that type name: the caller's
 own file, else its crate, else — only from a trait impl, whose type may be
 another crate's — all of them. An inherent impl lives in its type's crate, and
 so does every impl that crate can call on it, so a call there never leaves the
-crate: tokio's `Builder::new() { Self::default() }`, whose `default` is
+crate (a test, bench or example target's crate includes the files under its
+directory that its `mod`s pull in, such as `tests/common/mod.rs`): tokio's `Builder::new() { Self::default() }`, whose `default` is
 derived, no longer binds tokio-util's `Builder::default`. When the caller's
 file defines the type's method only in trait impls, an inherent one in another
 file outranks it, so the crate decides; so it does when the file holds that
 name's impls in different inline `mod`s (a test module's mock type of the same
-name). Past its crate, a call in an inherent impl looks only at files no crate
-layout places, such as `tests/common/mod.rs` under a test's `mod common;`. The
-caller itself counts as no candidate: a trait method calling its type's
+name), unless the caller's own inherent impl defines the method. The caller
+itself counts as no candidate: a trait method calling its type's
 inherent namesake still binds it. Because the answer now depends on other
 files, a caller is re-extracted when a method of its type and name appears in
 or leaves another file (deletions included), and an incremental index matches
@@ -69,9 +69,9 @@ Cursor<&mut [u8]>`, `… for Cursor<Vec<u8>>`) all name their type `Cursor`.
 Two impls of one trait never cover one type, and two inherent impls may not
 both define a method for one type, so a `self.m()` no longer binds the `m` of
 another impl of its file that the language keeps apart from its own. The
-inherent rule holds only when the caller's own `m` exists in every build: with
-`#[cfg]` on it or on its block, the other block's `m` may be the one that runs,
-and it stays.
+inherent rule holds only when the caller's own `m` exists wherever the call
+does: with a `#[cfg]` on that `m`, the other block's `m` may be the one that
+runs, and it stays. (A `#[cfg]` on the whole block gates the caller too.)
 
 `self.get_mut()` with `self: Pin<&mut Self>` is `Pin::get_mut`, and
 `self.clone()` with `self: Arc<Self>` is `Arc`'s: method lookup meets the
@@ -163,7 +163,7 @@ delivered, the share of code-search calls (Grep, Glob, Read, and Bash `grep` /
 `rg` / `find` / `cat` / … / `git grep`) that ran `code-graph-mcp` or a
 code-graph MCP tool. A named teammate's transcript records its name, not its
 type, so those share one row. On this repository before the hook existed,
-general-purpose subagents sent 111 of 4,162 such calls to code-graph (2.7%).
+general-purpose subagents sent 106 of 4,133 such calls to code-graph (2.6%).
 
 **Not covered:** a method whose Rust impl is written inside a macro
 (`cfg_rt! { … }`, D#149) is still no node, so a typed receiver of a type
@@ -175,7 +175,8 @@ through one (none on tokio), and so is one a derive writes
 crate the index can name, so its `self` calls still look across the whole
 workspace. A `self` call that resolved to nothing is not revisited when its
 method appears in another file (as in 0.162.0): the next edit of its own file,
-or a rebuild, binds it. In `claude plugin eval` runs, where the plugin registers
+or a rebuild, binds it. Nor is a caller re-resolved when only the parameter
+count of another file's method changes (as in 0.162.0). In `claude plugin eval` runs, where the plugin registers
 its hooks during the run's own SessionStart, the SubagentStart hook reached no
 subagent in 3 of 3 runs, for a reason not yet known, so the `subagent-callers`
 eval measures the parent's prompt, not the hook.

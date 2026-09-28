@@ -26,6 +26,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import sys
 from collections import defaultdict
 
@@ -38,15 +39,68 @@ WRAPPERS = {"timeout", "time", "env", "npx", "nice", "command", "exec"}
 HOOK_MARK = "code-graph AST index"
 
 
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def without_heredoc_bodies(command):
+    """The command with every heredoc body removed: those lines are data (a
+    script being written, text piped to python), not commands."""
+    out, end = [], None
+    for line in command.split("\n"):
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        out.append(line)
+        m = HEREDOC.search(line)
+        if m:
+            end = m.group(2)
+    return "\n".join(out)
+
+
+def stages(command):
+    """`|` / `&&` / `||` / `;` / newline separated stages, split outside quotes."""
+    out, cur, quote, i = [], [], None, 0
+    while i < len(command):
+        c = command[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"' and i + 1 < len(command):
+                cur.append(c)
+                i += 1
+                c = command[i]
+            cur.append(c)
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c in "|;&\n":
+            out.append("".join(cur))
+            cur = []
+            if command[i:i + 2] in ("&&", "||"):
+                i += 1
+        else:
+            cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return out
+
+
 def command_words(stage):
     """A stage's words from its command word on: environment assignments and
-    wrappers (with their options and a timeout's duration) are skipped."""
-    words = stage.strip().split()
+    wrappers (with their options and a timeout's duration) are skipped.
+    `command -v X` only looks X up, so it runs nothing."""
+    try:
+        words = shlex.split(stage)
+    except ValueError:
+        words = stage.strip().split()
     i = 0
     while i < len(words):
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i]):
             i += 1
         elif os.path.basename(words[i]) in WRAPPERS:
+            if words[i] == "command" and i + 1 < len(words) and words[i + 1] in ("-v", "-V"):
+                return []
             i += 1
             while i < len(words) and (words[i].startswith("-") or re.match(r"^[0-9.]+[smhd]?$", words[i])):
                 i += 1
@@ -68,7 +122,7 @@ def classify_bash(command):
     named code-graph-mcp (`cd ~/code-graph-mcp`, `cargo run --bin
     code-graph-mcp`) is not a code-graph call."""
     kinds = set()
-    for stage in re.split(r"\|\||&&|[|;\n]", command):
+    for stage in stages(without_heredoc_bodies(command)):
         words = command_words(stage)
         if not words:
             continue

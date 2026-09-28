@@ -29,6 +29,12 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(ss.classify_bash("timeout 30 code-graph-mcp impact f | head -5"), "cg")
         self.assertEqual(ss.classify_bash("CODE_GRAPH_QUIET=1 npx @sdsrs/code-graph show f"), "cg")
         self.assertEqual(ss.classify_bash("git -C repo grep -n foo"), "search")
+        # Quotes, heredoc bodies and `command -v` run nothing (pre-tag review round 2).
+        self.assertEqual(ss.classify_bash('grep -E "a|code-graph-mcp x" README.md'), "search")
+        self.assertEqual(ss.classify_bash('git commit -m "fix; code-graph-mcp now works"'), None)
+        self.assertEqual(ss.classify_bash("cat > p.sh <<'EOF'\ncode-graph-mcp callgraph X\nEOF\nls"), "search")
+        self.assertEqual(ss.classify_bash("command -v code-graph-mcp"), None)
+        self.assertEqual(ss.classify_bash("cat <<EOF | code-graph-mcp grep x\nbody\nEOF"), "cg")
 
     def test_tools(self):
         self.assertEqual(ss.classify_tool("Grep", {}), "search")

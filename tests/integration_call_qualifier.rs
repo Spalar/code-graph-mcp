@@ -489,6 +489,118 @@ fn an_inherent_self_call_reaches_a_module_the_layout_cannot_place() {
 }
 
 #[test]
+fn a_lib_self_call_never_reaches_a_test_modules_namesake() {
+    // Only a test / bench / example target may own the files no crate layout
+    // places under its directory (`mod common;`). `src/lib.rs` cannot: its
+    // `self.borrow()` is std's blanket `Borrow`, `self.clone()` the derive
+    // (pre-tag review round 2, fixture `c4`, `cargo check --tests` passes).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c4\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        r#"use std::borrow::Borrow;
+pub struct Holder;
+impl Holder {
+    pub fn same(&self) -> &Self { self.borrow() }
+}
+#[derive(Clone)]
+pub struct List;
+impl List {
+    pub fn dup(&self) -> Self { self.clone() }
+}
+"#,
+    );
+    write(
+        root,
+        "tests/common/mod.rs",
+        "pub struct Holder;\nimpl Holder {\n    pub fn borrow(&self) -> &Self { self }\n}\npub struct List;\nimpl Clone for List {\n    fn clone(&self) -> Self { List }\n}\n",
+    );
+    write(root, "tests/t.rs", "mod common;\n");
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of_in_file(&db, "borrow", "tests/common/mod.rs"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        callers_of_in_file(&db, "clone", "tests/common/mod.rs"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_cfg_on_the_callers_own_block_gates_the_caller_too() {
+    // The caller's block is `#[cfg(feature = "x")]`: whenever `go` exists, its
+    // own `k` does, so the other block's `k` stays another type's (E0592).
+    // Only a `#[cfg]` on the method itself can leave the other `k` the one
+    // that runs (pre-tag review round 2, fixture `c3/s6`).
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Z;
+#[cfg(feature = "x")]
+impl Z {
+    pub fn k(&self) -> u8 { 1 }
+    pub fn go(&self) -> u8 { self.k() }
+}
+impl Z {
+    #[cfg(not(feature = "x"))]
+    pub fn k(&self) -> u8 { 2 }
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "k"), vec![(5, 4)]);
+}
+
+#[test]
+fn an_inherent_impl_defining_the_method_decides_despite_a_nested_namesake() {
+    // `a::W`'s own inherent impl always defines `id`, so `self.id()` is that
+    // `id` (E0592): another module's `W` in the file does not hand the call to
+    // the crate, which would also bind `other.rs`'s `W::id` (pre-tag review
+    // round 2, fixture `c3/s5`).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c3\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "pub mod s5;\npub mod other;\n");
+    write(
+        root,
+        "src/s5.rs",
+        r#"pub mod a {
+    pub struct W;
+    impl W {
+        pub fn go(&self) -> u8 { self.id() }
+        pub fn id(&self) -> u8 { 1 }
+    }
+    pub mod b {
+        pub struct W;
+        impl W { pub fn id(&self) -> u8 { 2 } }
+    }
+}
+"#,
+    );
+    write(
+        root,
+        "src/other.rs",
+        "pub struct W;\nimpl W {\n    pub fn id(&self) -> u8 { 9 }\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(call_lines(&db, "id"), vec![(4, 5)]);
+}
+
+#[test]
 fn self_call_exclusion_never_falls_through_to_another_file() {
     // The only same-file `flush` is another impl's of the same trait, so it
     // goes; the crate's other file has a third impl's `flush`. Removing the
