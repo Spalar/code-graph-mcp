@@ -611,7 +611,6 @@ pub(super) fn extract_rust_macro_token_call(
     // (D#132): `assert!(tempdir().is_ok())` after `use tempfile::tempdir`.
     use super::rust_use::UseRewrite;
     let (target_name, metadata) = match super::rust_use::rewrite_call(node, source, name, None) {
-        Some(UseRewrite::Rename(own)) => (own, None),
         Some(UseRewrite::Path {
             name,
             segments,

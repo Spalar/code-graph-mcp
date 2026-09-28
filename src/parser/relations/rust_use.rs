@@ -42,10 +42,11 @@ pub(super) enum UseRoot {
 /// What a `use` makes of a call (see [`rewrite_call`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum UseRewrite {
-    /// A project item imported under another name (`use crate::a::f as g; g()`):
-    /// still a bare call, of the item's own name.
-    Rename(String),
-    /// A path call: the callee name and the path before it, root first.
+    /// A path call: the callee name and the path before it, root first. A
+    /// project item imported under another name (`use crate::a::f as g; g()`)
+    /// is one too, of `crate::a::f`: called bare by its own name, it bound
+    /// every import of that name in the file (`use crate::b::f;` beside it —
+    /// batch-1 review M2).
     Path {
         name: String,
         segments: Vec<String>,
@@ -684,8 +685,7 @@ pub(super) fn rewrite_call(
             let (name, segments) = bound.split_last()?;
             match root {
                 UseRoot::Project if name == callee => None,
-                UseRoot::Project => Some(UseRewrite::Rename(name.clone())),
-                UseRoot::Extern => Some(UseRewrite::Path {
+                UseRoot::Project | UseRoot::Extern => Some(UseRewrite::Path {
                     name: name.clone(),
                     segments: segments.to_vec(),
                     root,

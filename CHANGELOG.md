@@ -3,11 +3,11 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 92 → 96 because the Rust and JavaScript fixes below change
+`INDEX_VERSION` goes 92 → 97 because the Rust and JavaScript fixes below change
 which `calls`, `imports` and `exports` edges a file produces. Nothing to run. To
 pin back: `npm i -g @sdsrs/code-graph@0.161.0`, or `cargo install
 code-graph-mcp --version 0.161.0`; plugin users can set the version in the
-marketplace entry. An older binary leaves a v96 index intact and warns instead
+marketplace entry. An older binary leaves a v97 index intact and warns instead
 of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
@@ -25,16 +25,22 @@ through the path the `use` writes:
 - A path rooted at `std`, `core`, `alloc` or `proc_macro` binds no project
   item. One rooted at a crate that is not a package of the project resolves as
   that path written in the call does: only through a project module of the
-  crate's name, which there usually is none of.
+  crate's name, which there usually is none of. When a `Cargo.toml` names a
+  crate the scan cannot read (a top-level `lib = { … }` or `package.name`, a
+  name or a `package =` rename that is no string literal), such a path may be
+  that crate's: it resolves without its root, and a bare call by its name, as
+  before.
 - A path rooted at a package of the workspace (by its crate name, `-` read as
-  `_`, or an `extern crate x as y` alias) or at this crate (`crate::`,
+  `_`: the package's name, its `[lib] name`, a dependency's `package = "…"`
+  rename of it, or an `extern crate x as y` alias) or at this crate (`crate::`,
   `self::`, `super::`, a module the file declares) is looked for in that crate
   only: in the module file the path names, else among the crate's items of that
   name and owner type whose module shares the most leading path with it (a
   `pub use` re-export). Several such items bind as `ambiguous`. None at all
   waits in the pending-call buffer for a later run.
-- A renamed project import (`use crate::a::f as g; g()`) is called by its own
-  name.
+- A renamed project import (`use crate::a::f as g; g()`) is a call through
+  its path (`crate::a::f`), so it binds that `f` and not every `f` another
+  `use` of the file imports.
 - The `use` counts where it stands: one inside `mod tests { … }` or a function
   body applies there only, a file-level one does not reach into `mod tests`
   unless it holds `use super::*`, a local item of the call's namespace wins
@@ -95,12 +101,20 @@ carries it:
   `&mut T`; a `static` or `const`; a field of a struct the same file defines
   (`self.buf`, `self.inner.flag`). `Box<T>`, `Rc<T>` and `Arc<T>` (a
   project's own `Arc` too) are `T`, plus impls on the pointer itself.
-- The file's `use` says whose type it is. A std type or a dependency's
-  (`AtomicU8`, `String`, `bytes::BytesMut`, a primitive) binds only a project
-  trait's method (`impl Ext for String {}` still gives `s.helper()` its
-  default method) or an impl on that very type (`impl Weigh for AtomicU16`),
-  and none of another project type: a type an item macro defines has no node,
-  so "not a known struct" proves nothing. A project type binds its own
+- The file's `use` says whose type it is (a suffixed literal, `7u32`, is its
+  suffix's type). A std type or a dependency's (`AtomicU8`, `String`,
+  `bytes::BytesMut`, a primitive) binds only a project trait's method
+  (`impl Ext for String {}` still gives `s.helper()` its default method), a
+  project impl's on that very type (`impl Weigh for AtomicU16`,
+  `impl StrExt for &str` for a `str`) unless the impl's own file defines a
+  project type of that name (`struct File; impl File { … }` is not
+  `std::fs::File`'s), and none of another project type: a type an item macro
+  defines has no node, so "not a known struct" proves nothing. Where no impl
+  on the type itself answers, it also binds a blanket impl
+  (`impl<T: Display> Shout for T`) when the caller's file is the impl's or
+  imports from it, one on a slice, array or tuple for a receiver of no name
+  (`b: &[u8]`), a slice's for a `Vec` and `str`'s for a `String`, which deref
+  to them, and a primitive's for an unsuffixed literal. A project type binds its own
   methods when it has one, else resolves as before (a trait's default method
   or a `Deref` target may run). Of several project types of that name, the
   one the `use` path names wins, through a re-export as a path call's does
@@ -157,10 +171,12 @@ cannot see. Now:
 - A name the root does not define (a re-export) is looked for elsewhere in the
   crate as before, but never in the other crate's root file, for a path call
   and for the import's own name lookup.
-- The index records each such package's root `mod` items, so an incremental
-  run that sees main.rs gain or lose `mod user;` re-extracts the files under
-  `user` (and, when the record appears, goes away, or is unknown, every file
-  of the package), as a rebuild would resolve them.
+- The index records each such package's root `mod` items, so any run that
+  indexes main.rs after it gains or loses `mod user;` (an incremental run, or
+  a query's refresh of the file: `show`, an MCP tool's `file_path`, a result
+  set's resync) re-extracts the files under `user` (and, when the record
+  appears, goes away, or is unknown, every file of the package), as a rebuild
+  would resolve them.
 
 On tokio-1.41.1 (no package there has both roots) and on this repo (whose
 main.rs declares only its `tests` module and defines nothing a library file
@@ -177,6 +193,46 @@ Measured cost (ms, previous commit → this): full index of tokio
 `src/domain.rs` 259.1 → 265.3. Adding `mod sandbox;` to this repo's main.rs
 re-extracts the 2 files under `src/sandbox/`, and the index after it, and
 after removing it again, matched a rebuild edge for edge.
+
+### Pre-release review repairs (Rust)
+
+The review of the three Rust changes above reproduced two ways an index
+stopped matching a rebuild, and two regressions; each is repaired with a test
+that fails without it:
+
+- A query's refresh of a crate root that gained `mod engine;` left
+  `engine.rs` bound to the library for good: only the incremental run checked
+  the roots, and it then saw an empty diff. Every path that indexes a file now
+  applies the same check and records the roots
+  (`test_rust_reextraction_triggers_hold_on_every_indexing_path` runs each
+  trigger through the incremental, cached, refresh and resync paths).
+- A project `struct Duration` anywhere dropped `d.ext()` on a
+  `std::time::Duration` from `impl Ext for std::time::Duration` on a rebuild,
+  while an incremental run kept it; rustc calls that impl. Only the impl's own
+  file now decides whether it is on the project's type, and a typed call is
+  re-extracted when a class of its receiver's name moves.
+- A std receiver lost the project impls that run on it: blanket impls,
+  `&str`, `[u8]` and `7u32` receivers (restored, see the D#112 section above);
+  a `[lib] name` or a dependency's `package =` rename lost every call through
+  its `use` (3 → 0 on the review's fixture; now found).
+- A renamed project import bound the original name's other imports too (see
+  the D#132 section above).
+
+On tokio-1.41.1 (SCIP oracle, gold 7,908 call pairs, both arms indexed copies
+of one clone), 9962a87 → this: correct pairs 5,247 → 5,247 (none lost or
+gained, none moved between tiers), `inferred` precision 2,550/2,725 (93.6%)
+unchanged, `extracted` 1,641/1,888 unchanged, one wrong `ambiguous` pair added
+(mio's `Waker`, see Not covered). On this repo (one snapshot for both arms,
+gold 7,471): the judged pairs are identical (7,251 correct, 24 wrong); two
+Rust edges change only their metadata (renamed imports, now path calls).
+Full index, mean of 5 alternating runs after a warm-up (ms, 9962a87 → this):
+tokio 2,594 → 2,620, this repo 2,235 → 2,112 (load average 4–9); a `show`
+that refreshes an edited tokio file 228 → 232. The review's fixture edit
+sequences, 23 runs over its lib.rs + main.rs workspace, the `Duration` crate,
+the `[lib] name` workspace and tokio (the `show`-first refresh among them),
+all match a rebuild's `calls` and `imports` edges (tokio's std-named structs
+on `calls`; their `imports` are the Not covered item below); on 9962a87, 5
+did not.
 
 ### A call through a renamed JavaScript import binds the export
 
@@ -356,6 +412,35 @@ same always-on figure before and after.
   resolves through its import edge as before.
 - A crate whose library is not at `<package>/src/lib.rs` (a `[lib] path`) is
   not found by its name; such a path resolves as a path written in the call.
+  A dependency rename (`engine = { package = "core-pkg" }`) names core-pkg's
+  library in every crate of the project, not only the one that declares it.
+- An `extern crate x as y` at a crate root is seen only in that file, though
+  Rust puts `y` in every module's extern prelude: `use y::Cfg;` elsewhere binds
+  nothing (the previous release bound a same-named local `Cfg` instead).
+- A bare call of a name that a renamed import also imports under its original
+  name (`use crate::a::helper as a_helper; use crate::b::helper; helper()`)
+  binds both `helper`s, as before: the post pass that binds bare calls through
+  import edges reads the original name. So does
+  `use crate::a::helper; helper()` beside a nested `fn helper` in another
+  function, and a `pub use` re-export binds every same-named item of the
+  crate, not only the one it names (both as before).
+- A typed Rust call bound to its receiver type's one method is still
+  classified by name: with same-named methods elsewhere it is `ambiguous`,
+  hidden at the default confidence floor (tokio: 1,056 of the correct pairs
+  the oracle judges are `ambiguous`).
+- A blanket impl whose type parameter is not one capital letter and digits
+  (`impl<Fut: Future> Ext for Fut`) reads as a type named `Fut` and binds no
+  std receiver; the parameter names are not recorded. A trait imported only
+  through a re-export or a glob does not put its blanket impl in scope. An
+  impl on a project type in a file that does not define it (tokio spreads
+  `impl Handle` over several files) still binds a std receiver of that name,
+  and an impl on std's type in a file that also defines a same-named project
+  type binds none.
+- An import (or a `references` edge) bound to the `<external>` sentinel or to
+  a same-named item by name does not follow a type of that name appearing in
+  another file: adding `pub struct Duration;` to tokio's `util/mod.rs` leaves
+  26 `imports` edges of an incremental run different from a rebuild's (32 on
+  9962a87; the review found the same drift on 0.161.0).
 - A Rust receiver whose type only a closure parameter, a pattern or another
   method's return gives stays untyped (see above). On this repo that leaves 10
   wrong `as_str` edges (`.map(|n| n.name.as_str())`), 11 wrong `commit` edges
@@ -370,7 +455,7 @@ same always-on figure before and after.
   a std receiver keeps every project trait's method of that name
   (`rd.take(4)` on a `&[u8]` binds `StreamExt::take` beside
   `AsyncReadExt::take`, 2 edges), mio's `Waker` keeps an impl on std's
-  `Waker` (1), and `tokio::sync::Semaphore` keeps the mpsc `Semaphore`
+  `Waker` (1; `impl WakerRef for &Waker`, now read as an impl on `Waker`), and `tokio::sync::Semaphore` keeps the mpsc `Semaphore`
   trait's `add_permits` (2).
 - One correct tokio pair was bound only through a wrong call: in
   `read_dir_entry_info`, `temp_dir.path()` (a `tempfile::TempDir`) bound

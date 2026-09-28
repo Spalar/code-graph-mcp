@@ -478,9 +478,8 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
 }
 
 /// Apply what the file's `use` declarations make of a Rust call (see
-/// [`super::rust_use`]) to its callee and qualifier: a renamed project import is
-/// called by its own name, and a name bound to a path becomes a path call
-/// through it. Returns the root kind of a rewritten path, for [`with_use_root`].
+/// [`super::rust_use`]) to its callee and qualifier: a name bound to a path
+/// (a renamed project import too) becomes a path call through it. Returns the root kind of a rewritten path, for [`with_use_root`].
 /// Only a callee spelled with a plain leading name is looked up: `crate::`,
 /// `self::`, `super::`, `Self::`, a leading `::` and `<T as Tr>::` bind nothing.
 pub(super) fn rust_use_rewrite(
@@ -502,21 +501,14 @@ pub(super) fn rust_use_rewrite(
         }
         _ => None,
     }?;
-    match rewrite {
-        UseRewrite::Rename(name) => {
-            *callee = name;
-            None
-        }
-        UseRewrite::Path {
-            name,
-            segments,
-            root,
-        } => {
-            *callee = name;
-            *qualifier = helpers::CalleeQualifier::Path(segments);
-            Some(root)
-        }
-    }
+    let UseRewrite::Path {
+        name,
+        segments,
+        root,
+    } = rewrite;
+    *callee = name;
+    *qualifier = helpers::CalleeQualifier::Path(segments);
+    Some(root)
 }
 
 /// `metadata` with `"u"`: a path a `use` spelled out, rooted at this crate

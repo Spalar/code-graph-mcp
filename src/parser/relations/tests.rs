@@ -3907,6 +3907,59 @@ fn test_rust_call_records_its_argument_count() {
     assert_eq!(meta("self_less"), None);
 }
 
+/// Batch-1 review M1: each pattern that rebinds a typed local leaves the
+/// receiver untyped (the `for`, `match` and `while let` guards of
+/// `binding_type`), and an impl-level type parameter used inside a generic
+/// method is no type named `T` (`is_generic_param` walks past the method's own
+/// generics). Each row's control is the same source without the rebinding,
+/// which is typed, so no row passes for want of a receiver type.
+#[test]
+fn test_rust_receiver_rebinding_patterns_leave_it_untyped() {
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "for",
+            "fn f(v: Vec<G>) { let w = Widget::new(); for w in v { w.spin(); } }",
+            "fn f(v: Vec<G>) { let w = Widget::new(); for x in v { w.spin(); } }",
+        ),
+        (
+            "match",
+            "fn f(g: G) { let w = Widget::new(); match g { w => w.spin() } }",
+            "fn f(g: G) { let w = Widget::new(); match g { x => w.spin() } }",
+        ),
+        (
+            "while let",
+            "fn f(mut it: I) { let w = Widget::new(); while let Some(w) = it.next() { w.spin(); } }",
+            "fn f(mut it: I) { let w = Widget::new(); while let Some(x) = it.next() { w.spin(); } }",
+        ),
+        (
+            "impl-level generic",
+            "struct S<T>(T);\nimpl<T> S<T> {\n    fn f<U>(&self, w: T, u: U) { w.spin(); }\n}",
+            "struct S<T>(T);\nimpl<T> S<T> {\n    fn f<U>(&self, w: Widget, u: U) { w.spin(); }\n}",
+        ),
+    ];
+    let spin_meta = |code: &str| {
+        extract_relations(code, "rust")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == "spin")
+            .expect("missing call to spin")
+            .metadata
+            .unwrap_or_default()
+    };
+    let mut bad = Vec::new();
+    for (shape, rebound, control) in rows {
+        let got = spin_meta(rebound);
+        if got.contains(r#""rt":"#) {
+            bad.push(format!("{shape}: typed {got}"));
+        }
+        let ctl = spin_meta(control);
+        if !ctl.contains(r#""rt":"Widget""#) {
+            bad.push(format!("{shape} control: untyped {ctl}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
 #[test]
 fn test_rust_callee_self_recv_within_impl() {
     let code = r#"

@@ -3699,6 +3699,7 @@ fn resolve_deferred_relations(
             }
 
             let mut handled = true;
+            let opaque_meta: Option<String>;
             let mut call_meta = d.metadata.as_deref();
             let guessed = d
                 .metadata
@@ -3883,6 +3884,16 @@ fn resolve_deferred_relations(
                     ) {
                         UseAnchor::None => segments,
                         UseAnchor::Unplaced(stripped) => stripped,
+                        UseAnchor::Opaque(stripped) if !stripped.is_empty() => stripped,
+                        // A bare call through a crate no manifest could be read
+                        // for: by its name, as before D#132 (the default chain
+                        // below), and classified like any bare call.
+                        UseAnchor::Opaque(_) => {
+                            opaque_meta = call_meta.map(super::resolve::ambiguous_meta);
+                            call_meta = opaque_meta.as_deref();
+                            handled = false;
+                            Vec::new()
+                        }
                         UseAnchor::Foreign => continue,
                         UseAnchor::At(anchor) => {
                             match super::resolve::rust_anchored_targets(
@@ -3940,13 +3951,17 @@ fn resolve_deferred_relations(
                             continue;
                         }
                     };
-                    let filtered = path_filter_candidates(
-                        &segments,
-                        &same_lang,
-                        &node_id_to_path,
-                        db,
-                        crate_roots,
-                    )?;
+                    let filtered = if handled {
+                        path_filter_candidates(
+                            &segments,
+                            &same_lang,
+                            &node_id_to_path,
+                            db,
+                            crate_roots,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
                     if !filtered.is_empty() {
                         let final_targets = if filtered.len() > 1 {
                             refine_ambiguous_targets(&filtered, &d.rel_path, &node_id_to_path)

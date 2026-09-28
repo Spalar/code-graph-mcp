@@ -9230,6 +9230,495 @@ fn test_rust_crate_root_membership_incremental_matches_rebuild() {
     assert_eq!(reindexed(&[MAIN_USER, MAIN_USER_EXTRA]), [2, 1]);
 }
 
+/// Every entry point that indexes a file, for the parity tests below.
+#[derive(Clone, Copy, Debug)]
+enum IndexPath {
+    /// `run_incremental_index` (the CLI, the server's startup drift check).
+    Incremental,
+    /// `run_incremental_index_cached` with the directory cache of the last
+    /// scan (the file watcher).
+    Cached,
+    /// `ensure_file_indexed` per edited file (an MCP tool's `file_path`).
+    Refresh,
+    /// `resync_stale_files` over the edited files (a read command's result
+    /// refresh).
+    Resync,
+}
+
+/// Index `before`, apply each step of `steps` in turn through `path` alone,
+/// and after each require the edges a rebuild of the tree then has; finally
+/// run an ordinary incremental index and require them again. Returns the last
+/// rebuild's edges.
+fn assert_path_matches_rebuild(
+    before: &[(&str, &str)],
+    steps: &[&[(&str, Option<&str>)]],
+    path: IndexPath,
+) -> Vec<String> {
+    let (project, _d, db) = fresh_index_of(before);
+    let root = project.path();
+    let (_, mut cache) = crate::indexer::merkle::scan_directory_cached(root, None).unwrap();
+    let mut tree: Vec<(String, String)> = before
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    let mut want = Vec::new();
+    for after in steps {
+        for (p, body) in after.iter() {
+            tree.retain(|(q, _)| q != p);
+            match body {
+                Some(b) => {
+                    let full = root.join(p);
+                    fs::create_dir_all(full.parent().unwrap()).unwrap();
+                    fs::write(full, b).unwrap();
+                    tree.push((p.to_string(), b.to_string()));
+                }
+                None => fs::remove_file(root.join(p)).unwrap(),
+            }
+        }
+        let edited: Vec<String> = after.iter().map(|(p, _)| p.to_string()).collect();
+        match path {
+            IndexPath::Incremental => {
+                run_incremental_index(&db, root, None, None).unwrap();
+            }
+            IndexPath::Cached => {
+                cache = run_incremental_index_cached(&db, root, None, Some(&cache), None)
+                    .unwrap()
+                    .1;
+            }
+            IndexPath::Refresh => {
+                for p in &edited {
+                    ensure_file_indexed(&db, root, p, None).unwrap();
+                }
+            }
+            IndexPath::Resync => {
+                let outcome = crate::indexer::resync::resync_stale_files(
+                    &db,
+                    root,
+                    &edited,
+                    64,
+                    RefreshScope::IncludeNew,
+                );
+                assert!(!outcome.is_partial(), "{outcome:?}");
+            }
+        }
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p2, _d2, control) = fresh_index_of(&files);
+        want = edge_set(&control);
+        assert_eq!(
+            call_edges_with_confidence(&db),
+            call_edges_with_confidence(&control),
+            "{path:?}: calls after {after:?} must equal a rebuild"
+        );
+        assert_eq!(
+            edge_set(&db),
+            want,
+            "{path:?}: edges after {after:?} must equal a rebuild"
+        );
+    }
+    run_incremental_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        edge_set(&db),
+        want,
+        "{path:?}: edges after {steps:?} and an incremental run must equal a rebuild"
+    );
+    want
+}
+
+/// Batch-1 review B1: every path that indexes a file applies the same
+/// re-extraction triggers, so each leaves the index equal to a rebuild: a
+/// root's `mod` edit (D#136, which only the incremental run checked, so a
+/// query's refresh of main.rs left `engine.rs` bound to the library for good),
+/// a `use`'s module gaining the item (D#132), and a type's impl turning from
+/// std's to the project's struct's (D#112).
+#[test]
+fn test_rust_reextraction_triggers_hold_on_every_indexing_path() {
+    let twin = |main: &'static str| {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"twin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod user;\npub fn run() {}\n"),
+            ("src/main.rs", main),
+            ("src/user.rs", "use crate::run;\nfn u() {\n    run();\n}\n"),
+            ("src/cli.rs", "use crate::run;\nfn c() {\n    run();\n}\n"),
+        ]
+    };
+    const MAIN: &str = "mod cli;\nfn run() {}\nfn main() {}\n";
+    const MAIN_USER: &str = "mod cli;\nmod user;\nfn run() {}\nfn main() {}\n";
+    let uses = |wa: &'static str| {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod wa;\npub mod wc;\npub mod user;\n"),
+            ("src/wa.rs", wa),
+            ("src/wc.rs", "pub fn widget() {}\n"),
+            (
+                "src/user.rs",
+                "use crate::wa::widget;\nfn go() {\n    widget();\n}\n",
+            ),
+        ]
+    };
+    let typed = |e: &'static str| {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod t;\npub mod x;\npub mod e;\n"),
+            ("src/t.rs", "pub trait Ext {\n    fn ext(&self) {}\n}\n"),
+            ("src/e.rs", e),
+            (
+                "src/x.rs",
+                "use crate::t::Ext;\nuse std::time::Duration;\n\
+                 pub fn g() {\n    let d: Duration = Duration::ZERO;\n    d.ext();\n}\n",
+            ),
+        ]
+    };
+    const E_OWN: &str = "use crate::t::Ext;\npub struct Duration;\n\
+        impl Ext for Duration {\n    fn ext(&self) {}\n}\n";
+    const E_STD: &str = "use crate::t::Ext;\nuse std::time::Duration;\n\
+        impl Ext for Duration {\n    fn ext(&self) {}\n}\n";
+    let has = |edges: &[String], e: &str| edges.iter().any(|x| x == e);
+    for path in [
+        IndexPath::Incremental,
+        IndexPath::Cached,
+        IndexPath::Refresh,
+        IndexPath::Resync,
+    ] {
+        let want =
+            assert_path_matches_rebuild(&twin(MAIN), &[&[("src/main.rs", Some(MAIN_USER))]], path);
+        assert!(
+            has(&want, "src/user.rs.u --calls--> src/main.rs.run")
+                && has(&want, "src/user.rs.u --calls--> src/lib.rs.run"),
+            "{path:?}: {want:#?}"
+        );
+        // ...and loses it again through the same path: the record of the
+        // roots the first refresh stored is what tells the second one.
+        let want = assert_path_matches_rebuild(
+            &twin(MAIN),
+            &[
+                &[("src/main.rs", Some(MAIN_USER))],
+                &[("src/main.rs", Some(MAIN))],
+            ],
+            path,
+        );
+        assert!(
+            !has(&want, "src/user.rs.u --calls--> src/main.rs.run"),
+            "{path:?}: {want:#?}"
+        );
+        let want = assert_path_matches_rebuild(
+            &uses("pub fn other() {}\n"),
+            &[&[("src/wa.rs", Some("pub fn other() {}\npub fn widget() {}\n"))]],
+            path,
+        );
+        assert!(
+            has(&want, "src/user.rs.go --calls--> src/wa.rs.widget")
+                && !has(&want, "src/user.rs.go --calls--> src/wc.rs.widget"),
+            "{path:?}: {want:#?}"
+        );
+        // std's `Duration` keeps no impl of the project's `Duration`: the
+        // trait's default method is the one candidate. Once the impl is on
+        // std's type, two methods answer and the call waits, as a rebuild's.
+        let want =
+            assert_path_matches_rebuild(&typed(E_OWN), &[&[("src/e.rs", Some(E_STD))]], path);
+        assert!(
+            !want.iter().any(|e| e.starts_with("src/x.rs.g --calls-->")),
+            "{path:?}: {want:#?}"
+        );
+        let want =
+            assert_path_matches_rebuild(&typed(E_STD), &[&[("src/e.rs", Some(E_OWN))]], path);
+        assert!(
+            has(&want, "src/x.rs.g --calls--> src/t.rs.ext")
+                && !has(&want, "src/x.rs.g --calls--> src/e.rs.ext"),
+            "{path:?}: {want:#?}"
+        );
+    }
+}
+
+/// Batch-1 review B2: a project type named like the std type a file uses does
+/// not take that file's calls away from an impl on std's type. rustc calls
+/// `impl Ext for std::time::Duration` on `std::time::Duration`; a rebuild
+/// dropped the edge once any file defined `struct Duration`, and an incremental
+/// run kept it, so the two disagreed.
+#[test]
+fn test_rust_std_receiver_keeps_its_impl_beside_a_same_named_project_type() {
+    let tree = |y: Option<&'static str>| {
+        let mut t = vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                if y.is_some() {
+                    "pub mod t;\npub mod x;\npub mod e;\npub mod y;\n"
+                } else {
+                    "pub mod t;\npub mod x;\npub mod e;\n"
+                },
+            ),
+            ("src/t.rs", "pub trait Ext {\n    fn ext(&self);\n}\n"),
+            (
+                "src/e.rs",
+                "impl crate::t::Ext for std::time::Duration {\n    fn ext(&self) {}\n}\n",
+            ),
+            (
+                "src/x.rs",
+                "use crate::t::Ext;\nuse std::time::Duration;\n\
+                 pub fn g() {\n    let d: Duration = Duration::ZERO;\n    d.ext();\n}\n",
+            ),
+        ];
+        if let Some(y) = y {
+            t.push(("src/y.rs", y));
+        }
+        t
+    };
+    const Y: &str = "pub struct Duration;\nimpl Duration {\n    pub fn ext(&self) {}\n}\n";
+    const RIGHT: &str = "src/x.rs.g -> src/e.rs.Duration.ext";
+    let (_p, _d, db) = fresh_index_of(&tree(None));
+    assert!(calls_by_qualified_name(&db).contains(&RIGHT.to_string()));
+    // The project's `Duration` appears, with no method (nothing re-resolves
+    // `x.rs` by name) and with one of that name. Calls only: the `references`
+    // edge `e.rs` writes to `std::time::Duration` binds the new struct by name
+    // on a rebuild and not incrementally, which predates D#112 (see
+    // CHANGELOG, Not covered).
+    const LIB_Y: &str = "pub mod t;\npub mod x;\npub mod e;\npub mod y;\n";
+    for y in ["pub struct Duration;\n", Y] {
+        assert_incremental_matches_rebuild(
+            &tree(None),
+            &[("src/lib.rs", Some(LIB_Y)), ("src/y.rs", Some(y))],
+        );
+    }
+    let (_p, _d, db) = fresh_index_of(&tree(Some(Y)));
+    let calls = calls_by_qualified_name(&db);
+    assert!(calls.contains(&RIGHT.to_string()), "{calls:#?}");
+    assert!(
+        !calls.contains(&"src/x.rs.g -> src/y.rs.Duration.ext".to_string()),
+        "{calls:#?}"
+    );
+}
+
+/// Batch-1 review H1: a std receiver keeps a project trait's method that a
+/// blanket impl (`impl<T: Display> Shout for T`), an impl on `&str` or `[u8]`,
+/// or an impl on the type of a suffixed literal (`7u32`) defines, as rustc
+/// calls them and as 0.161.0 bound them; and still binds no other project
+/// type's method of that name.
+#[test]
+fn test_rust_std_receiver_keeps_blanket_reference_slice_and_literal_impls() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod ext;\npub mod decoy;\npub mod recv;\npub mod noscope;\n",
+        ),
+        // A std type's own `shout` (its trait not in scope here): a blanket
+        // impl applies to every type, so only a file that can see its trait
+        // binds it.
+        (
+            "src/noscope.rs",
+            "pub fn no_trait(t: std::thread::Thread) {\n    t.shout();\n}\n",
+        ),
+        (
+            "src/ext.rs",
+            "use std::fmt::Display;\n\
+             pub trait Shout {\n    fn shout(&self);\n}\n\
+             impl<T: Display + ?Sized> Shout for T {\n    fn shout(&self) {}\n}\n\
+             pub trait NumExt {\n    fn twice(&self);\n}\n\
+             impl NumExt for u32 {\n    fn twice(&self) {}\n}\n\
+             impl NumExt for u64 {\n    fn twice(&self) {}\n}\n\
+             pub trait StrExt {\n    fn yell(&self);\n}\n\
+             impl StrExt for &str {\n    fn yell(&self) {}\n}\n\
+             pub trait SliceExt {\n    fn first_two(&self);\n}\n\
+             impl SliceExt for [u8] {\n    fn first_two(&self) {}\n}\n\
+             pub trait Loud {\n    fn loud(&self);\n}\n\
+             impl Loud for str {\n    fn loud(&self) {}\n}\n\
+             pub trait Quiet {\n    fn hush(&self);\n}\n\
+             impl Quiet for String {\n    fn hush(&self) {}\n}\n\
+             impl Quiet for str {\n    fn hush(&self) {}\n}\n\
+             pub struct B;\nimpl B {\n    pub fn shout(&self) {}\n}\n\
+             pub trait Addr {\n    fn addrs(&self);\n}\n\
+             impl Addr for std::net::SocketAddrV4 {\n    fn addrs(&self) {}\n}\n\
+             impl<T: Addr + ?Sized> Addr for &T {\n    fn addrs(&self) {}\n}\n",
+        ),
+        (
+            "src/decoy.rs",
+            "pub struct Horn;\nimpl Horn {\n    pub fn shout(&self) {}\n    pub fn yell(&self) {}\n    \
+             pub fn first_two(&self) {}\n    pub fn twice(&self) {}\n    pub fn loud(&self) {}\n}\n",
+        ),
+        (
+            "src/recv.rs",
+            "use crate::ext::{Addr, Loud, NumExt, Quiet, Shout, SliceExt, StrExt};\n\
+             pub fn blanket() {\n    let s = String::new();\n    s.shout();\n}\n\
+             pub fn str_literal() {\n    \"hi\".yell();\n}\n\
+             pub fn str_param(s: &str) {\n    s.yell();\n}\n\
+             pub fn slice(b: &[u8]) {\n    b.first_two();\n}\n\
+             pub fn literal() {\n    7u32.twice();\n}\n\
+             pub fn string_deref() {\n    let s = String::new();\n    s.loud();\n}\n\
+             pub fn vec_deref(v: Vec<u8>) {\n    v.first_two();\n}\n\
+             pub fn exact_first(a: std::net::SocketAddrV4) {\n    a.addrs();\n}\n\
+             pub fn exact_string() {\n    let s = String::new();\n    s.hush();\n}\n",
+        ),
+    ]);
+    let calls = calls_by_qualified_name(&db);
+    let mut bad = Vec::new();
+    for (caller, right, wrong) in [
+        ("blanket", "src/ext.rs.T.shout", "src/decoy.rs.Horn.shout"),
+        (
+            "str_literal",
+            "src/ext.rs.&str.yell",
+            "src/decoy.rs.Horn.yell",
+        ),
+        (
+            "str_param",
+            "src/ext.rs.&str.yell",
+            "src/decoy.rs.Horn.yell",
+        ),
+        (
+            "slice",
+            "src/ext.rs.[u8].first_two",
+            "src/decoy.rs.Horn.first_two",
+        ),
+        ("literal", "src/ext.rs.u32.twice", "src/decoy.rs.Horn.twice"),
+        ("literal", "src/ext.rs.u32.twice", "src/ext.rs.u64.twice"),
+        // A `String` derefs to `str`, a `Vec` to a slice.
+        (
+            "string_deref",
+            "src/ext.rs.str.loud",
+            "src/decoy.rs.Horn.loud",
+        ),
+        (
+            "vec_deref",
+            "src/ext.rs.[u8].first_two",
+            "src/decoy.rs.Horn.first_two",
+        ),
+        // An impl on the type itself answers before a blanket one.
+        (
+            "exact_first",
+            "src/ext.rs.SocketAddrV4.addrs",
+            "src/ext.rs.&T.addrs",
+        ),
+        (
+            "exact_string",
+            "src/ext.rs.String.hush",
+            "src/ext.rs.str.hush",
+        ),
+        // A one-letter project struct is no type parameter.
+        ("blanket", "src/ext.rs.T.shout", "src/ext.rs.B.shout"),
+    ] {
+        let from = |t: &str| format!("src/recv.rs.{caller} -> {t}");
+        if !calls.contains(&from(right)) {
+            bad.push(format!("{caller}: missing {right}"));
+        }
+        if calls.contains(&from(wrong)) {
+            bad.push(format!("{caller}: wrong {wrong}"));
+        }
+    }
+    if calls.contains(&"src/noscope.rs.no_trait -> src/ext.rs.T.shout".to_string()) {
+        bad.push("no_trait: wrong src/ext.rs.T.shout (trait not in scope)".to_string());
+    }
+    assert!(bad.is_empty(), "{bad:#?}\n{calls:#?}");
+}
+
+/// Batch-1 review H2: a package whose library is named in `[lib] name` (or
+/// that a dependency renames with `package = …`) is found by that name, so a
+/// `use corelib::engine_start` binds core-pkg's item and not a same-named one
+/// elsewhere. A manifest whose names cannot be read keeps such a path's
+/// resolution by name, as before D#132, instead of dropping it.
+#[test]
+fn test_rust_crate_found_by_its_lib_name_or_dependency_rename() {
+    let tree = |core_manifest: &'static str, app_manifest: &'static str, root: &'static str| {
+        let lib: &'static str = Box::leak(
+            format!(
+                "use {root}::engine_start;\nuse {root}::Motor;\n\
+                 pub fn run() {{\n    engine_start();\n    let m = Motor::new();\n    m.rev();\n}}\n"
+            )
+            .into_boxed_str(),
+        );
+        vec![
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"core-pkg\", \"app\"]\n",
+            ),
+            ("core-pkg/Cargo.toml", core_manifest),
+            (
+                "core-pkg/src/lib.rs",
+                "pub fn engine_start() {}\npub struct Motor;\nimpl Motor {\n    \
+                 pub fn new() -> Motor {\n        Motor\n    }\n    pub fn rev(&self) {}\n}\n",
+            ),
+            ("app/Cargo.toml", app_manifest),
+            ("app/src/lib.rs", lib),
+        ]
+    };
+    const PKG: &str = "[package]\nname = \"core-pkg\"\nversion = \"0.1.0\"\n";
+    const LIB_NAMED: &str =
+        "[package]\nname = \"core-pkg\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"corelib\"\n";
+    const LIB_UNREADABLE: &str =
+        "lib = { name = \"corelib\" }\n[package]\nname = \"core-pkg\"\nversion = \"0.1.0\"\n";
+    const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+    const APP_RENAME: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+        [dependencies]\nengine = { path = \"../core-pkg\", package = \"core-pkg\" }\n";
+    let want = [
+        "app/src/lib.rs.run -> core-pkg/src/lib.rs.engine_start",
+        "app/src/lib.rs.run -> core-pkg/src/lib.rs.Motor.new",
+        "app/src/lib.rs.run -> core-pkg/src/lib.rs.Motor.rev",
+    ];
+    let mut bad = Vec::new();
+    for (case, core, app, root) in [
+        ("lib name", LIB_NAMED, APP, "corelib"),
+        ("dependency rename", PKG, APP_RENAME, "engine"),
+        ("unreadable lib name", LIB_UNREADABLE, APP, "corelib"),
+    ] {
+        let (_p, _d, db) = fresh_index_of(&tree(core, app, root));
+        let calls = calls_by_qualified_name(&db);
+        for w in want {
+            if !calls.contains(&w.to_string()) {
+                bad.push(format!("{case}: missing {w} (has {calls:?})"));
+            }
+        }
+    }
+    // A dependency the project does not hold still binds nothing.
+    let (_p, _d, db) = fresh_index_of(&tree(PKG, APP, "serde"));
+    let calls = calls_by_qualified_name(&db);
+    if calls
+        .iter()
+        .any(|c| c.starts_with("app/src/lib.rs.run -> "))
+    {
+        bad.push(format!("foreign crate bound: {calls:?}"));
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Batch-1 review M2: a renamed project import binds the item its path names,
+/// not every import of the item's original name.
+#[test]
+fn test_rust_renamed_import_binds_only_its_own_path() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub mod a;\npub mod b;\npub mod ren;\n"),
+        ("src/a.rs", "pub fn helper() {}\n"),
+        ("src/b.rs", "pub fn helper() {}\n"),
+        (
+            "src/ren.rs",
+            "use crate::a::helper as a_helper;\nuse crate::b::helper;\n\
+             fn n2() {\n    a_helper();\n}\n",
+        ),
+    ]);
+    let calls = calls_by_qualified_name(&db);
+    assert!(
+        calls.contains(&"src/ren.rs.n2 -> src/a.rs.helper".to_string())
+            && !calls.contains(&"src/ren.rs.n2 -> src/b.rs.helper".to_string()),
+        "{calls:#?}"
+    );
+}
+
 /// D#120 fixture: one caller file reaching every accepted and every refused
 /// shape of a renamed import (see `test_js_renamed_import_call_shapes` for the
 /// parser half).

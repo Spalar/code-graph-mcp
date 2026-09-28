@@ -13,8 +13,10 @@
 //!   has one; otherwise the call resolves as before (a trait's default method,
 //!   a `Deref` target).
 //! - `{"rt":"R","rk":"f"}`: a std/core/alloc type or a primitive (`R` may be
-//!   empty: a slice, a tuple). A method of a project struct, enum or union
-//!   other than one named `R` is no candidate; a trait's method is.
+//!   empty: a slice, a tuple, an unsuffixed literal). A method of a project
+//!   struct, enum or union other than one named `R` is no candidate; a trait's
+//!   method is, and so is one of a blanket, reference, slice or primitive impl
+//!   that can run on `R` (`resolve::foreign_receiver_owner`).
 //! - `{"rt":"T","rc":"krate"}`: a type rooted at a crate name that is not
 //!   std's; the resolver decides whether that crate is a package of the
 //!   workspace (then as `"p"`) or a dependency (then as `"f"`).
@@ -224,9 +226,12 @@ impl<'s> Cx<'s> {
             "string_literal" | "raw_string_literal" => {
                 Some(TyOut::Recv(RecvTy::Foreign("str".into())))
             }
-            "integer_literal" | "float_literal" => {
-                Some(TyOut::Recv(RecvTy::Foreign(String::new())))
-            }
+            // `7u32` is a `u32`; an unsuffixed literal has no type yet.
+            "integer_literal" | "float_literal" => Some(TyOut::Recv(RecvTy::Foreign(
+                literal_suffix(self.text(&e))
+                    .unwrap_or_default()
+                    .to_string(),
+            ))),
             "boolean_literal" => Some(TyOut::Recv(RecvTy::Foreign("bool".into()))),
             "char_literal" => Some(TyOut::Recv(RecvTy::Foreign("char".into()))),
             "reference_expression" => self.expr_type(e.child_by_field_name("value")?),
@@ -801,6 +806,20 @@ impl<'s> Cx<'s> {
         }
         last
     }
+}
+
+/// The type suffix of a numeric literal (`7u32`, `1.5f64`, `0xffu8`), or None.
+/// A hex literal's trailing `f32` is digits (`0x1f32`), not a suffix.
+fn literal_suffix(text: &str) -> Option<&'static str> {
+    const SUFFIXES: &[&str] = &[
+        "u128", "usize", "u16", "u32", "u64", "u8", "i128", "isize", "i16", "i32", "i64", "i8",
+        "f32", "f64",
+    ];
+    let hex = text.starts_with("0x") || text.starts_with("0X");
+    SUFFIXES
+        .iter()
+        .copied()
+        .find(|s| text.ends_with(s) && !(hex && s.starts_with('f')))
 }
 
 /// Whether a foreign type may deref to a project type: a std smart pointer or

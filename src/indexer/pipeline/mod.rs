@@ -364,8 +364,26 @@ pub fn apply_file_refreshes(
         return Ok(());
     }
 
-    let files: Vec<String> = reindex.iter().map(|(p, _)| p.clone()).collect();
+    let mut files: Vec<String> = reindex.iter().map(|(p, _)| p.clone()).collect();
     let hashes: HashMap<String, String> = reindex.iter().cloned().collect();
+
+    // D#136, as the incremental run applies it (batch-1 review B1): a refresh
+    // of main.rs that adds `mod engine;` moves `engine.rs` into main.rs's crate
+    // without touching it. Left to the next incremental run, the root's hash
+    // was already current, the run saw an empty diff and never compared the
+    // record, and `engine.rs` stayed bound to the library for good. The files
+    // the index will hold: its rows, less the ones dropped, plus the new ones.
+    let root_mods = {
+        let dropped: HashSet<&String> = drop_rows.iter().collect();
+        let mut held: HashSet<String> = get_all_file_hashes(db.conn())?
+            .into_keys()
+            .filter(|p| !dropped.contains(p))
+            .collect();
+        held.extend(files.iter().cloned());
+        let (moved, record) = rust_root_mod_moves_of_run(db, project_root, &files, held.iter())?;
+        files.extend(moved);
+        record
+    };
 
     // Cross-file edges into these files' nodes need their context strings rebuilt
     // *after* the node IDs are replaced — capture the dirty set BEFORE re-indexing.
@@ -407,6 +425,13 @@ pub fn apply_file_refreshes(
     // never happens. The alternative destroys the marker outright, so this is
     // the lesser of the two; it is not nothing.
     fan_out_to_new_duplicate_definitions(db, project_root, &hashes, model)?;
+    if let Some(root_mods) = root_mods {
+        crate::storage::queries::set_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+            &root_mods,
+        )?;
+    }
     if was_interrupted {
         crate::storage::queries::set_meta(
             db.conn(),
@@ -487,29 +512,18 @@ pub fn run_incremental_index_cached(
     // D#136: a root's `mod` edit moves files to the other crate of a lib.rs +
     // main.rs package, and changes what their `crate::` names, without touching
     // them. Only a run whose diff has a file can have edited a root.
+    //
+    // Every other path that indexes a file (`apply_file_refreshes`) applies the
+    // same check, so a root it re-indexed never reaches here as an empty diff
+    // with a stale record (batch-1 review B1).
     let mut diff_files = [diff.new_files, diff.changed_files].concat();
     let root_mods = if diff_files.is_empty() && deleted_files.is_empty() {
         None
     } else {
-        let crates = resolve::collect_rust_crates(project_root);
-        let stored = crate::storage::queries::get_meta(
-            db.conn(),
-            crate::storage::schema::META_KEY_RUST_ROOT_MODS,
-        )?;
-        let known: HashSet<&String> = diff_files.iter().collect();
-        let moved: Vec<String> =
-            resolve::rust_root_mod_moves(stored.as_deref(), &crates, current_hashes.keys())
-                .into_iter()
-                .filter(|p| !known.contains(p))
-                .collect();
-        if !moved.is_empty() {
-            tracing::info!(
-                "[incremental] re-extracting {} Rust file(s) a crate root's `mod` edit moved",
-                moved.len()
-            );
-        }
+        let (moved, record) =
+            rust_root_mod_moves_of_run(db, project_root, &diff_files, current_hashes.keys())?;
         diff_files.extend(moved);
-        Some(crates.root_mods_json()).filter(|now| stored.as_ref() != Some(now))
+        record
     };
     let to_index = to_index_after_interrupt_check(db, diff_files, &current_hashes)?;
 
@@ -588,6 +602,38 @@ pub fn run_incremental_index_cached(
     }
 
     Ok((result, new_cache))
+}
+
+/// D#136 for one run over `run_files`: the Rust files, outside `run_files`,
+/// that a crate root's `mod` edit moved between the stored record of the roots'
+/// `mod` items and the tree now, and the record to store once the run has
+/// indexed them (None when it did not change). `held` is every file the index
+/// will hold after the run. Shared by every path that indexes a file, so none
+/// can leave the record behind the roots it indexed.
+fn rust_root_mod_moves_of_run<'a>(
+    db: &Database,
+    project_root: &Path,
+    run_files: &[String],
+    held: impl Iterator<Item = &'a String>,
+) -> Result<(Vec<String>, Option<String>)> {
+    let crates = resolve::collect_rust_crates(project_root);
+    let stored = crate::storage::queries::get_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+    )?;
+    let known: HashSet<&String> = run_files.iter().collect();
+    let moved: Vec<String> = resolve::rust_root_mod_moves(stored.as_deref(), &crates, held)
+        .into_iter()
+        .filter(|p| !known.contains(p))
+        .collect();
+    if !moved.is_empty() {
+        tracing::info!(
+            "[index] re-extracting {} Rust file(s) a crate root's `mod` edit moved",
+            moved.len()
+        );
+    }
+    let record = Some(crates.root_mods_json()).filter(|now| stored.as_ref() != Some(now));
+    Ok((moved, record))
 }
 
 /// D#24's second extraction round: re-extract the bare-name callers that a run

@@ -652,6 +652,19 @@ pub(super) fn resolve_pending_calls_touching(
                             Anchored::Nothing => continue,
                         }
                     }
+                    // A crate no manifest could be read for: by name, as the
+                    // deferred pass's default chain binds it.
+                    UseAnchor::Opaque(stripped) if stripped.is_empty() => {
+                        guessed = row.metadata.as_deref().map(ambiguous_meta);
+                        candidates
+                    }
+                    UseAnchor::Opaque(stripped) => path_filter_candidates(
+                        &stripped,
+                        &candidates,
+                        &node_id_to_path,
+                        db,
+                        crate_roots,
+                    )?,
                     // Drop on empty (drain the row without binding), never bare-fall-back.
                     UseAnchor::Unplaced(stripped) => path_filter_candidates(
                         &stripped,
@@ -1239,24 +1252,31 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
         .copied()
         .chain(method_owners.iter())
         .collect();
+    // A Rust call typed by its receiver (`"rt"`, D#112) reads whether the file
+    // of each candidate impl defines a struct of the receiver's name
+    // (`foreign_receiver_owner`): it moves with a class of that name.
     let mut stmt = conn.prepare(
         "SELECT f.path, json_extract(e.metadata, '$.q'), json_extract(e.metadata, '$.v'),
-                json_extract(e.metadata, '$.fc'), t.name, json_extract(e.metadata, '$.vc')
+                json_extract(e.metadata, '$.fc'), t.name, json_extract(e.metadata, '$.vc'),
+                json_extract(e.metadata, '$.rt')
          FROM edges e
          JOIN nodes s ON s.id = e.source_id JOIN files f ON f.id = s.file_id
          JOIN nodes t ON t.id = e.target_id
          WHERE e.relation = 'calls'
            AND (json_extract(e.metadata, '$.q') IN ('rtype', 'super')
                 OR json_extract(e.metadata, '$.fc') IS NOT NULL
-                OR json_extract(e.metadata, '$.vc') IS NOT NULL)
+                OR json_extract(e.metadata, '$.vc') IS NOT NULL
+                OR json_extract(e.metadata, '$.rt') IS NOT NULL)
          UNION
          SELECT f.path, json_extract(p.metadata, '$.q'), json_extract(p.metadata, '$.v'),
-                json_extract(p.metadata, '$.fc'), p.target_name, json_extract(p.metadata, '$.vc')
+                json_extract(p.metadata, '$.fc'), p.target_name, json_extract(p.metadata, '$.vc'),
+                json_extract(p.metadata, '$.rt')
          FROM pending_unresolved_calls p
          JOIN nodes s ON s.id = p.source_id JOIN files f ON f.id = s.file_id
          WHERE json_extract(p.metadata, '$.q') IN ('rtype', 'super')
             OR json_extract(p.metadata, '$.fc') IS NOT NULL
-            OR json_extract(p.metadata, '$.vc') IS NOT NULL",
+            OR json_extract(p.metadata, '$.vc') IS NOT NULL
+            OR json_extract(p.metadata, '$.rt') IS NOT NULL",
     )?;
     let calls = stmt.query_map([], |r| {
         Ok((
@@ -1266,11 +1286,16 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
             r.get::<_, Option<String>>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
         ))
     })?;
     for call in calls {
-        let (path, q, v, fc, target, vc) = call?;
+        let (path, q, v, fc, target, vc, rt) = call?;
         if in_run.contains(&path) || out.contains(&path) {
+            continue;
+        }
+        if rt.as_ref().is_some_and(|t| classes.contains(t)) {
+            out.insert(path);
             continue;
         }
         let through_field = fc.as_deref().and_then(last).is_some_and(|owner| {
@@ -2006,6 +2031,12 @@ pub(super) struct RustCrates {
     /// `src/` directory → the top-level modules its lib.rs and main.rs declare,
     /// for each package that has both (D#136).
     root_mods: std::collections::BTreeMap<String, RootMods>,
+    /// Some manifest names a crate the scan could not read
+    /// ([`CargoNames::unreadable`]): a path rooted at a crate name no package
+    /// answers to may be that one, so it resolves by name, as before D#132.
+    opaque: bool,
+    /// `(key, package)` dependency renames, until the walk resolves them.
+    renames: Vec<(String, String)>,
 }
 
 /// Which of a package's two crates a file is compiled into (D#136): the one
@@ -2247,7 +2278,10 @@ pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
                 walk(&entry.path(), root, depth + 1, out);
             } else if name == "Cargo.toml" {
                 if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                    if let Some(pkg) = parse_cargo_package_name(&text) {
+                    let names = parse_cargo_names(&text);
+                    out.opaque |= names.unreadable;
+                    out.renames.extend(names.renames);
+                    if let Some(pkg) = names.package {
                         let rel = dir
                             .strip_prefix(root)
                             .map(|r| r.to_string_lossy().replace('\\', "/"))
@@ -2265,6 +2299,13 @@ pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
                             };
                             out.root_mods.insert(src.clone(), mods);
                         }
+                        // The library's crate name (`[lib] name`, batch-1
+                        // review H2) is what `use` paths write; the package's
+                        // stays, as a dependency rename looks it up.
+                        if let Some(lib) = names.lib {
+                            out.src_dirs.insert(lib.clone(), src.clone());
+                            out.names.insert(lib);
+                        }
                         out.src_dirs.insert(pkg.clone(), src);
                         out.names.insert(pkg);
                     }
@@ -2275,42 +2316,135 @@ pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
 
     let mut out = RustCrates::default();
     walk(root, root, 0, &mut out);
+    // `engine = { package = "core-pkg" }`: `engine` is core-pkg's library in
+    // the depending crate. A rename of a package the project does not hold is
+    // a dependency's, and names nothing here.
+    for (key, pkg) in std::mem::take(&mut out.renames) {
+        if let Some(src) = out.src_dirs.get(&pkg).cloned() {
+            out.src_dirs.entry(key.clone()).or_insert(src);
+            out.names.insert(key);
+        }
+    }
     out
 }
 
-/// Pull `name = "..."` out of a `Cargo.toml`'s `[package]` table, normalized to
-/// the module spelling (`-` → `_`). Deliberately a line scan rather than a TOML
-/// parse: the only shape that matters is a literal string on one line, and
-/// `name.workspace = true` (no literal here) correctly yields `None`.
-fn parse_cargo_package_name(text: &str) -> Option<String> {
-    let mut in_package = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("name") else {
-            continue;
-        };
-        let Some(rest) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let rest = rest.trim_start();
+/// The crate names a `Cargo.toml` declares, module spelling (`-` → `_`).
+#[derive(Debug, Default, PartialEq)]
+struct CargoNames {
+    /// `[package] name`.
+    package: Option<String>,
+    /// `[lib] name`.
+    lib: Option<String>,
+    /// `(dependency key, package)` of each `package = "…"` rename.
+    renames: Vec<(String, String)>,
+    /// A package or library name, or a rename, the line scan cannot read: a
+    /// top-level dotted or inline `lib`/`package` key, a name that is no
+    /// literal, a rename whose package is no literal.
+    unreadable: bool,
+}
+
+/// Read [`CargoNames`] off a manifest. Deliberately a line scan rather than a
+/// TOML parse: the shape that matters is a literal string on one line, and
+/// `name.workspace = true` (no literal here) correctly yields nothing. What it
+/// cannot read it says so, and the resolver then keeps resolving a path
+/// through an unknown crate name by name, as before D#132, instead of dropping
+/// it.
+fn parse_cargo_names(text: &str) -> CargoNames {
+    let mut out = CargoNames::default();
+    // The table the line is in: None before any header.
+    let mut table: Option<String> = None;
+    let literal = |rest: &str| -> Option<String> {
+        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
         let quote = rest.chars().next()?;
         if quote != '"' && quote != '\'' {
             return None;
         }
         let value = rest[1..].split(quote).next()?;
-        if value.is_empty() {
-            return None;
+        (!value.is_empty()).then(|| value.replace('-', "_"))
+    };
+    let is_deps = |t: &str| {
+        let last = t.rsplit('.').next().unwrap_or(t);
+        matches!(
+            last,
+            "dependencies" | "dev-dependencies" | "build-dependencies"
+        )
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-        return Some(value.replace('-', "_"));
+        if line.starts_with('[') {
+            table = Some(
+                line.trim_matches(|c| c == '[' || c == ']')
+                    .trim()
+                    .to_string(),
+            );
+            continue;
+        }
+        let key = line
+            .split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        match table.as_deref() {
+            None => {
+                if key == "lib"
+                    || key == "package"
+                    || key.starts_with("lib.")
+                    || key.starts_with("package.")
+                {
+                    out.unreadable = true;
+                }
+            }
+            Some(t @ ("package" | "lib")) => {
+                if key == "name" {
+                    let rest = &line["name".len()..];
+                    match literal(rest) {
+                        Some(v) if t == "package" => out.package = Some(v),
+                        Some(v) => out.lib = Some(v),
+                        None => out.unreadable = true,
+                    }
+                }
+            }
+            Some(t) if is_deps(t) => {
+                // `engine = { path = "..", package = "core-pkg" }`
+                let Some(brace) = line.find('{') else {
+                    continue;
+                };
+                let table = &line[brace..];
+                let Some(at) = table.match_indices("package").map(|(i, _)| i).find(|&i| {
+                    table[..i].ends_with(|c: char| c == '{' || c == ',' || c.is_whitespace())
+                        && table[i + "package".len()..].trim_start().starts_with('=')
+                }) else {
+                    continue;
+                };
+                match literal(&table[at + "package".len()..]) {
+                    Some(pkg) => out.renames.push((key.replace('-', "_"), pkg)),
+                    None => out.unreadable = true,
+                }
+            }
+            Some(t) => {
+                // `[dependencies.engine]` … `package = "core-pkg"`
+                let Some((deps, dep)) = t.rsplit_once('.') else {
+                    continue;
+                };
+                if is_deps(deps) && key == "package" {
+                    match literal(&line["package".len()..]) {
+                        Some(pkg) => out.renames.push((dep.trim().replace('-', "_"), pkg)),
+                        None => out.unreadable = true,
+                    }
+                }
+            }
+        }
     }
-    None
+    out
+}
+
+/// `name = "..."` of a `Cargo.toml`'s `[package]` table, normalized to the
+/// module spelling (`-` → `_`).
+#[cfg(test)]
+fn parse_cargo_package_name(text: &str) -> Option<String> {
+    parse_cargo_names(text).package
 }
 
 /// Filter a candidate set down to those matching the Path qualifier:
@@ -2679,6 +2813,11 @@ pub(super) enum UseAnchor {
     /// file, `super` above the crate root): the path filter over the path
     /// without its root, as the same path written in the call gets.
     Unplaced(Vec<String>),
+    /// Rooted at a crate name no package answers to while some manifest names
+    /// a crate the scan could not read ([`RustCrates`]'s `opaque`): it may be
+    /// that one, so the path without its root, and a bare call by its name, as
+    /// before D#132.
+    Opaque(Vec<String>),
 }
 
 /// A module path inside one crate: its directory (`tokio/src/`), the file(s) its
@@ -2724,6 +2863,8 @@ pub(super) fn rust_use_anchor(
                 })
             } else if RUST_FOREIGN_ROOTS.contains(&first.as_str()) {
                 UseAnchor::Foreign
+            } else if crates.opaque {
+                UseAnchor::Opaque(rest.to_vec())
             } else {
                 UseAnchor::None
             }
@@ -3614,10 +3755,11 @@ pub(super) struct ProjectClassNames {
     /// Rust function id → its parameters ([`rust_call_shape_admits`]); None
     /// until loaded.
     rust_fn_shapes: Option<HashMap<i64, RustFnShape>>,
-    /// Names of the project's Rust structs, enums and unions, and of its
-    /// traits (`interface` nodes) ([`Self::rust_receiver_candidates`]); None
-    /// until loaded.
-    rust_concrete: Option<HashSet<String>>,
+    /// The project's Rust structs, enums and unions as (file id, name), the
+    /// names of all of them, and of its traits (`interface` nodes)
+    /// ([`Self::rust_receiver_candidates`]); None until loaded.
+    rust_concrete: Option<HashSet<(i64, String)>>,
+    rust_concrete_names: HashSet<String>,
     rust_traits: HashSet<String>,
 }
 
@@ -3630,9 +3772,119 @@ pub(super) enum RustRecv {
     /// when there is one; of same-named types, the one the path names.
     Project(String, Option<String>, Option<Vec<String>>),
     /// A std or dependency type (the name may be empty): only a project
-    /// trait's method, or one of an impl on that very type (`impl Tr for u32`)
-    /// when the project defines no type of that name.
+    /// trait's method, or one of an impl that can run on that type
+    /// ([`foreign_receiver_owner`]: on that very type unless the impl's
+    /// file defines a project type of that name, a blanket impl, a reference,
+    /// slice or primitive one).
     Foreign(String),
+}
+
+/// Rust's primitive types, as an impl names them (`impl NumExt for u32`).
+const RUST_PRIMITIVES: &[&str] = &[
+    "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+    "i128", "isize", "f32", "f64",
+];
+
+/// How a method of an impl on `owner` (the owner its qualified name writes:
+/// `u32`, `&str`, `[u8]`, `T`) stands for a receiver of the std or dependency
+/// type `ty` (empty: a type with no name, such as a slice or an unsuffixed
+/// literal). A project trait's own method is admitted before this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignOwner {
+    /// Cannot run on it.
+    No,
+    /// An impl on that very type (`impl Weigh for AtomicU16`, `impl StrExt
+    /// for &str` for a `str`): what method lookup finds first.
+    Exact,
+    /// Can run on it only when no exact impl answers (batch-1 review H1): one
+    /// on a slice,
+    /// array, tuple, pointer, `fn` or `dyn` type for a receiver with no name,
+    /// a slice's for a `Vec` and `str`'s for a `String` (which deref to them),
+    /// a primitive's for a receiver with no name (`7.twice()`). tokio's
+    /// `SocketAddrV4::new(..).to_socket_addrs(..)` binds the impl for
+    /// `SocketAddrV4`, not the blanket one for `&T` beside it.
+    Loose,
+    /// A blanket impl on a type parameter no project type is named after
+    /// (`impl<T: Display> Shout for T`, written `T`, or `&mut T`): as
+    /// [`Self::Loose`], and only where its trait can be in scope, the caller's
+    /// file being the impl's or importing from it. It applies to every type,
+    /// so without that tokio's `thread.id()` bound `impl<T: Wait> Wait for
+    /// &mut T`'s `id` in five files that never name `Wait`.
+    Blanket,
+}
+
+/// [`ForeignOwner`] of an impl on `owner` for a receiver of type `ty`. An impl
+/// on a named type is exact unless the impl's own file defines a project
+/// struct, enum or union of that name (`own_type_here`): then it is that
+/// type's. Asked of the impl's file, not of the whole project, because a
+/// project `struct Duration` elsewhere does not make `impl Ext for
+/// std::time::Duration` the project's, and because the answer then changes
+/// only with that file, which re-resolves its callers (batch-1 review B2: the
+/// project-wide reading changed a rebuild's answer when any file gained the
+/// struct, and nothing re-resolved an incremental run's).
+fn foreign_receiver_owner(
+    ty: &str,
+    owner: &str,
+    no_project_type_named: bool,
+    own_type_here: impl FnOnce() -> bool,
+) -> ForeignOwner {
+    let mut o = owner.trim();
+    while let Some(rest) = o.strip_prefix('&') {
+        let rest = rest.trim_start();
+        let rest = match rest.strip_prefix('\'') {
+            Some(lt) => lt
+                .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+                .trim_start(),
+            None => rest,
+        };
+        o = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    }
+    let loose = |admits: bool| {
+        if admits {
+            ForeignOwner::Loose
+        } else {
+            ForeignOwner::No
+        }
+    };
+    let type_param = o
+        .strip_prefix(|c: char| c.is_ascii_uppercase())
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()));
+    if type_param && no_project_type_named {
+        return ForeignOwner::Blanket;
+    }
+    if o.starts_with(['[', '(', '*']) || o.starts_with("fn(") || o.starts_with("dyn ") {
+        return loose(ty.is_empty() || (ty == "Vec" && o.starts_with('[')));
+    }
+    if RUST_PRIMITIVES.contains(&o) {
+        if o == ty {
+            return ForeignOwner::Exact;
+        }
+        return loose(ty.is_empty() || (o == "str" && ty == "String"));
+    }
+    if o == ty && !own_type_here() {
+        ForeignOwner::Exact
+    } else {
+        ForeignOwner::No
+    }
+}
+
+/// The file of `caller_path` and every file its `imports` edges reach: where a
+/// trait a call can see may be defined ([`ForeignOwner::Blanket`]).
+fn rust_files_in_scope(
+    conn: &rusqlite::Connection,
+    caller_path: &str,
+) -> rusqlite::Result<HashSet<i64>> {
+    conn.prepare(
+        "SELECT f.id FROM files f WHERE f.path = ?1
+         UNION
+         SELECT t.file_id FROM files f
+         JOIN nodes s ON s.file_id = f.id
+         JOIN edges e ON e.source_id = s.id AND e.relation = 'imports'
+         JOIN nodes t ON t.id = e.target_id
+         WHERE f.path = ?1",
+    )?
+    .query_map([caller_path], |r| r.get::<_, i64>(0))?
+    .collect()
 }
 
 /// The receiver type keys of a Rust call's metadata, or None.
@@ -3655,6 +3907,8 @@ pub(super) fn rust_receiver(metadata: Option<&str>, crate_roots: &RustCrates) ->
         (Some("p"), _) => Some(RustRecv::Project(name, via, path)),
         (Some("f"), _) => Some(RustRecv::Foreign(name)),
         (_, Some(krate)) if crate_roots.contains(krate) => Some(RustRecv::Project(name, via, path)),
+        // Maybe a package whose manifest could not be read: untyped, as before.
+        (_, Some(_)) if crate_roots.opaque => None,
         (_, Some(_)) => Some(RustRecv::Foreign(name)),
         _ => None,
     }
@@ -3799,37 +4053,76 @@ impl ProjectClassNames {
             RustRecv::Foreign(ty) => {
                 if self.rust_concrete.is_none() {
                     let mut stmt = db.conn().prepare(
-                        "SELECT DISTINCT n.name, n.type = 'interface' FROM nodes n
+                        "SELECT DISTINCT n.file_id, n.name, n.type = 'interface' FROM nodes n
                          JOIN files f ON f.id = n.file_id
                          WHERE f.language = 'rust'
                            AND n.type IN ('struct', 'enum', 'union', 'interface')",
                     )?;
                     let mut concrete = HashSet::new();
-                    for row in
-                        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
-                    {
-                        let (name, is_trait) = row?;
+                    for row in stmt.query_map([], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                        ))
+                    })? {
+                        let (file_id, name, is_trait) = row?;
                         if is_trait {
                             self.rust_traits.insert(name);
                         } else {
-                            concrete.insert(name);
+                            self.rust_concrete_names.insert(name.clone());
+                            concrete.insert((file_id, name));
                         }
                     }
                     self.rust_concrete = Some(concrete);
                 }
                 let concrete = self.rust_concrete.as_ref().expect("loaded above");
                 let traits = &self.rust_traits;
+                let names = &self.rust_concrete_names;
                 // Owners are compared by name: a type defined inside an item
                 // macro (`cfg_net! { pub struct TcpStream … }`) has no node, but
                 // its impls' methods do, so "not a known struct" is no proof
                 // that an owner is not the project's.
-                Ok(candidates
+                let verdicts: Vec<(i64, ForeignOwner)> = candidates
                     .iter()
-                    .copied()
-                    .filter(|id| match owner(id) {
-                        Some(o) => traits.contains(o) || (o == ty && !concrete.contains(o)),
-                        None => true,
+                    .map(|id| {
+                        let verdict = match owner(id) {
+                            None => ForeignOwner::Exact,
+                            Some(o) if traits.contains(o) => ForeignOwner::Exact,
+                            Some(o) => {
+                                let file_id = self.node_info.get(id).map(|(f, _)| *f);
+                                foreign_receiver_owner(&ty, o, !names.contains(o), || {
+                                    file_id.is_some_and(|f| concrete.contains(&(f, o.to_string())))
+                                })
+                            }
+                        };
+                        (*id, verdict)
                     })
+                    .collect();
+                // A loose impl only where no impl on the type itself answers.
+                let exact = verdicts.iter().any(|(id, v)| {
+                    *v == ForeignOwner::Exact && owner(id).is_some_and(|o| !traits.contains(o))
+                });
+                let reach = if !exact && verdicts.iter().any(|(_, v)| *v == ForeignOwner::Blanket) {
+                    rust_files_in_scope(db.conn(), caller_path)?
+                } else {
+                    HashSet::new()
+                };
+                Ok(verdicts
+                    .into_iter()
+                    .filter(|(id, v)| match v {
+                        ForeignOwner::Exact => true,
+                        ForeignOwner::Loose => !exact,
+                        ForeignOwner::Blanket => {
+                            !exact
+                                && self
+                                    .node_info
+                                    .get(id)
+                                    .is_some_and(|(f, _)| reach.contains(f))
+                        }
+                        ForeignOwner::No => false,
+                    })
+                    .map(|(id, _)| id)
                     .collect())
             }
         }
