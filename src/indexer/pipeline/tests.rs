@@ -8941,6 +8941,106 @@ fn test_rust_receiver_types_incremental_matches_rebuild() {
     );
 }
 
+/// A typed call on a struct of its own file that lacks the method binds only
+/// what could run. Whether the struct has a `Deref` is read from other files,
+/// and the call may then have bound nothing and left no row behind (`clone` is
+/// a name the default chain drops): an incremental run that adds or removes
+/// the `Deref`, or the struct's own method, must still give a rebuild's edges.
+#[test]
+fn test_rust_receiver_runnable_candidates_incremental_matches_rebuild() {
+    fn tree(caller: &'static str, other: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "mod caller;\nmod other;\n"),
+            ("src/caller.rs", caller),
+            ("src/other.rs", other),
+        ]
+    }
+    let has = |edges: &[String], e: &str| edges.iter().any(|x| x == e);
+    const NOTHING: &str = "pub struct Unrelated;\n";
+    const DEREF: &str = "impl std::ops::Deref for crate::caller::Inner {\n\
+        type Target = crate::caller::Token;\n\
+        fn deref(&self) -> &crate::caller::Token { unimplemented!() }\n}\n";
+    const OWN_CLONE: &str = "impl Clone for crate::caller::Inner {\n\
+        fn clone(&self) -> Self { crate::caller::Inner }\n}\n";
+    for (method, token_impl) in [
+        ("poke", "impl Token {\n    pub fn poke(&self) {}\n}\n"),
+        (
+            "clone",
+            "impl Clone for Token {\n    fn clone(&self) -> Self { Token }\n}\n",
+        ),
+    ] {
+        // `Inner` has no `method`; `Token`, in the same file, does.
+        let caller: &'static str = Box::leak(
+            format!(
+                "pub struct Inner;\npub struct Token;\n{token_impl}\
+                 pub struct Holder {{ inner: Inner }}\n\
+                 impl Holder {{\n    pub fn go(&self) {{ self.inner.{method}(); }}\n}}\n"
+            )
+            .into_boxed_str(),
+        );
+        let to_token = format!("src/caller.rs.go --calls--> src/caller.rs.{method}");
+        // `Inner` gains a `Deref` in another file: `Token`'s method may run now.
+        let want = assert_all_edges_match_rebuild(
+            &tree(caller, NOTHING),
+            &[("src/other.rs", Some(DEREF))],
+        );
+        assert!(has(&want, &to_token), "{method}: {want:#?}");
+        // ...and loses it: no other type's method runs on an `Inner`.
+        let want = assert_all_edges_match_rebuild(
+            &tree(caller, DEREF),
+            &[("src/other.rs", Some(NOTHING))],
+        );
+        assert!(!has(&want, &to_token), "{method}: {want:#?}");
+    }
+    // `Inner` gains its own `poke` through a split impl in another file: the
+    // call, which bound nothing and left no row, now binds it; and back.
+    let caller: &'static str = "pub struct Inner;\npub struct Token;\n\
+        impl Token {\n    pub fn poke(&self) {}\n}\n\
+        pub struct Holder { inner: Inner }\n\
+        impl Holder {\n    pub fn go(&self) { self.inner.poke(); }\n}\n";
+    const OWN_POKE: &str = "impl crate::caller::Inner {\n    pub fn poke(&self) {}\n}\n";
+    let want =
+        assert_all_edges_match_rebuild(&tree(caller, NOTHING), &[("src/other.rs", Some(OWN_POKE))]);
+    assert!(
+        has(&want, "src/caller.rs.go --calls--> src/other.rs.poke"),
+        "{want:#?}"
+    );
+    assert!(
+        !has(&want, "src/caller.rs.go --calls--> src/caller.rs.poke"),
+        "{want:#?}"
+    );
+    let want =
+        assert_all_edges_match_rebuild(&tree(caller, OWN_POKE), &[("src/other.rs", Some(NOTHING))]);
+    assert!(
+        !want
+            .iter()
+            .any(|e| e.starts_with("src/caller.rs.go --calls-->")),
+        "{want:#?}"
+    );
+    // `Inner` gains its own `clone` in another file, and loses it again: never
+    // `Token`'s. (Its own is cross-file, where the default chain drops the name
+    // `clone` as it always has; the parity is the point.)
+    let caller: &'static str = "pub struct Inner;\npub struct Token;\n\
+        impl Clone for Token {\n    fn clone(&self) -> Self { Token }\n}\n\
+        pub struct Holder { inner: Inner }\n\
+        impl Holder {\n    pub fn go(&self) { self.inner.clone(); }\n}\n";
+    let want = assert_all_edges_match_rebuild(
+        &tree(caller, NOTHING),
+        &[("src/other.rs", Some(OWN_CLONE))],
+    );
+    let to_token = "src/caller.rs.go --calls--> src/caller.rs.clone";
+    assert!(!has(&want, to_token), "{want:#?}");
+    let want = assert_all_edges_match_rebuild(
+        &tree(caller, OWN_CLONE),
+        &[("src/other.rs", Some(NOTHING))],
+    );
+    assert!(!has(&want, to_token), "{want:#?}");
+}
+
 /// D#136: a package with both `src/lib.rs` and `src/main.rs` builds two crates.
 /// `twin` declares `user`, `engine`, `deep` (inline, holding the file
 /// `deep/inner.rs`) and `shared` from lib.rs; `cli` and `shared` from main.rs;

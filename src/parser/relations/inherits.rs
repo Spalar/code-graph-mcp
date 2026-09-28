@@ -231,6 +231,8 @@ fn extract_rust_impl_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelatio
         return;
     };
     let type_name = impl_rel.source_name.clone();
+    // The methods' qualified names carry the bare type name whatever the path.
+    let method_owner = crate::parser::rust_impl_type_name(&type_name);
     results.push(impl_rel);
     // For each method in the trait impl block, emit a method-level implements
     // edge: TypeName → method_name. This ensures dead code detection sees
@@ -261,7 +263,7 @@ fn extract_rust_impl_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelatio
             source_name: type_name.clone(),
             target_name: method_name.to_string(),
             relation: REL_IMPLEMENTS.into(),
-            metadata: Some(super::serialize_impl_method_metadata(&type_name)),
+            metadata: Some(super::serialize_impl_method_metadata(&method_owner)),
             source_language: String::new(),
             source_line: None,
         });

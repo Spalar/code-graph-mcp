@@ -9,6 +9,34 @@ pub fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
     source.get(node.byte_range()).unwrap_or("")
 }
 
+/// The name a Rust impl block's type is recorded under: its generic arguments
+/// dropped, then its last path segment (`crate::a::List<L, L::Target>` →
+/// `List`). Single source of truth for the node walk (method qualified names),
+/// the relation walk (`self.m()` / `Self::m()` payloads) and trait-impl
+/// heritage, which must agree for a method filter to find anything. The
+/// arguments go first because they may hold paths themselves: splitting on
+/// `::` first named that impl `Target>`, and a payload that kept them
+/// (`Gen<T>`) matched no method at all.
+pub(crate) fn rust_impl_type_name(type_text: &str) -> String {
+    rust_type_path(type_text).pop().unwrap_or_default()
+}
+
+/// The path segments of a Rust type as written, its generic arguments dropped
+/// (`std::io::Error` → [std, io, Error]; `List<L, L::Target>` → [List]).
+pub(crate) fn rust_type_path(type_text: &str) -> Vec<String> {
+    let mut bare = String::with_capacity(type_text.len());
+    let mut depth = 0usize;
+    for c in type_text.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => bare.push(c),
+            _ => {}
+        }
+    }
+    bare.split("::").map(|s| s.trim().to_string()).collect()
+}
+
 /// Recognize an Express/Fastify/Koa-style HTTP route registration call
 /// (`app|router|server|fastify.METHOD(path, ...)`) and return its (METHOD, path).
 /// Single source of truth for the recognized receiver objects + HTTP-method map,
@@ -95,4 +123,24 @@ pub(crate) fn route_handler_name(node: &tree_sitter::Node, source: &str) -> Opti
     // find_routes_by_path matches on the metadata `$.path` (storage/queries/
     // routes.rs), not the node name, so trace / route lookup is unaffected.
     Some(format!("{}#L{}", base, node.start_position().row + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rust_impl_type_name;
+
+    #[test]
+    fn rust_impl_type_name_drops_arguments_before_the_path() {
+        for (text, want) in [
+            ("Plain", "Plain"),
+            ("Gen<T>", "Gen"),
+            ("crate::db_a::Db", "Db"),
+            ("crate::a::List<L, L::Target>", "List"),
+            ("Outer<Inner<u8>, a::B>", "Outer"),
+            ("<T as Link>::Target", "Target"),
+            ("&'a mut Foo<T>", "&'a mut Foo"),
+        ] {
+            assert_eq!(rust_impl_type_name(text), want, "{text}");
+        }
+    }
 }

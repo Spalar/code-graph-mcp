@@ -1124,28 +1124,17 @@ fn extract_nodes(
         }
         "impl_item" => {
             if let Some(type_node) = node.child_by_field_name("type") {
-                let impl_name_full = node_text(&type_node, source);
-                // Strip path prefix so `impl crate::db_a::Db` is captured as
-                // "Db" (matching what callers use as `Self`/`self` payload).
-                // Mirrors the strip in relations/mod.rs walk_for_relations
-                // for impl_item — keeps qualified_name consistent across the
-                // two parser walks (treesitter.rs builds nodes; relations/mod.rs
-                // builds edges).
-                let impl_name = impl_name_full.rsplit("::").next().unwrap_or(impl_name_full);
-                // Strip generic parameters so `impl<T> Foo<T>` produces method
-                // qualified_names like "Foo.method" not "Foo<T>.method". The
-                // self_filter_candidates resolver and impl_method metadata
-                // both encode the bare type name (see relations/rust.rs);
-                // keeping the impl name bare avoids a LIKE mismatch that would
-                // drop every method-level implements edge.
-                let impl_name = impl_name.split('<').next().unwrap_or(impl_name).trim();
+                // `impl<T> crate::db_a::Db<T>` is captured as "Db": the name
+                // the relation walk puts in `self`/`Self` payloads and
+                // trait-impl heritage (see `rust_impl_type_name`).
+                let impl_name = super::rust_impl_type_name(node_text(&type_node, source));
                 let first_child = results.len();
                 extract_children(
                     node,
                     source,
                     language,
                     config,
-                    Some(impl_name),
+                    Some(&impl_name),
                     results,
                     depth,
                     node_is_test,

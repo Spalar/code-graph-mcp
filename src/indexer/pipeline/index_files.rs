@@ -833,6 +833,38 @@ fn module_node_of(
 ///
 /// Returns the number of rows actually created; `insert_edge_cached` dedups,
 /// so a repeat of an existing edge counts zero.
+/// Bind a typed call to `targets` minus what its receiver's type rules out
+/// ([`super::resolve::RecvNever`]). A call that leaves with nothing, ruled out
+/// by what other files say of the type, is buffered instead, so a change there
+/// finds it (`typed_callers_of_class_drift`).
+fn bind_unless_ruled_out(
+    db: &Database,
+    sources: &[i64],
+    targets: &[i64],
+    never: &super::resolve::RecvNever,
+    d: &DeferredRelation,
+    metadata: Option<&str>,
+) -> Result<usize> {
+    let kept: Vec<i64> = targets
+        .iter()
+        .copied()
+        .filter(|id| !never.ids.contains(id))
+        .collect();
+    if kept.is_empty() && !targets.is_empty() && never.read_elsewhere {
+        for &src_id in sources {
+            crate::storage::queries::insert_pending_unresolved_call(
+                db.conn(),
+                src_id,
+                &d.target_name,
+                &d.language,
+                metadata,
+            )?;
+        }
+        return Ok(0);
+    }
+    insert_relation_edges(db, sources, &kept, &d.relation, metadata, false)
+}
+
 fn insert_relation_edges(
     db: &Database,
     sources: &[i64],
@@ -1376,13 +1408,36 @@ fn resolve_batch_relations(
             // Widget`; without this both matched `source_name == "Widget"` and the
             // constructor got a bogus `inherits` edge. Blacklist fn/method (rather
             // than whitelist type kinds) so no language's type node is missed.
+            // A Rust impl's type is never a trait either (a trait is a type only
+            // as `dyn Trait`): `impl Semaphore for bounded::Semaphore` names a
+            // `Semaphore` that is not this file's trait of that name.
             let type_source_only = rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS;
+            let rust_impl = pf.language == "rust" && rel.relation == REL_IMPLEMENTS;
+            // `impl Tr for crate::a::Type` names this file's `Type` only when
+            // `a` is this file's module path (the parser keeps such a path
+            // whole; see `rust::extract_rust_impl_trait`).
+            let source_name: &str = match rel.source_name.strip_prefix("crate::") {
+                Some(rest) if rust_impl => {
+                    let segments: Vec<&str> = rest.split("::").collect();
+                    let (name, module) = segments.split_last().expect("split yields one");
+                    let here = super::resolve::rust_crate_layout(&pf.rel_path)
+                        .map(|(_, _, m)| m)
+                        .unwrap_or_default();
+                    if module.iter().copied().eq(here.iter().map(String::as_str)) {
+                        name
+                    } else {
+                        rel.source_name.as_str()
+                    }
+                }
+                _ => rel.source_name.as_str(),
+            };
             let mut source_ids = (0..pf.node_ids.len())
                 .filter(|&i| {
-                    (pf.node_names[i] == rel.source_name
-                        || pf.node_qualified_names[i].as_deref() == Some(rel.source_name.as_str()))
+                    (pf.node_names[i] == source_name
+                        || pf.node_qualified_names[i].as_deref() == Some(source_name))
                         && (!type_source_only
                             || !matches!(pf.node_types[i].as_str(), "function" | "method"))
+                        && !(rust_impl && pf.node_types[i] == "interface")
                 })
                 .collect::<Vec<_>>();
             // Same-named definitions in one file (cfg twins, `@overload` stubs,
@@ -3668,7 +3723,15 @@ fn resolve_deferred_relations(
                     if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method") {
                         if let Some(impl_type) = meta.get("v").and_then(|v| v.as_str()) {
                             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
-                            let filtered = self_filter_candidates(impl_type, &all, db)?;
+                            let filtered = self_filter_candidates(
+                                impl_type,
+                                &all,
+                                &source_ids,
+                                &d.rel_path,
+                                &node_id_to_path,
+                                None,
+                                db,
+                            )?;
                             if !filtered.is_empty() {
                                 edges_created += insert_relation_edges(
                                     db,
@@ -3697,6 +3760,17 @@ fn resolve_deferred_relations(
                 all,
             )?;
             let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
+            // What the receiver's type rules out: dropped from what is bound
+            // below, never from the pool it is chosen from.
+            let never = classes.rust_receiver_never(
+                db,
+                &d.language,
+                &d.target_name,
+                d.metadata.as_deref(),
+                crate_roots,
+                &d.rel_path,
+                &all,
+            )?;
             let all = classes.rust_receiver_candidates(
                 db,
                 &d.language,
@@ -3807,20 +3881,28 @@ fn resolve_deferred_relations(
                             None // ambiguous either way → drop, as at batch time
                         };
                         if let Some(tgt_id) = target {
-                            edges_created += insert_relation_edges(
+                            edges_created += bind_unless_ruled_out(
                                 db,
                                 &source_ids,
                                 &[tgt_id],
-                                &d.relation,
+                                &never,
+                                d,
                                 call_meta,
-                                false,
                             )?;
                         }
                     }
                 }
                 Some(CalleeMeta::SelfRecv(impl_type)) | Some(CalleeMeta::SelfType(impl_type)) => {
                     let same_lang = same_lang_of(&all, &d.language, &[]);
-                    let filtered = self_filter_candidates(&impl_type, &same_lang, db)?;
+                    let filtered = self_filter_candidates(
+                        &impl_type,
+                        &same_lang,
+                        &source_ids,
+                        &d.rel_path,
+                        &node_id_to_path,
+                        call_meta,
+                        db,
+                    )?;
                     if !filtered.is_empty() {
                         edges_created += insert_relation_edges(
                             db,
@@ -4035,13 +4117,13 @@ fn resolve_deferred_relations(
                 })
                 .collect();
             if !same_file_targets.is_empty() {
-                edges_created += insert_relation_edges(
+                edges_created += bind_unless_ruled_out(
                     db,
                     &source_ids,
                     &same_file_targets,
-                    &d.relation,
+                    &never,
+                    d,
                     call_meta,
-                    false,
                 )?;
                 continue;
             }
@@ -4082,14 +4164,8 @@ fn resolve_deferred_relations(
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
-                edges_created += insert_relation_edges(
-                    db,
-                    &source_ids,
-                    &final_targets,
-                    &d.relation,
-                    call_meta,
-                    false,
-                )?;
+                edges_created +=
+                    bind_unless_ruled_out(db, &source_ids, &final_targets, &never, d, call_meta)?;
                 continue;
             }
             // Still unresolved after seeing the WHOLE tree — this is what the

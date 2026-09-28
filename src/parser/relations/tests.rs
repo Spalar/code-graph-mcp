@@ -3976,8 +3976,9 @@ fn test_rust_callee_self_recv_within_impl() {
         .expect("missing call to helper");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"n":0,"q":"self","v":"Db"}"#),
-        "self.method() inside impl Db emits SelfRecv with type name"
+        Some(r#"{"inh":1,"n":0,"q":"self","v":"Db"}"#),
+        "self.method() inside impl Db emits SelfRecv with type name, marked as \
+         an inherent impl's (\"inh\"), whose calls stay in the crate"
     );
 }
 
@@ -3999,7 +4000,9 @@ fn test_rust_callee_self_type_within_impl() {
         .expect("missing call to default from make");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"n":0,"q":"stype","v":"Db"}"#),
+        // `"inh"`: an inherent impl's call; `"wide"`: the file defines `Db`'s
+        // `default` only in a trait impl, which an inherent one would outrank.
+        Some(r#"{"inh":1,"n":0,"q":"stype","v":"Db","wide":1}"#),
         "Self::method() inside impl Db emits SelfType with type name"
     );
 }
@@ -7767,7 +7770,7 @@ fn test_rust_self_path_in_a_trait_default_method_names_the_trait() {
         metas,
         vec![
             Some(r#"{"n":0,"q":"stype","v":"Tr"}"#),
-            Some(r#"{"n":0,"q":"stype","v":"S"}"#)
+            Some(r#"{"inh":1,"n":0,"q":"stype","v":"S"}"#)
         ],
         "{all:?}"
     );

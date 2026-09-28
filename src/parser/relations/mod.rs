@@ -60,6 +60,7 @@ mod receiver;
 pub use receiver::{cpp_class_fields, CppField};
 mod routes;
 mod rust;
+mod rust_impls;
 mod rust_receiver;
 mod rust_use;
 mod typescript;
@@ -170,6 +171,7 @@ pub fn extract_relations_from_tree(
     rust::reset_fn_local_names_cache();
     rust_use::reset();
     rust_receiver::reset();
+    rust_impls::reset();
     member::reset_import_bound(tree.root_node(), source, config.name);
     receiver::reset();
     walk_for_relations(
@@ -810,14 +812,10 @@ fn walk_for_relations(
     // (relations source_name="conn" matches pf.node_names "conn"; would
     // become "Database.conn" if folded into current_class).
     let child_rust_impl: Option<String> = if language == "rust" && kind == "impl_item" {
-        node.child_by_field_name("type").map(|t| {
-            let full = node_text(&t, source);
-            // Strip path prefix: `impl crate::db_a::Db` → "Db". Mirrors
-            // treesitter.rs's parent_class strip so SelfRecv payloads
-            // match qualified_name (which uses just the rightmost type
-            // segment).
-            full.rsplit("::").next().unwrap_or(full).to_string()
-        })
+        // `impl<T> crate::db_a::Db<T>` → "Db", the name its methods'
+        // qualified_names carry (see `rust_impl_type_name`).
+        node.child_by_field_name("type")
+            .map(|t| crate::parser::rust_impl_type_name(node_text(&t, source)))
     } else {
         None
     };

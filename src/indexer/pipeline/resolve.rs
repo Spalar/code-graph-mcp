@@ -557,6 +557,18 @@ pub(super) fn resolve_pending_calls_touching(
             );
         }
         let no_files = HashSet::new();
+        let never = classes.rust_receiver_never(
+            db,
+            &row.source_language,
+            &row.target_name,
+            row.metadata.as_deref(),
+            crate_roots,
+            source_id_to_path
+                .get(&row.source_id)
+                .map(String::as_str)
+                .unwrap_or_default(),
+            &candidates,
+        )?;
         let candidates = classes.rust_receiver_candidates(
             db,
             &row.source_language,
@@ -696,7 +708,15 @@ pub(super) fn resolve_pending_calls_touching(
             }
             Some(CalleeMeta::SelfType(t)) | Some(CalleeMeta::SelfRecv(t)) => {
                 // Drop on empty (drain the row without binding), never bare-fall-back.
-                self_filter_candidates(&t, &candidates, db)?
+                self_filter_candidates(
+                    &t,
+                    &candidates,
+                    &[row.source_id],
+                    caller_path,
+                    &node_id_to_path,
+                    row.metadata.as_deref(),
+                    db,
+                )?
             }
             Some(CalleeMeta::Path(segments)) => {
                 // A path a `use` spelled out (D#132), as the deferred pass reads it.
@@ -813,7 +833,15 @@ pub(super) fn resolve_pending_calls_touching(
             resolved
         };
 
-        for tgt_id in &refined {
+        // What the receiver's type rules out is dropped from the result; a call
+        // left with nothing stays buffered when other files decided that.
+        if never.read_elsewhere
+            && !refined.is_empty()
+            && refined.iter().all(|id| never.ids.contains(id))
+        {
+            continue;
+        }
+        for tgt_id in refined.iter().filter(|id| !never.ids.contains(id)) {
             if insert_edge_cached(db.conn(), row.source_id, *tgt_id, REL_CALLS, metadata)? {
                 edges_added += 1;
                 touched.insert(caller_path.to_string());
@@ -1384,6 +1412,17 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
             continue;
         }
         if rt.as_ref().is_some_and(|t| classes.contains(t)) {
+            out.insert(path);
+            continue;
+        }
+        // It also loses the candidates its type's methods and `Deref` rule out
+        // (`ProjectClassNames::rust_receiver_never`), buffered when that left it
+        // nothing: a moved method of that name, or a moved `deref`, moves it.
+        if rt.as_ref().is_some_and(|t| {
+            methods.iter().any(|(o, m)| {
+                o == t && (*m == target || matches!(m.as_str(), "deref" | "deref_mut"))
+            })
+        }) {
             out.insert(path);
             continue;
         }
@@ -2729,14 +2768,91 @@ fn filter_by_segment_chain(
 ///
 /// Not file-restricted — Rust allows `impl Type {}` blocks to span multiple
 /// files (e.g. `impl Database` is split across 3+ files in this repo), so we
-/// match by `qualified_name LIKE 'Type.%'` across all files.
+/// match by `qualified_name LIKE 'Type.%'` across all files. But one name can
+/// be several types: broadcast's and mpsc's `Receiver` in one crate, tokio's and
+/// tokio-util's `Wheel` in two. So the nearest methods of that name win: the
+/// caller's own file (which cannot define two types of one name), else its
+/// crate (an inherent impl lives in its type's crate), else all of them — a
+/// trait impl may sit outside its type's crate (`impl Show for a::Foo` in `b`,
+/// whose `self.name()` is `a`'s). A call in an inherent impl (`"inh"`) stops at
+/// its crate: the impl lives in its type's crate, and so does every impl that
+/// crate can call on the type. When the caller's file defines the type's method
+/// only in trait impls (`"wide"`), the file is skipped: an inherent method of
+/// that name in another file outranks a trait's. The callers themselves are no evidence of
+/// where the method lives: `Self::poll_accept(self)` inside the trait impl's
+/// own `poll_accept` means the inherent one elsewhere.
+///
+/// Then the call's `"xl"` lines drop, from what was chosen, the caller's-file
+/// methods of impls the language keeps apart from the caller's
+/// (`parser::relations::rust_impls`). Dropped AFTER the choice, never before:
+/// a tier emptied by them binds nothing rather than falling through to a wider
+/// one, so the rule only ever removes an edge the choice would have made.
 pub(super) fn self_filter_candidates(
     impl_type: &str,
     candidates: &[i64],
+    callers: &[i64],
+    caller_path: &str,
+    node_id_to_path: &HashMap<i64, String>,
+    metadata: Option<&str>,
     db: &crate::storage::db::Database,
 ) -> anyhow::Result<Vec<i64>> {
     // Chunked under MAX_IN_PARAMS (issue #30).
-    filter_method_ids(db.conn(), candidates, Some(impl_type))
+    let of_type = filter_method_ids(db.conn(), candidates, Some(impl_type))?;
+    let crate_dir = rust_crate_layout(caller_path).map(|(dir, _, _)| dir);
+    let nearest = |keep: &dyn Fn(&str) -> bool| -> Vec<i64> {
+        of_type
+            .iter()
+            .copied()
+            .filter(|id| !callers.contains(id))
+            .filter(|id| node_id_to_path.get(id).is_some_and(|p| keep(p)))
+            .collect()
+    };
+    let facts: Option<serde_json::Value> = metadata
+        .filter(|m| m.contains(r#""xl":"#) || m.contains(r#""inh":"#) || m.contains(r#""wide":"#))
+        .and_then(|m| serde_json::from_str(m).ok());
+    let inherent = facts.as_ref().is_some_and(|v| v.get("inh").is_some());
+    // The file has the type's method only in trait impls: an inherent one in
+    // another file outranks it, so the file is no proof and the crate decides.
+    let wide = facts.as_ref().is_some_and(|v| v.get("wide").is_some());
+    let mut chosen = if wide {
+        Vec::new()
+    } else {
+        nearest(&|p| p == caller_path)
+    };
+    if chosen.is_empty() {
+        if let Some(crate_dir) = &crate_dir {
+            chosen =
+                nearest(&|p| rust_crate_layout(p).is_some_and(|(dir, _, _)| dir == *crate_dir));
+        }
+    }
+    if chosen.is_empty() && !(inherent && crate_dir.is_some()) {
+        chosen = of_type;
+    }
+    let excluded: Vec<i64> = facts
+        .as_ref()
+        .and_then(|v| {
+            v.get("xl")?
+                .as_array()
+                .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
+        })
+        .unwrap_or_default();
+    if excluded.is_empty() {
+        return Ok(chosen);
+    }
+    let mut stmt = db
+        .conn()
+        .prepare_cached("SELECT start_line FROM nodes WHERE id = ?1")?;
+    let mut kept = Vec::with_capacity(chosen.len());
+    for id in chosen {
+        if node_id_to_path.get(&id).is_some_and(|p| p == caller_path) {
+            let line: i64 = stmt.query_row([id], |r| r.get(0))?;
+            if excluded.contains(&line) {
+                continue;
+            }
+        }
+        kept.push(id);
+    }
+    Ok(kept)
 }
 
 /// Where a Rust file sits in its crate: the directory module files hang off, the
@@ -2744,7 +2860,7 @@ pub(super) fn self_filter_candidates(
 /// (`src/`, [lib.rs, main.rs], [a, b]); `src/a/mod.rs` → [a]; a test/bench/
 /// example target `tests/t.rs` is its own root, (`tests/`, [tests/t.rs], []).
 /// None where the layout says nothing sure (`src/bin/`, `tests/common/…`).
-fn rust_crate_layout(path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+pub(super) fn rust_crate_layout(path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
     let src_at = if path.starts_with("src/") {
         Some(0)
     } else {
@@ -3832,6 +3948,24 @@ struct ClassNode {
     nested: bool,
 }
 
+/// The type an impl on a reference names: `&'a mut Foo` → `Foo`. Other types
+/// come back as written.
+fn rust_referent(owner: &str) -> &str {
+    let mut rest = owner.trim();
+    while let Some(r) = rest.strip_prefix('&') {
+        rest = r.trim_start();
+        if let Some(r) = rest.strip_prefix('\'') {
+            rest = r
+                .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+                .trim_start();
+        }
+        if let Some(r) = rest.strip_prefix("mut ") {
+            rest = r.trim_start();
+        }
+    }
+    rest
+}
+
 /// What receiver-type resolution reads from the index, loaded once per pass and
 /// then answered from memory — per call it runs no SQL beyond fetching the file
 /// and qualified name of candidates it has not seen yet (django: one `__init__`
@@ -3863,6 +3997,24 @@ pub(super) struct ProjectClassNames {
     rust_concrete: Option<HashSet<(i64, String)>>,
     rust_traits: HashSet<String>,
     rust_blanket: HashMap<i64, Box<str>>,
+    /// The same structs, enums and unions as (file path, name); loaded with
+    /// `rust_concrete`.
+    rust_concrete_at: HashSet<(String, String)>,
+    /// Types with a `deref` / `deref_mut` method (a `Deref` impl): a call on
+    /// one may run its target's methods; loaded with `rust_concrete`.
+    rust_deref_owners: HashSet<String>,
+}
+
+/// What [`ProjectClassNames::rust_receiver_never`] rules out of a typed Rust
+/// call's candidates.
+#[derive(Debug, Default)]
+pub(super) struct RecvNever {
+    /// The candidates that cannot run.
+    pub(super) ids: HashSet<i64>,
+    /// Ruled out by what OTHER files say of the receiver's type (its methods,
+    /// its `Deref`): a call this leaves with nothing to bind is buffered, not
+    /// dropped, so a change there finds it (`typed_callers_of_class_drift`).
+    pub(super) read_elsewhere: bool,
 }
 
 /// The receiver type a Rust method call carries (parser `rust_receiver.rs`,
@@ -4066,6 +4218,8 @@ impl ProjectClassNames {
     /// trait's). A project type with no method of that name keeps every
     /// candidate: a trait's default method or a `Deref` target runs then.
     /// Calls without a receiver type, and other languages', pass through.
+    /// [`Self::rust_receiver_never`] then names, of what this keeps, what can
+    /// never run.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn rust_receiver_candidates(
         &mut self,
@@ -4084,18 +4238,8 @@ impl ProjectClassNames {
         let Some(recv) = rust_receiver(metadata, crate_roots) else {
             return Ok(candidates);
         };
-        let missing: Vec<i64> = candidates
-            .iter()
-            .copied()
-            .filter(|id| !self.node_info.contains_key(id))
-            .collect();
-        if !missing.is_empty() {
-            self.node_info
-                .extend(crate::storage::queries::get_node_files_and_qualified_names(
-                    db.conn(),
-                    &missing,
-                )?);
-        }
+        self.load_rust_types(db)?;
+        self.load_node_info(db, &candidates)?;
         let owner = |id: &i64| -> Option<&str> {
             let (_, q) = self.node_info.get(id)?;
             let (owner, _) = q.rsplit_once('.')?;
@@ -4135,44 +4279,6 @@ impl ProjectClassNames {
                 )
             }
             RustRecv::Foreign(ty) => {
-                if self.rust_concrete.is_none() {
-                    let mut stmt = db.conn().prepare(
-                        "SELECT DISTINCT n.file_id, n.name, n.type = 'interface' FROM nodes n
-                         JOIN files f ON f.id = n.file_id
-                         WHERE f.language = 'rust'
-                           AND n.type IN ('struct', 'enum', 'union', 'interface')",
-                    )?;
-                    let mut concrete = HashSet::new();
-                    for row in stmt.query_map([], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, bool>(2)?,
-                        ))
-                    })? {
-                        let (file_id, name, is_trait) = row?;
-                        if is_trait {
-                            self.rust_traits.insert(name);
-                        } else {
-                            concrete.insert((file_id, name));
-                        }
-                    }
-                    self.rust_concrete = Some(concrete);
-                    let mut stmt = db.conn().prepare(
-                        "SELECT n.id, n.signature FROM nodes n
-                         JOIN files f ON f.id = n.file_id
-                         WHERE f.language = 'rust' AND n.type = 'function'
-                           AND n.signature LIKE '<%'",
-                    )?;
-                    for row in
-                        stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-                    {
-                        let (id, signature) = row?;
-                        if let (Some(param), _) = rust_blanket_signature(&signature) {
-                            self.rust_blanket.insert(id, param.into());
-                        }
-                    }
-                }
                 let concrete = self.rust_concrete.as_ref().expect("loaded above");
                 let traits = &self.rust_traits;
                 let blanket = &self.rust_blanket;
@@ -4212,6 +4318,175 @@ impl ProjectClassNames {
                     .collect())
             }
         }
+    }
+
+    /// Of a typed Rust call's candidates, those the language rules out, to be
+    /// dropped from whatever the call's resolution then binds. Removed from the
+    /// result, never from the pool the result is chosen from: a smaller pool
+    /// can turn "several methods, bind none" into "one method, bind it", and
+    /// this may only ever take an edge away.
+    ///
+    /// - `arc.clone()` (`Arc<T>` / `Rc<T>`): method lookup meets the pointer's
+    ///   `Clone` at `&Arc<T>`, before any deref reaches `T`. The pointer is read
+    ///   by name, as the parser reads these pointers everywhere
+    ///   (`rust_receiver::SMART_POINTERS`), so this reads no other file.
+    /// - A struct of the caller's own file with no method of that name and no
+    ///   `Deref`: it cannot be an alias (the module would hold two items of one
+    ///   name) and reaches no other type's methods. Its `Deref` and methods are
+    ///   read from other files ([`RecvNever::read_elsewhere`]).
+    ///
+    /// What stays is anything that could run ([`Self::only_runnable`]).
+    /// Anything less certain — an imported or unknown type — rules out nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rust_receiver_never(
+        &mut self,
+        db: &crate::storage::db::Database,
+        language: &str,
+        target_name: &str,
+        metadata: Option<&str>,
+        crate_roots: &RustCrates,
+        caller_path: &str,
+        candidates: &[i64],
+    ) -> anyhow::Result<RecvNever> {
+        if language != "rust" || candidates.is_empty() {
+            return Ok(RecvNever::default());
+        }
+        let Some(RustRecv::Project(ty, via, _)) = rust_receiver(metadata, crate_roots) else {
+            return Ok(RecvNever::default());
+        };
+        self.load_rust_types(db)?;
+        self.load_node_info(db, candidates)?;
+        let clone_of_pointer =
+            target_name == "clone" && matches!(via.as_deref(), Some("Arc" | "Rc"));
+        let runnable = if clone_of_pointer {
+            self.only_runnable(candidates, via.as_deref().expect("matched above"), None)
+        } else {
+            let owns = candidates.iter().any(|id| {
+                self.node_info
+                    .get(id)
+                    .and_then(|(_, q)| q.rsplit_once('.'))
+                    .map(|(o, _)| o.rsplit("::").next().unwrap_or(o))
+                    .is_some_and(|o| o == ty || via.as_deref() == Some(o))
+            });
+            let local = self
+                .rust_concrete_at
+                .contains(&(caller_path.to_string(), ty.clone()));
+            if owns || !local || self.rust_deref_owners.contains(&ty) {
+                return Ok(RecvNever::default());
+            }
+            self.only_runnable(candidates, &ty, via.as_deref())
+        };
+        Ok(RecvNever {
+            ids: candidates
+                .iter()
+                .copied()
+                .filter(|id| !runnable.contains(id))
+                .collect(),
+            read_elsewhere: !clone_of_pointer,
+        })
+    }
+
+    /// File id and qualified name of every candidate not seen yet.
+    fn load_node_info(
+        &mut self,
+        db: &crate::storage::db::Database,
+        candidates: &[i64],
+    ) -> anyhow::Result<()> {
+        let missing: Vec<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !self.node_info.contains_key(id))
+            .collect();
+        if !missing.is_empty() {
+            self.node_info
+                .extend(crate::storage::queries::get_node_files_and_qualified_names(
+                    db.conn(),
+                    &missing,
+                )?);
+        }
+        Ok(())
+    }
+
+    /// The project's Rust types, traits, blanket-impl methods and `Deref`
+    /// owners, read once per pass.
+    fn load_rust_types(&mut self, db: &crate::storage::db::Database) -> anyhow::Result<()> {
+        if self.rust_concrete.is_some() {
+            return Ok(());
+        }
+        let mut stmt = db.conn().prepare(
+            "SELECT DISTINCT n.file_id, f.path, n.name, n.type = 'interface' FROM nodes n
+             JOIN files f ON f.id = n.file_id
+             WHERE f.language = 'rust'
+               AND n.type IN ('struct', 'enum', 'union', 'interface')",
+        )?;
+        let mut concrete = HashSet::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
+            ))
+        })? {
+            let (file_id, path, name, is_trait) = row?;
+            if is_trait {
+                self.rust_traits.insert(name);
+            } else {
+                self.rust_concrete_at.insert((path, name.clone()));
+                concrete.insert((file_id, name));
+            }
+        }
+        self.rust_concrete = Some(concrete);
+        let mut stmt = db.conn().prepare(
+            "SELECT n.id, n.signature FROM nodes n
+             JOIN files f ON f.id = n.file_id
+             WHERE f.language = 'rust' AND n.type = 'function'
+               AND n.signature LIKE '<%'",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, signature) = row?;
+            if let (Some(param), _) = rust_blanket_signature(&signature) {
+                self.rust_blanket.insert(id, param.into());
+            }
+        }
+        let mut stmt = db.conn().prepare(
+            "SELECT n.qualified_name FROM nodes n
+             JOIN files f ON f.id = n.file_id
+             WHERE f.language = 'rust' AND n.name IN ('deref', 'deref_mut')
+               AND n.qualified_name LIKE '%.%'",
+        )?;
+        for q in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            if let Some((owner, _)) = q?.rsplit_once('.') {
+                self.rust_deref_owners.insert(owner.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// The candidates that could run for a receiver of type `ty` (behind the
+    /// pointer `via`, if any) that has no method of that name and no `Deref`:
+    /// a method of `ty` itself — also through an impl on a reference to it,
+    /// which auto-ref reaches — or of `via`, a trait's default method, a
+    /// blanket impl's method. Another type's method, known or not, is not.
+    fn only_runnable(&self, candidates: &[i64], ty: &str, via: Option<&str>) -> Vec<i64> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|id| {
+                let Some((_, q)) = self.node_info.get(id) else {
+                    return true;
+                };
+                let Some((owner, _)) = q.rsplit_once('.') else {
+                    return true;
+                };
+                let owner = owner.rsplit("::").next().unwrap_or(owner);
+                let referent = rust_referent(owner);
+                referent == ty
+                    || via == Some(referent)
+                    || self.rust_traits.contains(owner)
+                    || self.rust_blanket.contains_key(id)
+            })
+            .collect()
     }
 
     /// [`member_call_candidates`] from memory: the deferred pass and the pending

@@ -346,6 +346,12 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             let shadowed = ctx.language == "rust"
                 && bare_call
                 && super::rust::shadowed_by_enclosing_local(&node, source, &callee);
+            // `self.get_mut()` with `self: Pin<&mut Self>` is `Pin::get_mut`, no
+            // project function (`rust_impls::answered_by_the_self_wrapper`).
+            let shadowed = shadowed
+                || (ctx.language == "rust"
+                    && matches!(qualifier, helpers::CalleeQualifier::SelfRecv(_))
+                    && super::rust_impls::answered_by_the_self_wrapper(node, source, &callee));
             // The file's `use` names what the call's leading name stands for
             // (D#132): `use std::sync::Mutex; Mutex::new()` is std's.
             let use_root = if ctx.language == "rust" && !shadowed {
@@ -440,10 +446,29 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     )
                     .then(|| super::rust_receiver::receiver_type(node, source))
                     .flatten();
+                    // A `self`/`Self` call cannot reach the same-named method of
+                    // another impl the language keeps apart (`rust_impls.rs`).
+                    // In an inherent impl it never leaves the crate either.
+                    let (facts, inherent) = match &qualifier {
+                        helpers::CalleeQualifier::SelfRecv(_)
+                        | helpers::CalleeQualifier::SelfType(_)
+                            if ctx.current_rust_impl.is_some() =>
+                        {
+                            (
+                                super::rust_impls::self_call_facts(node, source, &callee),
+                                super::rust_impls::in_inherent_impl(node),
+                            )
+                        }
+                        _ => (super::rust_impls::SelfCallFacts::default(), false),
+                    };
                     metadata.map(|m| {
-                        with_receiver_type(
-                            with_use_root(with_rust_arity(m, node), use_root),
-                            receiver,
+                        with_self_call_facts(
+                            with_receiver_type(
+                                with_use_root(with_rust_arity(m, node), use_root),
+                                receiver,
+                            ),
+                            &facts,
+                            inherent,
                         )
                     })
                 } else {
@@ -539,6 +564,35 @@ fn with_receiver_type(metadata: String, receiver: Option<super::rust_receiver::R
     };
     for (k, v) in super::rust_receiver::receiver_keys(&ty) {
         map.insert(k.into(), v.into());
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// `metadata` with what a `self`/`Self` call's own file tells the resolver
+/// (`rust_impls::self_call_facts`): `"xl"`, the start lines of same-file methods
+/// the call cannot reach; `"wide"`, set when the file defines the type's method
+/// of that name only in trait impls, which an inherent one elsewhere outranks;
+/// and `"inh"`, set in an inherent impl, whose calls stay in the crate
+/// (`rust_impls::in_inherent_impl`). Unchanged when there is none of these.
+fn with_self_call_facts(
+    metadata: String,
+    facts: &super::rust_impls::SelfCallFacts,
+    inherent: bool,
+) -> String {
+    if facts.excluded.is_empty() && !facts.trait_only_here && !inherent {
+        return metadata;
+    }
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    if !facts.excluded.is_empty() {
+        map.insert("xl".into(), serde_json::json!(facts.excluded));
+    }
+    if facts.trait_only_here {
+        map.insert("wide".into(), serde_json::json!(1));
+    }
+    if inherent {
+        map.insert("inh".into(), serde_json::json!(1));
     }
     serde_json::Value::Object(map).to_string()
 }

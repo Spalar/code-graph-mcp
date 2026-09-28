@@ -1,5 +1,79 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 99 → 100 because the Rust fixes below change which
+`calls` and `implements` edges a file produces, and the names of some Rust
+methods. Nothing to run.
+
+Measured against 0.162.0 on the same checkouts: on tokio-1.41.1 the SCIP
+oracle finds 290 more correct call edges and 37 fewer wrong ones, with no
+correct edge lost and no wrong edge added; the 30 new calls it cannot judge
+are each a `self.m()` / `Self::m()` written in the caller's own body, and the
+529 `implements` edges that go all pointed at another file's method, which a
+trait impl's method never is. On this repository: 43 more correct call edges,
+nothing else changed. On hono, express, flask and leveldb every node, edge and
+buffered call is identical. A full index of tokio takes 2.69 s against
+0.162.0's 2.86 s, and an edit that adds a method 0.24 s against 0.25 s.
+
+### `self.m()` in a generic Rust impl has its edge
+
+Three places named a Rust impl block's type, each its own way. The call
+payload kept the generic arguments, so inside `impl<T> Gen<T>` every
+`self.m()` and `Self::m()` looked for methods of `Gen<T>`, found none, and
+produced no edge at all. The node walk split on `::` before dropping the
+arguments, so `impl<L: Link> List<L, L::Target>` named its methods
+`Target>.push_front`, and `impl … for RefCell<Vec<task::Notified<T>>>` named
+its methods `Notified.…`. All three now drop the generic arguments first.
+
+### A `self` call binds its own type's method
+
+With those calls resolving, a `self.m()` met every same-named type of the
+workspace. It now binds the nearest methods of that type name: the caller's
+own file, else its crate, else — only from a trait impl, whose type may be
+another crate's — all of them. An inherent impl lives in its type's crate, and
+so does every impl that crate can call on it, so a call there never leaves the
+crate: tokio's `Builder::new() { Self::default() }`, whose `default` is
+derived, no longer binds tokio-util's `Builder::default`. When the caller's
+file defines the type's method only in trait impls, an inherent one in another
+file outranks it, so the crate decides. The caller itself counts as no
+candidate: a trait method calling its type's inherent namesake still binds it.
+
+Impls of one type that differ only in their arguments (`impl AsyncWrite for
+Cursor<&mut [u8]>`, `… for Cursor<Vec<u8>>`) all name their type `Cursor`.
+Two impls of one trait never cover one type, and two inherent impls may not
+both define a method for one type, so a `self.m()` no longer binds the `m` of
+another impl of its file that the language keeps apart from its own.
+
+`self.get_mut()` with `self: Pin<&mut Self>` is `Pin::get_mut`, and
+`self.clone()` with `self: Arc<Self>` is `Arc`'s: method lookup meets the
+receiver's own type first. Neither binds the project's method of that name.
+
+### A typed receiver binds nothing its type rules out
+
+A call on a receiver whose type the source writes down fell back to every
+method of that name when the type had none of its own. Two cases now drop what
+cannot run: `arc.clone()` on an `Arc<T>` / `Rc<T>` is the pointer's `clone`,
+and a struct of the caller's own file with no such method and no `Deref`
+reaches no other type's method. Only the result loses the ruled-out methods;
+what the call is resolved from does not, so a smaller pool never turns "several
+methods, bind none" into "one method, bind it".
+
+### `impl Trait for path::Type` binds only this file's type
+
+`impl Tr for crate::Foo` and `mod imp { impl Drop for super::Counters }` bound
+no `implements` edge; they do now when the path names an item of the file.
+`impl From<Elapsed> for std::io::Error` in a file defining its own `Error`
+binds nothing, as before, and a trait is never the source of a Rust impl's
+edge (tokio's `impl Semaphore for bounded::Semaphore` beside `trait
+Semaphore`).
+
+**Not covered:** a method whose Rust impl is written inside a macro
+(`cfg_rt! { … }`, D#149) is still no node, so a typed receiver of a type
+defined that way keeps every candidate; so does one reached through a type
+alias or a `Deref` the index cannot follow.
+
 ## 0.162.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

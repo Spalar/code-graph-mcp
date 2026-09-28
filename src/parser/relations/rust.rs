@@ -268,18 +268,32 @@ pub(super) fn extract_rust_impl_trait(
     let trait_node = node.child_by_field_name("trait")?;
     let type_node = node.child_by_field_name("type")?;
     let trait_name = node_text(&trait_node, source).to_string();
-    let type_text = node_text(&type_node, source).to_string();
-    // Strip generics so source resolution can match the bare struct name.
-    // The `type` field on a generic impl block returns the full `Type<'a, W>`
-    // text; Phase 2 source resolution (index_files.rs) does exact-name match
-    // against local node names ("Type"), so without stripping, no edge would
-    // emit for any generic trait impl — every method appears dead.
-    let type_name = type_text
-        .split('<')
-        .next()
-        .unwrap_or(&type_text)
-        .trim()
-        .to_string();
+    // Phase 2 source resolution (index_files.rs) matches this name against the
+    // file's own nodes, so it may be the bare type name only where the path
+    // provably names an item of this file: a single segment (`Type<'a, W>`),
+    // `self::Type`, or `super::Type` from inside an inline `mod` (tokio's
+    // `mod imp { impl Drop for super::Counters }`). `crate::…::Type` is kept
+    // whole for the resolver, which knows the file's module path. Any other
+    // path (`std::io::Error`, `bounded::Semaphore`) is kept whole and matches
+    // nothing: the file's own `Error` is not std's.
+    let path = crate::parser::rust_type_path(node_text(&type_node, source));
+    let in_inline_mod = {
+        let mut cur = node.parent();
+        let mut found = false;
+        while let Some(n) = cur {
+            if n.kind() == "mod_item" {
+                found = true;
+                break;
+            }
+            cur = n.parent();
+        }
+        found
+    };
+    let type_name = match path.as_slice() {
+        [name] => name.clone(),
+        [root, name] if root == "self" || (root == "super" && in_inline_mod) => name.clone(),
+        _ => path.join("::"),
+    };
     if trait_name.is_empty() || type_name.is_empty() {
         return None;
     }
