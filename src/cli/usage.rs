@@ -427,6 +427,17 @@ pub struct RecommendationSummary {
     /// (disclosure-gap class, roadmap 2026-07-18 §1.6). A sub-breakdown of
     /// `by_action["inject"]`; `by_action["inject"] - inject_skipped` = delivered.
     pub inject_skipped: u64,
+    /// Stop-hook reports (hook:"stop", action:"stop_check"): a signature changed
+    /// this turn and callers in files the turn did not edit were listed (D#163).
+    pub stop_checks: u64,
+    /// Their follow-ups (action:"stop_followup"), judged at the next Stop, and
+    /// how many found a listed caller file edited after the report — the
+    /// roadmap's adoption rate is `stop_adopted / stop_followups`.
+    pub stop_followups: u64,
+    pub stop_adopted: u64,
+    /// SubagentStart deliveries of the index facts (hook:"subagent"). Whether
+    /// the subagent then used the index is in its transcript, not here.
+    pub subagent_contexts: u64,
 }
 
 /// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
@@ -453,6 +464,29 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
         };
         let action = v.get("action").and_then(|x| x.as_str());
         let hook = v.get("hook").and_then(|x| x.as_str());
+
+        // Stop / SubagentStart lines (D#163) are counted here and skipped before
+        // the funnel: neither is a search nor a recommendation, and they arrived
+        // after every figure the funnel has recorded, so letting them disarm it
+        // (as `live_impact` does) would change what those figures mean.
+        match (hook, action) {
+            (Some("stop"), Some("stop_check")) => {
+                s.stop_checks += 1;
+                continue;
+            }
+            (Some("stop"), Some("stop_followup")) => {
+                s.stop_followups += 1;
+                if v.get("adopted").and_then(|x| x.as_bool()) == Some(true) {
+                    s.stop_adopted += 1;
+                }
+                continue;
+            }
+            (Some("subagent"), Some("subagent_context")) => {
+                s.subagent_contexts += 1;
+                continue;
+            }
+            _ => {}
+        }
 
         // Re-search detection runs on every tool event, before action bucketing.
         let is_search_event = matches!(hook, Some("grep") | Some("read"))

@@ -88,6 +88,14 @@ function runMain() {
   if (!text) return;
   const { emitEventContext } = require('./hook-emit');
   process.stdout.write(emitEventContext('SubagentStart', text) + '\n');
+  // D#163: how many subagents were handed the facts. Whether they then used
+  // the index is in their transcripts, not here (scripts/subagent_share.py).
+  // The agent type is harness input; only a plain name is kept.
+  const agent = typeof input.agent_type === 'string' && /^[\w:.-]{1,64}$/.test(input.agent_type)
+    ? input.agent_type : null;
+  require('./recommendation-log').recordRecommendation(root, {
+    hook: 'subagent', action: 'subagent_context', ...(agent ? { agent } : {}),
+  });
 }
 
 if (require.main === module) runMain();

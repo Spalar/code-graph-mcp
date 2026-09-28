@@ -291,6 +291,7 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
   }
 
   const lines = [];
+  const listed = new Set();
   for (const c of changed.slice(0, MAX_SYMBOLS_CHECKED)) {
     const refs = callers(c.symbol, c.file);
     if (!refs || refs.length === 0) continue;
@@ -318,6 +319,7 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
     }
     lines.push(line);
     next.reported.push(c.key);
+    for (const r of untouched) listed.add(r.file);
   }
   // Changed beyond the query cap: named, not dropped in silence (review M1).
   // Not marked reported, and a later turn does not see them as changed again
@@ -327,7 +329,36 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
     lines.push('  ' + unchecked.length + ' more changed, callers not checked: ' +
       unchecked.map((c) => shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(c.file)).join(', '));
   }
-  return { lines, state: next };
+  // `symbols` / `files`: what the report names, for its telemetry and its
+  // follow-up (D#163). Not part of `state`.
+  return { lines, state: next, symbols: next.reported.length - state.reported.length, files: [...listed].sort() };
+}
+
+// The follow-up remembers at most this many of a report's caller files.
+const MAX_FOLLOWUP_FILES = 64;
+
+/**
+ * Whether a report was acted on: a caller file it listed was edited after it —
+ * an Edit logged since `pending.at`, or an mtime at or after it (Write, `sed
+ * -i`, formatters; the same reading as "touched this turn"). Judged at the
+ * next Stop, which is the end of the continuation the feedback starts.
+ * @param {{at:number, files:string[]}} pending  left in the Stop state by the report
+ * @param {{ts:number, file:string}[]} edits  the session's edit log
+ * @param {(file:string)=>number|null} mtimeMs
+ * @returns {{adopted:boolean, listed:number, edited:number}}
+ */
+function followUpOf(pending, edits, mtimeMs) {
+  const listed = new Set(pending.files);
+  const edited = new Set();
+  for (const e of edits) {
+    if (e.ts >= pending.at && listed.has(e.file)) edited.add(e.file);
+  }
+  for (const f of listed) {
+    if (edited.has(f)) continue;
+    const m = mtimeMs(f);
+    if (m !== null && m >= pending.at) edited.add(f);
+  }
+  return { adopted: edited.size > 0, listed: listed.size, edited: edited.size };
 }
 
 function formatStopContext(lines) {
@@ -350,17 +381,32 @@ function readStdinJson() {
 function runMain() {
   if (process.env.CODE_GRAPH_QUIET_HOOKS === '1') return;
   const input = readStdinJson();
-  if (!input || input.stop_hook_active === true) return;
-  if (!input.session_id) return;
+  if (!input || !input.session_id) return;
 
   const { resolveProjectRoot } = require('./project-root');
   const root = resolveProjectRoot(typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd());
   if (root === null) return;
 
   const sessionEdits = require('./session-edits');
+  const { recordRecommendation } = require('./recommendation-log');
+  const mtimeMs = (file) => {
+    try { return fs.statSync(path.join(root, file)).mtimeMs; } catch { return null; }
+  };
+  const state = sessionEdits.readStopState(root, input.session_id);
+  // The previous report's follow-up (D#163), at every Stop — the one ending
+  // the continuation that report started included. It only records: nothing
+  // is emitted, so a continuation cannot loop through it.
+  if (state.pending) {
+    const f = followUpOf(state.pending, sessionEdits.readEdits(root, input.session_id), mtimeMs);
+    recordRecommendation(root, { hook: 'stop', action: 'stop_followup', ...f });
+    delete state.pending;
+    sessionEdits.writeStopState(root, input.session_id, state);
+  }
+  // A continuation caused by a Stop hook is never re-checked.
+  if (input.stop_hook_active === true) return;
+
   const edits = sessionEdits.readEdits(root, input.session_id);
   if (edits.length === 0) return; // no log → nothing to check, and nothing written
-  const state = sessionEdits.readStopState(root, input.session_id);
 
   const { remainingMs } = require('./hook-fail-open');
   const run = (cmd, args, defaultMs) => {
@@ -410,10 +456,13 @@ function runMain() {
             return { file: r.file_path, name: r.name, line: findCallSiteLine(text, symbol, r.start_line) };
           });
       },
-      mtimeMs: (file) => {
-        try { return fs.statSync(path.join(root, file)).mtimeMs; } catch { return null; }
-      },
+      mtimeMs,
     });
+  }
+  const now = report.state.lastStopAt;
+  if (report.lines.length > 0 && report.files && report.files.length > 0) {
+    recordRecommendation(root, { hook: 'stop', action: 'stop_check', symbols: report.symbols, callers: report.files.length });
+    report.state.pending = { at: now, files: report.files.slice(0, MAX_FOLLOWUP_FILES) };
   }
   sessionEdits.writeStopState(root, input.session_id, report.state);
 
@@ -427,5 +476,5 @@ if (require.main === module) runMain();
 
 module.exports = {
   extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
-  MAX_SYMBOLS_CHECKED, MAX_CALLERS_LISTED,
+  followUpOf, MAX_SYMBOLS_CHECKED, MAX_CALLERS_LISTED,
 };

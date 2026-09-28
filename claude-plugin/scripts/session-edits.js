@@ -9,7 +9,9 @@
 //
 //   .cg-edits-<cwdHash>-<sid>.jsonl  one line per Edit call: {ts, file, symbol[, sigs]}
 //   .cg-stop-<cwdHash>-<sid>.json    written by the Stop hook only:
-//                                    {lastStopAt, reported: ["file#symbol", …]}
+//                                    {lastStopAt, reported: ["file#symbol", …],
+//                                     pending?: {at, files: […]}} — the last
+//                                    report's caller files, until its follow-up
 //
 // The edit log is APPEND-only: parallel Edit calls each run their own hook
 // process, and a read-modify-write JSON file would drop one of two concurrent
@@ -108,10 +110,15 @@ function readStopState(root, sessionId) {
   if (!p) return empty;
   try {
     const s = JSON.parse(fs.readFileSync(p, 'utf8'));
-    return {
+    const out = {
       lastStopAt: typeof s.lastStopAt === 'number' ? s.lastStopAt : null,
       reported: Array.isArray(s.reported) ? s.reported.filter((x) => typeof x === 'string') : [],
     };
+    const p2 = s.pending;
+    if (p2 && typeof p2.at === 'number' && Array.isArray(p2.files)) {
+      out.pending = { at: p2.at, files: p2.files.filter((x) => typeof x === 'string') };
+    }
+    return out;
   } catch { return empty; }
 }
 

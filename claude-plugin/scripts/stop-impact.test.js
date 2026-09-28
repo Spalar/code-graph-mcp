@@ -12,7 +12,7 @@ const { spawnSync, execFileSync } = require('node:child_process');
 delete process.env.CLAUDE_CONFIG_DIR;
 
 const {
-  extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
+  extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext, followUpOf,
 } = require('./stop-impact');
 
 // --- extractSignatures ------------------------------------------------------
@@ -341,6 +341,53 @@ test('e2e: signature change with an untouched caller → exactly one b.rs:line, 
   const third = stop(sb, 'sess-3');
   assert.ok(third, 'sess-3 changed the signature this turn');
   assert.match(third.hookSpecificOutput.additionalContext, /src\/b\.rs:5/);
+});
+
+// D#163: the roadmap's Stop metric ("reported, and adopted") needs both halves
+// in recommendations.jsonl.
+function stopRecords(sb) {
+  let raw = '';
+  try { raw = fs.readFileSync(path.join(sb.repo, '.code-graph', 'recommendations.jsonl'), 'utf8'); } catch { /* none */ }
+  return raw.split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.hook === 'stop');
+}
+
+test('e2e: a report is recorded, and the next Stop records that a listed caller file was edited', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t);
+  edit(sb, 's', 'src/a.rs', 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  assert.ok(stop(sb, 's'), 'the signature change is reported');
+  assert.deepEqual(stopRecords(sb).map((r) => [r.action, r.symbols, r.callers]), [['stop_check', 1, 1]]);
+
+  // The turn continues on the feedback, fixes the caller, and ends with
+  // stop_hook_active: that Stop is not re-checked, but it is the follow-up.
+  edit(sb, 's', 'src/b.rs', '    compute(v)', '    compute(v, 1)');
+  assert.equal(stop(sb, 's', { stop_hook_active: true }), null, 'a continuation is never re-checked');
+  const after = stopRecords(sb);
+  assert.deepEqual(after.map((r) => [r.action, r.adopted, r.listed, r.edited]),
+    [['stop_check', undefined, undefined, undefined], ['stop_followup', true, 1, 1]]);
+
+  // One follow-up per report.
+  assert.equal(stop(sb, 's', { stop_hook_active: true }), null);
+  assert.equal(stopRecords(sb).length, 2);
+});
+
+test('e2e: a report whose callers stay untouched records adopted:false at the next Stop', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t);
+  edit(sb, 's', 'src/a.rs', 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  assert.ok(stop(sb, 's'));
+  assert.equal(stop(sb, 's'), null, 'already reported');
+  assert.deepEqual(stopRecords(sb).map((r) => [r.action, r.adopted]),
+    [['stop_check', undefined], ['stop_followup', false]]);
+});
+
+test('followUpOf: a listed file edited after the report is adoption; earlier or unlisted is not', () => {
+  const pending = { at: 9000, files: ['src/b.rs', 'src/c.rs'] };
+  const mtimes = (m) => (f) => (f in m ? m[f] : 1000);
+  assert.deepEqual(followUpOf(pending, [{ ts: 9500, file: 'src/b.rs' }], mtimes({})),
+    { adopted: true, listed: 2, edited: 1 });
+  assert.deepEqual(followUpOf(pending, [{ ts: 8000, file: 'src/b.rs' }, { ts: 9500, file: 'src/z.rs' }], mtimes({})),
+    { adopted: false, listed: 2, edited: 0 }, 'an edit before the report, or of a file it did not list');
+  assert.deepEqual(followUpOf(pending, [], mtimes({ 'src/c.rs': 9000 })),
+    { adopted: true, listed: 2, edited: 1 }, 'an mtime at the report counts (Write, sed -i)');
 });
 
 test('e2e: caller also edited in the same turn → silent', { skip: e2eSkip }, (t) => {

@@ -133,6 +133,27 @@ test('e2e: every matched agent type receives one SubagentStart envelope ≤400 c
   }
 });
 
+test('e2e: a delivered context is recorded once with its agent type; a silent run records nothing', { skip: posixOnly }, (t) => {
+  // D#163: without this line the roadmap had no count of subagents given the facts.
+  const sb = sandbox(t, JSON.stringify(REPORT));
+  const records = () => {
+    let raw = '';
+    try { raw = fs.readFileSync(path.join(sb.project, '.code-graph', 'recommendations.jsonl'), 'utf8'); } catch { /* none */ }
+    return raw.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  };
+  const payload = { hook_event_name: 'SubagentStart', session_id: 's', agent_id: 'a', cwd: sb.project };
+  assert.equal(run(sb, { ...payload, agent_type: 'Explore' }).status, 0);
+  assert.deepEqual(records().map((r) => [r.hook, r.action, r.agent]), [['subagent', 'subagent_context', 'Explore']]);
+
+  assert.equal(run(sb, { ...payload, agent_type: 'Plan' }, { env: { CODE_GRAPH_QUIET_HOOKS: '1' } }).stdout, '');
+  assert.equal(records().length, 1, 'a silenced run delivers nothing and records nothing');
+
+  // The agent type is harness input: anything but a plain name is left out.
+  assert.equal(run(sb, { ...payload, agent_type: 'x\n{"hook":"grep"}' }).status, 0);
+  const last = records().at(-1);
+  assert.deepEqual([last.hook, last.action, 'agent' in last], ['subagent', 'subagent_context', false]);
+});
+
 test('e2e: silent with no index, with a failing health check, and under CODE_GRAPH_QUIET_HOOKS=1', { skip: posixOnly }, (t) => {
   const sb = sandbox(t, JSON.stringify(REPORT));
   const payload = { hook_event_name: 'SubagentStart', agent_type: 'Explore' };
