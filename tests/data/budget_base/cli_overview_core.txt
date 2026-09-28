@@ -1,0 +1,5 @@
+core/api.py
+  class: Unused00, Unused01, Unused02, Unused03, Unused04, Unused05, Unused06, Unused07, Unused08, Unused09
+  function: api_00 (1×), api_01 (1×), api_02 (1×), api_03 (1×), api_04 (1×), api_05 (1×), api_06 (1×), api_07 (1×), api_08 (1×), api_09 (1×), api_10 (1×), api_11 (1×), api_12 (1×), api_13 (1×), api_14 (1×), api_15 (1×), api_16 (1×), api_17 (1×), api_18 (1×), api_19 (1×), api_20 (1×), api_21 (1×), api_22 (1×), api_23 (1×), api_24 (1×), api_25 (1×), api_26 (1×), api_27 (1×), api_28 (1×), api_29 (1×), api_30 (1×), api_31 (1×), api_32 (1×), api_33 (1×), api_34 (1×), unused_00, unused_01, unused_02, unused_03, unused_04, unused_05, unused_06, unused_07, unused_08, unused_09, unused_10, unused_11
+core/use.py
+  function: use_all

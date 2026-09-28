@@ -254,6 +254,74 @@ Measured on this repo, 20 interleaved runs each: an empty `callgraph` p50
 functions with no caller, 68 of 120 on this repo now show at least one site,
 17 of 55 on express and 23 of 107 on hono.
 
+### An answer can be asked for at a size, and every cut names a command
+
+`map`, `overview`, `callgraph` and `show` take `--budget <tokens>`, and MCP
+`project_map`, `module_overview`, `get_call_graph` and `get_ast_node` take an
+optional `max_tokens` (100-100000; size is bytes/3 of the text or JSON the
+caller receives, the ratio `CHARS_PER_TOKEN` already uses). The answer is
+ranked by caller count (call-edge in-degree; for `map`, a module's incoming
+imports). The lowest-ranked items are shortened first: a module loses its key
+symbols, a symbol its signature, a definition its body, a call-graph node its
+type. Then they are left out, and a call-graph node always goes before its
+parent. An item is printed whole or not at all. In `overview` of a directory
+(CLI and MCP) one file gets at most 70% of the budget. Text answers end with
+`… budget N tokens: …` and `next: <command>`. MCP answers carry a `budget`
+object (`max_tokens`, `omitted`, what was shortened, `next`). Without a budget
+nothing changes. With a budget the start is the uncapped answer, so a large
+budget can return more than the default (every dependency in `map`, every
+export in `module_overview`, the flat call graph instead of the rollup).
+`--budget` cannot be combined with `--json` or `--compact`. MCP `compact` has no
+effect beside `max_tokens` and is listed in `ignored_arguments`.
+
+Every existing cut in these four tools now ends with a command that returns
+what it left out. The text of each cut notice is unchanged; the command is
+added after it.
+
+| Cut | Command added |
+|---|---|
+| `map`: `... and N more dependencies` (the text caps them at 30) | `next: code-graph-mcp map --json` |
+| `map --compact`: `... and N more modules` / `hot functions` | `next: code-graph-mcp map` |
+| `map --json --compact`: `hot_functions_truncated` | `"next": "code-graph-mcp map --json"` |
+| MCP `project_map compact`: `hot_functions_truncated` | `"next": "code-graph-mcp map"`, or `map --json` when the threshold tier also cut |
+| MCP `module_overview`: `active_capped`, an inactive group's `more` | `"next": "code-graph-mcp overview <path>"` |
+| MCP `get_call_graph`: `rollup_call_graph` | `"next": "code-graph-mcp callgraph <name> …"` |
+| MCP `get_ast_node`: `compressed_node` | `"next": "code-graph-mcp show <name> --file <file> …"` |
+| MCP threshold tier on these four tools: `_truncated` | the command for the whole answer (it replaces a handler's `next`) |
+
+Tests execute each suggested command and check that it returns the items that
+were left out. Default answers were compared with those of the binary built
+before this change: 7 text answers match byte for byte once the added
+`next:` lines are removed, and 10 JSON answers match once `next` is removed
+(`tests/data/budget_base/`).
+
+Measured size with a budget. A ratio is achieved bytes over budget×3, and "whole"
+means the unbudgeted answer was already smaller than the budget:
+
+| corpus | 500 tokens | 1000 tokens | 4000 tokens |
+|---|---|---|---|
+| this repo, `map` | 0.989 | 0.994 | whole (8.6 KB) |
+| this repo, `overview src` | 0.996 | 1.000 | 0.999 |
+| this repo, `callgraph node_text` | 0.993 | 0.999 | 0.999 |
+| this repo, MCP `project_map` | 0.993 | 0.999 | 1.022 |
+| this repo, MCP `module_overview src` | 0.961 | 0.991 | 1.019 |
+| hono, `map` | 0.984 | 1.000 | 1.000 |
+| hono, `overview src` | 0.991 | 0.999 | 1.000 |
+| hono, MCP `project_map` | 0.994 | 0.989 | 1.023 |
+| express, `map` | 1.000 | 1.000 | whole (5.0 KB) |
+| express, MCP `module_overview lib` | 0.998 | 0.998 | whole (4.8 KB) |
+
+The MCP answers at 4000 tokens exceed 1.0 by the `freshness` note (about 280
+bytes), which is attached after the budget is applied. One case lands under
+the band: express `show next --refs` at 1000 tokens came to 1,273 bytes (ratio
+0.42). Its body is larger than the budget and is left out whole rather than
+cut.
+
+The four tools' descriptions are unchanged. Each of the four tool schemas gains
+`max_tokens` (+150 bytes each), so `tools/list` goes from 9,120 to 9,720
+bytes. `claude plugin details` does not count MCP tool schemas; it reports the
+same always-on figure before and after.
+
 ### Not covered
 
 - A renamed import of a re-export (`import { a as b } from './index'` where

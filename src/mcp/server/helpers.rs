@@ -147,6 +147,32 @@ pub(super) const COUNT_RANGES: &[(&str, &str, u64, u64)] = &[
         crate::search::ast_query::MAX_LIMIT as u64,
     ),
     ("project_map", "centrality_limit", 1, 100),
+    // P1 #2 output budget. Derived, like the depth rows: the CLI's `--budget`
+    // clamps to the same two constants.
+    (
+        "project_map",
+        "max_tokens",
+        crate::budget::MIN_BUDGET_TOKENS,
+        crate::budget::MAX_BUDGET_TOKENS,
+    ),
+    (
+        "module_overview",
+        "max_tokens",
+        crate::budget::MIN_BUDGET_TOKENS,
+        crate::budget::MAX_BUDGET_TOKENS,
+    ),
+    (
+        "get_call_graph",
+        "max_tokens",
+        crate::budget::MIN_BUDGET_TOKENS,
+        crate::budget::MAX_BUDGET_TOKENS,
+    ),
+    (
+        "get_ast_node",
+        "max_tokens",
+        crate::budget::MIN_BUDGET_TOKENS,
+        crate::budget::MAX_BUDGET_TOKENS,
+    ),
     ("semantic_code_search", "top_k", 1, 100),
     ("semantic_code_search", "limit", 1, 100),
 ];
@@ -400,6 +426,187 @@ pub(super) fn strip_outer_generic(s: &str) -> Option<String> {
     } else {
         Some(candidate.to_string())
     }
+}
+
+/// Tools that take `max_tokens` (P1 #2). A call to one of them that carries the
+/// argument is already sized by the caller, so the threshold tier below does
+/// not apply to it.
+pub(super) const BUDGETED_TOOLS: &[&str] = &[
+    "project_map",
+    "module_overview",
+    "get_call_graph",
+    "get_ast_node",
+    "read_snippet",
+];
+
+/// Whether this call asked for a budgeted answer.
+pub(super) fn is_budgeted_call(tool: &str, args: &serde_json::Value) -> bool {
+    // `get_call_graph` in route mode is the HTTP-chain tracer, which takes no
+    // budget (`max_tokens` is reported back as ignored there).
+    let route_mode = args["route_path"]
+        .as_str()
+        .is_some_and(|r| !r.trim().is_empty());
+    BUDGETED_TOOLS.contains(&tool) && !args["max_tokens"].is_null() && !route_mode
+}
+
+/// Whether `v` (or anything under it) was cut by [`truncate_value`].
+fn subtree_truncated(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => {
+            m.contains_key("_array_truncations") || m.values().any(subtree_truncated)
+        }
+        serde_json::Value::Array(a) => a.iter().any(subtree_truncated),
+        serde_json::Value::String(s) => {
+            s.ends_with(" chars total]") && s.contains("... [truncated, ")
+        }
+        _ => false,
+    }
+}
+
+/// The CLI command that returns, uncut, what one of the budgeted tools'
+/// answer left out. Every cut in those four tools names one — the default
+/// tiers (`hot_functions_truncated`, `active_capped`, the call-graph rollup,
+/// `compressed_node`, the threshold tier below) and the budget alike — and
+/// each is the same binary's CLI, run from the project root.
+///
+/// `result` supplies what the arguments may not: the resolved function name
+/// of a call graph, the name and file of the node `get_ast_node` answered.
+pub(crate) fn cli_next_command(
+    tool: &str,
+    args: &serde_json::Value,
+    result: &serde_json::Value,
+) -> Option<crate::budget::NextCommand> {
+    use crate::budget::NextCommand;
+    let s = |k: &str| {
+        args[k]
+            .as_str()
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+    };
+    let on = |k: &str| args[k].as_bool().unwrap_or(false);
+    match canonical_tool(tool) {
+        "project_map" => Some(NextCommand::new("map").arg("--json")),
+        "module_overview" => {
+            let path = s("path").map(|p| normalize_path_arg_for_cli(&p))?;
+            Some(NextCommand::new("overview").arg(path))
+        }
+        "get_call_graph" => {
+            if let Some(route) = s("route_path") {
+                return Some(
+                    NextCommand::new("trace")
+                        .arg(route)
+                        .opt("--depth", args["depth"].as_u64().map(|d| d.to_string()))
+                        .flag_if(
+                            args["include_middleware"] == json!(false),
+                            "--no-middleware",
+                        ),
+                );
+            }
+            let name = result["function"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| s("symbol_name"))
+                .or_else(|| s("function_name"))?;
+            let direction = s("direction").map(|d| d.to_ascii_lowercase());
+            Some(
+                NextCommand::new("callgraph")
+                    .arg(name)
+                    .opt("--file", s("file_path"))
+                    .opt("--direction", direction.filter(|d| d != "both"))
+                    .opt("--depth", args["depth"].as_u64().map(|d| d.to_string()))
+                    .flag_if(on("include_tests"), "--include-tests")
+                    .opt("--min-confidence", s("min_confidence")),
+            )
+        }
+        "get_ast_node" => {
+            let name = result["name"].as_str()?;
+            let file = result["file_path"].as_str()?;
+            // `context_lines` defaults to 3 on the node_id path and 0 on the name
+            // path; the CLI's default is 0 unless `--node-id`, so pass it whenever
+            // the answer carried context.
+            let ctx = match args["context_lines"].as_u64() {
+                Some(c) => c,
+                None if !args["node_id"].is_null() => 3,
+                None => 0,
+            };
+            Some(
+                NextCommand::new("show")
+                    .arg(name)
+                    .arg("--file")
+                    .arg(file)
+                    .flag_if(on("include_references"), "--refs")
+                    .flag_if(on("include_impact"), "--impact")
+                    .flag_if(on("include_tests"), "--include-tests")
+                    .opt("--context-lines", (ctx > 0).then(|| ctx.to_string())),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// `module_overview` accepts `./x`, `.`, and `x\\y`; the CLI wants a path a
+/// shell can pass along unchanged from the project root.
+fn normalize_path_arg_for_cli(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    let p = p.strip_prefix("./").unwrap_or(&p).to_string();
+    if p.is_empty() {
+        ".".to_string()
+    } else {
+        p
+    }
+}
+
+/// After [`centralized_compress`]: a result it cut gets `next`, the command
+/// that returns the whole answer (budgeted tools only — they are the ones
+/// P1 #2 covers). `dead_code` / `dependencies` folded into `module_overview`
+/// come from their own CLI commands, so a cut there names that command too.
+///
+/// It replaces a `next` the handler already set: that one names what the
+/// handler's own cap left out (`project_map compact`'s hot functions →
+/// `map`), while this tier can cut any array (the same answer's modules and
+/// dependencies, which `map`'s text caps at 30) — the whole answer covers both.
+pub(super) fn attach_compression_next(
+    tool: &str,
+    args: &serde_json::Value,
+    mut value: serde_json::Value,
+) -> serde_json::Value {
+    if value.get("_truncated").is_none() {
+        return value;
+    }
+    let Some(cmd) = cli_next_command(tool, args, &value) else {
+        return value;
+    };
+    let mut cmds = vec![cmd.to_string()];
+    if canonical_tool(tool) == "module_overview" {
+        let path = args["path"].as_str().map(normalize_path_arg_for_cli);
+        if let Some(path) = path {
+            if value.get("dead_code").is_some_and(subtree_truncated) {
+                cmds.push(
+                    crate::budget::NextCommand::new("dead-code")
+                        .arg(path.clone())
+                        .to_string(),
+                );
+            }
+            if value.get("dependencies").is_some_and(subtree_truncated) {
+                let dir = args["deps_direction"]
+                    .as_str()
+                    .unwrap_or("both")
+                    .to_ascii_lowercase();
+                let depth = args["deps_depth"].as_u64().unwrap_or(2).clamp(1, 10);
+                cmds.push(
+                    crate::budget::NextCommand::new("deps")
+                        .arg(path)
+                        .arg("--direction")
+                        .arg(dir)
+                        .arg("--depth")
+                        .arg(depth.to_string())
+                        .to_string(),
+                );
+            }
+        }
+    }
+    value["next"] = json!(cmds.join("; "));
+    value
 }
 
 /// Centralized compression for tool results that exceed the token threshold.
@@ -659,8 +866,9 @@ mod tests {
                 }
             }
         }
-        // Vacuity floor over the CLAMPED ones. Eight of the eleven COUNT_RANGES
-        // rows belong to a tool in `tools/list`; the other three
+        // Vacuity floor over the CLAMPED ones. Twelve of the fifteen COUNT_RANGES
+        // rows belong to a tool in `tools/list` (four of them the P1 #2
+        // `max_tokens` rows); the other three
         // (`find_http_route.depth`, `dependency_graph.depth`,
         // `find_similar_code.top_k`) are backends the client is never offered, so
         // they have no description to check.
@@ -670,8 +878,8 @@ mod tests {
         // too — by requiring silence. The earlier wording here claimed a ninth
         // published count would trip this number, which was never true.
         assert_eq!(
-            checked, 8,
-            "expected 8 published arguments with a COUNT_RANGES row; a change to \
+            checked, 12,
+            "expected 12 published arguments with a COUNT_RANGES row; a change to \
              the tool surface must be reflected here rather than silently \
              shrinking this guard"
         );
@@ -713,9 +921,10 @@ mod tests {
                 }
             }
         }
+        // 11 before P1 #2, plus `max_tokens` on four tools.
         assert_eq!(
-            numeric, 11,
-            "vacuity floor: 11 numeric arguments are published across the 7 tools"
+            numeric, 15,
+            "vacuity floor: 15 numeric arguments are published across the 7 tools"
         );
     }
 

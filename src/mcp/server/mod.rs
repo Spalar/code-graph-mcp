@@ -113,11 +113,21 @@ const HONORED_UNDECLARED_ARGS: &[(&str, &str)] = &[
 /// carry it unevenly: `direction`'s says "ignored when route_path is set",
 /// the other two say nothing. Disclosure at answer time is the one channel that
 /// cannot go stale relative to the code.
-const MODE_INERT_ARGS: &[(&str, &str, &[&str])] = &[(
-    "get_call_graph",
-    "route_path",
-    &["compact", "direction", "file_path"],
-)];
+///
+/// `max_tokens` (P1 #2) selects the budgeted answer, which is built from the
+/// full envelope and sized to the budget, so `compact` does nothing beside it.
+/// A numeric selector counts as selected when it is a number.
+const MODE_INERT_ARGS: &[(&str, &str, &[&str])] = &[
+    (
+        "get_call_graph",
+        "route_path",
+        &["compact", "direction", "file_path", "max_tokens"],
+    ),
+    ("get_call_graph", "max_tokens", &["compact"]),
+    ("project_map", "max_tokens", &["compact"]),
+    ("module_overview", "max_tokens", &["compact"]),
+    ("get_ast_node", "max_tokens", &["compact"]),
+];
 
 /// `(tool, argument, gate)` — `argument` is read only when `gate` is present and
 /// true. Used by `note_clamped_arguments` so a clamp is not reported for a value
@@ -2357,8 +2367,18 @@ impl McpServer {
         // compaction path in this codebase is an explicit field allowlist, and a new
         // top-level key that forgets to enrol in one gets silently dropped — the exact
         // bug the v0.97.1 audit found for `deps`. Attaching last makes that impossible.
+        //
+        // A call that carries `max_tokens` was sized by its handler to what the
+        // caller asked for, so the threshold tier is skipped for it; a result
+        // the tier cut names the command that returns the rest (P1 #2).
         result
-            .map(centralized_compress)
+            .map(|value| {
+                if helpers::is_budgeted_call(name, args) {
+                    value
+                } else {
+                    helpers::attach_compression_next(name, args, centralized_compress(value))
+                }
+            })
             .map(|value| self.note_ignored_arguments(name, args, value))
             .map(|value| self.note_clamped_arguments(name, args, value))
     }
@@ -2436,8 +2456,7 @@ impl McpServer {
             }
             let mode_selected = sent
                 .get(*selector)
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.trim().is_empty());
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()) || v.is_number());
             if !mode_selected {
                 continue;
             }
@@ -4191,6 +4210,10 @@ function handleLogin(req: Request) {
                 ("project_map", "centrality_limit") => json!({"include_centrality": true}),
                 ("semantic_code_search", "top_k") => json!({"query": "handler"}),
                 ("semantic_code_search", "limit") => json!({"query": "handler"}),
+                ("project_map", "max_tokens") => json!({}),
+                ("module_overview", "max_tokens") => json!({"path": "app.ts"}),
+                ("get_call_graph", "max_tokens") => json!({"symbol_name": "handler"}),
+                ("get_ast_node", "max_tokens") => json!({"symbol_name": "handler"}),
                 _ => return None,
             })
         };

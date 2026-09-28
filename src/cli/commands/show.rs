@@ -46,6 +46,165 @@ pub struct ShowArgs {
     /// JSON output
     #[arg(long)]
     pub json: bool,
+    /// Token budget for the text answer (bytes/3, 100-100000): definitions
+    /// with the fewest callers lose their body first (signature + file:line
+    /// stay), then reference lines, then whole definitions are left out; a
+    /// body is never cut part-way; ends with a command that prints the rest
+    #[arg(long, conflicts_with_all = ["json", "compact"])]
+    pub budget: Option<u64>,
+}
+
+/// The text `show` prints for one definition, split into the parts a budget
+/// can keep or leave out. Concatenated in field order it is exactly the
+/// unbudgeted answer.
+struct ShowNodeText {
+    header: String,
+    body: String,
+    calls: Vec<String>,
+    callers: Vec<String>,
+    /// `Called by:` is printed when the node has any caller, test callers
+    /// included, so the section can exist with no visible line.
+    callers_section: bool,
+    callers_hidden: String,
+    impact: String,
+}
+
+impl ShowNodeText {
+    fn render(&self, body: bool, calls: &[bool], callers: &[bool]) -> String {
+        let mut out = String::new();
+        out.push_str(&self.header);
+        if body {
+            out.push_str(&self.body);
+        }
+        if calls.iter().any(|k| *k) {
+            out.push_str("  Calls:\n");
+            for (l, k) in self.calls.iter().zip(calls) {
+                if *k {
+                    out.push_str(l);
+                }
+            }
+        }
+        let any_caller = callers.iter().any(|k| *k);
+        if self.callers_section && (any_caller || self.callers.is_empty()) {
+            out.push_str("  Called by:\n");
+            for (l, k) in self.callers.iter().zip(callers) {
+                if *k {
+                    out.push_str(l);
+                }
+            }
+            out.push_str(&self.callers_hidden);
+        }
+        out.push_str(&self.impact);
+        out
+    }
+
+    fn render_full(&self) -> String {
+        self.render(
+            true,
+            &vec![true; self.calls.len()],
+            &vec![true; self.callers.len()],
+        )
+    }
+}
+
+/// `show --budget`: the definitions fitted to `tokens`.
+///
+/// Units: one per definition (shorter form = the signature line without the
+/// body; ranked by call-edge in-degree) and one per reference line. Every body
+/// goes first (least-called definition first), then reference lines (from the
+/// end of each list), then whole definitions.
+fn show_budget_text(
+    conn: &rusqlite::Connection,
+    nodes: &[(i64, ShowNodeText)],
+    tokens: usize,
+    next: &crate::budget::NextCommand,
+) -> Result<String> {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    let ids: Vec<i64> = nodes.iter().map(|(id, _)| *id).collect();
+    let in_degree = budget::caller_counts(conn, &ids)?;
+    let nn = nodes.len();
+    // Unit layout: 0..nn definitions, then every reference line.
+    let mut refs: Vec<(usize, bool, usize)> = Vec::new(); // (node, is_caller, index)
+    for (ni, (_, t)) in nodes.iter().enumerate() {
+        refs.extend((0..t.calls.len()).map(|i| (ni, false, i)));
+        refs.extend((0..t.callers.len()).map(|i| (ni, true, i)));
+    }
+    let n = nn + refs.len();
+    let node_order = budget::order_by_importance(nn, |i| {
+        (in_degree.get(&nodes[i].0).copied().unwrap_or(0), Reverse(i))
+    });
+    let mut rank_of = vec![0usize; nn];
+    for (r, &i) in node_order.iter().enumerate() {
+        rank_of[i] = r;
+    }
+    let ref_order: Vec<usize> = budget::order_by_importance(refs.len(), |r| {
+        let (ni, _, idx) = refs[r];
+        (rank_of[ni], Reverse(idx))
+    })
+    .into_iter()
+    .map(|r| nn + r)
+    .collect();
+    let mut order = ref_order;
+    order.extend(node_order.iter().copied());
+    let steps = budget::standard_steps(&order, |u| u < nn && !nodes[u].1.body.is_empty());
+    let render = |levels: &[Level]| -> String {
+        let mut out = String::new();
+        let mut refs_cut = 0usize;
+        for (ni, (_, t)) in nodes.iter().enumerate() {
+            if levels[ni] == Level::Dropped {
+                continue;
+            }
+            let keep = |caller: bool, len: usize| -> Vec<bool> {
+                (0..len)
+                    .map(|i| {
+                        let r = refs
+                            .iter()
+                            .position(|&(a, b, c)| a == ni && b == caller && c == i)
+                            .unwrap();
+                        levels[nn + r] != Level::Dropped
+                    })
+                    .collect()
+            };
+            let calls = keep(false, t.calls.len());
+            let callers = keep(true, t.callers.len());
+            refs_cut += calls.iter().chain(&callers).filter(|k| !**k).count();
+            out.push_str(&t.render(levels[ni] == Level::Full, &calls, &callers));
+        }
+        let dropped = (0..nn).filter(|&i| levels[i] == Level::Dropped).count();
+        let no_body = (0..nn).filter(|&i| levels[i] == Level::Skeleton).count();
+        if let Some(line) = budget::notice(
+            "",
+            tokens,
+            &[
+                (dropped, "definition omitted", "definitions omitted"),
+                (
+                    no_body,
+                    "definition without its body",
+                    "definitions without their body",
+                ),
+                (
+                    refs_cut,
+                    "reference line omitted",
+                    "reference lines omitted",
+                ),
+            ],
+        ) {
+            out.push_str(&format!("{line}\nnext: {next}\n"));
+        }
+        out
+    };
+    Ok(budget::fit(
+        &vec![Level::Full; n],
+        &steps,
+        budget::budget_bytes(tokens),
+        |l| {
+            let s = render(l);
+            let len = s.len();
+            (s, len)
+        },
+    )
+    .output)
 }
 
 /// Show symbol details (code, type, signature).
@@ -438,8 +597,10 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut texts: Vec<(i64, ShowNodeText)> = Vec::with_capacity(nodes_with_paths.len());
     for (node, fp) in &nodes_with_paths {
-        writeln!(stdout, "{}", format_node_compact(node, fp))?;
+        let header = format!("{}\n", format_node_compact(node, fp));
+        let mut body = String::new();
         if !compact {
             if context_lines > 0 {
                 // Same worktree-aware root as the JSON arm above (FRS-4).
@@ -455,57 +616,57 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     // or a reader counting down from `start` is off by the amount
                     // of leading context.
                     if first != node.start_line || last != node.end_line {
-                        writeln!(
-                            stdout,
-                            "  [lines {}-{}, ±{} context]",
+                        body.push_str(&format!(
+                            "  [lines {}-{}, ±{} context]\n",
                             first, last, context_lines
-                        )?;
+                        ));
                     }
                     for line in code.lines() {
-                        writeln!(stdout, "  {}", line)?;
+                        body.push_str(&format!("  {}\n", line));
                     }
                 } else if !node.code_content.is_empty() {
                     for line in node.code_content.lines() {
-                        writeln!(stdout, "  {}", line)?;
+                        body.push_str(&format!("  {}\n", line));
                     }
                 }
             } else if !node.code_content.is_empty() {
                 for line in node.code_content.lines() {
-                    writeln!(stdout, "  {}", line)?;
+                    body.push_str(&format!("  {}\n", line));
                 }
             }
         }
+        let mut calls: Vec<String> = Vec::new();
+        let mut callers_lines: Vec<String> = Vec::new();
+        let mut callers_section = false;
+        let mut callers_hidden = String::new();
         if include_refs {
             use crate::domain::REL_CALLS;
             let include_tests = args.include_tests;
             // SURF-18: `?`, not `unwrap_or_default()` — see the JSON arm above.
             let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS)?;
             let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS)?;
-            if !callees.is_empty() {
-                writeln!(stdout, "  Calls:")?;
-                for (name, file) in &callees {
-                    writeln!(stdout, "    → {} ({})", name, file)?;
-                }
+            for (name, file) in &callees {
+                calls.push(format!("    → {} ({})\n", name, file));
             }
             if !callers.is_empty() {
+                callers_section = true;
                 let mut test_count = 0usize;
-                writeln!(stdout, "  Called by:")?;
                 for (name, file, is_test) in &callers {
                     if !include_tests && crate::domain::is_test_node(*is_test, name, file) {
                         test_count += 1;
                     } else {
-                        writeln!(stdout, "    ← {} ({})", name, file)?;
+                        callers_lines.push(format!("    ← {} ({})\n", name, file));
                     }
                 }
                 if test_count > 0 {
-                    writeln!(
-                        stdout,
-                        "    ({} test callers hidden, use --include-tests to show)",
+                    callers_hidden = format!(
+                        "    ({} test callers hidden, use --include-tests to show)\n",
                         test_count
-                    )?;
+                    );
                 }
             }
         }
+        let mut impact = String::new();
         if include_impact {
             let caller_set = crate::graph::routes::get_callers_with_route_info(
                 conn,
@@ -520,26 +681,68 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 "behavior",
                 is_function_like,
             );
-            writeln!(
-                stdout,
-                "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
+            impact.push_str(&format!(
+                "  Impact: {} — {} direct, {} transitive, {} files, {} routes\n",
                 cls.risk_level,
                 cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
                 cls.prod_callers.iter().filter(|c| c.depth > 1).count(),
                 cls.affected_files,
                 cls.route_callers.len()
-            )?;
+            ));
             if cls.test_count > 0 {
-                writeln!(
-                    stdout,
-                    "  ({} test callers excluded from the risk count)",
+                impact.push_str(&format!(
+                    "  ({} test callers excluded from the risk count)\n",
                     cls.test_count
-                )?;
+                ));
             }
             if let Some(note) = caller_set.truncation_note() {
-                writeln!(stdout, "  ⚠ {}", note)?;
+                impact.push_str(&format!("  ⚠ {}\n", note));
             }
         }
+        texts.push((
+            node.id,
+            ShowNodeText {
+                header,
+                body,
+                calls,
+                callers: callers_lines,
+                callers_section,
+                callers_hidden,
+                impact,
+            },
+        ));
+    }
+
+    if let Some(requested) = args.budget {
+        let tokens = clamp_arg(
+            "--budget",
+            requested,
+            crate::budget::MIN_BUDGET_TOKENS,
+            crate::budget::MAX_BUDGET_TOKENS,
+        ) as usize;
+        let mut next = match node_id_arg {
+            Some(id) => crate::budget::NextCommand::new("show")
+                .arg("--node-id")
+                .arg(id.to_string()),
+            None => {
+                crate::budget::NextCommand::new("show").arg(args.symbol.clone().unwrap_or_default())
+            }
+        };
+        next = next
+            .opt("--file", args.file.clone())
+            .flag_if(include_refs, "--refs")
+            .flag_if(include_impact, "--impact")
+            .flag_if(args.include_tests, "--include-tests")
+            .opt(
+                "--context-lines",
+                context_lines_explicit.map(|c| c.to_string()),
+            );
+        write!(stdout, "{}", show_budget_text(conn, &texts, tokens, &next)?)?;
+        return Ok(());
+    }
+
+    for (_, t) in &texts {
+        write!(stdout, "{}", t.render_full())?;
     }
 
     Ok(())

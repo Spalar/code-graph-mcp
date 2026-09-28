@@ -1,0 +1,304 @@
+fn hub  dense.js:1-152  ()
+  function hub() {
+    callee_0();
+    callee_1();
+    callee_2();
+    callee_3();
+    callee_4();
+    callee_5();
+    callee_6();
+    callee_7();
+    callee_8();
+    callee_9();
+    callee_10();
+    callee_11();
+    callee_12();
+    callee_13();
+    callee_14();
+    callee_15();
+    callee_16();
+    callee_17();
+    callee_18();
+    callee_19();
+    callee_20();
+    callee_21();
+    callee_22();
+    callee_23();
+    callee_24();
+    callee_25();
+    callee_26();
+    callee_27();
+    callee_28();
+    callee_29();
+    callee_30();
+    callee_31();
+    callee_32();
+    callee_33();
+    callee_34();
+    callee_35();
+    callee_36();
+    callee_37();
+    callee_38();
+    callee_39();
+    callee_40();
+    callee_41();
+    callee_42();
+    callee_43();
+    callee_44();
+    callee_45();
+    callee_46();
+    callee_47();
+    callee_48();
+    callee_49();
+    callee_50();
+    callee_51();
+    callee_52();
+    callee_53();
+    callee_54();
+    callee_55();
+    callee_56();
+    callee_57();
+    callee_58();
+    callee_59();
+    callee_60();
+    callee_61();
+    callee_62();
+    callee_63();
+    callee_64();
+    callee_65();
+    callee_66();
+    callee_67();
+    callee_68();
+    callee_69();
+    callee_70();
+    callee_71();
+    callee_72();
+    callee_73();
+    callee_74();
+    callee_75();
+    callee_76();
+    callee_77();
+    callee_78();
+    callee_79();
+    callee_80();
+    callee_81();
+    callee_82();
+    callee_83();
+    callee_84();
+    callee_85();
+    callee_86();
+    callee_87();
+    callee_88();
+    callee_89();
+    callee_90();
+    callee_91();
+    callee_92();
+    callee_93();
+    callee_94();
+    callee_95();
+    callee_96();
+    callee_97();
+    callee_98();
+    callee_99();
+    callee_100();
+    callee_101();
+    callee_102();
+    callee_103();
+    callee_104();
+    callee_105();
+    callee_106();
+    callee_107();
+    callee_108();
+    callee_109();
+    callee_110();
+    callee_111();
+    callee_112();
+    callee_113();
+    callee_114();
+    callee_115();
+    callee_116();
+    callee_117();
+    callee_118();
+    callee_119();
+    callee_120();
+    callee_121();
+    callee_122();
+    callee_123();
+    callee_124();
+    callee_125();
+    callee_126();
+    callee_127();
+    callee_128();
+    callee_129();
+    callee_130();
+    callee_131();
+    callee_132();
+    callee_133();
+    callee_134();
+    callee_135();
+    callee_136();
+    callee_137();
+    callee_138();
+    callee_139();
+    callee_140();
+    callee_141();
+    callee_142();
+    callee_143();
+    callee_144();
+    callee_145();
+    callee_146();
+    callee_147();
+    callee_148();
+    callee_149();
+  }
+  Calls:
+    → callee_0 (dense.js)
+    → callee_1 (dense.js)
+    → callee_2 (dense.js)
+    → callee_3 (dense.js)
+    → callee_4 (dense.js)
+    → callee_5 (dense.js)
+    → callee_6 (dense.js)
+    → callee_7 (dense.js)
+    → callee_8 (dense.js)
+    → callee_9 (dense.js)
+    → callee_10 (dense.js)
+    → callee_11 (dense.js)
+    → callee_12 (dense.js)
+    → callee_13 (dense.js)
+    → callee_14 (dense.js)
+    → callee_15 (dense.js)
+    → callee_16 (dense.js)
+    → callee_17 (dense.js)
+    → callee_18 (dense.js)
+    → callee_19 (dense.js)
+    → callee_20 (dense.js)
+    → callee_21 (dense.js)
+    → callee_22 (dense.js)
+    → callee_23 (dense.js)
+    → callee_24 (dense.js)
+    → callee_25 (dense.js)
+    → callee_26 (dense.js)
+    → callee_27 (dense.js)
+    → callee_28 (dense.js)
+    → callee_29 (dense.js)
+    → callee_30 (dense.js)
+    → callee_31 (dense.js)
+    → callee_32 (dense.js)
+    → callee_33 (dense.js)
+    → callee_34 (dense.js)
+    → callee_35 (dense.js)
+    → callee_36 (dense.js)
+    → callee_37 (dense.js)
+    → callee_38 (dense.js)
+    → callee_39 (dense.js)
+    → callee_40 (dense.js)
+    → callee_41 (dense.js)
+    → callee_42 (dense.js)
+    → callee_43 (dense.js)
+    → callee_44 (dense.js)
+    → callee_45 (dense.js)
+    → callee_46 (dense.js)
+    → callee_47 (dense.js)
+    → callee_48 (dense.js)
+    → callee_49 (dense.js)
+    → callee_50 (dense.js)
+    → callee_51 (dense.js)
+    → callee_52 (dense.js)
+    → callee_53 (dense.js)
+    → callee_54 (dense.js)
+    → callee_55 (dense.js)
+    → callee_56 (dense.js)
+    → callee_57 (dense.js)
+    → callee_58 (dense.js)
+    → callee_59 (dense.js)
+    → callee_60 (dense.js)
+    → callee_61 (dense.js)
+    → callee_62 (dense.js)
+    → callee_63 (dense.js)
+    → callee_64 (dense.js)
+    → callee_65 (dense.js)
+    → callee_66 (dense.js)
+    → callee_67 (dense.js)
+    → callee_68 (dense.js)
+    → callee_69 (dense.js)
+    → callee_70 (dense.js)
+    → callee_71 (dense.js)
+    → callee_72 (dense.js)
+    → callee_73 (dense.js)
+    → callee_74 (dense.js)
+    → callee_75 (dense.js)
+    → callee_76 (dense.js)
+    → callee_77 (dense.js)
+    → callee_78 (dense.js)
+    → callee_79 (dense.js)
+    → callee_80 (dense.js)
+    → callee_81 (dense.js)
+    → callee_82 (dense.js)
+    → callee_83 (dense.js)
+    → callee_84 (dense.js)
+    → callee_85 (dense.js)
+    → callee_86 (dense.js)
+    → callee_87 (dense.js)
+    → callee_88 (dense.js)
+    → callee_89 (dense.js)
+    → callee_90 (dense.js)
+    → callee_91 (dense.js)
+    → callee_92 (dense.js)
+    → callee_93 (dense.js)
+    → callee_94 (dense.js)
+    → callee_95 (dense.js)
+    → callee_96 (dense.js)
+    → callee_97 (dense.js)
+    → callee_98 (dense.js)
+    → callee_99 (dense.js)
+    → callee_100 (dense.js)
+    → callee_101 (dense.js)
+    → callee_102 (dense.js)
+    → callee_103 (dense.js)
+    → callee_104 (dense.js)
+    → callee_105 (dense.js)
+    → callee_106 (dense.js)
+    → callee_107 (dense.js)
+    → callee_108 (dense.js)
+    → callee_109 (dense.js)
+    → callee_110 (dense.js)
+    → callee_111 (dense.js)
+    → callee_112 (dense.js)
+    → callee_113 (dense.js)
+    → callee_114 (dense.js)
+    → callee_115 (dense.js)
+    → callee_116 (dense.js)
+    → callee_117 (dense.js)
+    → callee_118 (dense.js)
+    → callee_119 (dense.js)
+    → callee_120 (dense.js)
+    → callee_121 (dense.js)
+    → callee_122 (dense.js)
+    → callee_123 (dense.js)
+    → callee_124 (dense.js)
+    → callee_125 (dense.js)
+    → callee_126 (dense.js)
+    → callee_127 (dense.js)
+    → callee_128 (dense.js)
+    → callee_129 (dense.js)
+    → callee_130 (dense.js)
+    → callee_131 (dense.js)
+    → callee_132 (dense.js)
+    → callee_133 (dense.js)
+    → callee_134 (dense.js)
+    → callee_135 (dense.js)
+    → callee_136 (dense.js)
+    → callee_137 (dense.js)
+    → callee_138 (dense.js)
+    → callee_139 (dense.js)
+    → callee_140 (dense.js)
+    → callee_141 (dense.js)
+    → callee_142 (dense.js)
+    → callee_143 (dense.js)
+    → callee_144 (dense.js)
+    → callee_145 (dense.js)
+    → callee_146 (dense.js)
+    → callee_147 (dense.js)
+    → callee_148 (dense.js)
+    → callee_149 (dense.js)

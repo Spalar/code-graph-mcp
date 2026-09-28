@@ -37,6 +37,11 @@ pub struct CallgraphArgs {
     /// 'ambiguous' to show every edge.
     #[arg(long = "min-confidence")]
     pub min_confidence: Option<String>,
+    /// Token budget for the text answer (bytes/3, 100-100000): the deepest
+    /// nodes with the fewest callers are shortened, then left out (a node goes
+    /// before its parent); ends with a command that prints them
+    #[arg(long, conflicts_with_all = ["json", "compact"])]
+    pub budget: Option<u64>,
 }
 
 /// Call graph display.
@@ -407,9 +412,66 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         Ok(())
     }
 
+    // Footers are collected first so a budgeted answer can count them; the
+    // unbudgeted answer writes the same bytes after the tree.
+    let mut footer: Vec<u8> = Vec::new();
+    write_callgraph_footer(
+        &mut footer,
+        test_count,
+        test_callee_count,
+        &result,
+        boundaries.as_ref(),
+    )?;
+
+    if let Some(requested) = args.budget {
+        let tokens = clamp_arg(
+            "--budget",
+            requested,
+            crate::budget::MIN_BUDGET_TOKENS,
+            crate::budget::MAX_BUDGET_TOKENS,
+        ) as usize;
+        let next = crate::budget::NextCommand::new("callgraph")
+            .arg(raw_symbol)
+            .opt("--file", args.file.clone())
+            .opt(
+                "--direction",
+                (args.direction != "both").then(|| args.direction.clone()),
+            )
+            .opt("--depth", (args.depth != 3).then(|| args.depth.to_string()))
+            .flag_if(include_tests, "--include-tests")
+            .opt("--min-confidence", args.min_confidence.clone());
+        let root = root.unwrap();
+        let head = format!("{} ({})\n", root.name, root.file_path);
+        let text = callgraph_budget_text(
+            conn,
+            &head,
+            &children,
+            root_id,
+            &String::from_utf8_lossy(&footer),
+            tokens,
+            &next,
+        )?;
+        // The head line was already written above.
+        write!(stdout, "{}", &text[head.len()..])?;
+        return Ok(());
+    }
+
     render_subtree(&mut stdout, &children, root_id, "callers", compact)?;
     render_subtree(&mut stdout, &children, root_id, "callees", compact)?;
+    stdout.write_all(&footer)?;
 
+    Ok(())
+}
+
+/// The lines after the tree: hidden-test counts, traversal limits, hidden
+/// ambiguous edges, dynamic-dispatch boundaries.
+fn write_callgraph_footer<W: std::io::Write>(
+    stdout: &mut W,
+    test_count: usize,
+    test_callee_count: usize,
+    result: &crate::graph::query::CallGraphResult,
+    boundaries: Option<&crate::graph::boundaries::Boundaries>,
+) -> Result<()> {
     if test_count > 0 || test_callee_count > 0 {
         let mut parts: Vec<String> = Vec::new();
         if test_count > 0 {
@@ -445,11 +507,135 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             result.suppressed_ambiguous,
         )?;
     }
-    if let Some(b) = &boundaries {
-        b.render_text(&mut stdout, "  ")?;
+    if let Some(b) = boundaries {
+        b.render_text(stdout, "  ")?;
     }
-
     Ok(())
+}
+
+/// One rendered tree line of `callgraph` (depth, parent and whether it was
+/// deduplicated are already settled by the unbudgeted renderer's rules).
+struct TreeLine<'a> {
+    node: &'a crate::graph::query::CallGraphNode,
+    direction: &'static str,
+    /// Index of the parent line, `None` under the root.
+    parent: Option<usize>,
+}
+
+/// `callgraph --budget`: the tree fitted to `tokens`.
+///
+/// One unit per tree line. Least important first: deepest, then fewest
+/// callers (call-edge in-degree), then latest in the listing — so a node is
+/// always shortened or left out before its parent. The shorter form is the
+/// `--compact` line (`← name (file)`).
+fn callgraph_budget_text(
+    conn: &rusqlite::Connection,
+    head: &str,
+    children: &std::collections::HashMap<
+        (i64, &'static str),
+        Vec<&crate::graph::query::CallGraphNode>,
+    >,
+    root_id: i64,
+    footer: &str,
+    tokens: usize,
+    next: &crate::budget::NextCommand,
+) -> Result<String> {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    fn collect<'a>(
+        children: &std::collections::HashMap<
+            (i64, &'static str),
+            Vec<&'a crate::graph::query::CallGraphNode>,
+        >,
+        parent_id: i64,
+        parent: Option<usize>,
+        direction: &'static str,
+        out: &mut Vec<TreeLine<'a>>,
+    ) {
+        if let Some(kids) = children.get(&(parent_id, direction)) {
+            for n in kids {
+                out.push(TreeLine {
+                    node: n,
+                    direction,
+                    parent,
+                });
+                let me = out.len() - 1;
+                collect(children, n.node_id, Some(me), direction, out);
+            }
+        }
+    }
+    let mut lines: Vec<TreeLine> = Vec::new();
+    collect(children, root_id, None, "callers", &mut lines);
+    collect(children, root_id, None, "callees", &mut lines);
+    let ids: Vec<i64> = lines.iter().map(|l| l.node.node_id).collect();
+    let in_degree = budget::caller_counts(conn, &ids)?;
+    let n = lines.len();
+    let order = budget::order_by_importance(n, |i| {
+        (
+            Reverse(lines[i].node.depth),
+            in_degree.get(&lines[i].node.node_id).copied().unwrap_or(0),
+            Reverse(i),
+        )
+    });
+    let steps = budget::standard_steps(&order, |_| true);
+    let line_text = |l: &TreeLine, level: Level| -> String {
+        let indent = "  ".repeat(l.node.depth as usize);
+        let label = crate::domain::display_node_name(&l.node.name);
+        let (arrow, arrow_text) = match l.direction {
+            "callers" => ("←", "← called by"),
+            _ => ("→", "→ calls"),
+        };
+        if level == Level::Skeleton {
+            format!("{indent}{arrow} {label} ({})\n", l.node.file_path)
+        } else {
+            format!(
+                "{indent}{arrow_text}: {label} ({}) [{}]\n",
+                l.node.file_path, l.node.node_type
+            )
+        }
+    };
+    let render = |levels: &[Level]| -> String {
+        let mut out = String::from(head);
+        let mut shown = vec![false; n];
+        for (i, l) in lines.iter().enumerate() {
+            // A line whose parent is not shown is not shown either: the order
+            // above already guarantees it, this keeps the tree well-formed if
+            // the fill pass brings a child back without its parent.
+            let parent_shown = l.parent.is_none_or(|p| shown[p]);
+            if levels[i] == Level::Dropped || !parent_shown {
+                continue;
+            }
+            shown[i] = true;
+            out.push_str(&line_text(l, levels[i]));
+        }
+        out.push_str(footer);
+        let omitted = shown.iter().filter(|s| !**s).count();
+        let short = (0..n)
+            .filter(|&i| shown[i] && levels[i] == Level::Skeleton)
+            .count();
+        if let Some(line) = budget::notice(
+            "  ",
+            tokens,
+            &[
+                (omitted, "node omitted", "nodes omitted"),
+                (short, "node without its type", "nodes without their type"),
+            ],
+        ) {
+            out.push_str(&format!("{line}\n  next: {next}\n"));
+        }
+        out
+    };
+    Ok(budget::fit(
+        &vec![Level::Full; n],
+        &steps,
+        budget::budget_bytes(tokens),
+        |l| {
+            let s = render(l);
+            let len = s.len();
+            (s, len)
+        },
+    )
+    .output)
 }
 
 // --- impact subcommand ---

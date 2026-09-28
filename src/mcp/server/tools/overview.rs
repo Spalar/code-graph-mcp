@@ -3,6 +3,13 @@
 
 use super::super::*;
 
+/// Active exports the default answer lists in full; the rest are counted
+/// (`active_capped` / `total_active`) and named by `next`.
+const MAX_ACTIVE: usize = 30;
+/// Names per type the default answer lists for inactive symbols (`more` counts
+/// the rest).
+const MAX_INACTIVE_NAMES: usize = 8;
+
 impl McpServer {
     pub(in crate::mcp::server) fn tool_module_overview(
         &self,
@@ -35,6 +42,11 @@ impl McpServer {
         // against the tool the caller actually named.
         let deps_depth = arg_clamped(args, "deps_depth", "module_overview", 2)? as i64;
         let dead_min_lines = arg_u64(args, "dead_min_lines", 3)?;
+        // P1 #2: absent = the unbudgeted answer.
+        let max_tokens = match &args["max_tokens"] {
+            serde_json::Value::Null => None,
+            _ => Some(arg_clamped(args, "max_tokens", "module_overview", 0)? as usize),
+        };
 
         if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
@@ -126,148 +138,15 @@ impl McpServer {
             }
         };
 
-        let mut result = if let Some(cached) = cached_base {
+        // A budgeted call builds its own, uncapped base (the budget is the cap)
+        // and neither reads nor fills the cache.
+        let mut result = if max_tokens.is_some() {
+            self.module_overview_base(path, raw_path, usize::MAX, usize::MAX)?
+        } else if let Some(cached) = cached_base {
             cached
         } else {
-            let exports = queries::get_module_exports(self.db.conn(), path)?;
-            // Symbols the per-file export rule withheld. `summary` says "N active
-            // + M inactive exports", which a caller reads as the file's whole
-            // symbol census — for an ESM file it is only its public half, and
-            // nothing in the response said so. Zero for Python/Rust/Go/CommonJS.
-            //
-            // The query filters on `is_test_node_sql`, the SQL mirror of the
-            // `is_test_symbol` call the visible half uses below, so one rule
-            // governs both halves. The Err is kept as an Err —
-            // `not_exported_unavailable` below, matching the
-            // `dependencies_unavailable` / `dead_code_unavailable` convention,
-            // because "count failed" is not "nothing hidden".
-            let not_exported = queries::count_export_filtered_out(self.db.conn(), path);
-
-            // Filter out test functions — they add noise to module overviews
-            let exports: Vec<_> = exports
-                .into_iter()
-                .filter(|e| !is_test_symbol(&e.name, &e.file_path))
-                .collect();
-
-            // Get import/dependency info at file level
-            let files: std::collections::HashSet<&str> =
-                exports.iter().map(|e| e.file_path.as_str()).collect();
-
-            // Split exports into active (called by others) and inactive to save tokens.
-            let (active, inactive): (Vec<_>, Vec<_>) =
-                exports.iter().partition(|e| e.caller_count > 0);
-
-            let mut hot_candidates: Vec<_> =
-                exports.iter().filter(|e| e.caller_count > 0).collect();
-            hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
-            let hot_paths: Vec<serde_json::Value> = hot_candidates
-                .iter()
-                .take(5)
-                .map(|e| {
-                    let mut obj = json!({
-                        "name": e.name,
-                        "type": e.node_type,
-                        "file": e.file_path,
-                        "caller_count": e.caller_count,
-                    });
-                    if e.qualified_name != e.name {
-                        obj["qualified_name"] = json!(e.qualified_name);
-                    }
-                    obj
-                })
-                .collect();
-
-            // Active exports get full detail; inactive ones are summarized by type.
-            const MAX_ACTIVE: usize = 30;
-            let active_capped = active.len() > MAX_ACTIVE;
-            let mut active_sorted = active.clone();
-            active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
-            let active_exports: Vec<serde_json::Value> = active_sorted
-                .iter()
-                .take(MAX_ACTIVE)
-                .map(|e| {
-                    let mut obj = json!({
-                        "node_id": e.node_id,
-                        "name": e.name,
-                        "type": e.node_type,
-                        "file": e.file_path,
-                        "caller_count": e.caller_count,
-                        "signature": e.signature,
-                        "start_line": e.start_line,
-                        "end_line": e.end_line,
-                    });
-                    // Disambiguate same-named methods of different classes (parity with
-                    // CLI `overview --json`). Present only when it adds info.
-                    if e.qualified_name != e.name {
-                        obj["qualified_name"] = json!(e.qualified_name);
-                    }
-                    obj
-                })
-                .collect();
-
-            // Compact summary for inactive symbols — just counts by type.
-            //
-            // BTreeMap, not HashMap: this array goes straight into an
-            // LLM-visible tool response, and `HashMap`'s iteration order is
-            // seeded per instance — the same binary over the same index emitted
-            // a different group order on every run. That makes a response
-            // irreproducible and taints any run-to-run diff. Ordering by type is
-            // structural here rather than a sort applied afterwards, so the
-            // property cannot be lost by an edit that forgets the sort.
-            let mut inactive_by_type: std::collections::BTreeMap<&str, Vec<&str>> =
-                std::collections::BTreeMap::new();
-            for e in &inactive {
-                // Show `Class.method` for members so two same-named methods of different
-                // classes don't both surface as a bare, indistinguishable `render`.
-                inactive_by_type
-                    .entry(e.node_type.as_str())
-                    .or_default()
-                    .push(e.display_name());
-            }
-            let inactive_summary: Vec<serde_json::Value> = inactive_by_type
-                .iter()
-                .map(|(typ, names)| {
-                    let display: Vec<&&str> = names.iter().take(8).collect();
-                    let mut obj = json!({
-                        "type": typ,
-                        "count": names.len(),
-                        "names": display,
-                    });
-                    if names.len() > 8 {
-                        obj["more"] = json!(names.len() - 8);
-                    }
-                    obj
-                })
-                .collect();
-
-            let mut result = json!({
-                "path": raw_path,
-                "files_count": files.len(),
-                "active_exports": active_exports,
-                "inactive_summary": inactive_summary,
-                "hot_paths": hot_paths,
-                "summary": format!("Module '{}': {} active + {} inactive exports across {} files",
-                    raw_path, active.len(), inactive.len(), files.len())
-            });
-            match &not_exported {
-                Ok(0) => {}
-                Ok(n) => {
-                    result["not_exported_hidden"] = json!(n);
-                    result["not_exported_note"] = json!(queries::export_filter_note(*n));
-                }
-                Err(e) => result["not_exported_unavailable"] = json!(e.to_string()),
-            }
-            if files.is_empty() {
-                result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
-            }
-            if active_capped {
-                result["active_capped"] = json!(true);
-                result["showing"] = json!(MAX_ACTIVE);
-                result["total_active"] = json!(active.len());
-                result["hint"] =
-                    json!("Active exports capped. Use a more specific path to see all.");
-            }
-
+            let result =
+                self.module_overview_base(path, raw_path, MAX_ACTIVE, MAX_INACTIVE_NAMES)?;
             // Cache the full result (max 10 entries to bound memory)
             {
                 let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
@@ -349,8 +228,174 @@ impl McpServer {
             }
         }
 
+        if let Some(tokens) = max_tokens {
+            let next = crate::budget::NextCommand::new("overview").arg(if raw_path.is_empty() {
+                "."
+            } else {
+                raw_path
+            });
+            return Ok(module_overview_budgeted(&result, tokens, &next));
+        }
         if compact {
             return self.compact_module_overview(&result);
+        }
+        Ok(result)
+    }
+
+    /// The `module_overview` envelope before `include_deps` / `include_dead` /
+    /// `compact`. `max_active` / `max_inactive_names` are the default answer's
+    /// caps ([`MAX_ACTIVE`], [`MAX_INACTIVE_NAMES`]); a budgeted call passes
+    /// `usize::MAX` and lets the budget cut instead.
+    fn module_overview_base(
+        &self,
+        path: &str,
+        raw_path: &str,
+        max_active: usize,
+        max_inactive_names: usize,
+    ) -> Result<serde_json::Value> {
+        let exports = queries::get_module_exports(self.db.conn(), path)?;
+        // Symbols the per-file export rule withheld. `summary` says "N active
+        // + M inactive exports", which a caller reads as the file's whole
+        // symbol census — for an ESM file it is only its public half, and
+        // nothing in the response said so. Zero for Python/Rust/Go/CommonJS.
+        //
+        // The query filters on `is_test_node_sql`, the SQL mirror of the
+        // `is_test_symbol` call the visible half uses below, so one rule
+        // governs both halves. The Err is kept as an Err —
+        // `not_exported_unavailable` below, matching the
+        // `dependencies_unavailable` / `dead_code_unavailable` convention,
+        // because "count failed" is not "nothing hidden".
+        let not_exported = queries::count_export_filtered_out(self.db.conn(), path);
+
+        // Filter out test functions — they add noise to module overviews
+        let exports: Vec<_> = exports
+            .into_iter()
+            .filter(|e| !is_test_symbol(&e.name, &e.file_path))
+            .collect();
+
+        // Get import/dependency info at file level
+        let files: std::collections::HashSet<&str> =
+            exports.iter().map(|e| e.file_path.as_str()).collect();
+
+        // Split exports into active (called by others) and inactive to save tokens.
+        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter().partition(|e| e.caller_count > 0);
+
+        let mut hot_candidates: Vec<_> = exports.iter().filter(|e| e.caller_count > 0).collect();
+        hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
+        let hot_paths: Vec<serde_json::Value> = hot_candidates
+            .iter()
+            .take(5)
+            .map(|e| {
+                let mut obj = json!({
+                    "name": e.name,
+                    "type": e.node_type,
+                    "file": e.file_path,
+                    "caller_count": e.caller_count,
+                });
+                if e.qualified_name != e.name {
+                    obj["qualified_name"] = json!(e.qualified_name);
+                }
+                obj
+            })
+            .collect();
+
+        // Active exports get full detail; inactive ones are summarized by type.
+        let active_capped = active.len() > max_active;
+        let mut active_sorted = active.clone();
+        active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
+        let active_exports: Vec<serde_json::Value> = active_sorted
+            .iter()
+            .take(max_active)
+            .map(|e| {
+                let mut obj = json!({
+                    "node_id": e.node_id,
+                    "name": e.name,
+                    "type": e.node_type,
+                    "file": e.file_path,
+                    "caller_count": e.caller_count,
+                    "signature": e.signature,
+                    "start_line": e.start_line,
+                    "end_line": e.end_line,
+                });
+                // Disambiguate same-named methods of different classes (parity with
+                // CLI `overview --json`). Present only when it adds info.
+                if e.qualified_name != e.name {
+                    obj["qualified_name"] = json!(e.qualified_name);
+                }
+                obj
+            })
+            .collect();
+
+        // Compact summary for inactive symbols — just counts by type.
+        //
+        // BTreeMap, not HashMap: this array goes straight into an
+        // LLM-visible tool response, and `HashMap`'s iteration order is
+        // seeded per instance — the same binary over the same index emitted
+        // a different group order on every run. That makes a response
+        // irreproducible and taints any run-to-run diff. Ordering by type is
+        // structural here rather than a sort applied afterwards, so the
+        // property cannot be lost by an edit that forgets the sort.
+        let mut inactive_by_type: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for e in &inactive {
+            // Show `Class.method` for members so two same-named methods of different
+            // classes don't both surface as a bare, indistinguishable `render`.
+            inactive_by_type
+                .entry(e.node_type.as_str())
+                .or_default()
+                .push(e.display_name());
+        }
+        let inactive_summary: Vec<serde_json::Value> = inactive_by_type
+            .iter()
+            .map(|(typ, names)| {
+                let display: Vec<&&str> = names.iter().take(max_inactive_names).collect();
+                let mut obj = json!({
+                    "type": typ,
+                    "count": names.len(),
+                    "names": display,
+                });
+                if names.len() > max_inactive_names {
+                    obj["more"] = json!(names.len() - max_inactive_names);
+                }
+                obj
+            })
+            .collect();
+
+        let mut result = json!({
+            "path": raw_path,
+            "files_count": files.len(),
+            "active_exports": active_exports,
+            "inactive_summary": inactive_summary,
+            "hot_paths": hot_paths,
+            "summary": format!("Module '{}': {} active + {} inactive exports across {} files",
+                raw_path, active.len(), inactive.len(), files.len())
+        });
+        match &not_exported {
+            Ok(0) => {}
+            Ok(n) => {
+                result["not_exported_hidden"] = json!(n);
+                result["not_exported_note"] = json!(queries::export_filter_note(*n));
+            }
+            Err(e) => result["not_exported_unavailable"] = json!(e.to_string()),
+        }
+        if files.is_empty() {
+            result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
+        }
+        if active_capped {
+            result["active_capped"] = json!(true);
+            result["showing"] = json!(max_active);
+            result["total_active"] = json!(active.len());
+            result["hint"] = json!("Active exports capped. Use a more specific path to see all.");
+        }
+        // Every cut above (the active cap, an inactive group's `more`) is
+        // returned whole by the text listing (P1 #2).
+        let names_cut = result["inactive_summary"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|g| g.get("more").is_some()));
+        if active_capped || names_cut {
+            result["next"] = json!(crate::budget::NextCommand::new("overview")
+                .arg(if raw_path.is_empty() { "." } else { raw_path })
+                .to_string());
         }
         Ok(result)
     }
@@ -424,6 +469,7 @@ impl McpServer {
             "not_exported_hidden",
             "not_exported_note",
             "not_exported_unavailable",
+            "next",
         ] {
             if let Some(v) = full.get(key) {
                 result[key] = v.clone();
@@ -431,4 +477,164 @@ impl McpServer {
         }
         Ok(result)
     }
+}
+
+/// `module_overview` with `max_tokens`: the uncapped envelope fitted to the
+/// budget.
+///
+/// Units: each active export (ranked by caller count; shorter form drops
+/// `signature` / `end_line`) and each inactive name (all rank below every
+/// active export; each type group loses names from its tail, the groups in
+/// proportion). One file's active exports are first held to
+/// [`crate::budget::FILE_SHARE_PERCENT`] of the budget. `hot_paths`,
+/// `summary` and the folded `dependencies` / `dead_code` are kept whole.
+fn module_overview_budgeted(
+    full: &serde_json::Value,
+    tokens: usize,
+    next: &crate::budget::NextCommand,
+) -> serde_json::Value {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    let active = full["active_exports"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let groups = full["inactive_summary"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let names: Vec<Vec<serde_json::Value>> = groups
+        .iter()
+        .map(|g| g["names"].as_array().cloned().unwrap_or_default())
+        .collect();
+    let na = active.len();
+    // Inactive names: unit index na + offset[g] + j.
+    let mut offset = Vec::with_capacity(names.len());
+    let mut n = na;
+    for g in &names {
+        offset.push(n);
+        n += g.len();
+    }
+    let skeleton = |e: &serde_json::Value| {
+        let mut s = e.clone();
+        if let Some(o) = s.as_object_mut() {
+            o.remove("signature");
+            o.remove("end_line");
+        }
+        s
+    };
+    let size = |v: &serde_json::Value| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) + 1;
+    let callers = |i: usize| active[i]["caller_count"].as_i64().unwrap_or(0);
+    let active_order = budget::order_by_importance(na, |i| (callers(i), Reverse(i)));
+    let inactive_order = budget::interleave(
+        &names
+            .iter()
+            .enumerate()
+            .map(|(g, list)| {
+                budget::order_by_importance(list.len(), Reverse)
+                    .into_iter()
+                    .map(|j| offset[g] + j)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut order = inactive_order;
+    order.extend(active_order.iter().copied());
+    let has_skeleton = |u: usize| u < na;
+    let steps = budget::standard_steps(&order, has_skeleton);
+
+    // One file's share first.
+    let mut initial = vec![Level::Full; n];
+    let share = budget::budget_bytes(tokens) * budget::FILE_SHARE_PERCENT / 100;
+    let mut by_file: std::collections::BTreeMap<&str, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for &i in &active_order {
+        by_file
+            .entry(active[i]["file"].as_str().unwrap_or(""))
+            .or_default()
+            .push(i);
+    }
+    for units in by_file.values() {
+        budget::cap_group(
+            &mut initial,
+            units,
+            has_skeleton,
+            |u, l| match l {
+                Level::Full => size(&active[u]),
+                Level::Skeleton => size(&skeleton(&active[u])),
+                Level::Dropped => 0,
+            },
+            share,
+        );
+    }
+    let past_share = initial.iter().filter(|l| **l != Level::Full).count();
+
+    let render = |levels: &[Level]| -> serde_json::Value {
+        let mut out = full.clone();
+        out["active_exports"] = json!(active
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| levels[*i] != Level::Dropped)
+            .map(|(i, e)| if levels[i] == Level::Skeleton {
+                skeleton(e)
+            } else {
+                e.clone()
+            })
+            .collect::<Vec<_>>());
+        let mut names_omitted = 0usize;
+        let new_groups: Vec<serde_json::Value> = groups
+            .iter()
+            .enumerate()
+            .map(|(g, grp)| {
+                let kept: Vec<serde_json::Value> = names[g]
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| levels[offset[g] + j] != Level::Dropped)
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                let mut o = grp.clone();
+                let total = grp["count"].as_u64().unwrap_or(names[g].len() as u64) as usize;
+                names_omitted += names[g].len() - kept.len();
+                o["names"] = json!(kept);
+                if let Some(obj) = o.as_object_mut() {
+                    obj.remove("more");
+                }
+                if total > kept.len() {
+                    o["more"] = json!(total - kept.len());
+                }
+                o
+            })
+            .collect();
+        out["inactive_summary"] = json!(new_groups);
+        let active_omitted = (0..na).filter(|&i| levels[i] == Level::Dropped).count();
+        let short = (0..na).filter(|&i| levels[i] == Level::Skeleton).count();
+        if active_omitted + names_omitted + short > 0 {
+            let mut b = json!({ "max_tokens": tokens });
+            let mut omitted = serde_json::Map::new();
+            if active_omitted > 0 {
+                omitted.insert("active_exports".into(), json!(active_omitted));
+            }
+            if names_omitted > 0 {
+                omitted.insert("inactive_names".into(), json!(names_omitted));
+            }
+            if !omitted.is_empty() {
+                b["omitted"] = serde_json::Value::Object(omitted);
+            }
+            if short > 0 {
+                b["active_exports_without_signature"] = json!(short);
+            }
+            if past_share > 0 {
+                b["cut_for_file_share"] = json!(past_share);
+            }
+            b["next"] = json!(next.to_string());
+            out["budget"] = b;
+        }
+        out
+    };
+    budget::fit(&initial, &steps, budget::budget_bytes(tokens), |levels| {
+        let v = render(levels);
+        let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+        (v, len)
+    })
+    .output
 }

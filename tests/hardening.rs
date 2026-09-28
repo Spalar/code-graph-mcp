@@ -349,6 +349,14 @@ const FORBIDDEN_EDGES: &[(&str, &str, &str)] = &[
         "outcome must not borrow CLI internals — shared helpers live in utils",
     ),
     ("src/outcome.rs", "mcp", "outcome is surface-agnostic"),
+    // The budget engine (P1 #2) serves both surfaces; each surface renders its
+    // own units, so the engine must not reach into either.
+    (
+        "src/budget.rs",
+        "cli",
+        "budget is shared by CLI and MCP — surface rendering stays in the surfaces",
+    ),
+    ("src/budget.rs", "mcp", "budget is surface-agnostic"),
     // utils and domain are leaves: everything may depend on them, they on nothing.
     ("src/utils", "cli", "utils is a leaf"),
     ("src/utils", "mcp", "utils is a leaf"),

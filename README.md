@@ -167,6 +167,7 @@ src/
 ├── domain.rs     # Shared constants, relation types, env-var config
 ├── resolve.rs    # Shared symbol resolution + ambiguity verdicts (CLI and MCP)
 ├── outcome.rs    # Retrieval-adoption metrics from session transcripts
+├── budget.rs     # Output budgets (--budget / max_tokens): rank, shorten, drop, next step
 ├── cli/          # Every `code-graph-mcp <cmd>` subcommand (one file per command)
 ├── mcp/          # MCP protocol layer (JSON-RPC, tool registry, server)
 │   └── server/   # McpServer with IndexingState + CacheState sub-structs
@@ -349,6 +350,8 @@ cargo uninstall code-graph-mcp       # or delete the target/release binary
 | `ast_search` | Search AST nodes by text and/or structural filters (type, return type, params) |
 | `find_references` | Find all references to a symbol (callers, importers, inheritors, implementors, value/type references). Supports `compact` mode |
 
+**Output budget.** `project_map`, `module_overview`, `get_call_graph` and `get_ast_node` take an optional `max_tokens` (100-100000, counted as bytes/3 of the JSON answer). The answer is ranked by caller count; lower-ranked items are first shortened (no key symbols, no signature, no source body), then left out, and never cut in the middle. A `budget` object reports what was shortened or left out and `budget.next` is the CLI command that returns it. Without `max_tokens` the answer is unchanged. Every existing size cut in these four tools (`hot_functions_truncated`, `active_capped`, the call-graph rollup, `compressed_node`, `_truncated`) now carries a `next` command too.
+
 **Hidden aliases.** These names are not in `tools/list` but still dispatch via `tools/call`, so existing clients keep working: `trace_http_chain` / `find_http_route` (→ `get_call_graph` with `route_path`), `read_snippet` (→ `get_ast_node`), `dependency_graph`, `find_similar_code`, `find_dead_code`, plus the management tools `start_watch`, `stop_watch`, `get_index_status` and `rebuild_index`. `impact_analysis` is **removed** — calling it returns `Unknown tool`; use `get_ast_node` with `include_impact=true`, or the CLI's `impact --json` for the full report.
 
 ## CLI Commands
@@ -391,6 +394,8 @@ All tools are also available as CLI subcommands for shell scripts, hooks, and te
 | `serve` | — | Start the MCP JSON-RPC server on stdio (the default with no subcommand) |
 
 Common options: `--json` (JSON output), `--compact` (compact output), `--limit N`, `--depth N`, `--file <path>`.
+
+`map`, `overview`, `callgraph` and `show` take `--budget <tokens>` (100-100000, counted as bytes/3 of the text answer; not with `--json` or `--compact`). Items with the fewest callers are shortened first (a module loses its key symbols, a symbol its signature, a definition its body, a call-graph node its type), then left out, deepest call-graph nodes first. Nothing is cut in the middle, and in `overview` of a directory one file takes at most 70% of the budget. A notice line says what was left out and is followed by `next: <command>`, which prints it. The existing `... and N more` lines of `map` are followed by a `next:` line too.
 
 As of **v0.37.0** the CLI is [clap](https://docs.rs/clap)-based: **every subcommand has `--help`** for its full flag list (`code-graph-mcp <command> --help`), value flags accept both `--flag value` and `--flag=value`, and unknown flags or malformed arguments fail fast with a clear error and a non-zero exit code (`2`) instead of being silently ignored. For example, `trace` hides downstream middleware with `--no-middleware` (shown by default), and `snapshot` is a `create`/`inspect` subcommand pair.
 

@@ -1,0 +1,53 @@
+Modules:
+<root> (1 file, 151 symbols, javascript)
+  callee_0, callee_1, callee_10, callee_100, callee_101, callee_102
+core (2 files, 58 symbols, python)
+  api_00, api_01, api_02, api_03, api_04, api_05
+util (1 file, 20 symbols, python)
+  h_0, h_1, h_10, h_11, h_12, h_13
+pkg_00 (1 file, 5 symbols, python)
+  f_0_0, f_0_1, f_0_2
+pkg_01 (1 file, 5 symbols, python)
+  f_1_0, f_1_1, f_1_2
+pkg_02 (1 file, 5 symbols, python)
+  f_2_0, f_2_1, f_2_2
+pkg_03 (1 file, 5 symbols, python)
+  f_3_0, f_3_1, f_3_2
+pkg_04 (1 file, 5 symbols, python)
+  f_4_0, f_4_1, f_4_2
+pkg_05 (1 file, 5 symbols, python)
+  f_5_0, f_5_1, f_5_2
+pkg_06 (1 file, 5 symbols, python)
+  f_6_0, f_6_1, f_6_2
+pkg_07 (1 file, 5 symbols, python)
+  f_7_0, f_7_1, f_7_2
+pkg_08 (1 file, 5 symbols, python)
+  f_8_0, f_8_1, f_8_2
+pkg_09 (1 file, 5 symbols, python)
+  f_9_0, f_9_1, f_9_2
+pkg_10 (1 file, 5 symbols, python)
+  f_10_0, f_10_1, f_10_2
+pkg_11 (1 file, 5 symbols, python)
+  f_11_0, f_11_1, f_11_2
+  ... and 28 more modules
+
+Dependencies:
+  pkg_01 → util (3 imports)
+  pkg_02 → util (3 imports)
+  pkg_03 → util (3 imports)
+  pkg_04 → util (3 imports)
+  pkg_05 → util (3 imports)
+  pkg_06 → util (3 imports)
+  pkg_07 → util (3 imports)
+  pkg_08 → util (3 imports)
+  pkg_09 → util (3 imports)
+  pkg_10 → util (3 imports)
+  ... and 70 more dependencies
+
+Hot Functions:
+  h_0 (function) — 40 callers (util/helpers.py)
+  f_0_0 (function) — 2 callers (pkg_00/mod.py)
+  f_10_0 (function) — 2 callers (pkg_10/mod.py)
+  f_11_0 (function) — 2 callers (pkg_11/mod.py)
+  f_12_0 (function) — 2 callers (pkg_12/mod.py)
+  ... and 10 more hot functions
