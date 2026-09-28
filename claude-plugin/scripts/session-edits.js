@@ -7,7 +7,7 @@
 // SessionStart prune (24 h, mtime) and `uninstall`'s wholesale removal of that
 // dir cover them without a new cleanup path:
 //
-//   .cg-edits-<cwdHash>-<sid>.jsonl  one line per Edit call: {ts, file, symbol}
+//   .cg-edits-<cwdHash>-<sid>.jsonl  one line per Edit call: {ts, file, symbol[, sigs]}
 //   .cg-stop-<cwdHash>-<sid>.json    written by the Stop hook only:
 //                                    {lastStopAt, reported: ["file#symbol", …]}
 //
@@ -41,9 +41,31 @@ function stopStatePath(root, sessionId) {
   return key ? path.join(cgTmpDir(), `.cg-stop-${cwdHash(root)}-${key}.json`) : null;
 }
 
+// Baseline capture limits: a larger file, or more same-named definitions than
+// this, records no baseline — and the Stop hook then says nothing about it.
+const MAX_BASELINE_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_BASELINE_SIGS = 32;
+
+/**
+ * The symbol's definition headers in the file as it is NOW — called from
+ * PreToolUse, i.e. before the Edit lands. The Stop hook compares the working
+ * tree with the turn's first such record, so "changed this turn" means what it
+ * says (review H1). null = no exact reading (stop-impact.js LANGS, size, IO).
+ */
+function baselineSignatures(root, file, symbol) {
+  try {
+    const abs = path.join(root, file);
+    if (fs.statSync(abs).size > MAX_BASELINE_FILE_BYTES) return null;
+    const { extractSignatures } = require('./stop-impact');
+    const sigs = extractSignatures(fs.readFileSync(abs, 'utf8'), symbol, path.extname(file).toLowerCase());
+    return sigs && sigs.length <= MAX_BASELINE_SIGS ? sigs : null;
+  } catch { return null; }
+}
+
 /**
  * Append one Edit to the session log. Best-effort: a failed write costs the
- * Stop check one record, never the Edit it rides on.
+ * Stop check one record, never the Edit it rides on. A record with a symbol
+ * also carries `sigs`, that symbol's signatures before this Edit.
  * @param {string} root project root
  * @param {string} sessionId
  * @param {{file: string, symbol?: string|null}} rec file is root-relative
@@ -52,8 +74,10 @@ function stopStatePath(root, sessionId) {
 function recordEdit(root, sessionId, { file, symbol = null }, now = Date.now()) {
   const p = editsPath(root, sessionId);
   if (!p || !file) return false;
+  const rec = { ts: now, file, symbol: symbol || null };
+  if (symbol) rec.sigs = baselineSignatures(root, file, symbol);
   try {
-    fs.appendFileSync(p, JSON.stringify({ ts: now, file, symbol: symbol || null }) + '\n');
+    fs.appendFileSync(p, JSON.stringify(rec) + '\n');
     return true;
   } catch { return false; }
 }
@@ -70,7 +94,8 @@ function readEdits(root, sessionId) {
     try {
       const r = JSON.parse(line);
       if (r && typeof r.ts === 'number' && typeof r.file === 'string') {
-        out.push({ ts: r.ts, file: r.file, symbol: typeof r.symbol === 'string' ? r.symbol : null });
+        const sigs = Array.isArray(r.sigs) && r.sigs.every((x) => typeof x === 'string') ? r.sigs : null;
+        out.push({ ts: r.ts, file: r.file, symbol: typeof r.symbol === 'string' ? r.symbol : null, sigs });
       }
     } catch { /* torn line from a killed writer */ }
   }

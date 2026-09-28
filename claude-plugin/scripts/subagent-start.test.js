@@ -40,6 +40,23 @@ test('buildSubagentContext: worst case (huge count, stale flag, longest accepted
   assert.doesNotMatch(text, IMPERATIVE);
 });
 
+// The builder's longest output is below 400 (see the worst-case test), so the
+// ceiling check is only reachable with a lower limit. It is exercised here so
+// that deleting or inverting the check fails a test (review L7/M20).
+test('buildSubagentContext: text over the ceiling is dropped whole, never cut', () => {
+  const full = buildSubagentContext(REPORT);
+  assert.equal(buildSubagentContext(REPORT, full.length), full, 'exactly at the limit is kept');
+  assert.equal(buildSubagentContext(REPORT, full.length - 1), null, 'one over is silent');
+});
+
+test('buildSubagentContext: no repo-derived token reaches the text unfiltered', () => {
+  // `files` is coerced to a number and `index_age` must match the health-check
+  // shape, so shell or prompt text in either never reaches the subagent.
+  const t = buildSubagentContext({ files: '12', index_age: '$(touch PWNED)' });
+  assert.ok(t && !t.includes('$(') && !t.includes('PWNED'), t);
+  assert.equal(buildSubagentContext({ files: '12; rm -rf x' }), null);
+});
+
 test('buildSubagentContext: no report / empty index / junk age → silent or age dropped', () => {
   assert.equal(buildSubagentContext(null), null);
   assert.equal(buildSubagentContext({ files: 0 }), null);

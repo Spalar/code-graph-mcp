@@ -1,6 +1,6 @@
 ---
 status: implemented
-revision: 2
+revision: 3
 ---
 
 # P1 #3 — SubagentStart steering + Stop impact check (+ handler `if` filter)
@@ -82,7 +82,7 @@ number and skip.
   `{lastStopAt, reported}` in a second file. "Signature changed" = the sorted
   whitespace-free definition headers of the symbol differ between
   `git show HEAD:./file` and the working tree (text heuristics applied to both
-  sides). Callers = `refs --relation calls --min-confidence inferred`, `file:line`
+  sides) — superseded in r3, see the change log. Callers = `refs --relation calls --min-confidence inferred`, `file:line`
   of the first mention at or after the caller's start line. "Touched this
   turn" = Edit logged since the previous Stop, or mtime ≥ turn start (the
   previous Stop; the first logged Edit for the session's first turn). Both
@@ -113,3 +113,13 @@ number and skip.
 - r1 2026-09-28: created; approved under the user's batch AUTH.
 - r2 2026-09-28: implemented (a) and (b); (c) measured and skipped with the
   reason above.
+- r3 2026-09-28: review repairs. H1: the baseline is the symbol's headers
+  recorded by pre-edit-guide before the turn's first Edit of it (log field
+  `sigs`), not HEAD, so both sides of the check are this turn's; HEAD is no
+  longer read (the git-work-tree gate stays). M1: the 8-symbol cap bounds
+  `refs` queries over changed symbols only; the rest are named. M2: per-language
+  header rules (LANGS) for 13 languages, others silent; an added same-named
+  definition is not a change; an unterminated header (600 chars) is not read.
+  M3: repo-derived tokens shell-quoted via cg-answer.js `shellQuoteArg` /
+  `formatCgCommand`. Stop text 230 bytes for one caller. Tests: stop-impact 53
+  (7 e2e), session-edits 5, subagent-start 8; 31 mutations all red.

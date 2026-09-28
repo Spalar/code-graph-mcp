@@ -8,18 +8,27 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('St
 // pre-edit-guide.js pushes "this function has N callers" BEFORE an edit, when
 // nobody yet knows whether the edit will change the signature. This runs when
 // the turn ends and asks the question that can be answered then: of the
-// symbols edited this turn, which ones' signatures differ from HEAD, and
+// symbols edited this turn, which ones' signatures did THIS TURN change, and
 // which of their callers sit in files this turn did not touch? Those are
 // listed as `file:line`, once per symbol per session, through the Stop
 // event's `additionalContext` — documented as non-error feedback that lets
 // the turn continue, as opposed to `decision: "block"`
 // (https://code.claude.com/docs/en/hooks, "Stop decision control").
 //
+// "Changed this turn" compares the working tree with the signatures
+// pre-edit-guide recorded just before the turn's FIRST Edit of the symbol
+// (session-edits.js `sigs`) — not with HEAD. Both sides of the comparison are
+// then scoped to the same turn: a signature changed in turn 1, with its
+// callers fixed in turn 1, is not re-raised by a body-only edit in turn 2
+// (review H1), and uncommitted work from before the session is not reported
+// as this turn's.
+//
 // Silent when: `stop_hook_active` (a continuation this or another Stop hook
 // caused — never loop), no session edit log, no index, not a git work tree,
-// no signature changed, every caller's file was touched this turn, or the
-// symbol was already reported this session. CODE_GRAPH_QUIET_HOOKS=1 silences
-// it like the other injecting hooks.
+// no signature changed, the language has no exact header reading (LANGS),
+// every caller's file was touched this turn, or the symbol was already
+// reported this session. CODE_GRAPH_QUIET_HOOKS=1 silences it like the other
+// injecting hooks.
 //
 // "Touched this turn" = an Edit to the file was logged since the previous Stop,
 // OR the file's mtime is at or after the turn's start (covers Write, Bash
@@ -30,99 +39,180 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { hidden } = require('./proc-opts');
+const { shellQuoteArg, formatCgCommand } = require('./cg-answer');
 
 // Per-Stop work caps. The hook blocks the end of the turn, so its worst case
-// is bounded by count as well as by the registered budget.
+// is bounded by count as well as by the registered budget. The symbol cap
+// bounds the `refs` queries, so it applies AFTER the text-only "did the
+// signature change" filter (review M1): body-only edits do not use it up.
 const MAX_SYMBOLS_CHECKED = 8;
 const MAX_CALLERS_LISTED = 8;
-// A signature longer than this is cut: both sides are cut the same way, so
-// the comparison stays symmetric.
+// A header that has not ended within this many characters is not read at all
+// (no verdict), rather than cut: a cut header can run into the body, and a
+// body edit would then read as a signature change.
 const MAX_SIGNATURE_CHARS = 600;
 
 const COMMENT_LINE = /^\s*(?:\/\/|#|\*|\/\*|--|;)/;
-// First words that make a `Type name(` line a statement, not a definition.
+// First words that make a C-family `Type name(` line a statement, not a
+// definition.
 const NOT_A_TYPE = new Set([
   'return', 'new', 'throw', 'else', 'await', 'yield', 'case', 'delete', 'typeof',
   'echo', 'print', 'puts', 'if', 'while', 'for', 'switch', 'catch', 'when', 'not',
   'and', 'or', 'in', 'is', 'of', 'do', 'assert', 'raise', 'import', 'from', 'use',
   'let', 'const', 'var', 'mut', 'match', 'go', 'defer', 'sizeof', 'co_return',
+  'co_await', 'co_yield', 'default', 'goto',
 ]);
-// Files whose definitions end at a `:` (Python) or a newline (Ruby, Lua, …)
-// rather than at `{` / `;`.
-const COLON_TERMINATED = new Set(['.py', '.pyi']);
-const NEWLINE_TERMINATED = new Set(['.rb', '.lua', '.ex', '.exs', '.jl']);
+
+// How each language's definition headers are found and where they end. Only
+// languages whose headers these rules read exactly are listed; every other
+// extension gets no verdict, and the Stop hook says nothing about its symbols
+// (review M2: silent beats wrong).
+//
+//   keyword  a definition is `<keyword> name` (`receiver`: Go's `func (r T) name`;
+//            `typeParams`: Kotlin's `fun <T> name`)
+//   jsForms  also `const name = (…) =>` bindings and one-line class methods
+//   typed    C-family `Type name(` lines — no keyword exists
+//   ends     characters that end the header at bracket depth 0; `\n` included
+//            only where a newline outside brackets cannot continue a header
+//   arrowEnds  `=>` at depth 0 ends it (JS arrow bodies, C# expression bodies);
+//            elsewhere `=>` is part of a type (Scala) and never an end
+//   angles   `<…>` nests like a bracket (TS generics may hold `{`)
+//   afterParams  a lone `:` after the parameter list ends it (C++ member
+//            initializers, C# `: base(…)` — body, not signature)
+//   closeParen  the parameter list's `)` ends it (Ruby, Lua: no return types,
+//            and a one-line body may follow on the same line)
+const LANGS = new Map();
+function defineLang(exts, profile) {
+  for (const e of exts) LANGS.set(e, profile);
+}
+defineLang(['.rs'], { keyword: 'fn', ends: '{;' });
+defineLang(['.py', '.pyi'], { keyword: 'def', ends: ':' });
+defineLang(['.go'], { keyword: 'func', receiver: true, ends: '{;\n' });
+defineLang(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'],
+  { keyword: 'function\\*?', jsForms: true, ends: '{;', arrowEnds: true, angles: true });
+defineLang(['.php'], { keyword: 'function', ends: '{;' });
+defineLang(['.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx', '.java', '.cs'],
+  { typed: true, ends: '{;', arrowEnds: true, afterParams: true });
+defineLang(['.kt', '.kts'], { keyword: 'fun', typeParams: true, ends: '{=\n' });
+defineLang(['.scala', '.sc'], { keyword: 'def', ends: '{=\n' });
+defineLang(['.rb'], { keyword: 'def', ends: ';=\n', closeParen: true });
+defineLang(['.lua'], { keyword: 'function', ends: '\n', closeParen: true });
 
 function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function definitionPatterns(S, lang) {
+  const out = [];
+  if (lang.keyword) {
+    const receiver = lang.receiver ? '(?:\\([^)\\n]*\\)\\s*)?' : '';
+    const typeParams = lang.typeParams ? '(?:<[^>\\n]*>\\s*)?' : '';
+    out.push({ re: new RegExp(`\\b(?:${lang.keyword})\\s+${receiver}${typeParams}${S}\\b`, 'g') });
+  }
+  if (lang.jsForms) {
+    out.push({ re: new RegExp(`\\b(?:const|let|var)\\s+${S}\\s*=\\s*(?:async\\s+)?(?:function\\b|\\([^)\\n]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)`, 'g') });
+    out.push({ re: new RegExp(`^[ \\t]*(?:(?:async|static|get|set|public|private|protected|readonly|override)\\s+)*\\*?${S}\\s*\\([^()\\n]*\\)\\s*(?::\\s*[^{;=\\n]+)?\\{[ \\t]*$`, 'gm') });
+  }
+  if (lang.typed) {
+    out.push({ re: new RegExp(`^[ \\t]*((?:[A-Za-z_][\\w<>\\[\\],.*&:?]*[ \\t]+)+)${S}[ \\t]*\\(`, 'gm'), typed: true });
+  }
+  return out;
+}
+
 /**
- * Normalized signatures of every definition of `symbol` in `text`, sorted.
+ * Normalized signatures of every definition of `symbol` in `text`, sorted —
+ * or null when there is no exact reading: the language is not in LANGS, or a
+ * header did not end within MAX_SIGNATURE_CHARS.
  *
- * Text heuristics, applied IDENTICALLY to the HEAD and the working-tree copy:
- * the question is only "did any definition's header change", so a shape the
- * patterns misread in both copies cancels out. A definition is located by the
- * line it starts on (keyword `fn`/`function`/`def`/`func`, a `const x = (…) =>`
- * binding, a class-method line, or a C-family `Type name(` line) and runs from
- * that line's start to the first depth-0 `{`, `;` or `=>` — `:` for Python, a
- * newline for Ruby-like files. The key drops all whitespace and a trailing
- * comma, so a formatter re-wrapping the parameter list is not a change.
- * @returns {string[]}
+ * A definition is located by the line it starts on (LANGS) and runs from that
+ * line's start to the first end character at bracket depth 0. The key drops
+ * all whitespace and a trailing comma, so a formatter re-wrapping the
+ * parameter list is not a change.
+ * @returns {string[]|null}
  */
 function extractSignatures(text, symbol, ext = '') {
+  const lang = LANGS.get(String(ext).toLowerCase());
+  if (!lang) return null;
   if (typeof text !== 'string' || !symbol) return [];
-  const S = escapeRe(symbol);
-  const patterns = [
-    new RegExp(`\\b(?:fn|function\\*?|def|func|sub|proc)\\s+(?:\\([^)\\n]*\\)\\s*)?${S}\\b`, 'g'),
-    new RegExp(`\\b(?:const|let|var)\\s+${S}\\s*=\\s*(?:async\\s+)?(?:function\\b|\\([^)\\n]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)`, 'g'),
-    new RegExp(`^[ \\t]*(?:(?:async|static|get|set|public|private|protected|readonly|override)\\s+)*\\*?${S}\\s*\\([^()\\n]*\\)\\s*(?::\\s*[^{;=\\n]+)?\\{[ \\t]*$`, 'gm'),
-    new RegExp(`^[ \\t]*(?:[A-Za-z_][\\w<>\\[\\],.*&:?]*[ \\t]+)+${S}[ \\t]*\\(`, 'gm'),
-  ];
   const lineStarts = new Set();
-  for (const re of patterns) {
+  for (const { re, typed } of definitionPatterns(escapeRe(symbol), lang)) {
     for (const m of text.matchAll(re)) {
       const at = text.lastIndexOf('\n', m.index) + 1;
       const lineEnd = text.indexOf('\n', at);
       const line = text.slice(at, lineEnd === -1 ? text.length : lineEnd);
       if (COMMENT_LINE.test(line)) continue;
-      const first = (line.trim().match(/^[A-Za-z_]\w*/) || [''])[0];
-      if (re === patterns[3] && NOT_A_TYPE.has(first)) continue;
+      if (typed) {
+        const first = (line.trim().match(/^[A-Za-z_]\w*/) || [''])[0];
+        if (NOT_A_TYPE.has(first)) continue;
+        // `label: f(`, `case X: f(`, `public: f(` — a token ending in a lone
+        // `:` is a label or access specifier, never part of a return type.
+        if (m[1].split(/[ \t]+/).some((tok) => /(?:^|[^:]):$/.test(tok))) continue;
+      }
       lineStarts.add(at);
     }
   }
   const out = [];
-  for (const at of lineStarts) out.push(signatureKey(readHeader(text, at, ext)));
+  for (const at of lineStarts) {
+    const header = readHeader(text, at, lang);
+    if (header === null) return null;
+    out.push(signatureKey(header));
+  }
   return out.sort();
 }
 
-function readHeader(text, at, ext) {
-  const colon = COLON_TERMINATED.has(ext);
-  const newline = NEWLINE_TERMINATED.has(ext);
+function readHeader(text, at, lang) {
   let depth = 0;
-  let i = at;
-  const end = Math.min(text.length, at + MAX_SIGNATURE_CHARS);
-  for (; i < end; i++) {
+  let angle = 0;
+  let sawParams = false;
+  const limit = Math.min(text.length, at + MAX_SIGNATURE_CHARS);
+  for (let i = at; i < limit; i++) {
     const c = text[i];
-    if (c === '(' || c === '[') depth++;
-    else if (c === ')' || c === ']') depth = Math.max(0, depth - 1);
-    else if (depth === 0) {
-      if (c === '{' || c === ';') break;
-      if (c === '=' && text[i + 1] === '>') break;
-      if (colon && c === ':') break;
-      if (newline && c === '\n' && i > at) break;
+    if (c === '=' && text[i + 1] === '>') {
+      if (lang.arrowEnds && depth === 0 && angle === 0) return text.slice(at, i);
+      i++; // part of a type or a default value: step over both characters
+      continue;
+    }
+    if (c === '(' || c === '[') { depth++; continue; }
+    if (c === ')' || c === ']') {
+      depth = Math.max(0, depth - 1);
+      if (c === ')' && depth === 0) {
+        sawParams = true;
+        if (lang.closeParen) return text.slice(at, i + 1);
+      }
+      continue;
+    }
+    if (depth !== 0) continue;
+    if (lang.angles && c === '<') { angle++; continue; }
+    if (lang.angles && c === '>') { angle = Math.max(0, angle - 1); continue; }
+    if (angle !== 0) continue;
+    if (lang.ends.includes(c) && !(c === '\n' && i === at)) return text.slice(at, i);
+    if (lang.afterParams && sawParams && c === ':' && text[i - 1] !== ':' && text[i + 1] !== ':') {
+      return text.slice(at, i);
     }
   }
-  return text.slice(at, i);
+  // End of text ends a header; running out of the character budget does not.
+  return limit === text.length ? text.slice(at, limit) : null;
 }
 
 function signatureKey(header) {
   return header.replace(/\s+/g, '').replace(/,\)/g, ')');
 }
 
-/** True when the definitions differ in number or in any header. */
+/**
+ * True when a definition that existed before is gone: its header changed, or
+ * it was removed while others of the same name remain. A definition ADDED
+ * beside unchanged ones (a new overload, a new `impl From<B>`) changes no
+ * existing caller's target, so it is not a change (review M2).
+ */
 function signatureChanged(oldSigs, newSigs) {
-  if (oldSigs.length !== newSigs.length) return true;
-  return oldSigs.some((s, i) => s !== newSigs[i]);
+  const remaining = new Map();
+  for (const s of newSigs) remaining.set(s, (remaining.get(s) || 0) + 1);
+  for (const s of oldSigs) {
+    const n = remaining.get(s) || 0;
+    if (n === 0) return true;
+    remaining.set(s, n - 1);
+  }
+  return false;
 }
 
 /**
@@ -146,15 +236,15 @@ function findCallSiteLine(text, symbol, startLine) {
  * a binary). Returns the lines to report and the next Stop state.
  *
  * @param {object} a
- * @param {{ts:number,file:string,symbol:string|null}[]} a.edits whole session log
+ * @param {{ts:number,file:string,symbol:string|null,sigs:string[]|null}[]} a.edits
+ *   whole session log; `sigs` = the symbol's signatures just before that Edit
  * @param {{lastStopAt:number|null, reported:string[]}} a.state
  * @param {number} a.now
- * @param {(file:string)=>string|null} a.headText  file at HEAD, null if absent
  * @param {(file:string)=>string|null} a.workText  file in the working tree
  * @param {(symbol:string,file:string)=>({file:string,line:number,name:string}[]|null)} a.callers
  * @param {(file:string)=>number|null} a.mtimeMs
  */
-function computeStopReport({ edits, state, now, headText, workText, callers, mtimeMs }) {
+function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
   const lastStopAt = state.lastStopAt;
   const turn = edits.filter((e) => lastStopAt === null || e.ts > lastStopAt);
   const next = { lastStopAt: now, reported: [...state.reported] };
@@ -168,27 +258,30 @@ function computeStopReport({ edits, state, now, headText, workText, callers, mti
     return m !== null && m >= turnStart;
   };
 
+  // One candidate per (file, symbol). Its baseline is what pre-edit-guide
+  // recorded before the turn's FIRST Edit of it — the signature as the turn
+  // found it. Later records of the same symbol this turn were taken after
+  // earlier edits had landed, so they are not the baseline.
   const seen = new Set();
-  const candidates = [];
+  const changed = [];
   for (const e of turn) {
     if (!e.symbol) continue;
     const key = `${e.file}#${e.symbol}`;
-    if (seen.has(key) || next.reported.includes(key)) continue;
+    if (seen.has(key)) continue;
     seen.add(key);
-    candidates.push({ key, file: e.file, symbol: e.symbol });
+    if (next.reported.includes(key)) continue;
+    // null: no exact reading (language, unreadable file, a pre-repair log
+    // line). [] (the definition was added this turn) needs no test of its
+    // own: signatureChanged counts only definitions that went missing.
+    if (!Array.isArray(e.sigs)) continue;
+    const after = extractSignatures(workText(e.file), e.symbol, path.extname(e.file).toLowerCase());
+    if (!after || after.length === 0) continue;     // removed, or no reading now
+    if (!signatureChanged(e.sigs, after)) continue; // body-only this turn
+    changed.push({ key, file: e.file, symbol: e.symbol });
   }
 
   const lines = [];
-  for (const c of candidates.slice(0, MAX_SYMBOLS_CHECKED)) {
-    const ext = path.extname(c.file).toLowerCase();
-    const before = headText(c.file);
-    const after = workText(c.file);
-    if (before === null || after === null) continue;          // new or deleted file
-    const oldSigs = extractSignatures(before, c.symbol, ext);
-    const newSigs = extractSignatures(after, c.symbol, ext);
-    if (oldSigs.length === 0 || newSigs.length === 0) continue; // added / removed / not found
-    if (!signatureChanged(oldSigs, newSigs)) continue;          // body-only edit
-
+  for (const c of changed.slice(0, MAX_SYMBOLS_CHECKED)) {
     const refs = callers(c.symbol, c.file);
     if (!refs || refs.length === 0) continue;
     const untouched = [];
@@ -202,22 +295,36 @@ function computeStopReport({ edits, state, now, headText, workText, callers, mti
     }
     if (untouched.length === 0) continue;
     untouched.sort((x, y) => (x.file < y.file ? -1 : x.file > y.file ? 1 : x.line - y.line));
-    const shown = untouched.slice(0, MAX_CALLERS_LISTED)
-      .map((r) => `${r.file}:${r.line}${r.name && r.name !== '<module>' ? ` (${r.name})` : ''}`);
-    let line = `  ${c.symbol}() in ${c.file}: ${shown.join(', ')}`;
+    // Every repo-derived token is shell-quoted (review M3): a file name is
+    // text from the repository, and the model may paste it into a command.
+    const shown = untouched.slice(0, MAX_CALLERS_LISTED).map((r) => {
+      const name = r.name && r.name !== '<module>' ? ' (' + shellQuoteArg(r.name) + ')' : '';
+      return shellQuoteArg(r.file) + ':' + r.line + name;
+    });
+    let line = '  ' + shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(c.file) + ': ' + shown.join(', ');
     if (untouched.length > MAX_CALLERS_LISTED) {
-      line += `, and ${untouched.length - MAX_CALLERS_LISTED} more (code-graph-mcp refs ${c.symbol} --file ${c.file})`;
+      line += ', and ' + (untouched.length - MAX_CALLERS_LISTED) + ' more (' +
+        formatCgCommand(['refs', c.symbol, '--file', c.file]) + ')';
     }
     lines.push(line);
     next.reported.push(c.key);
+  }
+  // Changed beyond the query cap: named, not dropped in silence (review M1).
+  // Not marked reported, and a later turn does not see them as changed again
+  // (their baseline moves on), so this line is the only mention they get.
+  const unchecked = changed.slice(MAX_SYMBOLS_CHECKED);
+  if (unchecked.length > 0) {
+    lines.push('  ' + unchecked.length + ' more changed, callers not checked: ' +
+      unchecked.map((c) => shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(c.file)).join(', '));
   }
   return { lines, state: next };
 }
 
 function formatStopContext(lines) {
   if (!lines.length) return null;
-  return '[code-graph] Signatures changed this turn (working tree vs HEAD); ' +
-    'their callers in files not edited this turn, from the code-graph index:\n' +
+  // No apostrophe in the fixed text: file names are single-quoted in it.
+  return '[code-graph] Signatures changed this turn (each compared with its file before ' +
+    'the first edit of it this turn); their callers in files not edited this turn, from the code-graph index:\n' +
     lines.join('\n') + '\n';
 }
 
@@ -261,6 +368,9 @@ function runMain() {
     } catch { return null; }
   };
 
+  // The comparison no longer reads HEAD (baselines come from the edit log),
+  // but "silent outside a git work tree" is the spec's contract for this
+  // hook, so the gate stays.
   const inGit = run('git', ['rev-parse', '--is-inside-work-tree'], 1000);
   let binary = null;
   let report = { lines: [], state: { lastStopAt: Date.now(), reported: state.reported } };
@@ -272,9 +382,6 @@ function runMain() {
       edits,
       state,
       now: Date.now(),
-      // `HEAD:./<path>` is resolved against cwd (= root), which need not be
-      // the top of the git work tree.
-      headText: (file) => run('git', ['show', `HEAD:./${file}`], 1000),
       workText: (file) => {
         try { return fs.readFileSync(path.join(root, file), 'utf8'); } catch { return null; }
       },

@@ -31,9 +31,11 @@ const MAX_CONTEXT_CHARS = 400;
  * The text a subagent receives, or null when there is nothing true to say.
  * @param {{files?: number, index_age?: string, index_version_stale?: boolean}} report
  *   `health-check --format json` output
+ * @param {number} [maxChars] ceiling; a parameter only so tests can reach the
+ *   check — the builder's longest output (389) is below the real one
  * @returns {string|null}
  */
-function buildSubagentContext(report) {
+function buildSubagentContext(report, maxChars = MAX_CONTEXT_CHARS) {
   if (!report || typeof report !== 'object') return null;
   const files = Number(report.files);
   if (!Number.isFinite(files) || files <= 0) return null;
@@ -46,7 +48,7 @@ function buildSubagentContext(report) {
     ' `code-graph-mcp callgraph <fn>` (callers and callees),' +
     ' `code-graph-mcp show <fn>` (a symbol\'s source and signature),' +
     ' `code-graph-mcp overview <dir>` (symbols of a module grouped by file).';
-  return text.length <= MAX_CONTEXT_CHARS ? text : null;
+  return text.length <= maxChars ? text : null;
 }
 
 function readStdinJson() {

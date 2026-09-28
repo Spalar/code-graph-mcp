@@ -399,18 +399,31 @@ Two hooks join the six that `install`, `update` and `doctor` register in
   up the tree, when no binary resolves, when the index has 0 files, or with
   `CODE_GRAPH_QUIET_HOOKS=1`. Median 125 ms per subagent spawn (20 runs).
 - **Stop** (`stop-impact.js`, 5 s budget). `pre-edit-guide.js` now appends
-  each Edit (file, and the symbol it extracted) to a per-session log in the
-  plugin's tmp dir. At the end of a turn, for each symbol edited in that turn
-  whose definition header differs between `HEAD` and the working tree, the
-  hook lists its callers (`refs --relation calls --min-confidence inferred`)
-  in files not edited this turn, as `file:line` of the call. A file counts as
-  edited when an Edit to it was logged since the previous Stop or its mtime is
-  after the turn began. Each symbol is reported once per session. The text goes
+  each Edit (file, the symbol it extracted, and that symbol's definition
+  headers as the file stood just before the Edit) to a per-session log in the
+  plugin's tmp dir. At the end of a turn, for each symbol whose headers now
+  differ from the ones recorded before the turn's first Edit of it, the hook
+  lists its callers (`refs --relation calls --min-confidence inferred`) in
+  files not edited this turn, as `file:line` of the call. The comparison is
+  with the start of the turn, not with `HEAD`: a caller fixed in the turn that
+  changed the signature is not raised again when a later turn edits only the
+  body, and uncommitted changes from before the session are not reported as
+  this turn's. A definition added beside unchanged same-named ones (a new
+  overload, a new `impl From<B>`) is not a change; one whose header changed or
+  that was removed is. A file counts as edited when an Edit to it was logged
+  since the previous Stop or its mtime is at or after the turn's start. Up to 8
+  changed symbols per Stop get a `refs` query, counted after body-only edits
+  are set aside; more are named in one line without callers. Each symbol is
+  reported once per session. File names, symbols and caller names are
+  shell-quoted where they are not plain (`'src/a$(x).rs':5`), including the
+  `code-graph-mcp refs … --file …` command shown past 8 callers. The text goes
   out as Stop `additionalContext`, not `decision: "block"`. Nothing is injected
   on `stop_hook_active`, outside a git work tree, without an index or binary,
-  for a body-only change, or with `CODE_GRAPH_QUIET_HOOKS=1`. One caller is 185
-  bytes; 8 symbols × 8 callers is 3,314 bytes (the shared 4,000-byte cap
-  applies). A session with no Edit exits in 34 ms median and writes nothing.
+  for a body-only change, for a language without an exact header reading
+  (see Not covered), or with `CODE_GRAPH_QUIET_HOOKS=1`. One caller is 230
+  bytes; 8 symbols × 8 callers is about 3,359 bytes (3,314 measured before the
+  header grew by 45 bytes; the shared 4,000-byte cap applies). A session with
+  no Edit exits in 34 ms median and writes nothing.
 
 The event names, input fields and output shapes were checked against the hooks
 reference (code.claude.com/docs/en/hooks) for Claude Code 2.1.283. A headless
@@ -603,10 +616,29 @@ now get a grep answer.
   whose `old_string` holds no definition header and no identifier it can place
   in a function is logged as a file edit only, and `Write` is not logged at
   all (its file still counts as edited by mtime). The header comparison is
-  textual: a header split across lines before a `{` (a Rust `where` clause, a
-  return type on its own line) is compared as written, and a signature change
-  made in a macro or a decorator is not seen. Callers are the index's; a call
-  through a string key is not one.
+  textual and covers Rust, Python, Go, JavaScript/TypeScript, PHP, C, C++,
+  Java, C#, Kotlin, Scala, Ruby and Lua; for any other language the Stop check
+  says nothing. Within those, a definition is found only in its keyword form
+  (`fn`/`def`/`func`/`function`/`fun`) or, for the C family, as a
+  `Type name(` line: a Kotlin extension (`fun String.f`), a Ruby
+  `def self.f`, a Lua `function M.f`, a C++ out-of-line `Foo::f` and a
+  constructor with no modifier before its name are not found, and nothing is
+  reported for them. A return type after `=>` (TypeScript function types,
+  Scala), a C# `where` clause and a Kotlin return type on the next line are
+  not compared. A header that has not ended within 600 characters is not
+  read. A signature change made in a macro or a decorator is not seen, and
+  neither is one made by an Edit that `pre-edit-guide.js` attributed to
+  another function (the baseline is then recorded after the change). Callers
+  are the index's; a call through a string key is not one.
+- A symbol whose signature changed while its callers were not checked (more
+  than 8 changed in one turn, no binary, or the 5 s budget spent) is not
+  checked again in a later turn: the next turn's baseline already has the new
+  signature.
+- File names are shell-quoted, not cleaned: a newline or instruction-like text
+  in a file name reaches the Stop text inside the quotes, as it already does
+  in `pre-edit-guide.js`'s caller list.
+- If the plugin's tmp dir becomes read-only mid-session, the Stop state is not
+  saved and the same symbol is reported at every Stop.
 - In a git worktree whose index lives in the main checkout, the edited path
   does not match the index's paths, and the Stop check says nothing.
 - The grep hooks' file check reads git's ignore rules, not ripgrep's: an
@@ -619,6 +651,11 @@ now get a grep answer.
   is still answered by the inject when its output is empty (as in 0.160.0).
 - `\b`, `\w` and a bracket on non-ASCII text can still differ between the
   dialects, under `-E` and `-P` as under basic regex.
+- Releases before this one do not recognise the two new settings.json
+  entries: after a downgrade, the older `uninstall` leaves them behind. On
+  POSIX each runs only if its script still exists; on Windows a missing script
+  is an error at every subagent spawn and Stop until the entries are removed
+  by hand.
 - The SubagentStart matcher uses Claude Code's exact-name list form, which
   takes hyphenated names from 2.1.195. On older versions it is read as an
   unanchored regex, so `Plan` also matches a custom agent named `Planner`.

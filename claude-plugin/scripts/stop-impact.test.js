@@ -65,17 +65,23 @@ test('findCallSiteLine: first mention at or after the caller start, else the sta
 const HEAD_A = 'pub fn compute(x: i32) -> i32 {\n    x + 1\n}\n';
 const SIG_A = 'pub fn compute(x: i32, y: i32) -> i32 {\n    x + y\n}\n';
 const BODY_A = 'pub fn compute(x: i32) -> i32 {\n    x + 2\n}\n';
+// What pre-edit-guide records with a symbol: its signatures before that Edit.
+const sigsOf = (text) => extractSignatures(text, 'compute', '.rs');
 
 function world({ work = SIG_A, mtimes = {}, refs } = {}) {
+  const calls = [];
   return {
-    headText: (f) => (f === 'src/a.rs' ? HEAD_A : null),
+    calls,
     workText: (f) => (f === 'src/a.rs' ? work : null),
-    callers: () => refs || [{ file: 'src/b.rs', line: 5, name: 'caller_b' }],
+    callers: (symbol, file) => { calls.push(symbol); return refs || [{ file: 'src/b.rs', line: 5, name: 'caller_b' }]; },
     mtimeMs: (f) => (f in mtimes ? mtimes[f] : 1000),
   };
 }
 const EMPTY = { lastStopAt: null, reported: [] };
-const EDIT_A = [{ ts: 5000, file: 'src/a.rs', symbol: null }, { ts: 5001, file: 'src/a.rs', symbol: 'compute' }];
+const EDIT_A = [
+  { ts: 5000, file: 'src/a.rs', symbol: null, sigs: null },
+  { ts: 5001, file: 'src/a.rs', symbol: 'compute', sigs: sigsOf(HEAD_A) },
+];
 
 test('stop: signature change in a.rs with an untouched caller in b.rs → one b.rs:line line', () => {
   const r = computeStopReport({ edits: EDIT_A, state: EMPTY, now: 9000, ...world() });
@@ -87,11 +93,24 @@ test('stop: signature change in a.rs with an untouched caller in b.rs → one b.
 });
 
 test('stop: caller file also edited this turn → silent (logged edit, or mtime inside the turn)', () => {
-  const logged = [...EDIT_A, { ts: 5002, file: 'src/b.rs', symbol: null }];
+  const logged = [...EDIT_A, { ts: 5002, file: 'src/b.rs', symbol: null, sigs: null }];
   assert.deepEqual(computeStopReport({ edits: logged, state: EMPTY, now: 9000, ...world() }).lines, []);
   // Not logged (Write, `sed -i`, a formatter) but modified after the turn began.
   const viaMtime = world({ mtimes: { 'src/b.rs': 6000 } });
   assert.deepEqual(computeStopReport({ edits: EDIT_A, state: EMPTY, now: 9000, ...viaMtime }).lines, []);
+});
+
+test('stop: mtime exactly at the turn start counts as touched', () => {
+  const r = computeStopReport({ edits: EDIT_A, state: { lastStopAt: 4000, reported: [] }, now: 9000,
+    ...world({ mtimes: { 'src/b.rs': 4000 } }) });
+  assert.deepEqual(r.lines, []);
+});
+
+test('stop: the first turn starts at the session\'s FIRST logged edit, not its last', () => {
+  // b.rs changed between the first and the last edit of the turn: touched.
+  const edits = [...EDIT_A, { ts: 7000, file: 'src/c.rs', symbol: null, sigs: null }];
+  const r = computeStopReport({ edits, state: EMPTY, now: 9000, ...world({ mtimes: { 'src/b.rs': 6000 } }) });
+  assert.deepEqual(r.lines, []);
 });
 
 test('stop: second Stop in the same session → silent, even after a new edit of the symbol', () => {
@@ -99,16 +118,37 @@ test('stop: second Stop in the same session → silent, even after a new edit of
   assert.equal(first.lines.length, 1);
   const again = computeStopReport({ edits: EDIT_A, state: first.state, now: 9500, ...world() });
   assert.deepEqual(again.lines, [], 'no edits since the last Stop');
-  const reEdit = [...EDIT_A, { ts: 9600, file: 'src/a.rs', symbol: 'compute' }];
+  // A record whose baseline still differs: silent only because it was reported.
+  const reEdit = [...EDIT_A, { ts: 9600, file: 'src/a.rs', symbol: 'compute', sigs: sigsOf(HEAD_A) }];
   assert.deepEqual(computeStopReport({ edits: reEdit, state: first.state, now: 9900, ...world() }).lines, [],
     'once per symbol per session');
 });
 
-test('stop: body-only change → silent; new or vanished definition → silent', () => {
+test('stop H1: a later turn compares with its own baseline, not HEAD', () => {
+  // Turn 1 changed the signature (and was silent, e.g. its caller was fixed).
+  // Turn 2 edits only the body: its record's baseline is turn 1's result.
+  const turn2 = [...EDIT_A, { ts: 9600, file: 'src/a.rs', symbol: 'compute', sigs: sigsOf(SIG_A) }];
+  const body2 = SIG_A.replace('x + y', 'x + y + 1');
+  const r = computeStopReport({ edits: turn2, state: { lastStopAt: 9000, reported: [] }, now: 9900, ...world({ work: body2 }) });
+  assert.deepEqual(r.lines, []);
+});
+
+test('stop H1: the baseline is the turn\'s FIRST record of the symbol', () => {
+  // Two edits of compute this turn; the second was recorded after the first
+  // had already changed the signature.
+  const edits = [...EDIT_A, { ts: 5003, file: 'src/a.rs', symbol: 'compute', sigs: sigsOf(SIG_A) }];
+  const r = computeStopReport({ edits, state: EMPTY, now: 9000, ...world() });
+  assert.equal(r.lines.length, 1, 'changed against the first record');
+});
+
+test('stop: body-only change → silent; new, vanished, or unreadable definition → silent', () => {
   assert.deepEqual(computeStopReport({ edits: EDIT_A, state: EMPTY, now: 9000, ...world({ work: BODY_A }) }).lines, []);
   assert.deepEqual(computeStopReport({ edits: EDIT_A, state: EMPTY, now: 9000, ...world({ work: 'fn other() {}\n' }) }).lines, []);
-  const newFile = { ...world(), headText: () => null };
-  assert.deepEqual(computeStopReport({ edits: EDIT_A, state: EMPTY, now: 9000, ...newFile }).lines, []);
+  const withSigs = (sigs) => [EDIT_A[0], { ...EDIT_A[1], sigs }];
+  assert.deepEqual(computeStopReport({ edits: withSigs([]), state: EMPTY, now: 9000, ...world() }).lines, [],
+    'added this turn');
+  assert.deepEqual(computeStopReport({ edits: withSigs(null), state: EMPTY, now: 9000, ...world() }).lines, [],
+    'no baseline (unsupported language, pre-repair log line)');
 });
 
 test('stop: edits before the previous Stop belong to an earlier turn', () => {
@@ -125,6 +165,52 @@ test('stop: callers are capped, sorted, and the rest named with the command that
   assert.match(r.lines[0], /and 3 more \(code-graph-mcp refs compute --file src\/a\.rs\)$/);
 });
 
+test('stop: one caller line per file:line; a module-level caller has no name', () => {
+  const refs = [
+    { file: 'src/b.rs', line: 5, name: 'caller_b' },
+    { file: 'src/b.rs', line: 5, name: 'caller_b' },
+    { file: 'src/c.rs', line: 2, name: '<module>' },
+  ];
+  const r = computeStopReport({ edits: EDIT_A, state: EMPTY, now: 9000, ...world({ refs }) });
+  assert.deepEqual(r.lines, ['  compute() in src/a.rs: src/b.rs:5 (caller_b), src/c.rs:2']);
+});
+
+test('stop M1: the symbol cap bounds refs queries over CHANGED symbols only; the rest are named', () => {
+  const n = 10;
+  const fns = (sig) => Array.from({ length: n }, (_, i) => `pub fn s${i}(x: i32${sig}) {\n}\n`).join('');
+  const before = fns('');
+  const after = fns(', y: i32');
+  // Eight body-only edits first, then ten real changes.
+  const edits = [];
+  for (let i = 0; i < 8; i++) edits.push({ ts: 5000 + i, file: 'src/z.rs', symbol: `body${i}`, sigs: [`pubfnbody${i}()`] });
+  for (let i = 0; i < n; i++) {
+    edits.push({ ts: 6000 + i, file: 'src/a.rs', symbol: `s${i}`, sigs: extractSignatures(before, `s${i}`, '.rs') });
+  }
+  const w = world({ work: after });
+  const bodies = Array.from({ length: 8 }, (_, i) => `pub fn body${i}() {\n  ${i}\n}\n`).join('');
+  w.workText = (f) => (f === 'src/a.rs' ? after : f === 'src/z.rs' ? bodies : null);
+  const r = computeStopReport({ edits, state: EMPTY, now: 9000, ...w });
+  assert.equal(w.calls.length, 8, `refs queries: ${w.calls.join(',')}`);
+  assert.deepEqual(w.calls, ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7']);
+  assert.equal(r.lines.length, 9);
+  assert.equal(r.lines[8], '  2 more changed, callers not checked: s8() in src/a.rs, s9() in src/a.rs');
+  assert.equal(r.state.reported.length, 8, 'the unchecked two are not marked reported');
+});
+
+test('stop M3: every repo-derived token in the text is shell-quoted', () => {
+  const edited = 'src/a$(touch PWNED).rs';
+  const refs = Array.from({ length: 9 }, (_, i) => ({ file: `src/m${i} x.rs`, line: 3, name: `c${i}` }));
+  refs[0] = { file: 'src/b`id`.rs', line: 3, name: "it's" };
+  const w = world({ refs });
+  w.workText = (f) => (f === edited ? SIG_A : null);
+  const edits = [{ ts: 5001, file: edited, symbol: 'compute', sigs: sigsOf(HEAD_A) }];
+  const [line] = computeStopReport({ edits, state: EMPTY, now: 9000, ...w }).lines;
+  assert.ok(line.startsWith("  compute() in 'src/a$(touch PWNED).rs': 'src/b`id`.rs':3"), line);
+  assert.ok(line.includes("'src/b`id`.rs':3 ('it'\\''s')"), line);
+  assert.ok(line.includes("'src/m1 x.rs':3 (c1)"), line);
+  assert.ok(line.endsWith("(code-graph-mcp refs compute --file 'src/a$(touch PWNED).rs')"), line);
+});
+
 // --- Spawned end to end: real git, real binary, sandbox HOME/TMPDIR ---------
 
 function realBinary() {
@@ -133,7 +219,13 @@ function realBinary() {
 const BIN = process.platform === 'win32' ? null : realBinary();
 const e2eSkip = !BIN && 'needs a code-graph-mcp binary and a POSIX shell';
 
-function sandboxRepo(t) {
+const DEFAULT_FILES = {
+  'src/lib.rs': 'pub mod a;\npub mod b;\n',
+  'src/a.rs': HEAD_A,
+  'src/b.rs': 'use crate::a::compute;\n\npub fn caller_b() -> i32 {\n    let v = 2;\n    compute(v)\n}\n',
+};
+
+function sandboxRepo(t, files = DEFAULT_FILES) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-stop-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const home = path.join(root, 'home');
@@ -144,11 +236,10 @@ function sandboxRepo(t) {
   const tmp = path.join(root, 'tmp');
   fs.mkdirSync(tmp);
   const repo = path.join(root, 'repo');
-  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
-  fs.writeFileSync(path.join(repo, 'src', 'lib.rs'), 'pub mod a;\npub mod b;\n');
-  fs.writeFileSync(path.join(repo, 'src', 'a.rs'), HEAD_A);
-  fs.writeFileSync(path.join(repo, 'src', 'b.rs'),
-    'use crate::a::compute;\n\npub fn caller_b() -> i32 {\n    let v = 2;\n    compute(v)\n}\n');
+  for (const [f, c] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(repo, f)), { recursive: true });
+    fs.writeFileSync(path.join(repo, f), c);
+  }
   fs.writeFileSync(path.join(repo, '.gitignore'), '.code-graph/\n');
   const env = {
     ...process.env,
@@ -167,7 +258,7 @@ function sandboxRepo(t) {
   // turn" is decided by the edit log and the edits the test makes — never by
   // a same-millisecond mtime.
   const past = new Date(Date.now() - 3600 * 1000);
-  for (const f of ['src/lib.rs', 'src/a.rs', 'src/b.rs']) fs.utimesSync(path.join(repo, f), past, past);
+  for (const f of Object.keys(files)) fs.utimesSync(path.join(repo, f), past, past);
   const index = () => execFileSync(BIN, ['incremental-index'], { cwd: repo, env, stdio: 'pipe' });
   index();
   return { root, repo, env, tmp, index };
@@ -218,15 +309,18 @@ test('e2e: signature change with an untouched caller → exactly one b.rs:line, 
   assert.match(ctx, /src\/b\.rs:5 \(caller_b\)/);
 
   assert.equal(stop(sb, 'sess-1'), null, 'second Stop in the same session is silent');
-  // A different session keeps its own ledger. Its edit is body-only, but the
-  // comparison is working tree vs HEAD, where the signature still differs and
-  // b.rs is still untouched — so sess-2 is told once too.
+  // A different session keeps its own ledger, and compares with the signature
+  // ITS turn started from: a body-only edit there changed no signature, so it
+  // is silent even though the working tree still differs from HEAD (review
+  // H1: this used to report, from a HEAD comparison).
   const header = 'pub fn compute(x: i32, y: i32) -> i32 {\n';
   edit(sb, 'sess-2', 'src/a.rs', header + '    x + 1', header + '    x + 1 + 0');
-  const other = stop(sb, 'sess-2');
-  assert.ok(other, 'sess-2 has not been told yet');
-  assert.match(other.hookSpecificOutput.additionalContext, /src\/b\.rs:5/);
   assert.equal(stop(sb, 'sess-2'), null);
+  // sess-3 changes the signature again, and is told.
+  edit(sb, 'sess-3', 'src/a.rs', header, 'pub fn compute(x: i32, y: i64) -> i32 {\n');
+  const third = stop(sb, 'sess-3');
+  assert.ok(third, 'sess-3 changed the signature this turn');
+  assert.match(third.hookSpecificOutput.additionalContext, /src\/b\.rs:5/);
 });
 
 test('e2e: caller also edited in the same turn → silent', { skip: e2eSkip }, (t) => {
@@ -254,4 +348,159 @@ test('e2e: body-only change → silent; not a git repo → silent; state stays i
   assert.equal(names.length, 2, names.join(', '));
   assert.match(names[0], /^\.cg-edits-[0-9a-f]{12}-s\.jsonl$/);
   assert.match(names[1], /^\.cg-stop-[0-9a-f]{12}-s\.json$/);
+});
+
+// --- Review repairs (P1 #3 review, 2026-09-28) ------------------------------
+
+// M2: what the text heuristic concludes for one old → new copy of a file.
+// 'changed' = a definition header of `symbol` differs; 'same' = found, none
+// differs; 'silent' = no verdict (unsupported language or no definition).
+function verdict(oldText, newText, symbol, ext) {
+  const a = extractSignatures(oldText, symbol, ext);
+  const b = extractSignatures(newText, symbol, ext);
+  if (!a || !b || a.length === 0 || b.length === 0) return 'silent';
+  return signatureChanged(a, b) ? 'changed' : 'same';
+}
+
+const SHAPES = [
+  // The reviewer's false positives: a body-only change read as a signature change.
+  ['py: `with f(...)` call is not a definition', '.py', 'load',
+    'def load(p):\n    with load(1) as f:\n        pass\n',
+    'def load(p):\n    with load(1, 2) as f:\n        pass\n', 'same'],
+  ['py: `elif f(...)` call is not a definition', '.py', 'ok',
+    'def ok(n):\n    if n:\n        pass\n    elif ok(1):\n        pass\n',
+    'def ok(n):\n    if n:\n        pass\n    elif ok(2):\n        pass\n', 'same'],
+  ['rust: a new same-named impl adds a definition, changes none', '.rs', 'from',
+    'impl From<A> for X {\n    fn from(a: A) -> X { X }\n}\n',
+    'impl From<A> for X {\n    fn from(a: A) -> X { X }\n}\nimpl From<B> for X {\n    fn from(b: B) -> X { X }\n}\n', 'same'],
+  ['kotlin: expression-bodied fun, body edited', '.kt', 'area',
+    'fun area(r: Double) =\n    r * r * 3.14\n\nfun other() {\n}\n',
+    'fun area(r: Double) =\n    r * r * 3.1416\n\nfun other() {\n}\n', 'same'],
+  ['kotlin: one-line expression body edited', '.kt', 'area',
+    'fun area(r: Double) = r * r * 3.14\n', 'fun area(r: Double) = r * r * 3.1416\n', 'same'],
+  ['scala: expression-bodied def, body edited', '.scala', 'f',
+    'def f(): Int = 1\n\ndef g() = {\n}\n',
+    'def f(): Int = 2\n\ndef g() = {\n}\n', 'same'],
+  // The reviewer's false negative.
+  ['ts: generic bound holding `{` — a new parameter is seen', '.ts', 'pick',
+    'function pick<T extends {id:number}>(a: T) {\n  return a;\n}\n',
+    'function pick<T extends {id:number}>(a: T, b: number) {\n  return a;\n}\n', 'changed'],
+  // Real changes in the same languages stay visible.
+  ['py: parameter added', '.py', 'load', 'def load(p):\n    pass\n', 'def load(p, q):\n    pass\n', 'changed'],
+  ['kotlin: parameter added to an expression body', '.kt', 'area',
+    'fun area(r: Double) =\n    r * r\n', 'fun area(r: Double, k: Double) =\n    r * r * k\n', 'changed'],
+  ['kotlin: bodyless interface fun, the NEXT fun changes', '.kt', 'area',
+    'interface S {\n    fun area(r: Double): Double\n}\nfun g() {\n  1\n}\n',
+    'interface S {\n    fun area(r: Double): Double\n}\nfun g(x: Int) {\n  1\n}\n', 'same'],
+  ['go: bodyless declaration, the NEXT func changes', '.go', 'Compute',
+    'func Compute(x int) int\n\nfunc other() {\n}\n', 'func Compute(x int) int\n\nfunc other(y int) {\n}\n', 'same'],
+  ['c#: expression-bodied member, body edited', '.cs', 'F',
+    '  public int F(int x) => x + 1;\n', '  public int F(int x) => x + 2;\n', 'same'],
+  ['header not ended within the character budget → silent', '.rs', 'compute',
+    'fn compute(' + 'a: u8, '.repeat(120) + ') {}\n', 'fn compute(' + 'a: u8, '.repeat(121) + ') {}\n', 'silent'],
+  ['scala: parameter added', '.scala', 'f', 'def f(): Int = 1\n', 'def f(x: Int): Int = x\n', 'changed'],
+  ['rust: one impl of two changes its parameter', '.rs', 'from',
+    'impl From<A> for X {\n    fn from(a: A) -> X { X }\n}\nimpl From<B> for X {\n    fn from(b: B) -> X { X }\n}\n',
+    'impl From<A> for X {\n    fn from(a: &A) -> X { X }\n}\nimpl From<B> for X {\n    fn from(b: B) -> X { X }\n}\n', 'changed'],
+  ['rust: a `match` guard calling the fn is not a definition', '.rs', 'compute',
+    'fn compute(x: i32) -> i32 {\n    match x {\n        a if compute(a) > 0 => 1,\n        _ => 0,\n    }\n}\n',
+    'fn compute(x: i32) -> i32 {\n    match x {\n        a if compute(a - 1) > 0 => 1,\n        _ => 0,\n    }\n}\n', 'same'],
+  ['ruby: body-only change (newline ends the header)', '.rb', 'run',
+    'def run(a, b)\n  a + b\nend\n', 'def run(a, b)\n  a - b\nend\n', 'same'],
+  ['ruby: endless def, body edited', '.rb', 'run', 'def run(a) = a + 1\n', 'def run(a) = a + 2\n', 'same'],
+  ['ruby: parameter added', '.rb', 'run', 'def run(a)\n  a\nend\n', 'def run(a, b)\n  a\nend\n', 'changed'],
+  ['lua: one-line function, body edited', '.lua', 'run',
+    'local function run(a) return a + 1 end\n', 'local function run(a) return a + 2 end\n', 'same'],
+  ['c++: constructor initializer list edited', '.cpp', 'Foo',
+    'explicit Foo(int x) : a(x), b{x} {\n}\n', 'explicit Foo(int x) : a(x + 1), b{x} {\n}\n', 'same'],
+  ['c++: a label before a call is not a type', '.cpp', 'compute',
+    'int compute(int x) {\nretry: compute(1);\n}\n', 'int compute(int x) {\nretry: compute(2);\n}\n', 'same'],
+  ['c++: parameter added', '.cpp', 'compute', 'int compute(int x) {\n}\n', 'int compute(int x, int y) {\n}\n', 'changed'],
+  ['java: parameter type changed', '.java', 'compute',
+    '  public int compute(int x) {\n  }\n', '  public int compute(long x) {\n  }\n', 'changed'],
+  ['go: parameter added', '.go', 'Compute',
+    'func (s *S) Compute(x int) (int, error) {\n}\n', 'func (s *S) Compute(x int, y int) (int, error) {\n}\n', 'changed'],
+  ['js: arrow binding parameter added', '.js', 'build',
+    'const build = (x) => x;\n', 'const build = (x, y) => x + y;\n', 'changed'],
+  // No exact reading for these: say nothing rather than guess.
+  ['elixir: unsupported → silent', '.ex', 'run',
+    'def run(a), do: a + 1\n', 'def run(a), do: a + 2\n', 'silent'],
+  ['unknown extension → silent', '.txt', 'run', 'def run(a):\n', 'def run(a, b):\n', 'silent'],
+];
+
+for (const [name, ext, symbol, before, after, want] of SHAPES) {
+  test(`M2 signature shapes: ${name}`, () => {
+    assert.equal(verdict(before, after, symbol, ext), want);
+  });
+}
+
+// e2e H1: a caller fixed in the same turn as the signature change must not
+// come back when a LATER turn only edits the function body.
+test('e2e H1: callers fixed in turn 1, body-only edit in turn 2 → silent both turns', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t);
+  edit(sb, 's', 'src/a.rs', 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  edit(sb, 's', 'src/b.rs', '    compute(v)', '    compute(v, 1)');
+  assert.equal(stop(sb, 's'), null, 'turn 1: the only caller was updated');
+  const header = 'pub fn compute(x: i32, y: i32) -> i32 {\n';
+  edit(sb, 's', 'src/a.rs', header + '    x + 1', header + '    x + y + 1');
+  const t2 = stop(sb, 's');
+  assert.equal(t2, null, t2 && t2.hookSpecificOutput.additionalContext);
+});
+
+// e2e M1: eight body-only edits before the one real change must not use up
+// the per-Stop symbol budget.
+test('e2e M1: the 9th edited symbol, the only signature change, is reported', { skip: e2eSkip }, (t) => {
+  const fns = [];
+  const callers = [];
+  for (let i = 0; i < 9; i++) {
+    fns.push(`pub fn f${i}xx(x: i32) -> i32 {\n    x + ${i}\n}\n`);
+    callers.push(`use crate::a::f${i}xx;\npub fn c${i}() -> i32 {\n    f${i}xx(1)\n}\n`);
+  }
+  const sb = sandboxRepo(t, { 'src/lib.rs': 'pub mod a;\npub mod b;\n', 'src/a.rs': fns.join('\n'), 'src/b.rs': callers.join('') });
+  for (let i = 0; i < 8; i++) {
+    edit(sb, 's', 'src/a.rs', `pub fn f${i}xx(x: i32) -> i32 {\n    x + ${i}`, `pub fn f${i}xx(x: i32) -> i32 {\n    x + ${i} + 0`);
+  }
+  edit(sb, 's', 'src/a.rs', 'pub fn f8xx(x: i32) -> i32 {', 'pub fn f8xx(x: i32, y: i32) -> i32 {');
+  const out = stop(sb, 's');
+  assert.ok(out, 'expected the f8xx report');
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /f8xx\(\) in src\/a\.rs: src\/b\.rs:\d+ \(c8\)/);
+  assert.doesNotMatch(ctx, /f[0-7]xx\(\)/, 'body-only edits are not reported');
+});
+
+// e2e M3: repo-derived tokens in the injected text are shell-quoted — the
+// edited file in the suggested command and every caller file.
+test('e2e M3: hostile file names are shell-quoted in the injected text', { skip: e2eSkip }, (t) => {
+  const edited = 'src/a$(touch PWNED).rs';
+  const files = { 'src/lib.rs': 'pub mod a;\n', [edited]: HEAD_A };
+  const caller = (name, arg) => `use crate::a::compute;\npub fn ${name}() -> i32 {\n    compute(${arg})\n}\n`;
+  for (let i = 0; i < 8; i++) files[`src/m${i}.rs`] = caller(`cm${i}`, i);
+  files['src/m$(id).rs'] = caller('cmx', 9);
+  const sb = sandboxRepo(t, files);
+  edit(sb, 's', edited, 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  const out = stop(sb, 's');
+  assert.ok(out, 'expected a report');
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.ok(ctx.includes("code-graph-mcp refs compute --file 'src/a$(touch PWNED).rs'"), ctx);
+  assert.ok(ctx.includes("'src/m$(id).rs':3"), ctx);
+  // No `$(` outside single quotes anywhere in the text.
+  assert.doesNotMatch(ctx.replace(/'[^']*'/g, "''"), /\$\(/, ctx);
+  assert.equal(fs.existsSync(path.join(sb.repo, 'PWNED')), false);
+});
+
+// Review L7 survivors M08 and M15: two documented silences no test pinned.
+test('e2e: CODE_GRAPH_QUIET_HOOKS=1 silences Stop; a session with no edit log writes nothing', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t);
+  edit(sb, 's', 'src/a.rs', 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  const quiet = hook({ ...sb, env: { ...sb.env, CODE_GRAPH_QUIET_HOOKS: '1' } }, 'stop-impact.js',
+    { session_id: 's', hook_event_name: 'Stop', cwd: sb.repo, stop_hook_active: false });
+  assert.equal(quiet.status, 0, quiet.stderr);
+  assert.equal(quiet.stdout, '');
+  const cg = path.join(sb.tmp, 'code-graph-mcp');
+  const stateFiles = () => fs.readdirSync(cg).filter((n) => n.startsWith('.cg-stop-'));
+  assert.deepEqual(stateFiles(), [], 'a quiet Stop does not advance the state either');
+
+  assert.equal(stop(sb, 'never-edited'), null);
+  assert.deepEqual(stateFiles(), [], 'no edit log → no state file');
+  assert.ok(stop(sb, 's'), 'the logged session is still reported once unquieted');
 });

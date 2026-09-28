@@ -53,17 +53,42 @@ test('recordEdit/readEdits round trip; torn lines and foreign shapes are skipped
     return { s1: se.readEdits('/p', 'S1'), s2: se.readEdits('/p', 'S2'), none: se.readEdits('/p', 'S3'),
              noSession: se.recordEdit('/p', '', { file: 'a' }) };
   `);
+  // '/p/src/a.rs' does not exist: a symbol record carries `sigs: null`.
   assert.deepEqual(got.s1, [
-    { ts: 10, file: 'src/a.rs', symbol: null },
-    { ts: 11, file: 'src/a.rs', symbol: 'compute' },
+    { ts: 10, file: 'src/a.rs', symbol: null, sigs: null },
+    { ts: 11, file: 'src/a.rs', symbol: 'compute', sigs: null },
   ]);
-  assert.deepEqual(got.s2, [{ ts: 12, file: 'src/z.rs', symbol: null }]);
+  assert.deepEqual(got.s2, [{ ts: 12, file: 'src/z.rs', symbol: null, sigs: null }]);
   assert.deepEqual(got.none, []);
   assert.equal(got.noSession, false, 'no session id → nothing written');
   // Everything landed in the redirected cgTmpDir.
   const names = fs.readdirSync(path.join(sb.tmp, 'code-graph-mcp')).sort();
   assert.equal(names.length, 2, names.join(','));
   assert.ok(names.every((n) => /^\.cg-edits-[0-9a-f]{12}-S[12]\.jsonl$/.test(n)), names.join(','));
+});
+
+test('recordEdit: a symbol record carries the signatures the file has at record time', (t) => {
+  const sb = sandbox(t);
+  const project = path.join(sb.root, 'project');
+  fs.mkdirSync(path.join(project, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(project, 'src', 'a.rs'), 'pub fn compute(x: i32) -> i32 {\n    x\n}\n');
+  fs.writeFileSync(path.join(project, 'src', 'a.ex'), 'def compute(x), do: x\n');
+  const many = Array.from({ length: 33 }, (_, i) => `fn compute(x: [u8; ${i}]) {}\n`).join('');
+  fs.writeFileSync(path.join(project, 'src', 'many.rs'), many);
+  const got = inChild(sb, `
+    const p = ${JSON.stringify(project)};
+    se.recordEdit(p, 'S', { file: 'src/a.rs', symbol: 'compute' }, 1);
+    // The edit lands after the record: the record keeps the old header.
+    require('fs').writeFileSync(require('path').join(p, 'src', 'a.rs'), 'pub fn compute(x: i64) {}\\n');
+    se.recordEdit(p, 'S', { file: 'src/a.ex', symbol: 'compute' }, 2);
+    se.recordEdit(p, 'S', { file: 'src/many.rs', symbol: 'compute' }, 3);
+    return se.readEdits(p, 'S').map((r) => r.sigs);
+  `);
+  assert.deepEqual(got, [
+    ['pubfncompute(x:i32)->i32'],
+    null,  // no exact reading for Elixir
+    null,  // more same-named definitions than the cap
+  ]);
 });
 
 test('stop state: missing/corrupt reads as empty; write is atomic and leaves no temp file', (t) => {
