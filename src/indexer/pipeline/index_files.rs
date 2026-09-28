@@ -3125,6 +3125,7 @@ fn restore_inbound_edges(
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
         let mut requeued = 0usize;
+        let mut requeued_typed: HashSet<(i64, &str, Option<&str>)> = HashSet::new();
         for (
             source_id,
             source_file_id,
@@ -3175,7 +3176,16 @@ fn restore_inbound_edges(
                     super::resolve::parse_callee_metadata(metadata.as_deref()),
                     Some(super::resolve::CalleeMeta::Import { .. })
                 );
-            let new_target_ids: Option<Vec<i64>> = (!renamed_import)
+            // A Rust call typed by its receiver (D#112) is decided by what the
+            // target's impl can run on, which an edit of the target's file can
+            // change while its qualified name stays: `impl<T: Display> Yell for
+            // T` rewritten as `impl Yell for T` keeps `T.yell`, and a `String`
+            // receiver loses it on a rebuild. Re-resolved in the deferred pass
+            // under the full rules, never restored by name (batch-1 review
+            // round 2). Only the Rust parser writes `rt`.
+            let receiver_typed = relation.as_str() == REL_CALLS
+                && metadata.as_deref().is_some_and(|m| m.contains(r#""rt":"#));
+            let new_target_ids: Option<Vec<i64>> = (!renamed_import && !receiver_typed)
                 .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
                 .flatten()
                 .map(|found| {
@@ -3239,6 +3249,32 @@ fn restore_inbound_edges(
                     // the index left missing every deferred edge and no
                     // self-heal).
                     skipped_intra_batch += 1;
+                    continue;
+                }
+                // A receiver-typed call goes through the deferred pass, as its
+                // first resolution did: the pending buffer keeps one row per
+                // caller and name, so requeued there it displaced (or was
+                // displaced by) the same caller's other `spawn_local` call, and
+                // tokio's `local.spawn_local(..)` lost its edge. One entry per
+                // call, though it was bound to several targets.
+                if receiver_typed {
+                    if requeued_typed.insert((
+                        *source_id,
+                        target_name.as_str(),
+                        metadata.as_deref(),
+                    )) {
+                        deferred.push(DeferredRelation {
+                            source_ids: vec![*source_id],
+                            source_name: String::new(),
+                            target_name: target_name.clone(),
+                            relation: relation.clone(),
+                            metadata: metadata.clone(),
+                            rel_path: src_path,
+                            language: src_lang,
+                            ns_file: None,
+                        });
+                        requeued += 1;
+                    }
                     continue;
                 }
                 if relation.as_str() == REL_CALLS {

@@ -3275,6 +3275,17 @@ pub(super) struct RustFnShape {
     pub(super) crate_private_dir: Option<Box<str>>,
 }
 
+/// A Rust signature split into the type parameter the parser writes before a
+/// blanket impl's method's parameter list (`<T> (&self) -> String` for `impl<T:
+/// Display> Shout for T`, parser `rust_blanket_impl_param`), if any, and the
+/// signature after it.
+pub(super) fn rust_blanket_signature(signature: &str) -> (Option<&str>, &str) {
+    signature
+        .strip_prefix('<')
+        .and_then(|s| s.split_once("> "))
+        .map_or((None, signature), |(param, rest)| (Some(param), rest))
+}
+
 /// The `impl`/`trait` type in a Rust function's qualified name (`Type.f`).
 fn rust_fn_owner(qualified_name: Option<&str>) -> Option<&str> {
     qualified_name
@@ -3283,6 +3294,7 @@ fn rust_fn_owner(qualified_name: Option<&str>) -> Option<&str> {
 }
 
 pub(super) fn rust_fn_shape(signature: Option<&str>, qualified_name: Option<&str>) -> RustFnShape {
+    let signature = signature.map(|s| rust_blanket_signature(s).1);
     let takes_self = signature.is_some_and(rust_signature_takes_self);
     let owner = rust_fn_owner(qualified_name);
     RustFnShape {
@@ -3845,11 +3857,12 @@ pub(super) struct ProjectClassNames {
     /// until loaded.
     rust_fn_shapes: Option<HashMap<i64, RustFnShape>>,
     /// The project's Rust structs, enums and unions as (file id, name), the
-    /// names of all of them, and of its traits (`interface` nodes)
+    /// names of its traits (`interface` nodes), and the methods of its blanket
+    /// impls with their type parameter ([`rust_blanket_signature`])
     /// ([`Self::rust_receiver_candidates`]); None until loaded.
     rust_concrete: Option<HashSet<(i64, String)>>,
-    rust_concrete_names: HashSet<String>,
     rust_traits: HashSet<String>,
+    rust_blanket: HashMap<i64, Box<str>>,
 }
 
 /// The receiver type a Rust method call carries (parser `rust_receiver.rs`,
@@ -3886,26 +3899,30 @@ enum ForeignOwner {
     /// for &str` for a `str`): what method lookup finds first.
     Exact,
     /// Can run on it only when no exact impl answers (batch-1 review H1): one
-    /// on a slice,
-    /// array, tuple, pointer, `fn` or `dyn` type for a receiver with no name,
-    /// a slice's for a `Vec` and `str`'s for a `String` (which deref to them),
-    /// a primitive's for a receiver with no name (`7.twice()`). tokio's
-    /// `SocketAddrV4::new(..).to_socket_addrs(..)` binds the impl for
-    /// `SocketAddrV4`, not the blanket one for `&T` beside it.
+    /// on a slice, array, tuple, pointer, `fn` or `dyn` type for a receiver
+    /// with no name, a slice's for a `Vec` and `str`'s for a `String` (which
+    /// deref to them), a primitive's for a receiver with no name (`7.twice()`),
+    /// and a blanket impl's (`impl<T: Display> Shout for T`, `impl<T> Wait for
+    /// &mut T`). tokio's `SocketAddrV4::new(..).to_socket_addrs(..)` binds the
+    /// impl for `SocketAddrV4`, not the blanket one for `&T` beside it.
+    ///
+    /// A blanket impl binds whether or not its trait is in the caller's scope:
+    /// batch-1 review round 2 withdrew the scope test, which asked whether the
+    /// caller's file imports any item of the impl's file and so admitted
+    /// `s.trim()` through `use crate::ext3::util`. Where rustc would call
+    /// std's method, that binds a wrong edge (CHANGELOG, Not covered).
     Loose,
-    /// A blanket impl on a type parameter no project type is named after
-    /// (`impl<T: Display> Shout for T`, written `T`, or `&mut T`): as
-    /// [`Self::Loose`], and only where its trait can be in scope, the caller's
-    /// file being the impl's or importing from it. It applies to every type,
-    /// so without that tokio's `thread.id()` bound `impl<T: Wait> Wait for
-    /// &mut T`'s `id` in five files that never name `Wait`.
-    Blanket,
 }
 
-/// [`ForeignOwner`] of an impl on `owner` for a receiver of type `ty`. An impl
-/// on a named type is exact unless the impl's own file defines a project
-/// struct, enum or union of that name (`own_type_here`): then it is that
-/// type's. Asked of the impl's file, not of the whole project, because a
+/// [`ForeignOwner`] of an impl on `owner` for a receiver of type `ty`.
+/// `blanket` is the type parameter the parser found the impl to be a blanket
+/// impl over (its self type is a parameter of its own `<…>` list,
+/// [`rust_blanket_signature`]): the impl's header alone decides it, so no
+/// other file can change the answer (batch-1 review round 2: asking whether
+/// any project type was named `T` changed a rebuild, not an incremental run).
+/// An impl on a named type is exact unless the impl's own file defines a
+/// project struct, enum or union of that name (`own_type_here`): then it is
+/// that type's. Asked of the impl's file, not of the whole project, because a
 /// project `struct Duration` elsewhere does not make `impl Ext for
 /// std::time::Duration` the project's, and because the answer then changes
 /// only with that file, which re-resolves its callers (batch-1 review B2: the
@@ -3914,7 +3931,7 @@ enum ForeignOwner {
 fn foreign_receiver_owner(
     ty: &str,
     owner: &str,
-    no_project_type_named: bool,
+    blanket: Option<&str>,
     own_type_here: impl FnOnce() -> bool,
 ) -> ForeignOwner {
     let mut o = owner.trim();
@@ -3935,11 +3952,8 @@ fn foreign_receiver_owner(
             ForeignOwner::No
         }
     };
-    let type_param = o
-        .strip_prefix(|c: char| c.is_ascii_uppercase())
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()));
-    if type_param && no_project_type_named {
-        return ForeignOwner::Blanket;
+    if blanket == Some(o) {
+        return ForeignOwner::Loose;
     }
     if o.starts_with(['[', '(', '*']) || o.starts_with("fn(") || o.starts_with("dyn ") {
         return loose(ty.is_empty() || (ty == "Vec" && o.starts_with('[')));
@@ -3955,25 +3969,6 @@ fn foreign_receiver_owner(
     } else {
         ForeignOwner::No
     }
-}
-
-/// The file of `caller_path` and every file its `imports` edges reach: where a
-/// trait a call can see may be defined ([`ForeignOwner::Blanket`]).
-fn rust_files_in_scope(
-    conn: &rusqlite::Connection,
-    caller_path: &str,
-) -> rusqlite::Result<HashSet<i64>> {
-    conn.prepare(
-        "SELECT f.id FROM files f WHERE f.path = ?1
-         UNION
-         SELECT t.file_id FROM files f
-         JOIN nodes s ON s.file_id = f.id
-         JOIN edges e ON e.source_id = s.id AND e.relation = 'imports'
-         JOIN nodes t ON t.id = e.target_id
-         WHERE f.path = ?1",
-    )?
-    .query_map([caller_path], |r| r.get::<_, i64>(0))?
-    .collect()
 }
 
 /// The receiver type keys of a Rust call's metadata, or None.
@@ -4159,15 +4154,28 @@ impl ProjectClassNames {
                         if is_trait {
                             self.rust_traits.insert(name);
                         } else {
-                            self.rust_concrete_names.insert(name.clone());
                             concrete.insert((file_id, name));
                         }
                     }
                     self.rust_concrete = Some(concrete);
+                    let mut stmt = db.conn().prepare(
+                        "SELECT n.id, n.signature FROM nodes n
+                         JOIN files f ON f.id = n.file_id
+                         WHERE f.language = 'rust' AND n.type = 'function'
+                           AND n.signature LIKE '<%'",
+                    )?;
+                    for row in
+                        stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                    {
+                        let (id, signature) = row?;
+                        if let (Some(param), _) = rust_blanket_signature(&signature) {
+                            self.rust_blanket.insert(id, param.into());
+                        }
+                    }
                 }
                 let concrete = self.rust_concrete.as_ref().expect("loaded above");
                 let traits = &self.rust_traits;
-                let names = &self.rust_concrete_names;
+                let blanket = &self.rust_blanket;
                 // Owners are compared by name: a type defined inside an item
                 // macro (`cfg_net! { pub struct TcpStream … }`) has no node, but
                 // its impls' methods do, so "not a known struct" is no proof
@@ -4180,7 +4188,8 @@ impl ProjectClassNames {
                             Some(o) if traits.contains(o) => ForeignOwner::Exact,
                             Some(o) => {
                                 let file_id = self.node_info.get(id).map(|(f, _)| *f);
-                                foreign_receiver_owner(&ty, o, !names.contains(o), || {
+                                let param = blanket.get(id).map(|b| &**b);
+                                foreign_receiver_owner(&ty, o, param, || {
                                     file_id.is_some_and(|f| concrete.contains(&(f, o.to_string())))
                                 })
                             }
@@ -4192,23 +4201,11 @@ impl ProjectClassNames {
                 let exact = verdicts.iter().any(|(id, v)| {
                     *v == ForeignOwner::Exact && owner(id).is_some_and(|o| !traits.contains(o))
                 });
-                let reach = if !exact && verdicts.iter().any(|(_, v)| *v == ForeignOwner::Blanket) {
-                    rust_files_in_scope(db.conn(), caller_path)?
-                } else {
-                    HashSet::new()
-                };
                 Ok(verdicts
                     .into_iter()
-                    .filter(|(id, v)| match v {
+                    .filter(|(_, v)| match v {
                         ForeignOwner::Exact => true,
                         ForeignOwner::Loose => !exact,
-                        ForeignOwner::Blanket => {
-                            !exact
-                                && self
-                                    .node_info
-                                    .get(id)
-                                    .is_some_and(|(f, _)| reach.contains(f))
-                        }
                         ForeignOwner::No => false,
                     })
                     .map(|(id, _)| id)

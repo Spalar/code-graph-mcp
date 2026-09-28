@@ -3,11 +3,11 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 92 → 98 because the Rust and JavaScript fixes below change
+`INDEX_VERSION` goes 92 → 99 because the Rust and JavaScript fixes below change
 which `calls`, `imports` and `exports` edges a file produces. Nothing to run. To
 pin back: `npm i -g @sdsrs/code-graph@0.161.0`, or `cargo install
 code-graph-mcp --version 0.161.0`; plugin users can set the version in the
-marketplace entry. An older binary leaves a v98 index intact and warns instead
+marketplace entry. An older binary leaves a v99 index intact and warns instead
 of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
@@ -110,9 +110,11 @@ carries it:
   project type of that name (`struct File; impl File { … }` is not
   `std::fs::File`'s), and none of another project type: a type an item macro
   defines has no node, so "not a known struct" proves nothing. Where no impl
-  on the type itself answers, it also binds a blanket impl
-  (`impl<T: Display> Shout for T`) when the caller's file is the impl's or
-  imports from it, one on a slice, array or tuple for a receiver of no name
+  on the type itself answers, it also binds a blanket impl whether or not
+  its trait is in scope (`impl<T: Display> Shout for T`, `impl<W: Wait> Wait
+  for &mut W`: the impl's self type is a parameter of its own `<…>` list,
+  read from its header alone; `impl<T> Tr for Box<T>` is an impl on `Box`),
+  one on a slice, array or tuple for a receiver of no name
   (`b: &[u8]`), a slice's for a `Vec` and `str`'s for a `String`, which deref
   to them, and a primitive's for an unsuffixed literal. A project type binds its own
   methods when it has one, else resolves as before (a trait's default method
@@ -233,6 +235,62 @@ the `[lib] name` workspace and tokio (the `show`-first refresh among them),
 all match a rebuild's `calls` and `imports` edges (tokio's std-named structs
 on `calls`; their `imports` are the Not covered item below); on 9962a87, 5
 did not.
+
+### Pre-release review repairs, round 2 (Rust)
+
+The review of the repairs above found that the blanket-impl rule they added
+broke the rebuild contract and bound calls through unrelated imports. The rule
+is withdrawn to what an impl's own header says:
+
+- Whether an impl is a blanket impl was decided by whether any project type
+  bore its parameter's name, so a `pub struct T;` added anywhere dropped the
+  blanket edges (4 on the review's fixture) on a rebuild and kept them on an
+  incremental run. It is now read from the impl's header when its file is
+  parsed: the self type, after `&`/`&mut`, is a parameter of the impl's own
+  `<…>` list. `impl<St: AsRef<str>> Ext for St` counts too, and `impl Tr for
+  T` on an imported `struct T` does not.
+- Blanket-impl methods now show their impl's type parameter in the signature
+  (`<T> (&self) -> u32`). No other signature changes: on tokio 5 of 9,575
+  nodes differ, all of them such methods, and on this repo none.
+- A blanket impl was admitted only when the caller's file imported some item
+  of the impl's file, so an unrelated import of that file admitted it (`use
+  crate::ext3::util; s.trim()`). That test is withdrawn, and a blanket impl
+  binds whether or not its trait is in scope (see Not covered).
+- An impl header rewritten from blanket to concrete (`impl<T: Display> Yell
+  for T` to `impl Yell for T` beside a `struct T`) kept a `String` caller's
+  edge on every incremental path and lost it on a rebuild. The edge was
+  restored by its qualified name, which had not changed. A receiver-typed call
+  into a re-indexed file is now re-resolved in the deferred pass. The deferred
+  pass is used, not the pending-call buffer: the buffer keeps one row per
+  caller and name, and there tokio's `local.spawn_local(..)` lost its edge to
+  the same caller's waiting `task::spawn_local(..)`. Cost: an incremental run
+  after editing tokio's `runtime/runtime.rs`, the file with the most such
+  calls (188 from other files), went from 186 to 201 ms and from 190 to 207 ms
+  (+7.7% and +9.1%; mean of 10 alternating runs, two rounds).
+
+Measured against the previous commit:
+
+- Edit sequences: the review's fixtures plus new ones around blanket impls
+  (`struct T` added and removed, a trait or its impl moved to another file,
+  the impl in another crate of a workspace, a header turned concrete and
+  back), 42 sequences in all. Each ran through an incremental run, a `deps`
+  refresh and, where it only edits existing files, a `show` of an item of the
+  edited file: 99 runs. `calls` edges matched a rebuild in 85 runs, against
+  65 before (all edges: 73, against 54). The blanket-impl sequences match in
+  44 of 46 runs, against 24.
+- The 14 runs that still differ:
+  - 8 are manifest-only edits (Not covered).
+  - 2 are an exact impl added and then removed beside glob-imported callers
+    (Not covered).
+  - 2 are `show` runs whose edit renamed or removed the item the query asked
+    for, so nothing was refreshed.
+  - 2 are the documented JavaScript `x.ts` case.
+  - Each of the 14 differed in the same edges before.
+- SCIP oracle on tokio-1.41.1 (gold 7,908 pairs): correct pairs 5,247 →
+  5,247, none lost or gained. `inferred` precision 2,550/2,725 and
+  `extracted` 1,641/1,888 are unchanged; `ambiguous` goes 1,056/2,113 →
+  1,056/2,118. On this repo (gold 7,824) the judged edges are identical
+  (7,585 correct).
 
 ### A call through a renamed JavaScript import binds the export
 
@@ -662,10 +720,15 @@ holding a file the index skips, the patterns above, and `grep -R`).
   classified by name: with same-named methods elsewhere it is `ambiguous`,
   hidden at the default confidence floor (tokio: 1,056 of the correct pairs
   the oracle judges are `ambiguous`).
-- A blanket impl whose type parameter is not one capital letter and digits
-  (`impl<Fut: Future> Ext for Fut`) reads as a type named `Fut` and binds no
-  std receiver; the parameter names are not recorded. A trait imported only
-  through a re-export or a glob does not put its blanket impl in scope. An
+- A blanket impl binds a std receiver whether or not its trait is in scope,
+  so a call that rustc sends to std's method of that name binds the
+  project's too: `s.trim()` on a `String` beside a project `impl<T:
+  AsRef<str>> Trimmy for T`. On tokio this adds 16 `ambiguous` edges that
+  0.161.0 did not have: 15 `.id()` calls (a `std::thread::Thread`'s, mostly)
+  bind `impl<T: Wait> Wait for &mut T`'s `id`, and `self.child.kill()` on a `std::process::Child` in
+  `process/windows.rs` binds `&mut T.kill`. The oracle judges 5 of them, all
+  wrong. No correct pair is lost, and the default confidence floor hides
+  them. A trait bound the receiver does not meet is not checked either. An
   impl on a project type in a file that does not define it (tokio spreads
   `impl Handle` over several files) still binds a std receiver of that name,
   and an impl on std's type in a file that also defines a same-named project
@@ -697,6 +760,10 @@ holding a file the index skips, the patterns above, and `grep -R`).
   function really calls and cannot pick among the project's `path` methods.
 - A typed call that no method answers waits in the pending-call buffer and
   ages out after 50 runs, like any buffered call.
+- A call whose receiver a glob import leaves untyped loses its blanket-impl
+  edge on an incremental run, not on a rebuild, when an impl on the receiver's
+  own type with a method of that name is added and then removed
+  (`use crate::ext::*; s.yell()`). 0.161.0 loses it too.
 - The dispatch-site scan is lexical. A local named like the function still
   reads as a function reference where the scan sees no declaration of it (a
   Java or C typed local `String url = …`, a TypeScript method parameter
@@ -732,6 +799,11 @@ holding a file the index skips, the patterns above, and `grep -R`).
   and binds both roots' `run`. A `#[path]` or macro-made `mod` below the top
   of a root file is not seen, and a `Cargo.toml` added or removed with no
   source file changing is noticed only by the next run that indexes a file.
+- An edit to a `Cargo.toml` alone (a new dependency, a `package =` rename, a
+  `[lib] name` change) is picked up at the next rebuild, not by an
+  incremental run: no file's calls are resolved again when only a manifest
+  changes. A manifest the scan cannot read, added anywhere in the tree, turns
+  `use <crate>::f; f()` into a call by name on the next rebuild only.
 - The Stop check sees only symbols `pre-edit-guide.js` could name: an Edit
   whose `old_string` holds no definition header and no identifier it can place
   in a function is logged as a file edit only, and `Write` is not logged at

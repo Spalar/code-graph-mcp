@@ -1139,6 +1139,7 @@ fn extract_nodes(
                 // keeping the impl name bare avoids a LIKE mismatch that would
                 // drop every method-level implements edge.
                 let impl_name = impl_name.split('<').next().unwrap_or(impl_name).trim();
+                let first_child = results.len();
                 extract_children(
                     node,
                     source,
@@ -1149,6 +1150,9 @@ fn extract_nodes(
                     depth,
                     node_is_test,
                 );
+                if let Some(param) = rust_blanket_impl_param(&node, &type_node, source) {
+                    mark_rust_blanket_methods(&node, source, param, &mut results[first_child..]);
+                }
                 return;
             }
         }
@@ -1428,6 +1432,63 @@ fn go_receiver_type(node: &tree_sitter::Node, source: &str) -> Option<String> {
         None
     } else {
         Some(base)
+    }
+}
+
+/// The type parameter a Rust `impl` is a blanket impl over: its self type is,
+/// after any `&`/`&'a`/`&mut`, a bare name that the impl's own `<…>` list
+/// declares (`impl<T: Display> Shout for T`, `impl<W: Wait> Wait for &mut W`).
+/// Decided from the impl's header alone, so a `struct T` anywhere else changes
+/// nothing (batch-1 review round 2). `impl<T> Tr for Box<T>`, `for [T]`, `for
+/// (T,)` and `for *const T` are impls on that type constructor, not on every
+/// type: no (their text is never a bare parameter name).
+fn rust_blanket_impl_param<'s>(
+    impl_node: &tree_sitter::Node,
+    type_node: &tree_sitter::Node,
+    source: &'s str,
+) -> Option<&'s str> {
+    let mut ty = *type_node;
+    while ty.kind() == "reference_type" {
+        ty = ty.child_by_field_name("type")?;
+    }
+    let name = node_text(&ty, source);
+    let params = impl_node.child_by_field_name("type_parameters")?;
+    // tree-sitter-rust 0.24: a type parameter, bounded or not, is a
+    // `type_parameter` with a `name` field; a lifetime has none.
+    (0..params.named_child_count())
+        .filter_map(|i| params.named_child(i))
+        .filter_map(|p| p.child_by_field_name("name"))
+        .any(|d| node_text(&d, source) == name)
+        .then_some(name)
+}
+
+/// Mark the methods of a blanket impl ([`rust_blanket_impl_param`]): their
+/// signature opens with the type parameter, `<T> (&self) -> String`, which the
+/// resolver reads (`resolve::rust_fn_shape`) to let them run on any receiver
+/// type. Only the impl's own items (a signature is a function's): a function
+/// nested in a method body keeps its signature.
+fn mark_rust_blanket_methods(
+    impl_node: &tree_sitter::Node,
+    source: &str,
+    param: &str,
+    nodes: &mut [ParsedNode],
+) {
+    let Some(body) = impl_node.child_by_field_name("body") else {
+        return;
+    };
+    let items: Vec<(u32, &str)> = (0..body.named_child_count())
+        .filter_map(|i| body.named_child(i))
+        .filter_map(|c| {
+            let name = c.child_by_field_name("name")?;
+            Some((c.start_position().row as u32 + 1, node_text(&name, source)))
+        })
+        .collect();
+    for n in nodes {
+        if items.contains(&(n.start_line, n.name.as_str())) {
+            if let Some(sig) = n.signature.as_mut() {
+                *sig = format!("<{param}> {sig}");
+            }
+        }
     }
 }
 
@@ -2960,6 +3021,81 @@ describe('Widget', () => {
             2,
             "both methods keep the bare name `Start`; got: {dump:?}"
         );
+    }
+
+    /// Batch-1 review round 2: a blanket impl's methods (the impl's self type,
+    /// after `&`/`&mut`, is a parameter of the impl's own `<…>` list) carry
+    /// that parameter before their signature, which the resolver reads. Every
+    /// other function's signature is the parameter list and return type, as
+    /// before: `show`, `overview` and `search` print it unchanged.
+    #[test]
+    fn test_rust_blanket_impl_methods_carry_their_type_parameter() {
+        let code = "\
+use crate::tt::T;
+pub trait Tr { fn m(&self) -> u8; }
+impl<T: std::fmt::Display> Tr for T {
+    fn m(&self) -> u8 {
+        fn nested(x: u8) -> u8 { x }
+        nested(1)
+    }
+    fn two(&self, a: u8) {}
+}
+impl<'a, W: Tr + ?Sized> Tr for &'a mut W { fn m(&self) -> u8 { 0 } }
+impl<St> Tr for &St { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for Box<T> { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for [T] { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for (T,) { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for Vec<T> { fn m(&self) -> u8 { 0 } }
+impl Tr for T { fn m(&self) -> u8 { 0 } }
+impl<U> Tr for T { fn m(&self) -> u8 { 0 } }
+impl<T> Wrapper<T> { pub fn get(&self) -> &T { &self.0 } }
+impl Tr for String { fn m(&self) -> u8 { 0 } }
+pub fn free<T>(t: T) -> T { t }
+";
+        let nodes = parse_code(code, "rust").unwrap();
+        let sigs: Vec<(u32, &str, &str)> = nodes
+            .iter()
+            .filter(|n| n.node_type == "function")
+            .map(|n| {
+                (
+                    n.start_line,
+                    n.name.as_str(),
+                    n.signature.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        let blanket = [
+            (4, "m", "<T> (&self) -> u8"),
+            (8, "two", "<T> (&self, a: u8)"),
+            (10, "m", "<W> (&self) -> u8"),
+            (11, "m", "<St> (&self) -> u8"),
+        ];
+        for want in blanket {
+            assert!(sigs.contains(&want), "missing {want:?} in {sigs:#?}");
+        }
+        for n in nodes.iter().filter(|n| n.node_type == "function") {
+            if blanket
+                .iter()
+                .any(|(l, name, _)| *l == n.start_line && *name == n.name)
+            {
+                continue;
+            }
+            // HEAD's shape, byte for byte: `(params)` then ` -> ret` if any.
+            let head = match (&n.param_types, &n.return_type) {
+                (Some(p), Some(r)) => format!("{p} -> {r}"),
+                (Some(p), None) => p.clone(),
+                _ => panic!("{} at {}: no parameters", n.name, n.start_line),
+            };
+            assert_eq!(
+                n.signature.as_deref(),
+                Some(head.as_str()),
+                "{} at {}",
+                n.name,
+                n.start_line
+            );
+        }
+        // Every function of the corpus was seen: 4 blanket, 10 others.
+        assert_eq!(sigs.len(), 14, "{sigs:#?}");
     }
 
     #[test]

@@ -9254,6 +9254,26 @@ fn assert_path_matches_rebuild(
     steps: &[&[(&str, Option<&str>)]],
     path: IndexPath,
 ) -> Vec<String> {
+    path_vs_rebuild(before, steps, path, true)
+}
+
+/// [`assert_path_matches_rebuild`] on `calls` edges alone: for a step whose
+/// other edges drift for a documented reason (a `references` edge a rebuild
+/// binds to a type added elsewhere, CHANGELOG Not covered).
+fn assert_path_calls_match_rebuild(
+    before: &[(&str, &str)],
+    steps: &[&[(&str, Option<&str>)]],
+    path: IndexPath,
+) -> Vec<String> {
+    path_vs_rebuild(before, steps, path, false)
+}
+
+fn path_vs_rebuild(
+    before: &[(&str, &str)],
+    steps: &[&[(&str, Option<&str>)]],
+    path: IndexPath,
+    all_edges: bool,
+) -> Vec<String> {
     let (project, _d, db) = fresh_index_of(before);
     let root = project.path();
     let (_, mut cache) = crate::indexer::merkle::scan_directory_cached(root, None).unwrap();
@@ -9262,6 +9282,7 @@ fn assert_path_matches_rebuild(
         .map(|(p, b)| (p.to_string(), b.to_string()))
         .collect();
     let mut want = Vec::new();
+    let mut want_calls = Vec::new();
     for after in steps {
         for (p, body) in after.iter() {
             tree.retain(|(q, _)| q != p);
@@ -9304,23 +9325,34 @@ fn assert_path_matches_rebuild(
         let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
         let (_p2, _d2, control) = fresh_index_of(&files);
         want = edge_set(&control);
+        want_calls = call_edges_with_confidence(&control);
         assert_eq!(
             call_edges_with_confidence(&db),
-            call_edges_with_confidence(&control),
+            want_calls,
             "{path:?}: calls after {after:?} must equal a rebuild"
         );
+        if all_edges {
+            assert_eq!(
+                edge_set(&db),
+                want,
+                "{path:?}: edges after {after:?} must equal a rebuild"
+            );
+        }
+    }
+    run_incremental_index(&db, root, None, None).unwrap();
+    if all_edges {
         assert_eq!(
             edge_set(&db),
             want,
-            "{path:?}: edges after {after:?} must equal a rebuild"
+            "{path:?}: edges after {steps:?} and an incremental run must equal a rebuild"
+        );
+    } else {
+        assert_eq!(
+            call_edges_with_confidence(&db),
+            want_calls,
+            "{path:?}: calls after {steps:?} and an incremental run must equal a rebuild"
         );
     }
-    run_incremental_index(&db, root, None, None).unwrap();
-    assert_eq!(
-        edge_set(&db),
-        want,
-        "{path:?}: edges after {steps:?} and an incremental run must equal a rebuild"
-    );
     want
 }
 
@@ -9504,7 +9536,8 @@ fn test_rust_std_receiver_keeps_its_impl_beside_a_same_named_project_type() {
 /// blanket impl (`impl<T: Display> Shout for T`), an impl on `&str` or `[u8]`,
 /// or an impl on the type of a suffixed literal (`7u32`) defines, as rustc
 /// calls them and as 0.161.0 bound them; and still binds no other project
-/// type's method of that name.
+/// type's method of that name. A blanket impl binds whether or not its trait is
+/// in the caller's scope (batch-1 review round 2 withdrew the scope test).
 #[test]
 fn test_rust_std_receiver_keeps_blanket_reference_slice_and_literal_impls() {
     let (_p, _d, db) = fresh_index_of(&[
@@ -9516,9 +9549,8 @@ fn test_rust_std_receiver_keeps_blanket_reference_slice_and_literal_impls() {
             "src/lib.rs",
             "pub mod ext;\npub mod decoy;\npub mod recv;\npub mod noscope;\n",
         ),
-        // A std type's own `shout` (its trait not in scope here): a blanket
-        // impl applies to every type, so only a file that can see its trait
-        // binds it.
+        // The blanket impl's trait is not in scope here: rustc rejects the
+        // call, and it binds all the same (no scope test).
         (
             "src/noscope.rs",
             "pub fn no_trait(t: std::thread::Thread) {\n    t.shout();\n}\n",
@@ -9618,10 +9650,212 @@ fn test_rust_std_receiver_keeps_blanket_reference_slice_and_literal_impls() {
             bad.push(format!("{caller}: wrong {wrong}"));
         }
     }
-    if calls.contains(&"src/noscope.rs.no_trait -> src/ext.rs.T.shout".to_string()) {
-        bad.push("no_trait: wrong src/ext.rs.T.shout (trait not in scope)".to_string());
+    for (right, wrong) in [
+        ("src/ext.rs.T.shout", "src/decoy.rs.Horn.shout"),
+        ("src/ext.rs.T.shout", "src/ext.rs.B.shout"),
+    ] {
+        let from = |t: &str| format!("src/noscope.rs.no_trait -> {t}");
+        if !calls.contains(&from(right)) {
+            bad.push(format!("no_trait: missing {right}"));
+        }
+        if calls.contains(&from(wrong)) {
+            bad.push(format!("no_trait: wrong {wrong}"));
+        }
     }
     assert!(bad.is_empty(), "{bad:#?}\n{calls:#?}");
+}
+
+/// Batch-1 review round 2's r1 fixture, cut down: `Yell` and a blanket impl
+/// of it in `ext.rs`, and a `String` receiver calling `yell` in `ca.rs`.
+fn blanket_tree(ext: &'static str, lib: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", lib),
+        ("src/ext.rs", ext),
+        (
+            "src/ca.rs",
+            "use crate::ext::Yell;\npub fn a1(s: String) {\n    s.yell();\n}\n",
+        ),
+    ]
+}
+
+const BLANKET_LIB: &str = "pub mod ext;\npub mod ca;\n";
+const BLANKET_LIB_TT: &str = "pub mod ext;\npub mod ca;\npub mod tt;\n";
+const EXT_BLANKET: &str = "use std::fmt::Display;\npub trait Yell {\n    fn yell(&self) -> String;\n}\n\
+    impl<T: Display> Yell for T {\n    fn yell(&self) -> String {\n        String::new()\n    }\n}\n";
+const EVERY_PATH: [IndexPath; 4] = [
+    IndexPath::Incremental,
+    IndexPath::Cached,
+    IndexPath::Refresh,
+    IndexPath::Resync,
+];
+
+/// Batch-1 review round 2, HIGH: whether an impl is a blanket impl is read
+/// from its own header (its self type is a parameter of its own `<…>` list),
+/// so a `pub struct T;` added in another file, or in the impl's own, changes
+/// nothing, on a rebuild as on every incremental path. It was decided by
+/// whether any project type was named `T`: a rebuild dropped the blanket
+/// binding and an incremental run kept it. A parameter of any name counts
+/// (`impl<St> … for St`); a concrete `T` that the impl imports does not.
+#[test]
+fn test_rust_blanket_impl_is_decided_by_its_own_header() {
+    const EXT_BLANKET_T: &str = "use std::fmt::Display;\npub trait Yell {\n    fn yell(&self) -> String;\n}\n\
+        impl<T: Display> Yell for T {\n    fn yell(&self) -> String {\n        String::new()\n    }\n}\n\
+        pub struct T;\n";
+    const EDGE: &str = "src/ca.rs.a1 --calls--> src/ext.rs.yell";
+    let before = blanket_tree(EXT_BLANKET, BLANKET_LIB);
+    for path in EVERY_PATH {
+        // Calls only: `ext.rs`'s `references` edge to `T` binds the new
+        // struct by name on a rebuild alone (CHANGELOG, Not covered).
+        let want = assert_path_calls_match_rebuild(
+            &before,
+            &[&[
+                ("src/lib.rs", Some(BLANKET_LIB_TT)),
+                ("src/tt.rs", Some("pub struct T;\n")),
+            ]],
+            path,
+        );
+        assert!(want.iter().any(|e| e == EDGE), "{path:?}: {want:#?}");
+        let want =
+            assert_path_matches_rebuild(&before, &[&[("src/ext.rs", Some(EXT_BLANKET_T))]], path);
+        assert!(want.iter().any(|e| e == EDGE), "{path:?}: {want:#?}");
+    }
+    const EXT_ST: &str = "pub trait Yell {\n    fn yell(&self) -> String;\n}\n\
+        impl<St: AsRef<str> + ?Sized> Yell for St {\n    fn yell(&self) -> String {\n        String::new()\n    }\n}\n";
+    let (_p, _d, db) = fresh_index_of(&blanket_tree(EXT_ST, BLANKET_LIB));
+    let calls = calls_by_qualified_name(&db);
+    assert!(
+        calls.contains(&"src/ca.rs.a1 -> src/ext.rs.St.yell".to_string()),
+        "{calls:#?}"
+    );
+    const EXT_CONCRETE: &str =
+        "use crate::tt::T;\npub trait Yell {\n    fn yell(&self) -> String;\n}\n\
+        impl Yell for T {\n    fn yell(&self) -> String {\n        String::new()\n    }\n}\n";
+    let mut tree = blanket_tree(EXT_CONCRETE, BLANKET_LIB_TT);
+    tree.push(("src/tt.rs", "pub struct T;\n"));
+    let (_p, _d, db) = fresh_index_of(&tree);
+    let calls = calls_by_qualified_name(&db);
+    assert!(
+        !calls.iter().any(|c| c.starts_with("src/ca.rs.a1 -> ")),
+        "{calls:#?}"
+    );
+}
+
+/// Batch-1 review round 2, MEDIUM: a blanket impl was admitted only when the
+/// caller's file imported some item of the impl's file, so `use
+/// crate::ext3::util; s.trim()` bound it and the same call without that import
+/// did not. The test is withdrawn: both bind it, as 24a8586 (0.161.0) does on
+/// the review's r1 fixture (`w1`, `w2` and `w3` all call `T.trim`), and every
+/// indexing path agrees with a rebuild while the import comes and goes.
+#[test]
+fn test_rust_blanket_impl_binds_without_a_scope_test() {
+    const EXT3: &str = "pub trait Trimmy {\n    fn trim(&self) -> usize;\n}\n\
+        impl<T: AsRef<str>> Trimmy for T {\n    fn trim(&self) -> usize {\n        0\n    }\n}\n\
+        pub fn util() {}\n";
+    const W1: &str =
+        "use crate::ext3::util;\npub fn w1(s: String) {\n    util();\n    let _ = s.trim();\n}\n";
+    const W2: &str = "pub fn w2(s: String) {\n    let _ = s.trim();\n}\n";
+    const W2_UTIL: &str =
+        "use crate::ext3::util;\npub fn w2(s: String) {\n    let _ = s.trim();\n}\n";
+    let tree = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "pub mod ext3;\npub mod cw1;\npub mod cw2;\n"),
+        ("src/ext3.rs", EXT3),
+        ("src/cw1.rs", W1),
+        ("src/cw2.rs", W2),
+    ];
+    let (_p, _d, db) = fresh_index_of(&tree);
+    let calls = calls_by_qualified_name(&db);
+    for caller in ["src/cw1.rs.w1", "src/cw2.rs.w2"] {
+        assert!(
+            calls.contains(&format!("{caller} -> src/ext3.rs.T.trim")),
+            "{caller}: {calls:#?}"
+        );
+    }
+    for path in EVERY_PATH {
+        assert_path_matches_rebuild(
+            &tree,
+            &[
+                &[("src/cw2.rs", Some(W2_UTIL))],
+                &[("src/cw2.rs", Some(W2))],
+            ],
+            path,
+        );
+    }
+}
+
+/// Batch-1 review round 2: re-resolving a receiver-typed call whose target's
+/// file was re-indexed must not go through the pending buffer, which keeps one
+/// row per caller and name: tokio's `localset_future_drives_all_local_futs`
+/// has a `task::spawn_local(..)` waiting there, and its `local.spawn_local(..)`
+/// lost its `LocalSet.spawn_local` edge when an unrelated edit re-indexed
+/// `task/local.rs`.
+#[test]
+fn test_rust_typed_call_re_resolved_beside_a_waiting_same_named_call() {
+    const LOCAL: &str = "pub struct LocalSet;\nimpl LocalSet {\n    \
+        pub fn new() -> Self {\n        LocalSet\n    }\n    \
+        pub fn spawn_local(&self, x: u8) {}\n}\n";
+    const LOCAL_EDITED: &str = "pub struct LocalSet;\nimpl LocalSet {\n    \
+        pub fn new() -> Self {\n        LocalSet\n    }\n    \
+        pub fn spawn_local(&self, x: u8) {}\n}\npub fn other() {}\n";
+    let tree = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod local;\npub mod task;\npub mod user;\n",
+        ),
+        ("src/local.rs", LOCAL),
+        ("src/task.rs", "pub fn yield_now() {}\n"),
+        (
+            "src/user.rs",
+            // `task.rs` has no `spawn_local`: that call waits in the buffer.
+            "use crate::local::LocalSet;\nuse crate::task;\npub fn f() {\n    \
+             let local = LocalSet::new();\n    local.spawn_local(1);\n    task::spawn_local(2);\n}\n",
+        ),
+    ];
+    const EDGE: &str = "src/user.rs.f --calls--> src/local.rs.spawn_local";
+    for path in EVERY_PATH {
+        let want =
+            assert_path_matches_rebuild(&tree, &[&[("src/local.rs", Some(LOCAL_EDITED))]], path);
+        assert!(want.iter().any(|e| e == EDGE), "{path:?}: {want:#?}");
+    }
+}
+
+/// Batch-1 review round 2: an impl header rewritten from a blanket impl to an
+/// impl on a concrete `T` keeps its method's qualified name (`T.yell`), so the
+/// caller's saved edge was restored by that name on every incremental path,
+/// while a rebuild asked the receiver's type again and dropped it. A call typed
+/// by its receiver is now re-resolved, not restored; the reverse edit binds
+/// it again.
+#[test]
+fn test_rust_blanket_impl_turned_concrete_re_resolves_its_typed_callers() {
+    const EXT_CONCRETE: &str =
+        "pub struct T;\npub trait Yell {\n    fn yell(&self) -> String;\n}\n\
+        impl Yell for T {\n    fn yell(&self) -> String {\n        String::new()\n    }\n}\n";
+    const EDGE: &str = "src/ca.rs.a1 --calls--> src/ext.rs.yell";
+    for path in EVERY_PATH {
+        let want = assert_path_matches_rebuild(
+            &blanket_tree(EXT_BLANKET, BLANKET_LIB),
+            &[&[("src/ext.rs", Some(EXT_CONCRETE))]],
+            path,
+        );
+        assert!(!want.iter().any(|e| e == EDGE), "{path:?}: {want:#?}");
+        let want = assert_path_matches_rebuild(
+            &blanket_tree(EXT_CONCRETE, BLANKET_LIB),
+            &[&[("src/ext.rs", Some(EXT_BLANKET))]],
+            path,
+        );
+        assert!(want.iter().any(|e| e == EDGE), "{path:?}: {want:#?}");
+    }
 }
 
 /// Batch-1 review H2: a package whose library is named in `[lib] name` (or
