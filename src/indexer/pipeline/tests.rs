@@ -8624,6 +8624,7 @@ fn d112_tree() -> Vec<(&'static str, &'static str)> {
              fn local_fn_return() {\n    let t = tempfile();\n    t.path();\n}\n\
              fn foreign_fn_unwrap() {\n    let d = tempdir().unwrap();\n    d.path();\n}\n\
              fn foreign_fn_try() -> Result<(), ()> {\n    let d = tempdir()?;\n    d.path();\n    Ok(())\n}\n\
+             fn crate_zero_arg() {\n    let d = tempfile::Builder::make();\n    d.path();\n}\n\
              fn crate_param(tx: Transaction<'_>) {\n    tx.commit();\n}\n\
              fn trait_default_kept() {\n    let s = String::new();\n    s.helper();\n}\n\
              fn impl_for_foreign() {\n    let a = AtomicU16::new(0);\n    a.weigh();\n}\n\
@@ -8663,7 +8664,8 @@ fn d112_tree() -> Vec<(&'static str, &'static str)> {
              fn if_let(o: Option<u8>) {\n    let a = AtomicU8::new(0);\n    if let Some(a) = o {\n        a.load(1);\n    }\n}\n\
              fn method_return(h: &Holder) {\n    let a = h.get();\n    a.load(1);\n}\n\
              fn destructured() {\n    let (a, b) = pair();\n    a.load(1);\n}\n\
-             fn crate_builder() {\n    let b = mycrate::types::Widget::builder();\n    b.spin();\n}\n",
+             fn crate_builder() {\n    let b = mycrate::types::Widget::builder();\n    b.spin();\n}\n\
+             fn generic_shadow<Gadget: Tr>(g: Gadget) {\n    g.spin();\n}\n",
         ),
     ]
 }
@@ -8706,6 +8708,7 @@ fn test_rust_receiver_types_by_shape() {
         ("src/foreign.rs.local_fn_return", &[], &[PATH]),
         ("src/foreign.rs.foreign_fn_unwrap", &[], &[PATH]),
         ("src/foreign.rs.foreign_fn_try", &[], &[PATH]),
+        ("src/foreign.rs.crate_zero_arg", &[], &[PATH]),
         ("src/foreign.rs.crate_param", &[], &[COMMIT]),
         ("src/foreign.rs.self_field", &[], &[LOAD]),
         ("src/foreign.rs.self_chain", &[], &[LOAD]),
@@ -8750,6 +8753,9 @@ fn test_rust_receiver_types_by_shape() {
         // A workspace crate's `T::f()` may return anything (a builder): not a
         // `T`, so not `T`'s own `spin` (two `spin`s: resolved by name, none).
         ("src/untyped.rs.crate_builder", &[], &["src/types.rs.Widget.spin"]),
+        // A generic parameter is whatever instantiates it, even when a project
+        // type shares its name (two `spin`s: resolved by name, none).
+        ("src/untyped.rs.generic_shadow", &[], &["src/types.rs.Gadget.spin"]),
     ];
     let (_p, _d, db) = fresh_index_of(&d112_tree());
     let edges = calls_by_qualified_name(&db);
