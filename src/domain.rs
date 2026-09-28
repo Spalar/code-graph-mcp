@@ -123,6 +123,13 @@ pub fn is_external_import_meta(metadata: Option<&str>) -> bool {
 /// untyped member resolution — so the edge is classified like one.
 pub const CALL_META_MEMBER: &str = r#"{"q":"member"}"#;
 
+/// Call `q` of a JS/TS call through a renamed import (D#120): `b()` where the
+/// nearest binding of `b` is `import { a as b } from 's'`, `const { a: b } =
+/// require('s')` or `const b = require('s').a` is recorded as a call of `a`
+/// stamped `{"q":"imp","js_module":s,"v":a}`. It binds only the top-level
+/// function the file `s` names exports as `a` (`resolve::js_import_targets`).
+pub const CALL_Q_IMPORT: &str = "imp";
+
 // -- Import `q` markers --
 //
 // Stamped onto an import relation's metadata by the parser and read back in
@@ -368,7 +375,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 95; // v95 (2026-09-28, D#136): in a package with both `src/lib.rs` and `src/main.rs`, a `use` rooted at `crate`/`self`/`super` binds the root of the crate its file is compiled into (lib.rs and main.rs their own; another file the root that alone declares its top-level module, read from the roots' top-level `mod` items; both or unknown keeps both), a `use` rooted at the package's name binds its library, and neither binds the other crate's root through a re-export or the import's name fallback; the record of the roots' `mod` items (`rust_root_mods` meta) lets an incremental run re-extract the files a root's `mod` edit moves. // v94 (2026-09-28, D#112): a Rust method call whose receiver type the source writes down carries it (`"rt"`, `"rk"`/`"rc"`, `"rv"`, `"rp"`): `self`, a `let` with a type or a value that fixes one, a parameter, a `static`/`const`, a field of a struct the file defines; a std or dependency type binds only a project trait's method or an impl on that type, a project type only its own methods (of same-named types, the one its `use` path names), and such a call the unique-method rule cannot decide waits in the pending-call buffer. // Older entries (v93 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 96; // v96 (2026-09-28, D#120): a JS/TS bare call whose nearest binding is a renamed import (`import { a as b }`, `const { a: b } = require()`, `const b = require().a`) is recorded as a call of the export `a` stamped `{"q":"imp","js_module":spec,"v":a}` and binds only the top-level function the file that specifier names publishes as `a` (its CommonJS export map, now stamped `{"as":key}` on `exports` edges, first), buffered while that file lacks it; a parameter, local or sibling function's binding of `b` keeps a bare call. // v95 (2026-09-28, D#136): in a package with both `src/lib.rs` and `src/main.rs`, a `use` rooted at `crate`/`self`/`super` binds the root of the crate its file is compiled into (lib.rs and main.rs their own; another file the root that alone declares its top-level module, read from the roots' top-level `mod` items; both or unknown keeps both), a `use` rooted at the package's name binds its library, and neither binds the other crate's root through a re-export or the import's name fallback; the record of the roots' `mod` items (`rust_root_mods` meta) lets an incremental run re-extract the files a root's `mod` edit moves. // Older entries (v94 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before

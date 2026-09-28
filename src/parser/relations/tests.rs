@@ -3983,6 +3983,223 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
     assert_eq!(qux.metadata.as_deref(), Some(r#"{"q":"member"}"#));
 }
 
+/// D#120: the accepted-shape table for a JS/TS call through a renamed import.
+/// A bare call whose name the NEAREST enclosing binding makes a renamed import
+/// (`import { a as b }`, `const { a: b } = require()`, `const b =
+/// require().a`) is recorded as a call of the export `a`, stamped with the
+/// specifier and the export. Every other binding of the name — a parameter, a
+/// local, a function or class, a catch or loop variable, a hoisted `var`, the
+/// same rename in a sibling function — leaves the call bare, as does every
+/// shape deliberately not taken (default and dynamic imports, nested or
+/// defaulted patterns, a re-export, which binds no local name).
+#[test]
+fn test_js_renamed_import_call_shapes() {
+    let imp = |spec: &str, export: &str| {
+        Some(format!(
+            r#"{{"js_module":"{spec}","q":"imp","v":"{export}"}}"#
+        ))
+    };
+    #[allow(clippy::type_complexity)]
+    let table: &[(&str, &str, &str, Vec<(&str, &str, Option<String>)>)] = &[
+        (
+            "esm named as",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "cjs destructuring rename",
+            "javascript",
+            "const { load: m } = require('./x');\nfunction go() { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "require().prop",
+            "javascript",
+            "var m = require(\"./x\").load;\nfunction go() { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "function-local require rename",
+            "javascript",
+            "function go() { const { load: m } = require('./x'); m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "package specifier (resolver binds nothing)",
+            "javascript",
+            "import { resolve as r } from 'path';\nfunction go() { r(); }",
+            vec![("go", "resolve", imp("path", "resolve"))],
+        ),
+        (
+            "typescript named as",
+            "typescript",
+            "import { load as m } from './x';\nfunction go(): void { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "a method named like the alias binds no lexical name",
+            "javascript",
+            "import { load as m } from './x';\nclass C { m() {} go() { m(); } }",
+            vec![("C.go", "load", imp("./x", "load"))],
+        ),
+        (
+            "outer rename seen from a nested function",
+            "javascript",
+            "const { load: m } = require('./x');\nfunction go() { function inner() { m(); } }",
+            vec![("inner", "load", imp("./x", "load"))],
+        ),
+        (
+            "inner rename wins over outer one",
+            "javascript",
+            "import { load as m } from './x';\n\
+             function go() { { const { save: m } = require('./y'); m(); } m(); }",
+            vec![
+                ("go", "save", imp("./y", "save")),
+                ("go", "load", imp("./x", "load")),
+            ],
+        ),
+        (
+            "plain named import stays bare",
+            "javascript",
+            "import { load } from './x';\nfunction go() { load(); }",
+            vec![("go", "load", None)],
+        ),
+        (
+            "require().prop of the same name stays bare",
+            "javascript",
+            "var load = require('./x').load;\nfunction go() { load(); }",
+            vec![("go", "load", None)],
+        ),
+        (
+            "default import (not taken)",
+            "javascript",
+            "import m from './x';\nfunction go() { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "namespace import keeps its receiver",
+            "javascript",
+            "import * as ns from './x';\nfunction go() { ns.load(); }",
+            vec![("go", "load", Some(r#"{"q":"recv","v":"ns"}"#.to_string()))],
+        ),
+        (
+            "F5: a sibling function's own m()",
+            "javascript",
+            "function f() { const { load: m } = require('./x'); m(); }\nfunction go() { m(); }",
+            vec![("f", "load", imp("./x", "load")), ("go", "m", None)],
+        ),
+        (
+            "F5: parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(m) { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: destructured parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go({ m }) { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: arrow parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(a) { return [a].map(m => m()); }",
+            vec![
+                ("go", "map", Some(r#"{"q":"member"}"#.to_string())),
+                ("go", "m", None),
+            ],
+        ),
+        (
+            "F5: local const shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { const m = () => 1; m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: block function declaration shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(a) { if (a) { function m() {} m(); } }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: hoisted var shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(a) { if (a) { var m = 1; } m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: catch parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { try {} catch (m) { m(); } }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: loop variable shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(xs) { for (const m of xs) m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: named function expression shadows inside itself",
+            "javascript",
+            "import { load as m } from './x';\nconst go = function m() { m(); };",
+            vec![("<module>", "m", None)],
+        ),
+        (
+            "dynamic import (not taken)",
+            "javascript",
+            "async function go() { const { load: m } = await import('./x'); m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "nested pattern (not taken)",
+            "javascript",
+            "const { a: { load: m } } = require('./x');\nfunction go() { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "defaulted pattern (not taken)",
+            "javascript",
+            "const { load: m = f } = require('./x');\nfunction go() { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "re-export binds no local name",
+            "javascript",
+            "export { load as l } from './x';\nfunction go() { l(); }",
+            vec![("go", "l", None)],
+        ),
+        (
+            "type-only import",
+            "typescript",
+            "import type { Load as L } from './x';\nfunction go() { L(); }",
+            vec![("go", "L", None)],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, language, code, want) in table {
+        let relations = extract_relations(code, language).unwrap();
+        let got: Vec<(&str, &str, Option<String>)> = relations
+            .iter()
+            .filter(|r| {
+                r.relation == REL_CALLS && !matches!(r.target_name.as_str(), "require" | "import")
+            })
+            .map(|r| {
+                (
+                    r.source_name.as_str(),
+                    r.target_name.as_str(),
+                    r.metadata.clone(),
+                )
+            })
+            .collect();
+        if &got != want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn test_python_receiver_type_propagation_from_ctor_assignment() {
     // Issue #32 cause 2: `recv.method()` whose receiver is fixed by a single

@@ -15,7 +15,7 @@
 //! its own receiver qualifiers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::node_text;
 
@@ -30,15 +30,32 @@ thread_local! {
     /// a JS import / `require` names (`'express'`, `'./x'`); None for a Python
     /// relative import.
     static IMPORT_BOUND: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+    /// JS/TS local names the current file binds, somewhere, to another name's
+    /// export (`b` in `import { a as b }`, `const { a: b } = require()`,
+    /// `const b = require().a`). Only a prefilter: whether a call's `b` IS that
+    /// binding is decided at the call by [`js_renamed_import_call`].
+    static RENAMED_IMPORTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// [`hoisted_var`] per (function body or program node id, name): a body is
+    /// scanned once per name, not once per call in it. Per file (node ids are
+    /// unique only within a tree): reset by `reset_import_bound`.
+    #[allow(clippy::type_complexity)]
+    static HOISTED: RefCell<HashMap<(usize, String), Option<Option<(String, String)>>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
 pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: &str) {
     let mut names = HashMap::new();
+    let mut renamed = HashSet::new();
     if matches!(family, "python" | "javascript" | "typescript" | "tsx") {
         collect(root, source, family, &mut names, 0);
     }
+    if matches!(family, "javascript" | "typescript" | "tsx") {
+        collect_renamed(root, source, &mut renamed, 0);
+    }
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
+    RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
+    HOISTED.with(|h| h.borrow_mut().clear());
 }
 
 fn collect(
@@ -129,6 +146,388 @@ fn collect(
         if let Some(c) = node.named_child(i) {
             collect(c, source, family, out, depth + 1);
         }
+    }
+}
+
+/// Every local name a renamed-import binding introduces anywhere in the file.
+fn collect_renamed(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>, depth: usize) {
+    if depth > 256 {
+        return;
+    }
+    match node.kind() {
+        "import_specifier" => {
+            if let Some((local, _, _)) = renamed_specifier(node, source) {
+                out.insert(local);
+            }
+            return;
+        }
+        "variable_declarator" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                match name.kind() {
+                    "identifier" => {
+                        let local = node_text(&name, source);
+                        if renamed_require_binding(node, local, source).is_some() {
+                            out.insert(local.to_string());
+                        }
+                    }
+                    "object_pattern" => {
+                        for i in 0..name.named_child_count() {
+                            let Some(value) = name
+                                .named_child(i)
+                                .filter(|c| c.kind() == "pair_pattern")
+                                .and_then(|p| p.child_by_field_name("value"))
+                                .filter(|v| v.kind() == "identifier")
+                            else {
+                                continue;
+                            };
+                            let local = node_text(&value, source);
+                            if renamed_require_binding(node, local, source).is_some() {
+                                out.insert(local.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i) {
+            collect_renamed(c, source, out, depth + 1);
+        }
+    }
+}
+
+/// `import { a as b } from 's'` (a value import, not `import type`): (`b`,
+/// `a`, `s`). None when the name is not renamed.
+fn renamed_specifier(spec: tree_sitter::Node, source: &str) -> Option<(String, String, String)> {
+    let name = spec.child_by_field_name("name")?;
+    let alias = spec.child_by_field_name("alias")?;
+    if name.kind() != "identifier" || alias.kind() != "identifier" {
+        return None;
+    }
+    let (export, local) = (node_text(&name, source), node_text(&alias, source));
+    if export == local || has_type_keyword(spec) {
+        return None;
+    }
+    let statement = ancestor(spec, "import_statement")?;
+    if has_type_keyword(statement) {
+        return None;
+    }
+    let module = statement.child_by_field_name("source")?;
+    let module = node_text(&module, source).trim_matches(['"', '\'', '`']);
+    (!module.is_empty()).then(|| (local.to_string(), export.to_string(), module.to_string()))
+}
+
+/// A TS `import type { … }` / `import { type A as B }`: binds no value.
+fn has_type_keyword(node: tree_sitter::Node) -> bool {
+    (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .any(|c| matches!(c.kind(), "type" | "typeof"))
+}
+
+fn ancestor<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == kind {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// The `require('s')` call a declarator's value is, with its specifier.
+fn require_call(value: tree_sitter::Node, source: &str) -> Option<String> {
+    if value.kind() != "call_expression"
+        || value
+            .child_by_field_name("function")
+            .is_none_or(|f| f.kind() != "identifier" || node_text(&f, source) != "require")
+    {
+        return None;
+    }
+    let arg = value.child_by_field_name("arguments")?.named_child(0)?;
+    if arg.kind() != "string" {
+        return None;
+    }
+    let spec = node_text(&arg, source).trim_matches(['"', '\'', '`']);
+    (!spec.is_empty()).then(|| spec.to_string())
+}
+
+/// The export and specifier `local` is a renamed require of in `declarator`:
+/// `const { a: local } = require('s')` or `const local = require('s').a`, the
+/// export `a` a different name. A nested or defaulted pattern, an awaited or
+/// dynamic `import()`, and a same-named binding are not.
+fn renamed_require_binding(
+    declarator: tree_sitter::Node,
+    local: &str,
+    source: &str,
+) -> Option<(String, String)> {
+    let name = declarator.child_by_field_name("name")?;
+    let value = declarator.child_by_field_name("value")?;
+    let (export, spec) = match name.kind() {
+        "identifier" if node_text(&name, source) == local => {
+            if value.kind() != "member_expression" {
+                return None;
+            }
+            let property = value.child_by_field_name("property")?;
+            let spec = require_call(value.child_by_field_name("object")?, source)?;
+            (node_text(&property, source).to_string(), spec)
+        }
+        "object_pattern" => {
+            let spec = require_call(value, source)?;
+            let export = (0..name.named_child_count())
+                .filter_map(|i| name.named_child(i))
+                .filter(|c| c.kind() == "pair_pattern")
+                .find_map(|pair| {
+                    let key = pair.child_by_field_name("key")?;
+                    let value = pair.child_by_field_name("value")?;
+                    (key.kind() == "property_identifier"
+                        && value.kind() == "identifier"
+                        && node_text(&value, source) == local)
+                        .then(|| node_text(&key, source).to_string())
+                })?;
+            (export, spec)
+        }
+        _ => return None,
+    };
+    (export != local).then_some((export, spec))
+}
+
+/// The export and specifier a JS/TS bare call `b()` reaches through a renamed
+/// import (D#120): `b` must be bound, by the NEAREST enclosing declaration of
+/// it, to `import { a as b } from 's'`, `const { a: b } = require('s')` or
+/// `const b = require('s').a` — so a parameter, a local, a function, class,
+/// catch or loop variable, or a hoisted `var` named `b` in between shadows it,
+/// and a rename inside one function is invisible to a sibling.
+pub(super) fn js_renamed_import_call(
+    call: tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> Option<(String, String)> {
+    if !matches!(family, "javascript" | "typescript" | "tsx") {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&function, source);
+    if !RENAMED_IMPORTS.with(|r| r.borrow().contains(name)) {
+        return None;
+    }
+    let mut child = call;
+    while let Some(scope) = child.parent() {
+        if let Some(binding) = binding_in(scope, child, name, source) {
+            return binding;
+        }
+        child = scope;
+    }
+    None
+}
+
+/// Function-like nodes: a scope whose parameters bind names and whose `var`s
+/// hoist to it.
+fn is_function_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_expression"
+            | "function"
+            | "arrow_function"
+            | "method_definition"
+            | "generator_function"
+            | "generator_function_declaration"
+    )
+}
+
+/// What `scope` binds `name` to, seen from its child `from`: Some(Some(…)) a
+/// renamed import, Some(None) anything else, None no binding here.
+#[allow(clippy::option_option)]
+fn binding_in(
+    scope: tree_sitter::Node,
+    from: tree_sitter::Node,
+    name: &str,
+    source: &str,
+) -> Option<Option<(String, String)>> {
+    let kind = scope.kind();
+    if is_function_like(kind) {
+        let params = scope
+            .child_by_field_name("parameters")
+            .or_else(|| scope.child_by_field_name("parameter"));
+        if params.is_some_and(|p| binds(p, name, source)) {
+            return Some(None);
+        }
+        // `function m() { m() }` as an expression names itself inside.
+        if matches!(
+            kind,
+            "function_expression" | "function" | "generator_function"
+        ) && scope
+            .child_by_field_name("name")
+            .is_some_and(|n| node_text(&n, source) == name)
+        {
+            return Some(None);
+        }
+    }
+    // `catch (m)`, `for (const m of xs)`.
+    let caught_or_looped = match kind {
+        "catch_clause" => scope
+            .child_by_field_name("parameter")
+            .is_some_and(|p| binds(p, name, source)),
+        "for_in_statement" => scope
+            .child_by_field_name("left")
+            .is_some_and(|l| l.id() != from.id() && binds(l, name, source)),
+        _ => false,
+    };
+    if caught_or_looped {
+        return Some(None);
+    }
+    for i in 0..scope.named_child_count() {
+        let Some(c) = scope.named_child(i) else {
+            continue;
+        };
+        if let Some(found) = declares(c, name, source) {
+            return Some(found);
+        }
+    }
+    // A `var` anywhere in a function body or the program is hoisted to it.
+    let body = if is_function_like(kind) {
+        scope.child_by_field_name("body")
+    } else if kind == "program" {
+        Some(scope)
+    } else {
+        None
+    };
+    let body = body?;
+    let key = (body.id(), name.to_string());
+    if let Some(memo) = HOISTED.with(|h| h.borrow().get(&key).cloned()) {
+        return memo;
+    }
+    let found = hoisted_var(body, name, source, 0);
+    HOISTED.with(|h| h.borrow_mut().insert(key, found.clone()));
+    found
+}
+
+/// What a statement directly in a scope declares `name` as, if it does.
+#[allow(clippy::option_option)]
+fn declares(stmt: tree_sitter::Node, name: &str, source: &str) -> Option<Option<(String, String)>> {
+    match stmt.kind() {
+        "lexical_declaration" | "variable_declaration" => declarators(stmt, name, source),
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_signature"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "enum_declaration" => stmt
+            .child_by_field_name("name")
+            .filter(|n| node_text(n, source) == name)
+            .map(|_| None),
+        "export_statement" => stmt
+            .child_by_field_name("declaration")
+            .and_then(|d| declares(d, name, source)),
+        "import_statement" => {
+            let mut found = None;
+            let mut stack = vec![stmt];
+            while let Some(n) = stack.pop() {
+                match n.kind() {
+                    "import_specifier" => {
+                        let local = n
+                            .child_by_field_name("alias")
+                            .or_else(|| n.child_by_field_name("name"));
+                        if local.is_some_and(|l| node_text(&l, source) == name) {
+                            found = Some(
+                                renamed_specifier(n, source)
+                                    .map(|(_, export, module)| (export, module)),
+                            );
+                        }
+                    }
+                    "identifier" if node_text(&n, source) == name => found = Some(None),
+                    "string" => {}
+                    _ => {
+                        for i in 0..n.named_child_count() {
+                            if let Some(c) = n.named_child(i) {
+                                stack.push(c);
+                            }
+                        }
+                    }
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::option_option)]
+fn declarators(
+    decl: tree_sitter::Node,
+    name: &str,
+    source: &str,
+) -> Option<Option<(String, String)>> {
+    for i in 0..decl.named_child_count() {
+        let Some(d) = decl
+            .named_child(i)
+            .filter(|d| d.kind() == "variable_declarator")
+        else {
+            continue;
+        };
+        if d.child_by_field_name("name")
+            .is_some_and(|n| binds(n, name, source))
+        {
+            return Some(renamed_require_binding(d, name, source));
+        }
+    }
+    None
+}
+
+/// A `var` declaring `name` inside `node`, not crossing into a nested function.
+#[allow(clippy::option_option)]
+fn hoisted_var(
+    node: tree_sitter::Node,
+    name: &str,
+    source: &str,
+    depth: usize,
+) -> Option<Option<(String, String)>> {
+    if depth > 256 {
+        return None;
+    }
+    for i in 0..node.named_child_count() {
+        let Some(c) = node.named_child(i) else {
+            continue;
+        };
+        if is_function_like(c.kind()) || matches!(c.kind(), "class_declaration" | "class") {
+            continue;
+        }
+        if c.kind() == "variable_declaration" {
+            if let Some(found) = declarators(c, name, source) {
+                return Some(found);
+            }
+        }
+        if let Some(found) = hoisted_var(c, name, source, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Whether a binding pattern (a declarator name, a parameter list, a catch
+/// parameter) binds `name`. Over-inclusive on purpose: a default value that
+/// mentions `name` counts, which only leaves a call bare.
+fn binds(pattern: tree_sitter::Node, name: &str, source: &str) -> bool {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            node_text(&pattern, source) == name
+        }
+        // `{ key: value }`: the key names a property, not a binding.
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .is_some_and(|v| binds(v, name, source)),
+        // TS type annotations bind nothing.
+        "type_annotation" => false,
+        _ => (0..pattern.named_child_count())
+            .filter_map(|i| pattern.named_child(i))
+            .any(|c| binds(c, name, source)),
     }
 }
 

@@ -55,6 +55,15 @@ pub(super) enum CalleeMeta {
     /// (`r->index_block.Add()`, `versions_->current()->Ref()`; parser
     /// `receiver::cpp_chain_receiver`). Rewritten like [`Self::Field`].
     Via,
+    /// JS/TS `b()` through a renamed import (D#120, parser
+    /// `member::js_renamed_import_call`), recorded as a call of the export.
+    /// Binds only what [`js_import_targets`] finds in the file `module` names:
+    /// never by name elsewhere, at batch time, in the deferred pass, or on the
+    /// pending sweep.
+    Import {
+        module: String,
+        export: String,
+    },
     /// Python `m.f()` where `m` is bound by an absolute import of module `v`
     /// (`relations/member.rs`): no project code runs unless `v` is a project
     /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
@@ -110,6 +119,10 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .get("v")?
             .as_str()
             .map(|r| CalleeMeta::Receiver(r.to_string())),
+        crate::domain::CALL_Q_IMPORT => Some(CalleeMeta::Import {
+            module: v.get("js_module")?.as_str()?.to_string(),
+            export: v.get("v")?.as_str()?.to_string(),
+        }),
         _ => None,
     }
 }
@@ -213,6 +226,92 @@ pub(super) fn refine_ambiguous_targets(
     }
 }
 
+/// The `pending_unresolved_calls.target_name` of a buffered call through a
+/// renamed import (D#120). The table is unique on (caller, target name,
+/// language), so the export's name alone let one caller's `m()` from './x' and
+/// `v()` from './val' — both calls of `load` — keep a single row between them,
+/// and whichever lost never bound. The sweep reads the call from its metadata,
+/// so this name only has to be distinct per (specifier, export).
+pub(super) fn js_import_pending_name(metadata: Option<&str>, target_name: &str) -> String {
+    match parse_callee_metadata(metadata) {
+        Some(CalleeMeta::Import { module, export }) => format!("{export}\u{1f}{module}"),
+        _ => target_name.to_string(),
+    }
+}
+
+/// The node a call through a renamed import binds (D#120): in the file the
+/// specifier names, the top-level function published under `export` — the
+/// symbol an export map renames to it (`module.exports = { load: realLoad }`,
+/// `exports.load = realLoad`, stamped `{"as": …}` by the parser) when the file
+/// has one, else its top-level function of that name. Never a method or a
+/// nested function sharing the name, and never anything outside that file.
+///
+/// `None` when the specifier names no indexed file (a package, a missing
+/// file): nothing to bind and nothing to wait for — a file appearing later
+/// re-extracts the importer (`existence_change_dependents`). `Some(empty)`
+/// when the file is there without such a function yet: the caller buffers the
+/// call, so the export binds when the file gains it.
+///
+/// Read from the database, after every batch's nodes and `exports` edges are
+/// in: the batch pass always defers these calls.
+pub(super) fn js_import_targets(
+    conn: &rusqlite::Connection,
+    caller_path: &str,
+    module: &str,
+    export: &str,
+    all_file_paths: &HashSet<String>,
+) -> Result<Option<Vec<i64>>> {
+    let Some(file) =
+        super::js_modules::resolve_js_specifier_path(module, caller_path, all_file_paths)
+    else {
+        return Ok(None);
+    };
+    // A candidate is a top-level function: no other function, method or class
+    // of its file spans its lines. (Two functions sharing one line both fail
+    // it: a missed edge, never a method's.)
+    const TOP_LEVEL: &str = "n.type = 'function'
+        AND NOT EXISTS (
+            SELECT 1 FROM nodes o
+            WHERE o.file_id = n.file_id AND o.id <> n.id
+              AND o.type IN ('function', 'method', 'class')
+              AND o.start_line <= n.start_line AND o.end_line >= n.end_line)";
+    // Every symbol the file exports under this name; the filter applies after,
+    // so an export map naming a class or a method binds nothing rather than a
+    // same-named function the map does not publish.
+    let mut mapped = conn.prepare_cached(&format!(
+        "SELECT n.id, ({TOP_LEVEL}) FROM files f
+         JOIN nodes m ON m.file_id = f.id AND m.name = '<module>'
+         JOIN edges e ON e.source_id = m.id AND e.relation = ?3
+         JOIN nodes n ON n.id = e.target_id AND n.file_id = f.id
+         WHERE f.path = ?1 AND json_extract(e.metadata, '$.as') = ?2"
+    ))?;
+    let rows: Vec<(i64, bool)> = mapped
+        .query_map(
+            rusqlite::params![file, export, crate::domain::REL_EXPORTS],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    if !rows.is_empty() {
+        let mut ids: Vec<i64> = rows
+            .into_iter()
+            .filter(|(_, f)| *f)
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        return Ok(Some(ids));
+    }
+    let mut named = conn.prepare_cached(&format!(
+        "SELECT n.id FROM files f JOIN nodes n ON n.file_id = f.id
+         WHERE f.path = ?1 AND n.name = ?2 AND {TOP_LEVEL}
+         ORDER BY n.id"
+    ))?;
+    let ids: Vec<i64> = named
+        .query_map(rusqlite::params![file, export], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(ids))
+}
+
 /// Sweep `pending_unresolved_calls` against the current node state. Rows whose
 /// `(target_name, source_language)` now match a real node become a `calls`
 /// edge and the pending row is dropped; rows that still don't resolve stay
@@ -295,6 +394,47 @@ pub(super) fn resolve_pending_calls_touching(
     let mut all_file_paths: Option<HashSet<String>> = None;
 
     for row in &pending {
+        // A call through a renamed import (D#120) binds what the file its
+        // specifier names exports, and nothing by name: a requeue after the
+        // export was renamed must bind what a rebuild binds, which is nothing.
+        if let Some(CalleeMeta::Import { module, export }) =
+            parse_callee_metadata(row.metadata.as_deref())
+        {
+            if all_file_paths.is_none() {
+                all_file_paths = Some(
+                    db.conn()
+                        .prepare("SELECT path FROM files")?
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<_>>()?,
+                );
+            }
+            let caller_path = source_id_to_path
+                .get(&row.source_id)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let files = all_file_paths.as_ref().expect("loaded above");
+            match js_import_targets(db.conn(), caller_path, &module, &export, files)? {
+                // Still waiting for the file to define it: stays buffered.
+                Some(ids) if ids.is_empty() => continue,
+                Some(ids) => {
+                    for tgt_id in ids.iter().filter(|id| **id != row.source_id) {
+                        if insert_edge_cached(
+                            db.conn(),
+                            row.source_id,
+                            *tgt_id,
+                            REL_CALLS,
+                            row.metadata.as_deref(),
+                        )? {
+                            edges_added += 1;
+                            touched.insert(caller_path.to_string());
+                        }
+                    }
+                }
+                None => {}
+            }
+            to_delete.push(row.id);
+            continue;
+        }
         let candidates: Vec<i64> = name_to_lang_targets
             .get(&row.target_name)
             .map(|entries| {
@@ -1762,7 +1902,9 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                             AND i.tid = tgt.id
                       )
                       -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
-                      -- qualifier (self / stype / rtype / super / path). Those bind the call
+                      -- qualifier (self / stype / rtype / super / path), or through a
+                      -- renamed JS import to the file its specifier names (imp,
+                      -- D#120). Those bind the call
                       -- by a structural signal (the receiver's impl type, or the
                       -- module path), not by a bare-name guess among same-name
                       -- siblings — so a duplicate bare name must not relabel them
@@ -1773,7 +1915,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- A typed call its class did not decide carries `amb`
                       -- (`ambiguous_meta`) and is classified like a bare one.
                       AND (json_extract(e.metadata, '$.q') IS NULL
-                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path')
+                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp')
                            OR json_extract(e.metadata, '$.amb') IS NOT NULL)
                  THEN ?3 ELSE ?4 END";
     const CONF_WHERE: &str = "

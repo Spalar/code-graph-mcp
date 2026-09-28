@@ -3,11 +3,12 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 92 → 95 because the Rust fixes below change which `calls`
-and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
-@sdsrs/code-graph@0.161.0`, or `cargo install code-graph-mcp --version
-0.161.0`; plugin users can set the version in the marketplace entry. An older
-binary leaves a v95 index intact and warns instead of rebuilding it; delete
+`INDEX_VERSION` goes 92 → 96 because the Rust and JavaScript fixes below change
+which `calls`, `imports` and `exports` edges a file produces. Nothing to run. To
+pin back: `npm i -g @sdsrs/code-graph@0.161.0`, or `cargo install
+code-graph-mcp --version 0.161.0`; plugin users can set the version in the
+marketplace entry. An older binary leaves a v96 index intact and warns instead
+of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
 ### A Rust call resolves through the file's `use`
@@ -177,8 +178,64 @@ Measured cost (ms, previous commit → this): full index of tokio
 re-extracts the 2 files under `src/sandbox/`, and the index after it, and
 after removing it again, matched a rebuild edge for edge.
 
+### A call through a renamed JavaScript import binds the export
+
+`import { load as loadModel } from './model'`,
+`const { clearCache: clearBinaryCache } = require('./find-binary')` and
+`const loadModel = require('./model').load` bind a local name the exporting
+file never defines, so `loadModel()` bound nothing, or another file's function
+of that name. It now binds the export in the file the specifier names:
+
+- The call is read as the export's (`load`) only when the nearest declaration
+  of `loadModel` around it is that import. A parameter, a local, a function or
+  class declaration, a catch or loop variable or a hoisted `var` of the same
+  name keeps the call bare, and a `require` rename inside one function is
+  invisible to a sibling function's own `loadModel()`.
+- It binds a top-level function only: never a class method or a nested
+  function that shares the name, nor a constant. A CommonJS export map that
+  publishes a function under another name is followed
+  (`module.exports = { load: realLoad }`, `exports.load = realLoad` bind
+  `realLoad`; those `exports` edges now record the published name), and when
+  the map publishes something else as `load`, the file's own `load` is not
+  bound.
+- A package's export (`import { resolve as r } from 'path'`) binds nothing.
+- An incremental run agrees with a rebuild: when the export is renamed away
+  the call binds nothing (it no longer binds a same-named function elsewhere);
+  when the file gains the export later, or its export map moves to another
+  function, the call binds it; when the file is deleted and comes back, it
+  binds again.
+
+This is the design of the change withdrawn before 0.160.0, redone against the
+four defects its review reproduced, each now a named test that fails on the
+withdrawn design (`test_js_renamed_import_*`).
+
+SCIP oracle, the same snapshot for both arms: this repo's JavaScript recall at
+the default floor 1,354 → 1,358 of 1,360 gold pairs (the four calls it adds
+are the four known misses, `doctor.js` ×3 and `auto-update.js`), inferred
+precision 519/519 → 523/523; hono 801 → 805 of 896, inferred precision
+492/522 → 496/526 (4 edges added, all judged correct; 9 more it adds are
+unjudged by the oracle and correct on reading); express unchanged (892 edges,
+identical line for line), and this repo's Python scores unchanged. No correct
+pair lost, no edge removed on any of the three. Full index time, median of 5
+alternating runs: this repo 1.88 s → 1.89 s, hono 0.54 s → 0.55 s, express
+0.19 s → 0.18 s.
+
 ### Not covered
 
+- A renamed import of a re-export (`import { a as b } from './index'` where
+  `index.js` has `export { a } from './impl'`), a default import
+  (`import b from './x'; b()`), a dynamic `import()`, a nested or defaulted
+  destructuring (`{ a: { c } }`, `{ a: b = f }`), and a call that is not a
+  bare call (`new B()` through `import { A as B }`, `b.call()`, `b` passed as
+  a callback) bind as before. So does a renamed ESM export
+  (`export { realLoad as load }`), which records no export map.
+- A renamed-import call whose file lacks the export waits in the pending-call
+  buffer and ages out after 50 runs, like any buffered call; an export added
+  after that binds on a rebuild only. A specifier that starts resolving to a
+  different file (`./x` from `x/index.js` to a new `x.js`) keeps the old edge
+  until the caller's file changes.
+- Two top-level functions on one line, or a function nested on its parent's
+  line, both read as nested: the call binds neither.
 - An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
   tokio's runtime) is no node, so a call the `use` sends there binds nothing
   (it waits in the pending-call buffer). Parsing a `cfg_*! { … }` body as the

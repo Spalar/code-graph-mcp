@@ -449,6 +449,21 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 } else {
                     metadata
                 };
+                // `b()` through `import { a as b }` / `const { a: b } =
+                // require()` calls the export `a` (D#120, `member.rs`).
+                let (callee, metadata) =
+                    match super::member::js_renamed_import_call(node, source, ctx.config.name) {
+                        Some((export, module)) => {
+                            let metadata = serde_json::json!({
+                                "q": crate::domain::CALL_Q_IMPORT,
+                                "js_module": module,
+                                "v": export,
+                            })
+                            .to_string();
+                            (export, Some(metadata))
+                        }
+                        None => (callee, metadata),
+                    };
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,

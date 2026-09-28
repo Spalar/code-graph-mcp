@@ -9229,3 +9229,261 @@ fn test_rust_crate_root_membership_incremental_matches_rebuild() {
     assert_eq!(reindexed(&[MAIN_EXTRA]), [1]);
     assert_eq!(reindexed(&[MAIN_USER, MAIN_USER_EXTRA]), [2, 1]);
 }
+
+/// D#120 fixture: one caller file reaching every accepted and every refused
+/// shape of a renamed import (see `test_js_renamed_import_call_shapes` for the
+/// parser half).
+const D120_TREE: &[(&str, &str)] = &[
+    (
+        "src/x.js",
+        "export function load() { return 1; }\nexport const arrow = () => 2;\n",
+    ),
+    (
+        "src/x2.js",
+        "function outer() { function load() { return 3; } return load(); }\nmodule.exports = { outer };\n",
+    ),
+    (
+        "src/cjs.js",
+        "function clearCache() { return 4; }\nmodule.exports = { clearCache };\n",
+    ),
+    (
+        "src/alias.js",
+        "function realLoad() { return 5; }\nclass Model {\n  load() { return 6; }\n}\nmodule.exports = { load: realLoad, Model };\n",
+    ),
+    (
+        "src/exp.js",
+        "function realSave() { return 7; }\nexports.save = realSave;\n",
+    ),
+    ("src/val.js", "export const load = 5;\n"),
+    ("src/reexp.js", "export { load } from './x';\n"),
+    // The export map publishes a class as `load`: the file's own function
+    // `load` is not what the import reaches.
+    (
+        "src/map2.js",
+        "function load() { return 11; }\nclass Real {}\nmodule.exports = { load: Real };\n",
+    ),
+    // A second `realLoad`: the call binds one of two same-named functions by
+    // the export map, not by name, so it stays `inferred`.
+    ("src/dup.js", "export function realLoad() { return 10; }\n"),
+    (
+        "src/other.js",
+        "export function m1() {}\nexport function resolve() {}\n",
+    ),
+    (
+        "src/use.js",
+        "import { load as loadModel, arrow as arr } from './x';\n\
+         import { resolve as m1 } from 'path';\n\
+         import { load as v } from './val';\n\
+         import { load as viaBarrel } from './reexp';\n\
+         const { clearCache: clearBinaryCache } = require('./cjs');\n\
+         const { load: aliasLoad } = require('./alias');\n\
+         const saveIt = require('./exp').save;\n\
+         const { load: n } = require('./x2');\n\
+         const { load: viaClassMap } = require('./map2');\n\
+         function load() { return 8; }\n\
+         function clearCache() { return 9; }\n\
+         function go() { loadModel(); arr(); m1(); v(); viaBarrel(); clearBinaryCache(); aliasLoad(); saveIt(); n(); viaClassMap(); }\n",
+    ),
+];
+
+/// The edges D120_TREE must and must not have from `use.js`'s `go`.
+fn check_d120_edges(edges: &[String], when: &str) {
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    let lost: Vec<&str> = [
+        "src/use.js.go --calls--> src/x.js.load",
+        "src/use.js.go --calls--> src/x.js.arrow",
+        "src/use.js.go --calls--> src/cjs.js.clearCache",
+        // `module.exports = { load: realLoad }` exports `realLoad` as `load`.
+        "src/use.js.go --calls--> src/alias.js.realLoad",
+        "src/use.js.go --calls--> src/exp.js.realSave",
+    ]
+    .into_iter()
+    .filter(|e| !has(e))
+    .collect();
+    let bound: Vec<&str> = [
+        // A rename usually avoids a same-file function of the export's name.
+        "src/use.js.go --calls--> src/use.js.load",
+        "src/use.js.go --calls--> src/use.js.clearCache",
+        // F6: a class method sharing the export's name is not the export.
+        "src/use.js.go --calls--> src/alias.js.load",
+        // A package's export runs no project code, whatever its names.
+        "src/use.js.go --calls--> src/other.js.resolve",
+        "src/use.js.go --calls--> src/other.js.m1",
+        "src/use.js.go --calls--> src/dup.js.realLoad",
+        "src/use.js.go --calls--> src/map2.js.load",
+        // A nested function is no export; a constant is not callable code.
+        "src/use.js.go --calls--> src/x2.js.load",
+        "src/use.js.go --calls--> src/val.js.load",
+    ]
+    .into_iter()
+    .filter(|e| has(e))
+    .collect();
+    assert!(
+        lost.is_empty() && bound.is_empty(),
+        "{when}: lost {lost:#?}\nbound {bound:#?}\n{edges:#?}"
+    );
+}
+
+/// D#120: a call through a renamed import binds the export in the file the
+/// specifier names — on a full index and after every file is touched in turn.
+#[test]
+fn test_js_renamed_import_binds_the_export() {
+    let (project, _d, db) = fresh_index_of(D120_TREE);
+    check_d120_edges(&edge_set(&db), "full index");
+    let aliased: Vec<String> = call_edges_with_confidence(&db)
+        .into_iter()
+        .filter(|e| e.starts_with("src/use.js.go -> src/alias.js.realLoad "))
+        .collect();
+    assert_eq!(
+        aliased,
+        [
+            r#"src/use.js.go -> src/alias.js.realLoad {"js_module":"./alias","q":"imp","v":"load"} inferred"#
+        ]
+    );
+    for (f, _) in D120_TREE {
+        let body = fs::read_to_string(project.path().join(f)).unwrap();
+        fs::write(project.path().join(f), format!("{body}\n")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        check_d120_edges(&edge_set(&db), &format!("after {f} changed"));
+    }
+    let files: Vec<(&str, String)> = D120_TREE
+        .iter()
+        .map(|(f, _)| (*f, fs::read_to_string(project.path().join(f)).unwrap()))
+        .collect();
+    let files: Vec<(&str, &str)> = files.iter().map(|(f, b)| (*f, b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        call_edges_with_confidence(&control),
+        "every file touched must equal a rebuild"
+    );
+}
+
+/// D#120 F1: the export renamed away. The requeued edge must not be bound by
+/// name in another file (`y.js:load`), and a later sweep must not either.
+#[test]
+fn test_js_renamed_import_export_renamed_away_matches_rebuild() {
+    let before: &[(&str, &str)] = &[
+        ("x.js", "export function load() {}\n"),
+        ("y.js", "export function load() {}\n"),
+        (
+            "a.js",
+            "import { load as m } from './x';\nconst { load: c } = require('./x');\nfunction go() { m(); c(); }\n",
+        ),
+    ];
+    assert_incremental_matches_rebuild(before, &[("x.js", Some("export function load2() {}\n"))]);
+    let (project, _d, db) = fresh_index_of(before);
+    assert!(edge_set(&db).contains(&"a.js.go --calls--> x.js.load".to_string()));
+    fs::write(project.path().join("x.js"), "export function load2() {}\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    // A second run sweeps the buffered row again.
+    fs::write(project.path().join("y.js"), "export function load() {}\n\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let calls: Vec<String> = edge_set(&db)
+        .into_iter()
+        .filter(|e| e.starts_with("a.js.go --calls-->"))
+        .collect();
+    assert!(calls.is_empty(), "{calls:#?}");
+}
+
+/// D#120 F2: an export the file gains later binds on the incremental run, and
+/// a changed CommonJS export map rebinds — as a rebuild of each tree does.
+#[test]
+fn test_js_renamed_import_export_added_later_matches_rebuild() {
+    let caller = (
+        "a.js",
+        "import { load as m } from './x';\nconst { save: s } = require('./z');\nfunction go() { m(); s(); }\n",
+    );
+    let z = "function one() {}\nfunction two() {}\nmodule.exports = { save: one };\n";
+    let before: &[(&str, &str)] = &[
+        ("x.js", "export function other() {}\n"),
+        ("z.js", z),
+        caller,
+    ];
+    let added = "export function other() {}\nexport function load() {}\n";
+    assert_incremental_matches_rebuild(before, &[("x.js", Some(added))]);
+    let moved = "function one() {}\nfunction two() {}\nmodule.exports = { save: two };\n";
+    assert_incremental_matches_rebuild(before, &[("z.js", Some(moved))]);
+    // Not vacuous: the incremental run binds both.
+    let (project, _d, db) = fresh_index_of(before);
+    fs::write(project.path().join("x.js"), added).unwrap();
+    fs::write(project.path().join("z.js"), moved).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let edges = edge_set(&db);
+    for want in [
+        "a.js.go --calls--> x.js.load",
+        "a.js.go --calls--> z.js.two",
+    ] {
+        assert!(
+            edges.contains(&want.to_string()),
+            "{want} missing: {edges:#?}"
+        );
+    }
+    assert!(
+        !edges.contains(&"a.js.go --calls--> z.js.one".to_string()),
+        "{edges:#?}"
+    );
+}
+
+/// D#120 F6: the export map changed so that only a class method shares the
+/// export's name; and the exporting file deleted, then restored.
+#[test]
+fn test_js_renamed_import_export_removed_or_deleted_matches_rebuild() {
+    let before: &[(&str, &str)] = &[
+        (
+            "alias.js",
+            "function realLoad() {}\nclass Model {\n  load() {}\n}\nmodule.exports = { load: realLoad, Model };\n",
+        ),
+        (
+            "a.js",
+            "const { load: m } = require('./alias');\nfunction go() { m(); }\n",
+        ),
+    ];
+    let no_export =
+        "function realLoad() {}\nclass Model {\n  load() {}\n}\nmodule.exports = { Model };\n";
+    assert_incremental_matches_rebuild(before, &[("alias.js", Some(no_export))]);
+    assert_incremental_matches_rebuild(before, &[("alias.js", None)]);
+    let (project, _d, db) = fresh_index_of(before);
+    let alias = fs::read_to_string(project.path().join("alias.js")).unwrap();
+    fs::remove_file(project.path().join("alias.js")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert!(!edge_set(&db)
+        .iter()
+        .any(|e| e.starts_with("a.js.go --calls-->")));
+    fs::write(project.path().join("alias.js"), alias).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let edges = edge_set(&db);
+    assert!(
+        edges.contains(&"a.js.go --calls--> alias.js.realLoad".to_string())
+            && !edges.contains(&"a.js.go --calls--> alias.js.load".to_string()),
+        "{edges:#?}"
+    );
+}
+
+/// D#120 F5: a rename inside one function is that function's; a sibling's own
+/// `m()` and a parameter `m` keep their bare resolution.
+#[test]
+fn test_js_renamed_import_is_scoped() {
+    let (_p, _d, db) = fresh_index_of(&[
+        ("x.js", "export function load() {}\n"),
+        ("z.js", "export function m() {}\n"),
+        (
+            "a.js",
+            "function f() { const { load: m } = require('./x'); m(); }\n\
+             function g() { m(); }\n\
+             function h(m) { m(); }\n",
+        ),
+    ]);
+    let edges = edge_set(&db);
+    assert!(
+        edges.contains(&"a.js.f --calls--> x.js.load".to_string()),
+        "{edges:#?}"
+    );
+    for wrong in [
+        "a.js.f --calls--> z.js.m",
+        "a.js.g --calls--> x.js.load",
+        "a.js.h --calls--> x.js.load",
+    ] {
+        assert!(!edges.contains(&wrong.to_string()), "{wrong}: {edges:#?}");
+    }
+}

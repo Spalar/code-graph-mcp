@@ -959,7 +959,7 @@ fn buffer_inbound_before_node_purge(
         crate::storage::queries::insert_pending_unresolved_call(
             db.conn(),
             source_id,
-            &target_name,
+            &super::resolve::js_import_pending_name(metadata.as_deref(), &target_name),
             &source_language,
             metadata.as_deref(),
         )?;
@@ -1743,6 +1743,18 @@ fn resolve_batch_relations(
                     // `click.echo()` through an import of a library module: no
                     // project code can run. A project module resolves as bare.
                     Some(CalleeMeta::Module(module)) if !py_modules.contains(&module) => {
+                        continue;
+                    }
+                    // `b()` through a renamed import (D#120) binds by the
+                    // exporting file's nodes and export map, which a later batch
+                    // may hold: decided in the deferred pass, from the database.
+                    Some(CalleeMeta::Import { .. }) => {
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
                         continue;
                     }
                     Some(CalleeMeta::Receiver(recv))
@@ -3155,8 +3167,17 @@ fn restore_inbound_edges(
                         .unwrap_or_default()
                 })
                 .clone();
-            let new_target_ids: Option<Vec<i64>> = batch_name_to_ids
-                .get(&(*target_file_id, target_name.as_str()))
+            // A call through a renamed import (D#120) is decided by the file's
+            // export map, not by the name its old target had: re-resolved from
+            // the pending buffer, never restored onto a same-named node.
+            let renamed_import = relation.as_str() == REL_CALLS
+                && matches!(
+                    super::resolve::parse_callee_metadata(metadata.as_deref()),
+                    Some(super::resolve::CalleeMeta::Import { .. })
+                );
+            let new_target_ids: Option<Vec<i64>> = (!renamed_import)
+                .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
+                .flatten()
                 .map(|found| {
                     found
                         .iter()
@@ -3224,7 +3245,7 @@ fn restore_inbound_edges(
                     crate::storage::queries::insert_pending_unresolved_call(
                         db.conn(),
                         *source_id,
-                        target_name,
+                        &super::resolve::js_import_pending_name(metadata.as_deref(), target_name),
                         &src_lang,
                         metadata.as_deref(),
                     )?;
@@ -3410,6 +3431,48 @@ fn resolve_deferred_relations(
         };
         if source_ids.is_empty() {
             continue;
+        }
+
+        // A call through a renamed import (D#120): the export in the file its
+        // specifier names, else buffered while that file lacks it, else nothing.
+        if d.relation == REL_CALLS {
+            if let Some(CalleeMeta::Import { module, export }) =
+                parse_callee_metadata(d.metadata.as_deref())
+            {
+                match super::resolve::js_import_targets(
+                    db.conn(),
+                    &d.rel_path,
+                    &module,
+                    &export,
+                    all_file_paths,
+                )? {
+                    Some(ids) if ids.is_empty() => {
+                        let pending_name =
+                            super::resolve::js_import_pending_name(d.metadata.as_deref(), &export);
+                        for source_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                *source_id,
+                                &pending_name,
+                                &d.language,
+                                d.metadata.as_deref(),
+                            )?;
+                        }
+                    }
+                    Some(ids) => {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &ids,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    }
+                    None => {}
+                }
+                continue;
+            }
         }
 
         let import_meta: Option<serde_json::Value> = if d.relation == REL_IMPORTS {

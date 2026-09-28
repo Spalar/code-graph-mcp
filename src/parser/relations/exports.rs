@@ -333,15 +333,22 @@ pub(super) fn extract_cjs_exports(
     }
     let left_text = node_text(&left, source);
 
-    let mut emit = |name: &str| {
+    // `key` is the name the export is published under when it differs from the
+    // symbol's own (`{ load: realLoad }`, `exports.load = realLoad`): stamped
+    // `{"as": key}`, the export map a renamed import's call binds through
+    // (D#120, `resolve::js_import_targets`).
+    let mut emit_as = |name: &str, key: Option<&str>| {
         if name.is_empty() {
             return;
         }
+        let metadata = key
+            .filter(|k| !k.is_empty() && *k != name)
+            .map(|k| serde_json::json!({ "as": k }).to_string());
         results.push(ParsedRelation {
             source_name: "<module>".into(),
             target_name: name.to_string(),
             relation: REL_EXPORTS.into(),
-            metadata: None,
+            metadata,
             source_language: String::new(),
             source_line: None,
         });
@@ -356,7 +363,7 @@ pub(super) fn extract_cjs_exports(
                         continue;
                     };
                     match prop.kind() {
-                        "shorthand_property_identifier" => emit(node_text(&prop, source)),
+                        "shorthand_property_identifier" => emit_as(node_text(&prop, source), None),
                         "pair" => {
                             // ONLY the value, and only when it names a symbol.
                             // Falling back to the KEY bound the wrong node:
@@ -369,7 +376,11 @@ pub(super) fn extract_cjs_exports(
                                 .child_by_field_name("value")
                                 .filter(|v| v.kind() == "identifier")
                             {
-                                emit(node_text(&v, source));
+                                let key = prop
+                                    .child_by_field_name("key")
+                                    .filter(|k| k.kind() == "property_identifier")
+                                    .map(|k| node_text(&k, source));
+                                emit_as(node_text(&v, source), key);
                             }
                         }
                         _ => {}
@@ -377,7 +388,7 @@ pub(super) fn extract_cjs_exports(
                 }
             }
             // `module.exports = helper`
-            "identifier" => emit(node_text(&right, source)),
+            "identifier" => emit_as(node_text(&right, source), None),
             _ => {}
         }
         return;
@@ -394,12 +405,13 @@ pub(super) fn extract_cjs_exports(
     if !is_exports_member {
         return;
     }
-    let named = if right.kind() == "identifier" {
-        Some(right)
-    } else {
-        left.child_by_field_name("property")
-    };
-    if let Some(n) = named {
-        emit(node_text(&n, source));
+    let property = left.child_by_field_name("property");
+    if right.kind() == "identifier" {
+        let key = property
+            .filter(|p| p.kind() == "property_identifier")
+            .map(|p| node_text(&p, source));
+        emit_as(node_text(&right, source), key);
+    } else if let Some(p) = property {
+        emit_as(node_text(&p, source), None);
     }
 }
