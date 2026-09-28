@@ -33,14 +33,56 @@ struct ImplBlock {
     /// `From<u16>` are different traits); None for an inherent impl.
     of_trait: Option<String>,
     /// Methods defined directly in the block: name, 1-based start line (the
-    /// line their node is stored with).
-    methods: Vec<(String, u32)>,
+    /// line their node is stored with), and whether a `#[cfg(…)]` gates it.
+    methods: Vec<(String, u32, bool)>,
+    /// A `#[cfg(…)]` gates the whole block.
+    cfg: bool,
+    /// The innermost inline `mod` holding the block (its node id), None at the
+    /// file's top level.
+    module: Option<usize>,
 }
 
 impl ImplBlock {
     fn defines(&self, method: &str) -> bool {
-        self.methods.iter().any(|(m, _)| m == method)
+        self.methods.iter().any(|(m, _, _)| m == method)
     }
+
+    /// Defines `method` in every build this block is in: neither the block nor
+    /// that definition is behind a `#[cfg(…)]`.
+    fn always_defines(&self, method: &str) -> bool {
+        !self.cfg && self.methods.iter().any(|(m, _, cfg)| m == method && !cfg)
+    }
+}
+
+/// Whether a `#[cfg(…)]` attribute sits directly before `item`.
+fn cfg_gated(item: tree_sitter::Node, source: &str) -> bool {
+    let mut prev = item.prev_named_sibling();
+    while let Some(p) = prev {
+        if p.kind() != "attribute_item" {
+            break;
+        }
+        let text: String = node_text(&p, source)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if text.starts_with("#[cfg(") {
+            return true;
+        }
+        prev = p.prev_named_sibling();
+    }
+    false
+}
+
+/// The innermost inline `mod { … }` holding `node`, None at top level.
+fn enclosing_module(node: tree_sitter::Node) -> Option<usize> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "mod_item" {
+            return Some(n.id());
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 thread_local! {
@@ -78,6 +120,7 @@ fn build(root: tree_sitter::Node, source: &str) -> HashMap<usize, ImplBlock> {
                             methods.push((
                                 node_text(&name, source).to_string(),
                                 item.start_position().row as u32 + 1,
+                                cfg_gated(item, source),
                             ));
                         }
                     }
@@ -88,6 +131,8 @@ fn build(root: tree_sitter::Node, source: &str) -> HashMap<usize, ImplBlock> {
                         ty: crate::parser::rust_impl_type_name(node_text(&ty, source)),
                         of_trait,
                         methods,
+                        cfg: cfg_gated(node, source),
+                        module: enclosing_module(node),
                     },
                 );
             }
@@ -121,10 +166,11 @@ pub(super) struct SelfCallFacts {
     /// Start lines of the file's methods of that name the call cannot reach:
     /// other impls the language keeps apart from the caller's (module doc).
     pub excluded: Vec<u32>,
-    /// The file defines the type's method of that name only in trait impls.
-    /// An inherent method of that name outranks a trait's in method lookup,
-    /// and one in another file of the crate may exist, so the file's own is no
-    /// proof of the target (`resolve::self_filter_candidates`).
+    /// The file's own methods of that name are no proof of the target, and
+    /// the crate decides (`resolve::self_filter_candidates`, `"wide"`): the
+    /// file defines them only in trait impls, which an inherent method of that
+    /// name in another file outranks; or some sit in another inline `mod`,
+    /// where the type's name may be another type's.
     pub trait_only_here: bool,
 }
 
@@ -163,11 +209,21 @@ pub(super) fn self_call_facts(
         let Some(mine) = blocks.get(&own.id()) else {
             return SelfCallFacts::default();
         };
-        let apart = mine.of_trait.is_some() || mine.defines(method);
+        // E0592 keeps another inherent `m` apart only when the caller's own
+        // is there in every build the call is: a `#[cfg]` on it, or on its
+        // block, may leave the other one the only `m` (pre-tag review).
+        let apart = mine.of_trait.is_some() || mine.always_defines(method);
         let mut excluded = Vec::new();
         let (mut inherent_here, mut trait_here) = (false, false);
+        // Blocks of the type's name in another inline `mod` may be another
+        // type of that name (a test module's mock): the file then holds two
+        // types of one name, and its own methods are no proof of the target.
+        let mut other_module = false;
         for (id, other) in blocks.iter().filter(|(_, b)| b.ty == mine.ty) {
-            for (_, line) in other.methods.iter().filter(|(m, _)| m == method) {
+            if other.module != mine.module && other.defines(method) {
+                other_module = true;
+            }
+            for (_, line, _) in other.methods.iter().filter(|(m, _, _)| m == method) {
                 if Some(*line) == caller_line && *id == own.id() {
                     continue; // the caller itself says nothing about its callee
                 }
@@ -184,28 +240,64 @@ pub(super) fn self_call_facts(
         excluded.dedup();
         SelfCallFacts {
             excluded,
-            trait_only_here: trait_here && !inherent_here,
+            trait_only_here: (trait_here && !inherent_here) || other_module,
         }
     })
 }
 
-/// `Pin`'s std methods that take `self` in some form.
-const PIN_METHODS: &[&str] = &[
-    "as_deref_mut",
-    "as_mut",
-    "as_ref",
-    "get_mut",
-    "get_ref",
-    "get_unchecked_mut",
-    "into_ref",
-    "map_unchecked",
-    "map_unchecked_mut",
-    "set",
-];
+/// Whether `Pin<Ptr>` itself has `method`, found before `Self` through
+/// `Deref`: every `Pin` has `as_ref`; one over a mutable pointer (`&mut T`,
+/// `Box<T>`) also `as_mut` and `set`; `Pin<&T>` has `get_ref` and
+/// `map_unchecked`, `Pin<&mut T>` `get_mut`, `get_unchecked_mut`, `into_ref`
+/// and `map_unchecked_mut`. A method its pointer lacks is `Self`'s
+/// (`*self.get_ref()` in a `Pin<&mut Self>` poll calls `Self::get_ref`). An
+/// unrecognized pointer answers `as_ref` only, which leaves every other call
+/// its edge to `Self`.
+fn pin_has(pointer: Option<tree_sitter::Node>, source: &str, method: &str) -> bool {
+    #[derive(PartialEq)]
+    enum Ptr {
+        Shared,
+        Unique,
+        Boxed,
+        Other,
+    }
+    let ptr = match pointer {
+        Some(p) if p.kind() == "reference_type" => {
+            let mut c = p.walk();
+            let unique = p
+                .children(&mut c)
+                .any(|ch| ch.kind() == "mutable_specifier");
+            if unique {
+                Ptr::Unique
+            } else {
+                Ptr::Shared
+            }
+        }
+        Some(p) if p.kind() == "generic_type" => {
+            let base = p
+                .child_by_field_name("type")
+                .map(|b| node_text(&b, source))
+                .unwrap_or("");
+            if base.rsplit("::").next() == Some("Box") {
+                Ptr::Boxed
+            } else {
+                Ptr::Other
+            }
+        }
+        _ => Ptr::Other,
+    };
+    match method {
+        "as_ref" => true,
+        "as_mut" | "set" => ptr == Ptr::Unique || ptr == Ptr::Boxed,
+        "get_ref" | "map_unchecked" => ptr == Ptr::Shared,
+        "get_mut" | "get_unchecked_mut" | "into_ref" | "map_unchecked_mut" => ptr == Ptr::Unique,
+        _ => false,
+    }
+}
 
 /// Whether a `self.method()` call is answered by the wrapper its enclosing
 /// function declares `self` as, not by `Self`: with `self: Pin<&mut Self>`,
-/// `self.get_mut()` is `Pin::get_mut`, and with `self: Arc<Self>`,
+/// `self.get_mut()` is `Pin::get_mut` ([`pin_has`]), and with `self: Arc<Self>`,
 /// `self.clone()` is `Arc`'s — method lookup meets the receiver's own type
 /// before any deref reaches `Self`. The wrapper is read by name, as the parser
 /// reads these pointers everywhere (`rust_receiver.rs`).
@@ -253,7 +345,14 @@ pub(super) fn answered_by_the_self_wrapper(
     };
     let text = node_text(&base, source);
     match text.rsplit("::").next().unwrap_or(text) {
-        "Pin" => PIN_METHODS.contains(&method),
+        "Pin" => {
+            let pointer = ty.child_by_field_name("type_arguments").and_then(|args| {
+                let mut c = args.walk();
+                let first = args.named_children(&mut c).next();
+                first
+            });
+            pin_has(pointer, source, method)
+        }
         "Arc" | "Rc" => method == "clone",
         _ => false,
     }

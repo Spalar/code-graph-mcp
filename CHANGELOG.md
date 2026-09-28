@@ -3,7 +3,7 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 99 → 101 because the Rust fixes below change which
+`INDEX_VERSION` goes 99 → 102 because the Rust fixes below change which
 `calls` and `implements` edges a file produces, the names of some Rust
 methods, and the confidence label of one class of Rust call. Nothing to run.
 **`callgraph` and `impact` on Rust code show fewer callers by default:** a
@@ -13,7 +13,7 @@ still in the graph; both commands say how many they hid, and
 `--min-confidence ambiguous` (MCP `min_confidence: "ambiguous"`) shows them.
 To pin back: `npm i -g @sdsrs/code-graph@0.162.0`, or `cargo install
 code-graph-mcp --version 0.162.0`; plugin users can set the version in the
-marketplace entry. An older binary leaves a v101 index intact and warns
+marketplace entry. An older binary leaves a v102 index intact and warns
 instead of rebuilding it; delete `.code-graph/index.db*` after pinning back to
 get its graph back.
 
@@ -30,8 +30,9 @@ are each a `self.m()` / `Self::m()` written in the caller's own body, and the
 529 `implements` edges that go all pointed at another file's method, which a
 trait impl's method never is. On this repository: 43 more correct call edges,
 nothing else changed. On hono, express, flask and leveldb every node, edge and
-buffered call is identical. A full index of tokio takes 2.69 s against
-0.162.0's 2.86 s, and an edit that adds a method 0.24 s against 0.25 s.
+buffered call is identical. A full index of tokio takes 2.58 s against
+0.162.0's 2.83 s, and an edit adding a file of three methods 0.81 s against
+0.89 s (medians of five interleaved runs of this release's final build).
 
 ### `self.m()` in a generic Rust impl has its edge
 
@@ -53,18 +54,36 @@ so does every impl that crate can call on it, so a call there never leaves the
 crate: tokio's `Builder::new() { Self::default() }`, whose `default` is
 derived, no longer binds tokio-util's `Builder::default`. When the caller's
 file defines the type's method only in trait impls, an inherent one in another
-file outranks it, so the crate decides. The caller itself counts as no
-candidate: a trait method calling its type's inherent namesake still binds it.
+file outranks it, so the crate decides; so it does when the file holds that
+name's impls in different inline `mod`s (a test module's mock type of the same
+name). Past its crate, a call in an inherent impl looks only at files no crate
+layout places, such as `tests/common/mod.rs` under a test's `mod common;`. The
+caller itself counts as no candidate: a trait method calling its type's
+inherent namesake still binds it. Because the answer now depends on other
+files, a caller is re-extracted when a method of its type and name appears in
+or leaves another file (deletions included), and an incremental index matches
+a rebuild in those cases.
 
 Impls of one type that differ only in their arguments (`impl AsyncWrite for
 Cursor<&mut [u8]>`, `… for Cursor<Vec<u8>>`) all name their type `Cursor`.
 Two impls of one trait never cover one type, and two inherent impls may not
 both define a method for one type, so a `self.m()` no longer binds the `m` of
-another impl of its file that the language keeps apart from its own.
+another impl of its file that the language keeps apart from its own. The
+inherent rule holds only when the caller's own `m` exists in every build: with
+`#[cfg]` on it or on its block, the other block's `m` may be the one that runs,
+and it stays.
 
 `self.get_mut()` with `self: Pin<&mut Self>` is `Pin::get_mut`, and
 `self.clone()` with `self: Arc<Self>` is `Arc`'s: method lookup meets the
 receiver's own type first. Neither binds the project's method of that name.
+Only what that `Pin` has counts: `as_ref` on any, `as_mut` and `set` on a
+mutable pointer, `get_ref` on `Pin<&T>`, `get_mut` on `Pin<&mut T>`; so
+`*self.get_ref()` in a `Pin<&mut Self>` poll still binds the type's own
+`get_ref`.
+
+An impl for a type whose generic arguments hold a function type (`impl Run for
+Box<dyn Fn() -> u8>`) names its methods `Box.run` again; the `>` of `->` had
+closed the arguments early (`Box u8>.run`).
 
 ### A typed receiver binds nothing its type rules out
 
@@ -151,9 +170,12 @@ general-purpose subagents sent 111 of 4,162 such calls to code-graph (2.7%).
 defined that way keeps every candidate; so does one reached through a type
 alias or a `Deref` the index cannot follow. A `Deref` written by a macro is
 invisible too, so the typed-receiver rule above can still drop a correct edge
-through one (none on tokio). A Rust file under `src/bin/` or `examples/`
-belongs to no crate the index can name, so its `self` calls still look across
-the whole workspace. In `claude plugin eval` runs, where the plugin registers
+through one (none on tokio), and so is one a derive writes
+(`#[derive(derive_more::Deref)]`). A Rust file under `src/bin/` belongs to no
+crate the index can name, so its `self` calls still look across the whole
+workspace. A `self` call that resolved to nothing is not revisited when its
+method appears in another file (as in 0.162.0): the next edit of its own file,
+or a rebuild, binds it. In `claude plugin eval` runs, where the plugin registers
 its hooks during the run's own SessionStart, the SubagentStart hook reached no
 subagent in 3 of 3 runs, for a reason not yet known, so the `subagent-callers`
 eval measures the parent's prompt, not the hook.

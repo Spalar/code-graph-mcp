@@ -1450,6 +1450,62 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
             out.insert(path);
         }
     }
+    // A Rust `self.m()` / `Self::m()` (`"self"` / `"stype"`, payload the impl's
+    // type) binds the nearest methods of its type — own file, else crate, else
+    // (from a trait impl) the workspace — so an `m` of that type appearing in or
+    // leaving ANY file can move it, deleted files included (pre-tag review:
+    // `a/src/y.rs` gaining `Foo::m` left the caller bound into another crate).
+    if !methods.is_empty() {
+        // Driven from the moved methods' names (few) through the name and
+        // target indexes, not from every call edge: scanning all of them cost
+        // ~100 ms on tokio's method-adding edit.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.cg_drift_names;
+             CREATE TEMP TABLE cg_drift_names (nm TEXT PRIMARY KEY);",
+        )?;
+        {
+            let mut ins = conn.prepare("INSERT OR IGNORE INTO cg_drift_names (nm) VALUES (?1)")?;
+            for (_, m) in &methods {
+                ins.execute([m])?;
+            }
+        }
+        let found = (|| -> Result<Vec<(String, String, Option<String>)>> {
+            let mut stmt = conn.prepare(
+                "SELECT f.path, t.name, json_extract(e.metadata, '$.v')
+                 FROM cg_drift_names d
+                 CROSS JOIN nodes t ON t.name = d.nm
+                 CROSS JOIN edges e ON e.target_id = t.id AND e.relation = 'calls'
+                 CROSS JOIN nodes s ON s.id = e.source_id
+                 CROSS JOIN files f ON f.id = s.file_id
+                 WHERE f.language = 'rust'
+                   AND json_extract(e.metadata, '$.q') IN ('self', 'stype')
+                 UNION
+                 SELECT f.path, p.target_name, json_extract(p.metadata, '$.v')
+                 FROM cg_drift_names d
+                 CROSS JOIN pending_unresolved_calls p ON p.target_name = d.nm
+                 CROSS JOIN nodes s ON s.id = p.source_id
+                 CROSS JOIN files f ON f.id = s.file_id
+                 WHERE f.language = 'rust'
+                   AND json_extract(p.metadata, '$.q') IN ('self', 'stype')",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })();
+        conn.execute_batch("DROP TABLE IF EXISTS temp.cg_drift_names;")?;
+        for (path, target, v) in found? {
+            if in_run.contains(&path) || out.contains(&path) {
+                continue;
+            }
+            if v.as_deref()
+                .and_then(last)
+                .is_some_and(|ty| methods.contains(&(ty, target)))
+            {
+                out.insert(path);
+            }
+        }
+    }
     Ok(out.into_iter().collect())
 }
 
@@ -2079,7 +2135,10 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                  THEN ?3 ELSE ?4 END";
     // Cross-file edges, plus one same-file class (D#162): a Rust method call
     // whose receiver the source leaves untyped (`q` member / chain with no
-    // `rt`, or a typed call its type did not decide, `amb`). Method dispatch
+    // `rt`). `amb` would mark a typed one its type did not decide, but only
+    // `rtype` / `super` / path calls carry it today, so for member / chain that
+    // arm only guards a future shape; a typed member call whose type lacks the
+    // method still binds by name and keeps `extracted`. Method dispatch
     // follows the receiver's type, not the caller's file, so binding the file's
     // own `m` is a by-name guess like a cross-file one — and a skewed one, since
     // a wrapper forwards `self.inner.m()` to a field of another type while its
@@ -2798,7 +2857,8 @@ fn filter_by_segment_chain(
 /// trait impl may sit outside its type's crate (`impl Show for a::Foo` in `b`,
 /// whose `self.name()` is `a`'s). A call in an inherent impl (`"inh"`) stops at
 /// its crate: the impl lives in its type's crate, and so does every impl that
-/// crate can call on the type. When the caller's file defines the type's method
+/// crate can call on the type — past the crate it looks only at files no crate
+/// layout places (`tests/common/…`), which a `mod` of the crate may include. When the caller's file defines the type's method
 /// only in trait impls (`"wide"`), the file is skipped: an inherent method of
 /// that name in another file outranks a trait's. The callers themselves are no evidence of
 /// where the method lives: `Self::poll_accept(self)` inside the trait impl's
@@ -2846,6 +2906,12 @@ pub(super) fn self_filter_candidates(
             chosen =
                 nearest(&|p| rust_crate_layout(p).is_some_and(|(dir, _, _)| dir == *crate_dir));
         }
+    }
+    if chosen.is_empty() && inherent && crate_dir.is_some() {
+        // A file no crate layout names (`tests/common/…`, `src/bin/…`) may be a
+        // module of the caller's crate (`mod common;` in a test target): the
+        // next nearest place an inherent impl's type keeps its methods.
+        chosen = nearest(&|p| rust_crate_layout(p).is_none());
     }
     if chosen.is_empty() && !(inherent && crate_dir.is_some()) {
         chosen = of_type;

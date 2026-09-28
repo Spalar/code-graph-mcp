@@ -26,13 +26,17 @@ pub(crate) fn rust_impl_type_name(type_text: &str) -> String {
 pub(crate) fn rust_type_path(type_text: &str) -> Vec<String> {
     let mut bare = String::with_capacity(type_text.len());
     let mut depth = 0usize;
+    let mut prev = '\0';
     for c in type_text.chars() {
+        // The `>` of `->` (`Box<dyn Fn() -> u8>`) closes nothing.
+        let arrow = c == '>' && prev == '-';
         match c {
             '<' => depth += 1,
-            '>' if depth > 0 => depth -= 1,
+            '>' if depth > 0 && !arrow => depth -= 1,
             _ if depth == 0 => bare.push(c),
             _ => {}
         }
+        prev = c;
     }
     bare.split("::").map(|s| s.trim().to_string()).collect()
 }
@@ -139,6 +143,10 @@ mod tests {
             ("Outer<Inner<u8>, a::B>", "Outer"),
             ("<T as Link>::Target", "Target"),
             ("&'a mut Foo<T>", "&'a mut Foo"),
+            // `->` inside the arguments is an arrow, not a closing `>` (pre-tag
+            // review: `Box<dyn Fn() -> u8>` named its methods `Box u8>.run`).
+            ("Box<dyn Fn() -> u8>", "Box"),
+            ("std::boxed::Box<dyn Fn(u8) -> Vec<u8>>", "Box"),
         ] {
             assert_eq!(rust_impl_type_name(text), want, "{text}");
         }

@@ -7237,6 +7237,125 @@ fn a_third_file_reclassifies_an_edge_between_two_files_it_never_touched() {
     );
 }
 
+/// `pending_unresolved_calls` as `caller file:caller -> target name`, sorted.
+fn pending_projection(db: &Database) -> Vec<String> {
+    let mut rows: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT f.path || ':' || n.name || ' -> ' || p.target_name
+             FROM pending_unresolved_calls p
+             JOIN nodes n ON n.id = p.source_id JOIN files f ON f.id = n.file_id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn a_self_call_follows_its_types_method_into_and_out_of_a_nearer_file() {
+    // Pre-tag review, finding 1. A `self.m()` binds the nearest methods of its
+    // type: own file, else crate, else (from a trait impl) the workspace. So a
+    // method of that type appearing in, or leaving, another file of the crate
+    // moves the answer of a caller this run never opens — and nothing
+    // re-extracted it: the incremental index kept an edge into crate `b` after
+    // `a/src/y.rs` gained `Foo::m`, and after y.rs was deleted it had a buffered
+    // row instead of the edge a rebuild binds.
+    let project_dir = TempDir::new().unwrap();
+    let root = project_dir.path();
+    let w = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    };
+    w("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    for pkg in ["a", "b"] {
+        w(
+            &format!("{pkg}/Cargo.toml"),
+            &format!("[package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+    }
+    w(
+        "b/src/lib.rs",
+        "pub struct Foo;\nimpl Foo {\n    pub fn m(&self) {}\n}\n",
+    );
+    w(
+        "a/src/lib.rs",
+        "pub mod x;\npub mod y;\npub trait Tr { fn go(&self); }\n",
+    );
+    w(
+        "a/src/x.rs",
+        "pub struct Foo;\nimpl crate::Tr for Foo {\n    fn go(&self) { self.m() }\n}\n",
+    );
+    w("a/src/y.rs", "pub fn unrelated() {}\n");
+
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    let rebuild = || {
+        let dir = TempDir::new().unwrap();
+        let control = Database::open(&dir.path().join("index.db")).unwrap();
+        run_full_index(&control, root, None, None).unwrap();
+        (
+            graph_projection_with_confidence(&control),
+            pending_projection(&control),
+            dir,
+        )
+    };
+    let go_calls = |rows: &[(String, String, String, String)]| -> Vec<String> {
+        rows.iter()
+            .filter(|(s, r, _, _)| s == "a/src/x.rs:go" && r == REL_CALLS)
+            .map(|(_, _, t, _)| t.clone())
+            .collect()
+    };
+
+    // The crate gains `Foo::m`: the call binds it, not crate b's.
+    w(
+        "a/src/y.rs",
+        "pub fn unrelated() {}\nimpl crate::x::Foo {\n    pub fn m(&self) {}\n}\n",
+    );
+    run_incremental_index(&db, root, None, None).unwrap();
+    let (full, full_pending, _d1) = rebuild();
+    assert_eq!(
+        go_calls(&full),
+        vec!["a/src/y.rs:m".to_string()],
+        "control: {full:?}"
+    );
+    assert_eq!(
+        graph_projection_with_confidence(&db),
+        full,
+        "after the method appeared"
+    );
+    assert_eq!(
+        pending_projection(&db),
+        full_pending,
+        "after the method appeared"
+    );
+
+    // And loses it again, in a run that only deletes a file.
+    fs::remove_file(root.join("a/src/y.rs")).unwrap();
+    run_incremental_index(&db, root, None, None).unwrap();
+    let (full, full_pending, _d2) = rebuild();
+    assert_eq!(
+        go_calls(&full),
+        vec!["b/src/lib.rs:m".to_string()],
+        "control: {full:?}"
+    );
+    assert_eq!(
+        graph_projection_with_confidence(&db),
+        full,
+        "after the file was deleted"
+    );
+    assert_eq!(
+        pending_projection(&db),
+        full_pending,
+        "after the file was deleted"
+    );
+}
+
 #[test]
 fn a_rust_untyped_same_file_method_call_is_labelled_by_its_name_count() {
     // D#162. `self.0.poll()` names only `poll`: a tuple field is untyped, so the
