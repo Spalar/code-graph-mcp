@@ -1949,7 +1949,11 @@ test('e2e: show-mode rewrite re-runs only the symbols that resolved', () => {
   const fixture = e2eFixture(
     `if (process.argv[2] !== 'show' || !process.argv[3].endsWith('A')) process.exit(1);\n` +
     `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
-  const cmd = `grep -A5 "fn ${uniq}A\\b\\|fn ${uniq}B\\b" src/`;
+  // A real path the index holds: a show answer of a missing one is no longer
+  // given (review of D#133, H-2), and grep without -r reads no directory.
+  fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'));
+  fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
+  const cmd = `grep -r -A5 "fn ${uniq}A\\b\\|fn ${uniq}B\\b" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
     assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ show ${uniq}A$`),
@@ -1968,7 +1972,11 @@ test('e2e: show-mode rewrite re-runs EVERY symbol that resolved', () => {
   const fixture = e2eFixture(
     `if (process.argv[2] !== 'show') process.exit(1);\n` +
     `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
-  const cmd = `grep -A5 "fn ${uniq}A\\b\\|fn ${uniq}B\\b" src/`;
+  // A real path the index holds: a show answer of a missing one is no longer
+  // given (review of D#133, H-2), and grep without -r reads no directory.
+  fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'));
+  fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
+  const cmd = `grep -r -A5 "fn ${uniq}A\\b\\|fn ${uniq}B\\b" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
     assert.match(rw.command, new RegExp(` show ${uniq}A; echo; CODE_GRAPH_INTERNAL=1 \\S+ show ${uniq}B$`));
@@ -3181,7 +3189,10 @@ test('translateBreToRg: a bracket expression rust would read differently is untr
   assert.equal(t('Foo[a&&b]'), null);
   assert.equal(t('Foo[a~~b]'), null);
   assert.equal(t('Foo[[x]'), null);
-  assert.equal(t('Foo[[:alpha:]]'), 'Foo[[:alpha:]]', 'a POSIX class means the same in both');
+  // A POSIX class is ASCII to rust and follows the locale in GNU grep and
+  // ugrep (`é`, `٣`; review of D#133, M-2).
+  assert.equal(t('Foo[[:alpha:]]'), null, 'a POSIX class');
+  assert.equal(t('Foo[a-z]'), 'Foo[a-z]');
   // The extended dialects are not translated, but POSIX brackets are the same
   // there: `[\(]` has no equivalent under -E either (D#133 #5).
   assert.equal(translateBreToRg('grep -rnE "Foo[\\(]" src/', 'Foo[\\(]'), null);
@@ -3448,7 +3459,8 @@ test('translateBreToRg: brackets and escapes the dialects disagree on are untran
   assert.equal(t('Foo[]-a]'), null, 'a leading ] is a range start in grep');
   assert.equal(t('Foo\\(\\)'), null, 'an empty group is an error in grep');
   for (const p of ['Foo\\z', 'Foo\\=', 'Foo\\_', 'Foo\\1', 'Foo\\d']) assert.equal(t(p), null, p);
-  assert.equal(t('Foo[[:digit:]]\\.\\*\\bx\\w'), 'Foo[[:digit:]]\\.\\*\\bx\\w');
+  assert.equal(t('Foo[[:digit:]]\\.\\*\\bx\\w'), null, 'a POSIX class (review of D#133, M-2)');
+  assert.equal(t('Foo[0-9]\\.\\*\\bx\\w'), 'Foo[0-9]\\.\\*\\bx\\w');
 });
 
 // R6 — never a throw on input no caller should send.
@@ -3586,7 +3598,8 @@ test('rewritePlan: a non-recursive plain grep of a directory, or of stdin, is no
   assert.equal(rewritePlan('grep -n "Foo" src/', dir), null);
   assert.equal(rewritePlan('grep -n "Foo"', dir), null);
   assert.notEqual(rewritePlan('grep -rn "Foo" src/', dir), null);
-  assert.notEqual(rewritePlan('grep -Rn "Foo" src/', dir), null);
+  // -R follows every symlink; cg's walk follows none (review of D#133, M-1).
+  assert.equal(rewritePlan('grep -Rn "Foo" src/', dir), null);
   assert.notEqual(rewritePlan('grep --recursive -n "Foo" src/', dir), null);
   assert.notEqual(rewritePlan('grep -n "Foo" src/a.rs', file), null);
   // rg and ag recurse by default; git grep searches the tracked tree.
@@ -3702,7 +3715,11 @@ test('translateBreToRg: a * in a leading position has no translation', () => {
   assert.equal(t('\\(*x\\)'), null);
   assert.equal(t('x\\|*y'), null);
   assert.equal(t('fo*o'), 'fo*o');
-  assert.equal(t('^a*'), '^a*');
+  assert.equal(t('^a*b'), '^a*b');
+  // `^a*` alone can match the empty string: declined with every such pattern
+  // (review of D#133, M-2), although ugrep reports an empty match that a `^`
+  // starts.
+  assert.equal(t('^a*'), null);
 });
 
 // Review of D#125, round 2 F1: one root-holding word was accepted when its
@@ -3748,16 +3765,18 @@ test('translateBreToRg: an extended or perl pattern the dialects read differentl
     assert.equal(E(p), null, `-E ${p}`);
   }
   assert.equal(translateBreToRg("grep -rnE 'FooBar\\' src/", 'FooBar\\'), null, 'a trailing backslash');
-  for (const p of ['\\<FooBar', 'FooBar\\>', 'FooBar[\\(]', '(?i)FooBar', 'FooBar++', 'FooBar\\Q']) {
+  // `\d` under Perl: ASCII to GNU grep, Unicode to rust (review of D#133, M-2).
+  for (const p of ['\\<FooBar', 'FooBar\\>', 'FooBar[\\(]', '(?i)FooBar', 'FooBar++', 'FooBar\\Q', 'FooBar\\d']) {
     assert.equal(P(p), null, `-P ${p}`);
     assert.equal(A(p), null, `ag ${p}`);
   }
-  // Look-alikes the three read alike keep their text.
+  // Look-alikes the three read alike keep their text. Not `[[:upper:]]`,
+  // `FooBar|` or `\d` under -P any more (review of D#133, M-2).
   for (const p of ['FooBar|BazQux', 'FooBar\\b', '\\<FooBar\\>', 'FooBar{2}', 'FooBar{2,}',
-    'Foo(Bar|Baz)', '^FooBar$', 'FooBar\\.x', '[[:upper:]]FooBar', 'FooBar|', 'a/b\\/FooBar']) {
+    'Foo(Bar|Baz)', '^FooBar$', 'FooBar\\.x', '[A-Z]FooBar', 'a/b\\/FooBar']) {
     assert.equal(E(p), p, `-E ${p}`);
   }
-  for (const p of ['FooBar\\d', 'FooBar\\b', 'FooBar|BazQux', 'Foo(Bar)+']) {
+  for (const p of ['FooBar\\b', 'FooBar|BazQux', 'Foo(Bar)+']) {
     assert.equal(P(p), p, `-P ${p}`);
     assert.equal(A(p), p, `ag ${p}`);
   }
@@ -3978,4 +3997,411 @@ test('e2e: a rewrite whose file set differs from the grep\'s runs as typed (D#13
       cleanupFixture({ dir: fx.dir }, control);
     }
   }
+});
+
+// ── D#133 review repairs: file sets and dialects the checks did not model ──
+// Each case was REPRODUCED by the pre-release review of cc2bb63 with GNU grep
+// 3.12, ugrep 7.8.4 (Claude Code's `grep`), ripgrep 15.1 and git 2.53. The
+// repair is a decline: the grep runs as typed.
+const d133r = require('./pre-grep-guide');
+
+function withTempDir(prefix, fn) {
+  const dir = fsE2e.realpathSync(fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), prefix)));
+  try { return fn(dir); } finally { fsE2e.rmSync(dir, { recursive: true, force: true }); }
+}
+function gitIn(dir) {
+  const git = (...a) => {
+    const r = spawnHook('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  git('init', '-q', '.');
+  fsE2e.mkdirSync(pathE2e.join(dir, 'src'), { recursive: true });
+  fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'a.rs'), 'fn a() {}\n');
+  fsE2e.writeFileSync(pathE2e.join(dir, '.gitignore'), '.code-graph/\n');
+  git('add', '-A');
+  git('commit', '-qm', 'init');
+  return git;
+}
+const put = (dir, rel, body = 'x\n') => {
+  fsE2e.mkdirSync(pathE2e.dirname(pathE2e.join(dir, rel)), { recursive: true });
+  fsE2e.writeFileSync(pathE2e.join(dir, rel), body);
+};
+const same = (root, verb, extra = {}) => d133r.searchesSameFiles({ root, target: 'src/', verb, ...extra });
+
+// H-1: cg's walk is ripgrep, which reads `.ignore` and `.rgignore` (and ag
+// `.agignore`) in the searched tree and in every directory above it; git does
+// not. An untracked file one of them names is read by grep -r and not by cg; a
+// tracked one is skipped by rg and read by cg's tracked-file supplement.
+test('searchesSameFiles: a ripgrep-only ignore file under, at or above the path declines (review H-1)', () => {
+  const cases = [
+    ['a tracked src/.ignore', (dir, git) => { put(dir, 'src/.ignore', 'u.rs\n'); put(dir, 'src/u.rs'); git('add', 'src/.ignore'); git('commit', '-qm', 'i'); }],
+    // Below the path, only git's listings see them: tracked, untracked, ignored.
+    ['a tracked src/sub/.ignore', (dir, git) => { put(dir, 'src/sub/.ignore', 'u.rs\n'); put(dir, 'src/sub/k.rs'); git('add', 'src/sub'); git('commit', '-qm', 'i'); }],
+    ['an untracked src/.rgignore', (dir) => { put(dir, 'src/.rgignore', 'u.rs\n'); }],
+    ['an untracked src/sub/.agignore', (dir) => { put(dir, 'src/sub/.agignore', 'u.rs\n'); put(dir, 'src/sub/k.rs'); }],
+    ['a .ignore at the root', (dir) => { put(dir, '.ignore', 'src/u.rs\n'); }],
+    ['a .rgignore at the root', (dir) => { put(dir, '.rgignore', 'src/u.rs\n'); }],
+    ['a gitignored src/.ignore', (dir) => { fsE2e.appendFileSync(pathE2e.join(dir, '.gitignore'), 'src/.ignore\n'); put(dir, 'src/.ignore', 'a.rs\n'); }],
+    ['a gitignored src/sub/.ignore', (dir, git) => {
+      fsE2e.appendFileSync(pathE2e.join(dir, '.gitignore'), 'src/sub/.ignore\n');
+      put(dir, 'src/sub/k.rs');
+      git('add', '-A');
+      git('commit', '-qm', 'k');
+      put(dir, 'src/sub/.ignore', 'k.rs\n');
+    }],
+  ];
+  for (const [name, setup] of cases) {
+    withTempDir('pre-grep-h1-', (dir) => {
+      const git = gitIn(dir);
+      for (const verb of ['grep', 'git', 'rg', 'ag']) assert.equal(same(dir, verb), true, `control ${verb}`);
+      setup(dir, git);
+      for (const verb of ['grep', 'git', 'rg', 'ag']) assert.equal(same(dir, verb), false, `${name}: ${verb}`);
+    });
+  }
+  // Above the repository: ripgrep reads a parent's .ignore, not its .gitignore.
+  for (const f of ['.ignore', '.rgignore']) {
+    withTempDir('pre-grep-h1up-', (outer) => {
+      const repo = pathE2e.join(outer, 'repo');
+      fsE2e.mkdirSync(repo);
+      gitIn(repo);
+      put(outer, '.gitignore', 'a.rs\n');
+      assert.equal(same(repo, 'grep'), true, 'a parent .gitignore is not read by ripgrep inside a repo');
+      put(outer, f, 'a.rs\n');
+      for (const verb of ['grep', 'git', 'rg']) assert.equal(same(repo, verb), false, `parent ${f}: ${verb}`);
+    });
+  }
+  // RIPGREP_CONFIG_PATH: cg passes no --no-config, so a config file's flags
+  // (--hidden, --no-ignore, --smart-case, …) change its search.
+  withTempDir('pre-grep-h1cfg-', (dir) => {
+    gitIn(dir);
+    const saved = process.env.RIPGREP_CONFIG_PATH;
+    try {
+      process.env.RIPGREP_CONFIG_PATH = pathE2e.join(dir, 'rgrc');
+      for (const verb of ['grep', 'git', 'rg']) assert.equal(same(dir, verb), false, `RIPGREP_CONFIG_PATH: ${verb}`);
+      process.env.RIPGREP_CONFIG_PATH = '';
+      assert.equal(same(dir, 'grep'), true, 'an empty RIPGREP_CONFIG_PATH names no config');
+    } finally {
+      if (saved === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = saved;
+    }
+  });
+  // Outside a git work tree ugrep reads a .gitignore; one between the root and
+  // the path declines too (conservative: ugrep reads only those it meets).
+  withTempDir('pre-grep-h1plaingi-', (root) => {
+    put(root, 'src/a.rs');
+    assert.equal(same(root, 'grep'), true, 'control');
+    put(root, '.gitignore', 'src/a.rs\n');
+    assert.equal(same(root, 'grep'), false, 'a .gitignore at a plain root');
+  });
+  // Outside a git work tree the same holds above the searched root.
+  withTempDir('pre-grep-h1plain-', (outer) => {
+    const root = pathE2e.join(outer, 'p');
+    put(root, 'src/a.rs');
+    assert.equal(same(root, 'grep'), true, 'control');
+    put(outer, '.ignore', 'a.rs\n');
+    assert.equal(same(root, 'grep'), false, 'a .ignore above a plain tree');
+  });
+});
+
+// M-1: grep -r and rg do not follow a symlink met while recursing; cg names a
+// tracked one on rg's command line (followed), and git grep searches the link
+// text. git grep does not enter a submodule; cg's walk does. grep -R follows
+// every symlink.
+test('searchesSameFiles: a symlink, submodule or nested repository under the path declines (review M-1)', () => {
+  const cases = [
+    ['a tracked file symlink', (dir, git) => { put(dir, 'other/real.rs'); fsE2e.symlinkSync('../other/real.rs', pathE2e.join(dir, 'src', 'link.rs')); git('add', '-A'); git('commit', '-qm', 'l'); }, ['grep', 'git', 'rg']],
+    ['an untracked file symlink', (dir) => { put(dir, 'other/real.rs'); fsE2e.symlinkSync('../other/real.rs', pathE2e.join(dir, 'src', 'link.rs')); }, ['grep', 'rg']],
+    ['an untracked dir symlink', (dir) => { put(dir, 'other/o.rs'); fsE2e.symlinkSync('../other', pathE2e.join(dir, 'src', 'ldir')); }, ['grep', 'rg']],
+    ['a submodule', (dir, git) => {
+      const sha = git('rev-parse', 'HEAD').trim();
+      git('update-index', '--add', '--cacheinfo', `160000,${sha},src/vend`);
+      git('commit', '-qm', 'sub');
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', 'vend'));
+    }, ['grep', 'git', 'rg']],
+    ['an untracked nested repository', (dir) => {
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', 'nest'));
+      gitIn(pathE2e.join(dir, 'src', 'nest'));
+    }, ['grep', 'rg']],
+  ];
+  for (const [name, setup, verbs] of cases) {
+    withTempDir('pre-grep-m1-', (dir) => {
+      const git = gitIn(dir);
+      setup(dir, git);
+      for (const verb of verbs) assert.equal(same(dir, verb), false, `${name}: ${verb}`);
+    });
+  }
+  withTempDir('pre-grep-m1plain-', (dir) => {
+    put(dir, 'src/a.rs');
+    put(dir, 'other/o.rs');
+    assert.equal(same(dir, 'grep'), true, 'control');
+    fsE2e.symlinkSync('../other', pathE2e.join(dir, 'src', 'ldir'));
+    assert.equal(same(dir, 'grep'), false, 'a symlink in a plain tree');
+  });
+  withTempDir('pre-grep-m1plainpath-', (dir) => {
+    put(dir, 'real/a.rs');
+    fsE2e.symlinkSync('real', pathE2e.join(dir, 'lnk'));
+    assert.equal(d133r.searchesSameFiles({ root: dir, target: 'real/', verb: 'grep' }), true, 'control');
+    assert.equal(d133r.searchesSameFiles({ root: dir, target: 'lnk/', verb: 'grep' }), false, 'the path is a symlink');
+  });
+  // grep -R follows every symlink: not reproduced at all.
+  assert.equal(rewritePlan('grep -Rn "FooBar" src/', { isDir: () => true }), null);
+  assert.equal(rewritePlan('grep -rRn "FooBar" src/', { isDir: () => true }), null);
+  assert.notEqual(rewritePlan('grep -rn "FooBar" src/', { isDir: () => true }), null);
+});
+
+// H-2: a `show` answer reads the index, whose walk (src/indexer/merkle.rs)
+// skips hidden entries even when tracked, the vendor/node_modules/target/
+// bower_components segments, files no language is detected for, files over
+// max_file_size, symlinks and ignored files. A grep reads them.
+test('searchesSameFiles: a show answer declines when grep reads a file the index skips (review H-2)', () => {
+  const cases = [
+    ['a tracked src/vendor/dep/b.rs', (dir, git) => { put(dir, 'src/vendor/dep/b.rs', 'fn target_fn() {}\n'); git('add', '-A'); git('commit', '-qm', 'v'); }, ['grep', 'git', 'rg']],
+    ['an untracked src/node_modules/x.js', (dir) => { put(dir, 'src/node_modules/x.js'); }, ['grep', 'rg']],
+    ['a tracked src/target/x.rs', (dir, git) => { put(dir, 'src/target/x.rs'); git('add', '-A'); git('commit', '-qm', 't'); }, ['grep', 'git', 'rg']],
+    ['a tracked src/bower_components/x.js', (dir, git) => { put(dir, 'src/bower_components/x.js'); git('add', '-A'); git('commit', '-qm', 'b'); }, ['grep', 'git', 'rg']],
+    ['a tracked hidden src/.h.rs', (dir, git) => { put(dir, 'src/.h.rs'); git('add', '-A'); git('commit', '-qm', 'h'); }, ['grep', 'git']],
+    ['a tracked src/notes.txt', (dir, git) => { put(dir, 'src/notes.txt'); git('add', '-A'); git('commit', '-qm', 'n'); }, ['grep', 'git', 'rg']],
+    ['a tracked src/Makefile', (dir, git) => { put(dir, 'src/Makefile'); git('add', '-A'); git('commit', '-qm', 'm'); }, ['grep', 'git', 'rg']],
+    ['a tracked src/A.RS', (dir, git) => { put(dir, 'src/A.RS'); git('add', '-A'); git('commit', '-qm', 'u'); }, ['grep', 'git', 'rg']],
+    ['a tracked 1 MiB + 1 byte src/big.rs', (dir, git) => { put(dir, 'src/big.rs', 'x'.repeat(1048577)); git('add', '-A'); git('commit', '-qm', 'big'); }, ['grep', 'git', 'rg']],
+    ['a tracked ignored src/gen.rs', (dir, git) => { fsE2e.appendFileSync(pathE2e.join(dir, '.gitignore'), 'src/gen.rs\n'); put(dir, 'src/gen.rs'); git('add', '-f', 'src/gen.rs', '.gitignore'); git('commit', '-qm', 'g'); }, ['git']],
+  ];
+  for (const [name, setup, verbs] of cases) {
+    withTempDir('pre-grep-h2-', (dir) => {
+      const git = gitIn(dir);
+      put(dir, 'src/b.py');
+      put(dir, 'src/c.md');
+      git('add', '-A');
+      git('commit', '-qm', 'more');
+      for (const verb of verbs) assert.equal(same(dir, verb, { show: true }), true, `control ${verb}`);
+      setup(dir, git);
+      for (const verb of verbs) {
+        assert.equal(same(dir, verb, { show: true }), false, `${name}: ${verb} show`);
+      }
+      if (verbs.includes('git')) assert.equal(same(dir, 'git'), true, `${name}: a grep answer reads it too`);
+    });
+  }
+  // 1 MiB exactly is indexed.
+  withTempDir('pre-grep-h2size-', (dir) => {
+    const git = gitIn(dir);
+    put(dir, 'src/edge.rs', 'x'.repeat(1048576));
+    git('add', '-A');
+    git('commit', '-qm', 'edge');
+    assert.equal(same(dir, 'grep', { show: true }), true, 'a 1 MiB file');
+  });
+  // Outside git: the same rules over the walk.
+  for (const [rel, want] of [['src/a.rs', true], ['src/notes.txt', false], ['src/vendor/x.go', false]]) {
+    withTempDir('pre-grep-h2plain-', (dir) => {
+      put(dir, 'src/k.rs');
+      put(dir, rel);
+      assert.equal(same(dir, 'grep', { show: true }), want, rel);
+      assert.equal(same(dir, 'grep'), true, `${rel}: a grep answer`);
+    });
+  }
+  // A file named as the path is itself the file set.
+  withTempDir('pre-grep-h2file-', (dir) => {
+    put(dir, 'src/k.rs');
+    put(dir, 'src/notes.txt');
+    const one = (target) => d133r.searchesSameFiles({ root: dir, target, verb: 'grep', show: true });
+    assert.equal(one('src/k.rs'), true, 'an indexed file');
+    assert.equal(one('src/notes.txt'), false, 'a file the index skips');
+  });
+});
+
+// The JS copy of the index's skip rules is pinned to the Rust source, so the
+// two cannot drift apart silently.
+test('index skip rules mirror src/indexer/merkle.rs, src/utils/config.rs and src/domain.rs (review H-2)', () => {
+  const repo = pathE2e.join(__dirname, '..', '..');
+  const merkle = fsE2e.readFileSync(pathE2e.join(repo, 'src', 'indexer', 'merkle.rs'), 'utf8');
+  const excluded = /const EXCLUDED: &\[&str\] = &\[([^\]]*)\]/.exec(merkle);
+  assert.ok(excluded, 'merkle.rs EXCLUDED');
+  assert.deepEqual([...d133r.INDEX_EXCLUDED_DIRS].sort(), [...excluded[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort());
+  // Both index walks skip hidden entries and do not follow links.
+  for (const fn of ['walk_indexable_files', 'scan_directory_cached']) {
+    const walk = new RegExp(`pub fn ${fn}\\([\\s\\S]*?\\.build\\(\\)`).exec(merkle);
+    assert.ok(walk, fn);
+    assert.match(walk[0], /WalkBuilder::new\(root\)\s*\.hidden\(true\)/, `${fn}: hidden(true)`);
+    assert.doesNotMatch(walk[0], /follow_links|\.ignore\(false\)|\.parents\(false\)/, `${fn}: default links and ignore files`);
+  }
+  const config = fsE2e.readFileSync(pathE2e.join(repo, 'src', 'utils', 'config.rs'), 'utf8');
+  const body = /pub fn detect_language[\s\S]*?match ext \{([\s\S]*?)_ => None/.exec(config);
+  assert.ok(body, 'config.rs detect_language');
+  const exts = [];
+  for (const line of body[1].split('\n')) {
+    const arm = /^\s*("[^"]*"(?:\s*\|\s*"[^"]*")*)\s*=>/.exec(line);
+    if (arm) exts.push(...[...arm[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]));
+  }
+  assert.ok(exts.length > 20, `${exts.length} extensions parsed`);
+  assert.deepEqual([...d133r.INDEX_EXTENSIONS].sort(), exts.sort());
+  const domain = fsE2e.readFileSync(pathE2e.join(repo, 'src', 'domain.rs'), 'utf8');
+  const size = /pub fn max_file_size\(\)[\s\S]*?"CODE_GRAPH_MAX_FILE_SIZE"[\s\S]*?unwrap_or\(([\d_]+)\)/.exec(domain);
+  assert.ok(size, 'domain.rs max_file_size');
+  assert.equal(d133r.INDEX_DEFAULT_MAX_FILE_SIZE, Number(size[1].replace(/_/g, '')));
+});
+
+test('e2e: a show rewrite whose path holds a file the index skips runs as typed (review H-2)', () => {
+  const uniq = `StubIdx${Date.now()}`;
+  const stub = `if (process.argv[2] !== 'show') process.exit(1);\n` +
+    `process.stdout.write('fn ' + process.argv[3] + '  src/a.rs:1-3\\n');`;
+  withTempDir('pre-grep-h2e2e-', (dir) => {
+    const git = gitIn(dir);
+    const fixture = { dir, stub: pathE2e.join(dir, 'cg-stub.js') };
+    fsE2e.mkdirSync(pathE2e.join(dir, '.code-graph'));
+    fsE2e.writeFileSync(pathE2e.join(dir, '.code-graph', 'index.db'), '');
+    fsE2e.writeFileSync(fixture.stub, '#!/usr/bin/env node\n' + stub);
+    fsE2e.chmodSync(fixture.stub, 0o755);
+    git('add', 'cg-stub.js');
+    git('commit', '-qm', 'stub');
+    const control = `grep -rn -A2 "fn ${uniq}A\\b" src/`;
+    const cmd = `grep -rn -A2 "fn ${uniq}B\\b" src/`;
+    try {
+      assert.match(rewriteOf(runHook(control, fixture)).command, new RegExp(` show ${uniq}A$`), 'control');
+      put(dir, 'src/vendor/dep/b.rs', `fn ${uniq}B() {}\n`);
+      git('add', '-A');
+      git('commit', '-qm', 'vendor');
+      const out = runHook(cmd, fixture).stdout.trim();
+      assert.ok(!out.startsWith('{'), `must run as typed, got ${out}`);
+    } finally {
+      cleanupFixture({ dir }, cmd);
+      cleanupFixture({ dir }, control);
+    }
+  });
+});
+
+// M-2: Claude Code's `grep` is ugrep, whose `\W` and `\D` match a line break
+// (`grep -E '\Wfoo_bar\('` printed the line before a match), and which prints no
+// line for an empty match. GNU grep reads `[[:alpha:]]`, `[[:digit:]]` with
+// Unicode, rust with ASCII; `\d` under -P is ASCII in GNU and Unicode in rust;
+// a quantified assertion (`\b{2}`, `\B+`, `$+`) is an error or a literal in
+// GNU and matches every line in rust. Measured on one fixture with each tool;
+// `\s`, `\S`, `.` and `[^…]` did not cross a line break in ugrep.
+test('translateBreToRg: constructs ugrep, GNU grep and rust regex read differently are declined (review M-2)', () => {
+  const B = (p) => translateBreToRg(`grep -rn "${p}" src/`, p);
+  const E = (p) => translateBreToRg(`grep -rnE "${p}" src/`, p);
+  const P = (p) => translateBreToRg(`grep -rnP "${p}" src/`, p);
+  const table = [
+    // [pattern, dialects that must decline it]
+    ['\\Wfoo_bar', 'BEP'],
+    ['foo\\W', 'BEP'],
+    ['\\Dfoo', 'P'],
+    ['foo\\d', 'P'],
+    ['[[:alpha:]]foo', 'BE'],
+    ['[[:digit:]]foo', 'BE'],
+    ['[^[:space:]]foo', 'BE'],
+    ['[[:upper:]]FooBar', 'BE'],
+    ['foo\\b{2}', 'E'],
+    ['foo\\B+', 'E'],
+    ['foo$+', 'E'],
+    ['\\<*foo', 'E'],
+    ['foo\\>{1,2}', 'E'],
+    ['foo\\b*', 'B'],
+    ['foo\\b\\{2\\}', 'B'],
+    ['foo\\>\\+', 'B'],
+    ['^\\?\\s*x', 'B'],
+    ['^\\{2\\}x', 'B'],
+    // `^`/`$` inside an alternative, a stray `}`: ugrep reads them apart
+    ['\\[*^[ab]', 'E'],
+    ['a$b', 'E'],
+    ['x}{1,}', 'EP'],
+    ['}?}', 'P'],
+    // nullable: ugrep prints no line for an empty match; GNU and rg print all
+    ['d?', 'EP'],
+    ['FooBar|', 'EP'],
+    ['(a|)', 'EP'],
+    ['x{0}', 'EP'],
+    ['a*', 'B'],
+    ['FooBar\\|', 'B'],
+    ['\\(ab\\)*', 'B'],
+    ['\\b', 'BEP'],
+    ['^', 'BE'],
+  ];
+  const fns = { B, E, P };
+  for (const [p, which] of table) {
+    for (const d of which) assert.equal(fns[d](p), null, `-${d} ${p}`);
+  }
+  // Look-alikes all three read alike keep their translation.
+  for (const [p, want] of [['foo\\w\\+', 'foo\\w+'], ['foo\\w+', 'foo\\w\\+'], ['fn\\s\\+foo', 'fn\\s+foo'], ['foo\\S', 'foo\\S'], ['foo\\b', 'foo\\b'],
+    ['a\\+', 'a+'], ['[^a]x', '[^a]x'], ['x.y', 'x.y'], ['\\(ab\\)\\+', '(ab)+'], ['^foo$', '^foo$']]) {
+    assert.equal(B(p), want, `basic ${p}`);
+  }
+  for (const p of ['foo\\w+', 'fn\\s+foo', 'FooBar|BazQux', '(a|b)c', 'x{2}', 'a+', '\\bfoo\\b', '\\<foo\\>', '[^a]x',
+    '^foo|^bar', '(^foo)', 'foo$|bar$', '(foo$)', 'x\\}']) {
+    assert.equal(E(p), p, `-E ${p}`);
+  }
+  for (const p of ['foo\\w+', 'fn\\s+foo', '(a|b)c', '\\bfoo\\b']) assert.equal(P(p), p, `-P ${p}`);
+  // rg reads its own pattern: the answer is rg too.
+  assert.equal(translateBreToRg('rg "\\Wfoo" src/', '\\Wfoo'), '\\Wfoo');
+});
+
+// L-6 R14: `-E` and `-P` together is "conflicting matchers" to GNU grep (exit
+// 2). No dialect is read, so there is no answer.
+test('translateBreToRg: -E and -P together have no translation (review L-6 R14)', () => {
+  for (const cmd of ['grep -rnEP "FooBar" src/', 'grep -rnPE "FooBar" src/', 'grep -rn -E -P "FooBar" src/',
+    'grep -rn --perl-regexp --extended-regexp "FooBar" src/']) {
+    assert.equal(translateBreToRg(cmd, 'FooBar'), null, cmd);
+  }
+  const cmd = 'grep -rnEP -A3 "fn foo_bar\\b" src/';
+  assert.equal(rewriteMatchesBlock(rewritePlan(cmd, { isDir: () => true }), classifyBlock(cmd), cmd, pickBlockPattern(cmd)), false);
+  assert.equal(translateBreToRg('grep -rnP "FooBar" src/', 'FooBar'), 'FooBar');
+  assert.equal(translateBreToRg('grep -rnE "FooBar" src/', 'FooBar'), 'FooBar');
+});
+
+// L-6: the reviewer's mutations of searchesSameFiles that stayed green.
+test('searchesSameFiles: git failure, hidden ancestors, .rgignore, the walk limit, .. and absolute paths decline (review L-6)', () => {
+  // R6: git that cannot run is no answer (only 128 means "not a repository").
+  withTempDir('pre-grep-l6r6-', (dir) => {
+    put(dir, 'src/a.rs');
+    assert.equal(same(dir, 'grep'), true, 'control');
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = pathE2e.join(dir, 'no-bin');
+      assert.equal(same(dir, 'grep'), false, 'git not found');
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+  // R7: a hidden directory on the way to the path, outside git.
+  withTempDir('pre-grep-l6r7-', (dir) => {
+    put(dir, '.hid/sub/a.rs');
+    assert.equal(d133r.searchesSameFiles({ root: dir, target: '.hid/sub/', verb: 'grep' }), false);
+    put(dir, 'vis/sub/a.rs');
+    assert.equal(d133r.searchesSameFiles({ root: dir, target: 'vis/sub/', verb: 'grep' }), true);
+  });
+  // R8: .rgignore is ripgrep's own ignore file, outside git too.
+  withTempDir('pre-grep-l6r8-', (dir) => {
+    put(dir, 'src/a.rs');
+    put(dir, '.rgignore', 'src/a.rs\n');
+    assert.equal(same(dir, 'grep'), false);
+  });
+  // R9: 20,001 entries is past the walk's limit (an absolute count, not one
+  // derived from the constant).
+  withTempDir('pre-grep-l6r9-', (dir) => {
+    for (let d = 0; d < 21; d++) {
+      const sub = pathE2e.join(dir, 'src', `d${d}`);
+      fsE2e.mkdirSync(sub, { recursive: true });
+      for (let f = 0; f < 1000; f++) fsE2e.writeFileSync(pathE2e.join(sub, `f${f}.rs`), '');
+    }
+    assert.equal(same(dir, 'grep'), false, '21,021 entries');
+    // In git: as many untracked files, then as many tracked ones for a show
+    // answer (each would be stat'ed).
+    const git = (...a) => {
+      const r = spawnHook('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stderr);
+    };
+    git('init', '-q', '.');
+    assert.equal(same(dir, 'grep'), false, '21,000 untracked files');
+    git('add', '-A');
+    git('commit', '-qm', 'many');
+    assert.equal(same(dir, 'grep'), true, 'tracked: a grep answer');
+    assert.equal(same(dir, 'grep', { show: true }), false, '21,000 tracked files: a show answer');
+  });
+  // R25: a path outside the root.
+  withTempDir('pre-grep-l6r25-', (outer) => {
+    put(outer, 'a/src/x.rs');
+    put(outer, 'b/y.rs');
+    const root = pathE2e.join(outer, 'a');
+    assert.equal(d133r.searchesSameFiles({ root, target: 'src', verb: 'grep' }), true, 'control');
+    assert.equal(d133r.searchesSameFiles({ root, target: '../b', verb: 'grep' }), false, '..');
+    assert.equal(d133r.searchesSameFiles({ root, target: pathE2e.join(outer, 'b'), verb: 'grep' }), false, 'absolute');
+  });
 });

@@ -459,8 +459,11 @@ function runMain() {
   // D#133 #8 — a grep or show answer must read the files the grep read
   // (untracked hidden or ignored ones, git grep's tracked-only set). Checked
   // only for an answer about to be injected: it runs git. The call graph does
-  // not depend on which files a grep reads.
-  if (answeredMode !== 'callgraph' && !searchesSameFiles({ root, target: searchPath, verb: plan.verb })) return;
+  // not depend on which files a grep reads. A `show` answer reads the index,
+  // which skips more (review of D#133, H-2).
+  if (answeredMode !== 'callgraph' && !searchesSameFiles({
+    root, target: searchPath, verb: plan.verb, show: answeredMode === 'show',
+  })) return;
 
   recordRecommendation(root, {
     hook: 'grep', action: 'inject', answered: true,

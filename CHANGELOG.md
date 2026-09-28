@@ -497,7 +497,7 @@ or gets no answer (the PostToolUse inject); none of them is emulated.
   `[\(]`, `a{,2}`, `a+?b`, `(?i)` and a leading `*` differently, and PCRE reads
   `\<` as the character `<`. A pattern using any of them is no longer
   answered; one all three read alike (`Foo|Bar`, `\bfoo\b`, `\<foo\>`, `x{2}`,
-  `(a|b)`, `[[:upper:]]`) still is. A quoted `"-E"` counts as the flag: the
+  `(a|b)`) still is. A quoted `"-E"` counts as the flag: the
   shell strips the quotes before grep reads it.
 - **`--include` with `/` or `**`.** GNU grep matches the glob against the base
   name, so `--include='src/*.js'` finds nothing there; cg's `-g` matches the
@@ -509,8 +509,7 @@ or gets no answer (the PostToolUse inject); none of them is emulated.
   hook asks `git ls-files` whether the path holds such a file for that verb;
   when it does, or git cannot tell, the grep runs as typed. Outside a git work
   tree it looks for hidden entries and ignore files under the path instead.
-  The check runs only for a grep about to be answered and costs 4–10 ms on
-  this repo (median of 9: `git grep` 4.0, `grep -r` 8.3, `rg` 9.1 on `src/`).
+  The check runs only for a grep about to be answered; its cost is below.
 - **`grep -c`.** GNU grep and ugrep print `file:0` for every file without a
   match; cg, `rg -c` and `git grep -c` print only files with matches. `grep -c`
   is no longer rewritten; `rg -c` and `git grep -c` still are. A rewritten grep
@@ -533,6 +532,53 @@ or gets no answer (the PostToolUse inject); none of them is emulated.
   answered an empty output the grep never produced. A grep after one of them,
   `cd x || exit 1; grep …` included, gets no inject.
 
+The pre-release review of these repairs reproduced more files and patterns the
+answer read differently. Each now runs as typed too:
+
+- **Ripgrep's own ignore files.** cg's walk is ripgrep, which reads `.ignore`
+  and `.rgignore` (ag: `.agignore`) inside the searched path and in every
+  directory above it, up to `/`; git reads none of them. A grep whose path
+  holds one, or sits below one, is not answered, and neither is any grep while
+  `RIPGREP_CONFIG_PATH` is set (cg passes ripgrep no `--no-config`).
+- **Symbolic links, submodules and `grep -R`.** `grep -r` and `rg` skip a
+  symbolic link met while recursing; cg named a tracked one on ripgrep's
+  command line, which follows it, and `git grep` searches the link's text.
+  `git grep` does not enter a submodule; cg's walk does. A path holding a
+  symbolic link, a submodule or an untracked nested repository is not
+  answered, and `grep -R`, which follows every link, never is.
+- **`show` reads the index.** Its walk skips hidden files even when tracked,
+  `vendor/`, `node_modules/`, `target/` and `bower_components/`, files of a
+  language it does not parse, files over `CODE_GRAPH_MAX_FILE_SIZE` (1 MiB)
+  and ignored files: `grep -rn -A2 "fn f\b" src/` printed a definition in
+  `src/vendor/` that the answer did not. `show` now answers only when every
+  file the grep reads is one the index holds. The hooks keep a copy of those
+  rules, and a test compares it with the Rust source.
+- **Patterns ugrep reads apart.** Claude Code's `grep` runs ugrep, whose `\W`
+  and `\D` match a line break (`grep -E '\Wfoo\('` also printed the line
+  before a match), and which prints no line for a match of nothing (`d?`,
+  `foo|`, `a*`) where GNU grep and rg print every line. POSIX classes
+  (`[[:alpha:]]`) are ASCII to rust and follow the locale in GNU grep and
+  ugrep; `\d` under `-P` is ASCII to GNU grep and Unicode to rust; a repeated
+  assertion (`\b{2}`, `$+`, `\b*`), a `^` or `$` inside an alternative and a
+  stray `}` read differently as well; and `-E` with `-P` is an error to GNU
+  grep. A pattern using any of them is not answered. On the review's fuzz
+  (1,500 generated patterns per dialect, each run through GNU grep 3.12,
+  ugrep 7.8.4 and rg 15.1 on one file, counting patterns rg finds), the
+  answered patterns that print differently went from 107 to 19 under `-E`,
+  88 to 1 under `-P` and 87 to 16 under basic regex. What is left is a
+  non-breaking space under `\s`, a non-ASCII letter beside `\b` (both under
+  Not covered), and a pattern starting with `-`, which the rewrite never
+  takes as a pattern.
+
+The file check now runs four `git ls-files` listings for every verb, plus an
+existence check for the three ignore files in each directory from the path up
+to `/`, and, for `show`, a `stat` of each file the grep reads. It runs only
+for a grep about to be answered. On this repo it takes 17–24 ms (median of 9,
+per verb and path, `show` included; 8–19 ms before). On a repository with
+200,000 untracked files under the path it takes 166–175 ms (median of 5;
+172–176 ms before) and now declines: more than 20,000 untracked files are not
+checked one by one.
+
 Replayed through both hooks' processes (a stub binary, one fixture project)
 over 17,739 grep commands from this machine's session logs: the rewrite
 accepts the same 31 commands before and after, each now with `-M 0`; the
@@ -549,6 +595,13 @@ decision in-process over the same commands, 1 was answered by `show` before
 (`rg -n "function seedUninstallHome" -A 20 …`, which also matches a longer
 name) and 0 after, and 321 of the 323 inject segments that asked for `show`
 now get a grep answer.
+
+The review repairs were replayed the same way over 17,337 commands (the
+17,099 in this machine's session logs by then, plus 238 adversarial ones from
+the review and the repair), against the previous commit: neither hook answers
+a command it did not answer before, no session-log command lost an answer,
+and the 24 newly declined are adversarial ones (`show` greps of a path
+holding a file the index skips, the patterns above, and `grep -R`).
 
 ### Not covered
 
@@ -708,16 +761,32 @@ now get a grep answer.
   saved and the same symbol is reported at every Stop.
 - In a git worktree whose index lives in the main checkout, the edited path
   does not match the index's paths, and the Stop check says nothing.
-- The grep hooks' file check reads git's ignore rules, not ripgrep's: an
-  `.ignore` or `.rgignore` file inside a git work tree hides files from cg
-  that `grep -r` reads. A matching binary file is reported as `binary file
-  matches` by GNU grep and not printed by ugrep or cg, and `grep -R` follows
-  symbolic links, which cg does not; neither is checked.
+- A matching binary file is reported as `binary file matches` by GNU grep and
+  not printed by ugrep or cg; the grep hooks do not check for one.
+- The grep hooks' file check reads the hook's own environment: a
+  `RIPGREP_CONFIG_PATH` or `CODE_GRAPH_MAX_FILE_SIZE` set only in the shell
+  profile, or a different size limit in the process that built the index, is
+  not seen. Git settings that change a search (`grep.patternType`,
+  `submodule.recurse`) and a shell alias for `grep` are not read either.
+  Outside a git work tree, a directory is read whole before the 20,000-entry
+  limit applies, and the walk has no time limit. `ag` is not installed here,
+  so its file set and dialect were not run.
 - A `show` answer prints definitions; `grep -A3 "fn foo\b"` also prints a
-  comment or string line holding `fn foo`. A grep after `false &&` or `true ||`
-  is still answered by the inject when its output is empty (as in 0.160.0).
+  comment or string line holding `fn foo`. The answer comes from the index as
+  last built, which also skips a file that is not UTF-8. `"fn  foo\b"` (two
+  spaces) is still answered by `show foo`, although it matches no
+  single-spaced definition.
+- When `show` does not answer a context grep (`-i`, `-F`, or no end of word),
+  the inject answers it with a grep answer without the `-A`/`-B`/`-C` lines.
+- A grep after `false &&`, `true ||`, or `set` with a quoted `"-e"` or
+  `'errexit'` is still answered by the inject when its output is empty (as in
+  0.160.0).
+- A grep the hooks decline for its files or its grammar leaves no record, so
+  the usage funnel cannot count those declines.
 - `\b`, `\w` and a bracket on non-ASCII text can still differ between the
-  dialects, under `-E` and `-P` as under basic regex.
+  dialects (ugrep's `\b` and `\w` are ASCII), under `-E` and `-P` as under
+  basic regex; so can `\s` on a non-breaking space, which GNU grep does not
+  match and ugrep and rust do.
 - Releases before this one do not recognise the two new settings.json
   entries: after a downgrade, the older `uninstall` leaves them behind. On
   POSIX each runs only if its script still exists; on Windows a missing script

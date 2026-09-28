@@ -1257,8 +1257,10 @@ function shellWords(s) {
 // (recursion, line numbers, filenames, binary skipping, the regex dialect).
 // Per verb, because letters differ: ag's `-n` is --norecurse and `-H` is
 // --heading, rg's `-r` is --replace. Context letters (A/B/C, a count value)
-// only reach the rewrite in `show` mode, which answers with the body.
-const ALLOWED_SHORT = { grep: 'rRnHsIiwFlcEPABC', git: 'rnHIiwFlcEPABC', rg: 'nHiwFlcsABC', ag: 'iwlcsABC' };
+// only reach the rewrite in `show` mode, which answers with the body. Not
+// `-R`: it follows every symlink under the path, which cg's walk does not
+// (review of D#133, M-1).
+const ALLOWED_SHORT = { grep: 'rnHsIiwFlcEPABC', git: 'rnHIiwFlcEPABC', rg: 'nHiwFlcsABC', ag: 'iwlcsABC' };
 const VALUE_SHORT_BY_VERB = { grep: 'ABC', git: 'ABC', rg: 'gtABC', ag: 'ABC' };
 const COMMON_LONG = ['ignore-case', 'word-regexp', 'fixed-strings', 'files-with-matches', 'count', 'line-number'];
 const ALLOWED_LONG = {
@@ -1405,16 +1407,70 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
  * a hidden entry, or an ignore file ripgrep, ag or ugrep reads, differs from
  * grep -r. Any failure to tell (git missing, a timeout, a walk too large) is
  * a difference: the grep runs.
- * @param {{root: string, target?: string, verb: string}} opts `target` is
- *   root-relative (undefined: the whole root).
+ *
+ * Review of D#133 found what git's view leaves out, and each now declines for
+ * every verb:
+ *   - H-1: ripgrep reads `.ignore` and `.rgignore` (ag `.agignore`) inside
+ *     the path and in every directory above it, up to `/`; git reads none of
+ *     them. cg passes rg no `--no-config`, so RIPGREP_CONFIG_PATH changes its
+ *     search too.
+ *   - M-1: grep -r and rg skip a symlink met while recursing, cg names a
+ *     tracked one on rg's command line (followed) and git grep searches the
+ *     link's text; git grep does not enter a submodule, cg's walk does.
+ * With `show`, the answer is the index's, whose walk (src/indexer/merkle.rs)
+ * also skips hidden entries even when tracked, the INDEX_EXCLUDED_DIRS
+ * segments, files of no detected language (src/utils/config.rs), files over
+ * max_file_size (src/domain.rs) and tracked ignored files; any of them in the
+ * path declines (H-2). The three lists are pinned to the Rust source by test.
+ * @param {{root: string, target?: string, verb: string, show?: boolean}} opts
+ *   `target` is root-relative (undefined: the whole root).
  */
 const HIDDEN_SEGMENT = /(?:^|\/)\.(?!\.?(?:\/|$))/;
-const IGNORE_FILES = ['.gitignore', '.ignore', '.rgignore', '.agignore'];
+const RG_ONLY_IGNORE_FILES = ['.ignore', '.rgignore', '.agignore'];
 const WALK_LIMIT = 20000;
-function searchesSameFiles({ root, target, verb } = {}) {
+const INDEX_EXCLUDED_DIRS = ['node_modules', 'vendor', 'target', 'bower_components'];
+const INDEX_EXTENSIONS = new Set(['rs', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'go', 'py', 'pyi', 'java',
+  'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'hh', 'hxx', 'html', 'htm', 'css', 'cs', 'kt', 'kts', 'rb', 'php',
+  'swift', 'dart', 'md', 'mdx', 'markdown', 'sh', 'bash', 'json']);
+const INDEX_DEFAULT_MAX_FILE_SIZE = 1048576;
+// As src/domain.rs reads it: a u64, else the default. The hook sees its own
+// environment, not the index process's.
+function indexMaxFileSize(env = process.env) {
+  const raw = env.CODE_GRAPH_MAX_FILE_SIZE;
+  return typeof raw === 'string' && /^\+?\d+$/.test(raw) ? Number(raw) : INDEX_DEFAULT_MAX_FILE_SIZE;
+}
+// Does the index read this root-relative file (by name; size is separate)?
+function indexReadsPath(rel) {
+  const segs = rel.split('/');
+  if (segs.some((s) => s.startsWith('.') || INDEX_EXCLUDED_DIRS.includes(s))) return false;
+  const base = segs[segs.length - 1];
+  const dot = base.lastIndexOf('.');
+  return dot > 0 && INDEX_EXTENSIONS.has(base.slice(dot + 1));
+}
+// Is there a ripgrep-only ignore file in `dir` or any directory above it?
+function rgIgnoreAbove(dir) {
+  for (let d = dir; ; d = path.dirname(d)) {
+    if (RG_ONLY_IGNORE_FILES.some((f) => fs.existsSync(path.join(d, f)))) return true;
+    if (path.dirname(d) === d) return false;
+  }
+}
+// A listed entry that cannot be read counts as a symlink (the caller declines);
+// a missing path does not.
+function isSymlink(p, { missing = true } = {}) {
+  try { return fs.lstatSync(p).isSymbolicLink(); } catch { return missing; }
+}
+function searchesSameFiles({ root, target, verb, show = false } = {}) {
   if (!root || !['grep', 'git', 'rg', 'ag'].includes(verb)) return false;
   const rel = target === undefined ? '' : String(target).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
   if (rel.split('/').includes('..') || path.isAbsolute(rel)) return false;
+  if (process.env.RIPGREP_CONFIG_PATH) return false;
+  if (rgIgnoreAbove(path.join(root, rel))) return false;
+  const maxSize = indexMaxFileSize();
+  // For `show`: every file the grep reads must be one the index holds.
+  const indexHolds = (files) => files.length <= WALK_LIMIT && files.every((f) => {
+    if (!indexReadsPath(f)) return false;
+    try { return fs.statSync(path.join(root, f)).size <= maxSize; } catch { return false; }
+  });
   const git = (args) => {
     const budget = require('./hook-fail-open').remainingMs(1500);
     if (budget === null) return { status: null, stdout: '' };
@@ -1429,32 +1485,49 @@ function searchesSameFiles({ root, target, verb } = {}) {
       const r = git(['ls-files', '-z', ...opts, '--', rel || '.']);
       return r.status === 0 ? String(r.stdout).split('\0').filter(Boolean) : null;
     };
-    const checks = {
-      // untracked hidden, untracked ignored, tracked ignored
-      grep: () => [ls('--others', '--exclude-standard'), ls('--others', '--ignored', '--exclude-standard', '--directory'),
-        ls('--cached', '--ignored', '--exclude-standard')],
-      git: () => [ls('--others', '--exclude-standard')],
-      rg: () => [ls('--cached'), ls('--cached', '--ignored', '--exclude-standard')],
-    };
-    const [a, b, c] = checks[verb === 'ag' ? 'rg' : verb]();
-    if (verb === 'grep') return a !== null && b !== null && c !== null && !a.some((f) => HIDDEN_SEGMENT.test(f))
-      && b.length === 0 && c.length === 0;
-    if (verb === 'git') return a !== null && a.length === 0;
-    return a !== null && b !== null && !a.some((f) => HIDDEN_SEGMENT.test(f)) && b.length === 0;
+    const staged = ls('--cached', '--stage');           // "<mode> <sha> <n>\t<path>"
+    const others = ls('--others', '--exclude-standard'); // untracked, not ignored
+    const ignoredOthers = ls('--others', '--ignored', '--exclude-standard', '--directory');
+    const ignoredTracked = ls('--cached', '--ignored', '--exclude-standard');
+    if (!staged || !others || !ignoredOthers || !ignoredTracked) return false;
+    const tracked = [];
+    for (const e of staged) {
+      // 120000: a symlink; 160000: a submodule (M-1).
+      if (/^1[26]0000 /.test(e)) return false;
+      tracked.push(e.slice(e.indexOf('\t') + 1));
+    }
+    // An untracked nested repository is listed as `dir/`; a symlink as a file.
+    if (others.length > WALK_LIMIT || others.some((f) => f.endsWith('/') || isSymlink(path.join(root, f)))) return false;
+    const base = (f) => path.posix.basename(f.replace(/\/+$/, ''));
+    if ([tracked, others, ignoredOthers].some((l) => l.some((f) => RG_ONLY_IGNORE_FILES.includes(base(f))))) return false;
+    const anyHidden = (l) => l.some((f) => HIDDEN_SEGMENT.test(f));
+    let reads;
+    if (verb === 'grep') {
+      if (anyHidden(others) || ignoredOthers.length || ignoredTracked.length) return false;
+      reads = [...tracked, ...others];
+    } else if (verb === 'git') {
+      if (others.length) return false;
+      reads = tracked;
+    } else {
+      if (anyHidden(tracked) || ignoredTracked.length) return false;
+      reads = [...tracked, ...others.filter((f) => !HIDDEN_SEGMENT.test(f))];
+    }
+    return !show || (ignoredTracked.length === 0 && indexHolds(reads));
   }
   // 128 is git's "not a git repository"; anything else is a failure to tell.
   if (inside.status !== 128) return false;
-  // Not a work tree: ripgrep's walk. An ignore file from the root down to the
-  // path, or any hidden entry inside it, sets the verbs apart.
+  // Not a work tree: ripgrep's walk. A .gitignore from the root down to the
+  // path (ugrep reads it; ripgrep's own ignore files were checked above), a
+  // hidden or symlinked directory on the way, or any hidden entry or symlink
+  // inside it sets the verbs apart.
   let dir = root;
   for (const seg of ['', ...(rel ? rel.split('/') : [])]) {
     if (seg) dir = path.join(dir, seg);
-    if (seg.startsWith('.')) return false;
-    for (const f of IGNORE_FILES) {
-      try { if (fs.existsSync(path.join(dir, f))) return false; } catch { return false; }
-    }
+    if (seg.startsWith('.') || (seg && isSymlink(dir, { missing: false }))) return false;
+    if (fs.existsSync(path.join(dir, '.gitignore'))) return false;
   }
   const start = path.join(root, rel);
+  const files = [];
   let seen = 0;
   const stack = [start];
   while (stack.length) {
@@ -1463,11 +1536,14 @@ function searchesSameFiles({ root, target, verb } = {}) {
     try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       if (++seen > WALK_LIMIT) return false;
-      if (e.name.startsWith('.')) return false;
+      if (e.name.startsWith('.') || e.isSymbolicLink()) return false;
       if (e.isDirectory()) stack.push(path.join(d, e.name));
+      else if (show) files.push(path.relative(root, path.join(d, e.name)).split(path.sep).join('/'));
     }
   }
-  return true;
+  // A file named as the path itself: its own entry was never listed.
+  if (show && rel && files.length === 0 && !isDirectory(start)) files.push(rel);
+  return !show || indexHolds(files);
 }
 
 // Does `rootTarget`, run from the root, name the path the grep clause's own
@@ -1593,6 +1669,7 @@ function showAnswersPattern(pattern, cmd) {
   const fixed = flags.has('-F');
   const word = flags.has('-w');
   const dialect = patternDialect(cmd);
+  if (dialect === 'conflict') return false;
   const alts = fixed ? [pattern] : pattern.split(dialect === 'basic' ? '\\|' : '|');
   return alts.every((alt) => {
     const m = SHOW_ALT.exec(alt);
@@ -1612,20 +1689,83 @@ function showAnswersPattern(pattern, cmd) {
 function translateBreToRg(cmd, pattern) {
   if (typeof pattern !== 'string' || !pattern) return pattern;
   const dialect = patternDialect(cmd);
-  if (dialect === 'basic') return breToRustRegex(pattern);
+  if (dialect === 'rust') return pattern;
+  if (dialect === 'conflict') return null;
   // D#133 #5: an extended or Perl pattern was passed on unchecked, and the
   // dialects read `\d`, `[\(]`, `a{,2}`, `a+?b` and `(?i)` differently (GNU
   // grep 3.12, ugrep 7.8 and cg run on one fixture).
-  if (dialect === 'extended' || dialect === 'perl') {
-    return portableExtended(pattern, { perl: dialect === 'perl' });
-  }
-  return pattern;
+  const out = dialect === 'basic'
+    ? breToRustRegex(pattern)
+    : portableExtended(pattern, { perl: dialect === 'perl' });
+  // ugrep, the `grep` Claude Code's shell runs, prints no line for an empty
+  // match, where GNU grep and rg print every line (review of D#133, M-2).
+  return out !== null && matchesEmpty(out) ? null : out;
+}
+
+/**
+ * Can this pattern (rust syntax, as translateBreToRg returns it) match the
+ * empty string? An assertion (`^`, `$`, `\b`, `\B`, `\<`, `\>`) matches
+ * empty; so does an atom under `*`, `?` or a `{0…}` repeat, a sequence of such
+ * atoms, and an alternation with one such branch (`a|`). Unreadable: true, so
+ * the caller declines.
+ */
+function matchesEmpty(pattern) {
+  let i = 0;
+  let bad = false;
+  const alt = () => {
+    let any = seq();
+    while (pattern[i] === '|') { i++; any = seq() || any; }
+    return any;
+  };
+  const seq = () => {
+    let all = true;
+    while (i < pattern.length && pattern[i] !== '|' && pattern[i] !== ')') {
+      let empty = atom();
+      for (;;) {
+        const c = pattern[i];
+        if (c === '*' || c === '?') { empty = true; i++; continue; }
+        if (c === '+') { i++; continue; }
+        const m = c === '{' ? /^\{(\d+)(?:,\d*)?\}/.exec(pattern.slice(i)) : null;
+        if (!m) break;
+        if (Number(m[1]) === 0) empty = true;
+        i += m[0].length;
+      }
+      all = all && empty;
+    }
+    return all;
+  };
+  const atom = () => {
+    const c = pattern[i];
+    if (c === '(') {
+      i++;
+      const inner = alt();
+      if (pattern[i] !== ')') bad = true;
+      i++;
+      return inner;
+    }
+    if (c === '\\') {
+      const n = pattern[i + 1];
+      i += 2;
+      return n === undefined || 'bB<>'.includes(n);
+    }
+    if (c === '[') {
+      const end = bracketEnd(pattern, i);
+      if (end === -1) { bad = true; i = pattern.length; return true; }
+      i = end + 1;
+      return false;
+    }
+    i++;
+    return c === '^' || c === '$';
+  };
+  const empty = alt();
+  return bad || i < pattern.length || empty;
 }
 
 /**
  * The regex dialect a grep clause's pattern is written in: 'rust' (rg, the
- * answer's own), 'perl' (ag, `-P`), 'extended' (`-E`) or 'basic' (plain grep
- * and git grep). `-F` is the callers' to read, from extractCgFlags, which
+ * answer's own), 'perl' (ag, `-P`), 'extended' (`-E`), 'basic' (plain grep
+ * and git grep), or 'conflict' (`-E` and `-P` together, an error to GNU
+ * grep). `-F` is the callers' to read, from extractCgFlags, which
  * knows a flag's value slot (`--include -F`).
  *
  * The grep's OWN clause, not the whole command. This was the one flag check
@@ -1648,37 +1788,51 @@ function patternDialect(cmd) {
   const words = clauseWords(firstShellClause(cmd).replace(VERB_STRIP, '')) || [];
   const has = (letter, long) => words.some((w) => w.text === `--${long}`
     || new RegExp(`^-[a-zA-Z]*${letter}[a-zA-Z]*(?:=|\\d|$)`).test(w.text));
-  if (has('P', 'perl-regexp')) return 'perl';
-  if (has('E', 'extended-regexp')) return 'extended';
+  const perl = has('P', 'perl-regexp');
+  const extended = has('E', 'extended-regexp');
+  // Both: GNU grep reports "conflicting matchers specified" and exits 2
+  // (review of D#133, L-4); there is no dialect to answer in.
+  if (perl && extended) return 'conflict';
+  if (perl) return 'perl';
+  if (extended) return 'extended';
   return 'basic';
 }
 
 // An extended (ERE) or Perl pattern that GNU grep, ugrep and rust regex all
 // read alike, returned as is; anything else is null and the grep runs. Only
 // escapes of the word/space/boundary classes and of metacharacters pass, and
-// `\<` `\>` only in ERE (PCRE reads them as the characters `<` `>`) and `\d`
-// only in Perl (GNU ERE reads it as `d`). A quantifier with nothing to repeat
-// (so every `(?` group) or after another quantifier (`+?` is lazy in rust, a
-// repeated group in ERE), a brace that is not `{n}`, `{n,}` or `{n,m}`, and a
-// bracket holding an escape, a nested `[` or a set operator are refused.
-const EXT_SAME_ESCAPE = 'wWsSbB.[]^$*+?(){}|\\/';
+// `\<` `\>` only in ERE (PCRE reads them as the characters `<` `>`). A
+// quantifier with nothing to repeat (so every `(?` group), after another
+// quantifier (`+?` is lazy in rust, a repeated group in ERE) or after an
+// assertion (`\b{2}`, `$+`: an error or a literal to GNU grep, every line to
+// rust), a brace that is not `{n}`, `{n,}` or `{n,m}`, and a bracket holding an
+// escape, a nested `[`, a set operator or a POSIX class are refused. Not
+// `\W`: ugrep's matches a line break, so `\Wfoo` also printed the line before
+// a match; not `\d` `\D` under Perl: ASCII to GNU grep, Unicode to rust, and
+// ugrep's `\D` matches a line break (review of D#133, M-2).
+const EXT_SAME_ESCAPE = 'wsSbB.[]^$*+?(){}|\\/';
 function portableExtended(pattern, { perl = false } = {}) {
   let atomStart = true;    // a quantifier here would repeat nothing
   let quantified = false;  // the previous token was a quantifier
+  let assertion = false;   // the previous token matches no character
+  let altStart = true;     // an alternative starts here
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
+    const wasAltStart = altStart;
+    altStart = false;
     if (c === '\\') {
       const n = pattern[i + 1];
       const same = n !== undefined && (EXT_SAME_ESCAPE.includes(n)
-        || (!perl && (n === '<' || n === '>')) || (perl && (n === 'd' || n === 'D')));
+        || (!perl && (n === '<' || n === '>')));
       if (!same) return null;
       i++;
       atomStart = false;
       quantified = false;
+      assertion = 'bB<>'.includes(n);
       continue;
     }
     if (c === '*' || c === '+' || c === '?' || c === '{') {
-      if (atomStart || quantified) return null;
+      if (atomStart || quantified || assertion) return null;
       if (c === '{') {
         const m = /^\{\d+(?:,\d*)?\}/.exec(pattern.slice(i));
         if (!m) return null;
@@ -1688,8 +1842,17 @@ function portableExtended(pattern, { perl = false } = {}) {
       continue;
     }
     quantified = false;
+    assertion = false;
+    // `^` and `$` only where an alternative starts or ends (so never `$+`):
+    // elsewhere ugrep reads them apart from GNU grep and rust (`\[*^[ab]`
+    // matched `[a]`). A stray `}` is an error to ugrep -P (review of D#133,
+    // M-2).
+    if (c === '^' && !wasAltStart) return null;
+    if (c === '$' && i + 1 < pattern.length && !')|'.includes(pattern[i + 1])) return null;
+    if (c === '}') return null;
     // After `(`, `|` or `^` a quantifier repeats nothing; that also refuses
     // every `(?` group (`(?i)`, `(?:`, a lookaround).
+    if (c === '(' || c === '|') altStart = true;
     if (c === '(' || c === '|' || c === '^') { atomStart = true; continue; }
     atomStart = false;
     if (c !== '[') continue;
@@ -1703,19 +1866,15 @@ function portableExtended(pattern, { perl = false } = {}) {
 // The index of the `]` closing the bracket expression opened at `i`, or -1
 // when the bracket reads differently in POSIX and rust regex: POSIX has no
 // escapes in a bracket, rust has escapes, `[` nesting and the `&&` `--` `~~`
-// set operators; a leading `]` is a member in POSIX. `[:alpha:]` is a POSIX
-// class in both. Unterminated: -1 (grep reports an error).
+// set operators; a leading `]` is a member in POSIX. A POSIX class
+// (`[:alpha:]`) is ASCII to rust and follows the locale in GNU grep and ugrep
+// (`é`, `٣`; review of D#133, M-2), so it counts as a nested `[`.
+// Unterminated: -1 (grep reports an error).
 function bracketEnd(pattern, i) {
   let j = i + 1;
   if (pattern[j] === '^') j++;
   if (pattern[j] === ']') return -1;
   for (; j < pattern.length && pattern[j] !== ']'; j++) {
-    if (pattern[j] === '[' && pattern[j + 1] === ':') {
-      const close = pattern.indexOf(':]', j + 2);
-      if (close === -1 || !POSIX_CLASSES.has(pattern.slice(j + 2, close))) return -1;
-      j = close + 1;
-      continue;
-    }
     if (pattern[j] === '\\' || pattern[j] === '[') return -1;
     if ('&-~'.includes(pattern[j]) && pattern[j + 1] === pattern[j]) return -1;
   }
@@ -1738,12 +1897,11 @@ function bracketEnd(pattern, i) {
 // Escapes: only the ones both read alike pass — the swapped operators, the
 // word/space/boundary classes, and an escaped metacharacter. `\1`, `\d`, `\z`,
 // `\_`, `\=` mean something else (or are an error) in one of the two, and so
-// do an empty group `\(\)`, an unknown `[:class:]` and a leading `]` in a
-// bracket (review of D#65).
+// do an empty group `\(\)`, any `[:class:]` and a leading `]` in a bracket
+// (review of D#65), `\W`, which matches a line break in ugrep, and a
+// quantifier after an assertion (`\b*`, `\>\{2\}`; review of D#133, M-2).
 const BRE_SWAPPED = '(){}+?|';
-const BRE_SAME_ESCAPE = 'wWsSbB<>.*[]^$\\/';
-const POSIX_CLASSES = new Set(['alpha', 'digit', 'alnum', 'upper', 'lower', 'space',
-  'punct', 'xdigit', 'blank', 'cntrl', 'graph', 'print']);
+const BRE_SAME_ESCAPE = 'wsSbB<>.*[]^$\\/';
 // An unescaped `^` is an anchor only where an alternative starts (the pattern's
 // start, after `\(` or `\|`), and `$` only where one ends (the pattern's end,
 // before `\)` or `\|`); elsewhere BRE reads them as literals and rust regex as
@@ -1753,21 +1911,27 @@ function breToRustRegex(pattern) {
   let out = '';
   let altStart = true;
   let anchor = false;
+  let assertion = false;
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
     const wasAltStart = altStart;
     const wasAnchor = anchor;
+    const wasAssertion = assertion;
     altStart = false;
     anchor = c === '^' && wasAltStart;
+    assertion = anchor;
     if (c === '\\' && i + 1 < pattern.length) {
       const n = pattern[++i];
       if (n === '(' && pattern.startsWith('\\)', i + 1)) return null;
+      if (wasAssertion && '+?{'.includes(n)) return null;
       if (BRE_SWAPPED.includes(n)) out += n;
       else if (BRE_SAME_ESCAPE.includes(n)) out += c + n;
       else return null;
       altStart = n === '(' || n === '|';
+      assertion = 'bB<>'.includes(n);
       continue;
     }
+    if (c === '*' && wasAssertion) return null;
     if (c === '^' && !wasAltStart) return null;
     // A `*` where an alternative starts, or right after its `^`, repeats
     // nothing: BRE reads it as a literal, rust regex as an error or a repeat of
@@ -2064,7 +2228,11 @@ function runMain() {
     // grep's own file set differs when the path holds untracked hidden, ignored
     // or (for git grep) untracked files. Checked only for an answer that would
     // replace the command: it runs git. The grep runs as typed.
-    if (plan && !searchesSameFiles({ root, target: extractSearchPath(cmd), verb: plan.verb })) return;
+    // A `show` answer reads the index instead, which skips more (review of
+    // D#133, H-2).
+    if (plan && !searchesSameFiles({
+      root, target: extractSearchPath(cmd), verb: plan.verb, show: answeredMode === 'show',
+    })) return;
 
     const answered = answer.status === 'hits';
     recordRecommendation(root, {
@@ -2173,6 +2341,10 @@ module.exports = {
   isDirectory,
   declKindsBySymbol, // D#125 #2 review
   searchesSameFiles, // D#133 #8
+  indexReadsPath,    // review of D#133 H-2: the index's own skip rules, mirrored
+  INDEX_EXCLUDED_DIRS,
+  INDEX_EXTENSIONS,
+  INDEX_DEFAULT_MAX_FILE_SIZE,
   showAnswersPattern, // D#133 — show answers whole names only
   resolveProjectRoot,    // v0.48 — subdir-cwd dark fix
   rebaseRelativePaths,   // v0.48 — subdir-cwd dark fix

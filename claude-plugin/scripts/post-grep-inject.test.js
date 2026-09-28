@@ -1305,3 +1305,70 @@ test('e2e D#133: the inject declines when the grep reads files the answer does n
     cleanupFixture(fixture, control);
   }
 });
+
+// ── D#133 review repairs on the PostToolUse side ─────────────────────
+function gitFixtureInject(stubBody) {
+  const fixture = e2eFixture(stubBody);
+  const git = (...a) => {
+    const r = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: fixture.dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  git('init', '-q', '.');
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  fs.writeFileSync(path.join(fixture.dir, 'src', 'a.rs'), 'x\n');
+  fs.writeFileSync(path.join(fixture.dir, '.gitignore'), '.code-graph/\nsrc/gen/\n');
+  git('add', '-A');
+  git('commit', '-qm', 'init');
+  return { fixture, git };
+}
+
+// L-6 R29: the inject passed its own verb to the file check; a check run for
+// another verb (git grep reads no untracked file, ignored or not) let grep -r's
+// ignored file through.
+test('e2e review L-6 R29: the inject checks the files of the grep\'s own verb', () => {
+  const uniq = `InjVerb${Date.now()}`;
+  const { fixture } = gitFixtureInject(d133Stub());
+  const control = `echo x; grep -rn "${uniq}A" src/`;
+  const cmd = `echo x; grep -rn "${uniq}B" src/`;
+  try {
+    assert.ok(runHook(control, fixture, {}, undefined, '').stdout.trim().startsWith('{'), 'control');
+    fs.mkdirSync(path.join(fixture.dir, 'src', 'gen'));
+    fs.writeFileSync(path.join(fixture.dir, 'src', 'gen', 'g.rs'), 'x\n');
+    assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'an untracked ignored file grep -r reads');
+  } finally {
+    cleanupFixture(fixture, cmd);
+    cleanupFixture(fixture, control);
+  }
+});
+
+// Review H-1 and H-2 on the inject: a `.ignore` hides files from cg's walk, and
+// a show answer reads the index, which skips vendor/.
+test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and on a file the index skips', () => {
+  const uniq = `InjIdx${Date.now()}`;
+  const cmds = [];
+  try {
+    {
+      const { fixture } = gitFixtureInject(d133Stub());
+      const control = `echo x; grep -rn -A2 "fn ${uniq}A\\b" src/`;
+      const cmd = `echo x; grep -rn -A2 "fn ${uniq}B\\b" src/`;
+      cmds.push([fixture, control], [fixture, cmd]);
+      assert.match(JSON.parse(runHook(control, fixture, {}, undefined, '').stdout).hookSpecificOutput.additionalContext,
+        /SHOWBODY/, 'control answers with show');
+      fs.mkdirSync(path.join(fixture.dir, 'src', 'vendor'));
+      fs.writeFileSync(path.join(fixture.dir, 'src', 'vendor', 'b.rs'), `fn ${uniq}B() {}\n`);
+      assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'src/vendor/ is not indexed');
+    }
+    {
+      const { fixture } = gitFixtureInject(d133Stub());
+      const control = `echo x; grep -rn "${uniq}C" src/`;
+      const cmd = `echo x; grep -rn "${uniq}D" src/`;
+      cmds.push([fixture, control], [fixture, cmd]);
+      assert.ok(runHook(control, fixture, {}, undefined, '').stdout.trim().startsWith('{'), 'control');
+      fs.writeFileSync(path.join(fixture.dir, 'src', '.ignore'), 'u.rs\n');
+      fs.writeFileSync(path.join(fixture.dir, 'src', 'u.rs'), 'x\n');
+      assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'src/.ignore');
+    }
+  } finally {
+    for (const [fixture, cmd] of cmds) cleanupFixture(fixture, cmd);
+  }
+});
