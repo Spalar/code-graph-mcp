@@ -122,13 +122,16 @@ carries it:
   one on a slice, array or tuple for a receiver of no name
   (`b: &[u8]`), a slice's for a `Vec` and `str`'s for a `String`, which deref
   to them, and a primitive's for an unsuffixed literal. A project type binds its own
-  methods when it has one, else resolves as before (a trait's default method
-  or a `Deref` target may run). Of several project types of that name, the
+  method of the name when one takes the call's arguments; else the call
+  resolves by name as before (a trait's default method or a `Deref` target may
+  run), which can bind another type's same-named method (see Not covered).
+  Of several project types of that name, the
   one the `use` path names wins, through a re-export as a path call's does
   (tokio's `use crate::loom::sync::Mutex` is not `tokio::sync::Mutex`).
 - A typed call the unique-method rule cannot decide (none, or several) waits
-  in the pending-call buffer, so the run that gives its type the method binds
-  it as a rebuild does.
+  in the pending-call buffer, which keeps one row per caller and name, as in
+  0.161.0: of two such calls of one name in one caller, one waits (see Not
+  covered).
 
 Deliberately untyped, resolved by name as before: a closure parameter without
 a type, a pattern binding (`if let Some(x)`, `match`, `for`, a destructuring
@@ -255,8 +258,10 @@ is withdrawn to what an impl's own header says:
   `<…>` list. `impl<St: AsRef<str>> Ext for St` counts too, and `impl Tr for
   T` on an imported `struct T` does not.
 - Blanket-impl methods now show their impl's type parameter in the signature
-  (`<T> (&self) -> u32`). No other signature changes: on tokio 5 of 9,575
-  nodes differ, all of them such methods, and on this repo none.
+  (`<T> (&self) -> u32`). So does a function nested in such a method, named
+  like it and starting on the method's line. No other signature changes: on
+  tokio 5 of 9,575 nodes differ, all of them blanket-impl methods, and on this
+  repo none.
 - A blanket impl was admitted only when the caller's file imported some item
   of the impl's file, so an unrelated import of that file admitted it (`use
   crate::ext3::util; s.trim()`). That test is withdrawn, and a blanket impl
@@ -365,22 +370,30 @@ nothing matches and every file that could hold a site was read, the block is
 one line (`(no dynamic-dispatch site names 'x')`) and the field is
 `{"sites":[],"total":0}`. When something was not read, the answer says what:
 a definition in a language with no shape table (bash, where `trap cleanup
-EXIT` dispatches by name), files over 2 MB or not UTF-8 that hold the name,
-files not reached within the scan's 1-second limit. The block is then
+EXIT` dispatches by name), every file over 2 MB (whether or not it holds the
+name), files not UTF-8 that hold the name, files not reached within the scan's
+1-second limit, and Rust paths passing the name as a value through a
+qualifier the scan cannot tie to a definition (below). The block is then
 `(no dynamic-dispatch site names 'x' in the files scanned; not scanned: bash
 files)` followed by the `grep` command (a block with sites gets a
 `not scanned: …` line), and the field gains `not_scanned` (`languages`,
-`skipped_files`, `files_past_time_limit`) and `next`. No edge is added, and a
+`skipped_files`, `files_past_time_limit`, `unresolved_paths`) and `next`. No
+edge is added, and a
 non-empty answer is unchanged byte for byte.
 
 The scan reads comments and string contents as blank (a string counts only
 where it is the key), skips test files, and in a file that declares a local,
 parameter or pattern of the name reads that file's bare uses as the local's.
 In Rust, `a.b` not followed by `(` is a field read and never counts (a method
-is passed as `Self::b` / `Type::b`); `Q::b` counts only when `Q` is where a
-definition of `b` lives (its type, its module, or `Self`, `self`, `super`,
-`crate`), so `Result::ok` and `thread::JoinHandle::join` are not a project
-`ok` / `join`; a parameter of a generic function binds its name
+is passed as `Self::b` / `Type::b`); `Q::b` is a site only when `Q` is where
+a definition of `b` lives (its type, its module's file or directory name, or
+`Self`, `self`, `super`, `crate`), so `Result::ok` and
+`thread::JoinHandle::join` are not a project `ok` / `join`. Any other `Q` can
+still be the name's own (the crate's name, an inline `mod`, a `use … as`
+alias, a trait), and so can `Wrapper::<u8>::b` and `<X as Tr>::b`: such a
+line is not listed as a site, and the answer does not claim none either
+(`not scanned: 1 Rust path with an unrecognized qualifier`). A parameter of a
+generic function binds its name
 (`fn map<T, F>(self, f: F)`), and so does a parameter named like the
 function on the definition's own line (`fn append(&mut self, append: bool)`);
 an attribute's arguments (`#[inline(never)]`) are not values. The scan is
@@ -388,7 +401,8 @@ linear in the file's size: it answered each occurrence's "which bracket
 encloses this" by scanning, which made a nested file quadratic (the review's
 240 KB `[get,[get,…]]` took 22.6 s for an empty `callgraph get`, now 45 ms,
 with the same answer). The shape table is in `src/graph/boundaries/mod.rs`;
-197 corpus rows over 14 languages pin what counts and what does not. There is
+197 corpus rows over 16 language tags (the 14 with a shape table, plus bash
+and markdown look-alikes) pin what counts and what does not. There is
 no block on a `--direction callees` query, on `refs --relation` other than
 `calls` or `references`, or for a symbol that is not a function.
 
@@ -418,8 +432,9 @@ ranked by caller count (call-edge in-degree; for `map`, a module's incoming
 imports). The lowest-ranked items are shortened first: a module loses its key
 symbols, a symbol its signature, a definition its body, a call-graph node its
 type. Then they are left out, and a call-graph node always goes before its
-parent. An item is printed whole or not at all. In `overview` of a directory
-(CLI and MCP) one file gets at most 70% of the budget. Text answers end with
+parent. An item is printed whole or not at all. In `overview` (CLI and MCP)
+one file gets at most 70% of the budget, also when the path is that one file.
+Text answers end with
 `… budget N tokens: …` and `next: <command>`. MCP answers carry a `budget`
 object (`max_tokens`, `omitted`, what was shortened, `next`). Every section
 counts against the budget, the ones a flag folds in too: `module_overview`'s
@@ -450,10 +465,11 @@ added after it.
 | MCP `module_overview`: `active_capped`, an inactive group's `more` | `"next": "code-graph-mcp overview <path>"` |
 | MCP `get_call_graph`: `rollup_call_graph` | `"next": "code-graph-mcp callgraph <name> …"` |
 | MCP `get_ast_node`: `compressed_node` | `"next": "code-graph-mcp show <name> --file <file> …"` |
-| MCP threshold tier on these four tools: `_truncated` | the command for the whole answer (it replaces a handler's `next`) |
+| MCP threshold tier on these four tools: `_truncated` | the command for the whole answer (it replaces a handler's `next`); for a cut `dead_code` or `centrality` section it does not return those entries (see Not covered) |
 
 Tests execute each suggested command and check that it returns the items that
-were left out. Default answers were compared with those of the binary built
+were left out, apart from those two threshold-tier sections. Default answers
+were compared with those of the binary built
 before this change: 7 text answers match byte for byte once the added
 `next:` lines are removed, and 10 JSON answers match once `next` is removed
 (`tests/data/budget_base/`).
@@ -502,8 +518,10 @@ Two hooks join the six that `install`, `update` and `doctor` register in
   adopted block never reached them. The hook runs `health-check` once and
   returns `additionalContext` stating the file count, the index age, a pending
   rebuild if there is one, and the `callgraph`, `show` and `overview` commands.
-  Facts only, capped at 400 characters: 321 bytes on this repo, 389 at the
-  longest input the builder accepts. Nothing is injected when no index is found
+  Facts only, capped at 400 characters: 321 bytes on this repo, 389 for a file
+  count of up to 9 digits. A longer or fractional count builds a longer text;
+  past 400 characters nothing is injected. Nothing is injected when no index
+  is found
   up the tree, when no binary resolves, when the index has 0 files, or with
   `CODE_GRAPH_QUIET_HOOKS=1`. Median 125 ms per subagent spawn (20 runs).
 - **Stop** (`stop-impact.js`, 5 s budget). `pre-edit-guide.js` now appends
@@ -528,7 +546,13 @@ Two hooks join the six that `install`, `update` and `doctor` register in
   out as Stop `additionalContext`, not `decision: "block"`. Nothing is injected
   on `stop_hook_active`, outside a git work tree, without an index or binary,
   for a body-only change, for a language without an exact header reading
-  (see Not covered), or with `CODE_GRAPH_QUIET_HOOKS=1`. One caller is 230
+  (see Not covered), for a file where the symbol's definition pattern matches
+  on a line over 2,000 characters (a minified or generated file), or with
+  `CODE_GRAPH_QUIET_HOOKS=1`. The baseline is read inside `pre-edit-guide.js`,
+  which has a 4 s timeout: on a 1.5 MB one-line bundle, finding the line once
+  per match took it 9.2–9.5 s. The line cap ends that reading at the first
+  match; the test that runs the hook on such a bundle takes 81–84 ms. One
+  caller is 230
   bytes; 8 symbols × 8 callers is about 3,359 bytes (3,314 measured before the
   header grew by 45 bytes; the shared 4,000-byte cap applies). A session with
   no Edit exits in 34 ms median and writes nothing.
@@ -629,9 +653,11 @@ answer read differently. Each now runs as typed too:
   ugrep 7.8.4 and rg 15.1 on one file, counting patterns rg finds), the
   answered patterns that print differently went from 107 to 19 under `-E`,
   88 to 1 under `-P` and 87 to 16 under basic regex. What is left is a
-  non-breaking space under `\s`, a non-ASCII letter beside `\b` (both under
-  Not covered), and a pattern starting with `-`, which the rewrite never
-  takes as a pattern.
+  non-breaking space under `\s`, a non-ASCII letter beside `\b`, and a
+  pattern starting with `-`, which the rewrite never takes as a pattern. The
+  fuzz did not cover two more, found by the pre-tag review: a `$` before a
+  CRLF line ending, and an empty alternative (`(a|)b` under `-E`/`-P`). These
+  four are under Not covered.
 
 The file check now runs four `git ls-files` listings for every verb, plus an
 existence check for the three ignore files in each directory from the path up
@@ -764,7 +790,16 @@ holding a file the index skips, the patterns above, and `grep -R`).
   `DirEntry::path`, which the untyped `first_entry.path()` of the same
   function really calls and cannot pick among the project's `path` methods.
 - A typed call that no method answers waits in the pending-call buffer and
-  ages out after 50 runs, like any buffered call.
+  ages out after 50 runs, like any buffered call. The buffer keeps one row per
+  caller and name: of two waiting calls of one name in one caller
+  (`s.yell(); t.yell()` on a `String` and a `Thread`), one is kept. When a
+  blanket impl appears later, an incremental run binds only that one, and a
+  rebuild binds both; 0.161.0 does the same.
+- A typed call whose type's same-named method takes a different number of
+  arguments (code mid-edit) resolves by name and can bind another type's
+  method (`h.block_on(f)` on a `Handle` whose `block_on` takes 2 arguments
+  binds `Other::block_on`). After the arity is fixed, an incremental run keeps
+  that edge until the caller's file changes; a rebuild binds `Handle`'s.
 - A call whose receiver a glob import leaves untyped loses its blanket-impl
   edge on an incremental run, not on a rebuild, when an impl on the receiver's
   own type with a method of that name is added and then removed
@@ -791,6 +826,17 @@ holding a file the index skips, the patterns above, and `grep -R`).
 - The dispatch block still prints when the caller traversal stopped at its
   row limit, and it scans the bare name: `callgraph Store::save --file a.rs`
   lists `save` sites on any object.
+- The MCP threshold tier's `next` does not return a cut `dead_code` or
+  `centrality` section: `module_overview include_dead dead_min_lines:1`, cut
+  from 90 dead-code entries to 15, names `dead-code <path>` without
+  `--min-lines 1` (which lists 50), and `project_map include_centrality
+  centrality_limit:40`, cut to 15, names `map --json`, which has no
+  centrality. With `max_tokens` the budget path names both
+  (`dead-code <path> --min-lines 1`, `centrality --limit N`).
+- A Rust `Q::b` value whose `Q` the dispatch scan cannot tie to a definition
+  of `b` is counted, not listed: the answer says `not scanned: N Rust paths
+  with an unrecognized qualifier` and names no line, so `grep -w -F b` is the
+  way to find it. A std path (`Result::ok`) is counted the same way.
 - A budgeted MCP `module_overview` of a directory can drop signatures
   (`active_exports_without_signature`) that its `next` command,
   `overview <dir>`, does not print either: the directory text form has no
@@ -823,7 +869,9 @@ holding a file the index skips, the patterns above, and `grep -R`).
   reported for them. A return type after `=>` (TypeScript function types,
   Scala), a C# `where` clause and a Kotlin return type on the next line are
   not compared. A header that has not ended within 600 characters is not
-  read. A signature change made in a macro or a decorator is not seen, and
+  read, and neither is any file where a definition pattern matches on a line
+  longer than 2,000 characters. A signature change made in a macro or a
+  decorator is not seen, and
   neither is one made by an Edit that `pre-edit-guide.js` attributed to
   another function (the baseline is then recorded after the change). Callers
   are the index's; a call through a string key is not one.
@@ -864,6 +912,12 @@ holding a file the index skips, the patterns above, and `grep -R`).
   dialects (ugrep's `\b` and `\w` are ASCII), under `-E` and `-P` as under
   basic regex; so can `\s` on a non-breaking space, which GNU grep does not
   match and ugrep and rust do.
+- A `$` at the end of a pattern is answered for `grep` and `grep -E`, but
+  ugrep (Claude Code's `grep`) also matches it before a `\r`, and rust regex,
+  rg and GNU grep do not: on a file with CRLF line endings the answer lists
+  fewer lines than the grep would.
+- An empty alternative under `-E` or `-P` (`(a|)b`) is answered with rg's
+  matches, where ugrep stops with an error ("empty (sub)expression").
 - Releases before this one do not recognise the two new settings.json
   entries: after a downgrade, the older `uninstall` leaves them behind. On
   POSIX each runs only if its script still exists; on Windows a missing script
