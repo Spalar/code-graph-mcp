@@ -53,12 +53,14 @@ const {
   firstShellClause,
   normalizeCommandPaths,
   rootOnlyInSearchPath,
-  grepSearchesNoDirectory,
   isDirectory,
   declKindsBySymbol,
   extractPatterns,
   rebaseRelativePaths,
   resolveProjectRoot,
+  rewritePlan,
+  showAnswersPattern,
+  searchesSameFiles,
 } = require('./pre-grep-guide');
 
 // The command HEAD is grep/rg/ag (or git grep, or a KEY=VALUE/env prefix). Kept
@@ -295,11 +297,20 @@ function runMain() {
       && !operandMatches(firstShellClause(rawSegs[idx]), extractSearchPath(segment), root, segCwd)) return;
   // D#125 #1 — the root strip rewrote a pattern that held the root.
   if (!rootOnlyInSearchPath(rawSegs[idx], root, extractSearchPath(segment))) return;
-  // D#125 #3 — a plain grep without -r searched no directory.
-  if (grepSearchesNoDirectory(firstShellClause(segment), extractSearchPath(segment),
-    (t) => isDirectory(path.resolve(root, t)))) return;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
+  // D#133 — the inject had no grammar of its own: a flag it did not know was
+  // dropped, so `"-rv"` (grep reads -r -v: the shell strips the quotes), ag's
+  // `-n` (no recursion), `rg --max-depth`, an abbreviated `--inv`, or a glob
+  // the shell expands one level deep (`src/*.js`) got an answer for another
+  // search. The grep clause must now read under the rewrite's grammar, the
+  // per-verb flag allowlist included, as the same pattern and path the answer
+  // uses. One grammar for both hooks, not a list of shapes to refuse. It also
+  // declines a plain grep without -r on a directory (D#125 #3), which a
+  // separate check here used to do.
+  const plan = rewritePlan(firstShellClause(segment), { isDir: (t) => isDirectory(path.resolve(root, t)) });
+  const norm = (p) => (p === undefined ? undefined : p.replace(/^\.\//, '').replace(/\/+$/, ''));
+  if (!plan || plan.pattern !== rawPattern || norm(plan.target) !== norm(extractSearchPath(segment))) return;
   // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they
   // re-stated hits the model already had). If the command's OWN output already
   // surfaced the grepped symbol, the inject is redundant → skip it, saving the
@@ -393,8 +404,10 @@ function runMain() {
     if (block.mode === 'show') {
       answeredMode = 'show';
       // Scoped like the rewrite: the grep's path and declaration kinds; a grep
-      // with a file filter gets the grep answer, which honors it.
-      answer = flags.includes('-g') || flags.includes('-t')
+      // with a file filter gets the grep answer, which honors it. So does a
+      // pattern `show` does not answer exactly (`fn foo` also matches
+      // `fn foobar`; D#133).
+      answer = flags.includes('-g') || flags.includes('-t') || !showAnswersPattern(rawPattern, segment)
         ? { status: 'unavailable' }
         : runShowAnswer({
           cwd: root, symbols: block.symbols, within: searchPath ?? '',
@@ -442,6 +455,12 @@ function runMain() {
     });
     return;
   }
+
+  // D#133 #8 — a grep or show answer must read the files the grep read
+  // (untracked hidden or ignored ones, git grep's tracked-only set). Checked
+  // only for an answer about to be injected: it runs git. The call graph does
+  // not depend on which files a grep reads.
+  if (answeredMode !== 'callgraph' && !searchesSameFiles({ root, target: searchPath, verb: plan.verb })) return;
 
   recordRecommendation(root, {
     hook: 'grep', action: 'inject', answered: true,

@@ -428,6 +428,70 @@ headless session, two handlers with the same command and different `if` rules
 both ran for one `grep …; sed …` call, which would emit two rewrites or two
 answers for one command.
 
+### The grep hooks answer a grep only where the answer reads the same files, flags and pattern
+
+The rest of the 0.160.0 and 0.161.0 review findings on the grep hooks, each
+reproduced there. Every shape below now runs as typed (the PreToolUse rewrite)
+or gets no answer (the PostToolUse inject); none of them is emulated.
+
+- **`-E`, `-P` and `ag` patterns** went to the answer's rust regex unchecked.
+  On one fixture, GNU grep 3.12, ugrep 7.8 and cg read `\d` (under `-E`),
+  `[\(]`, `a{,2}`, `a+?b`, `(?i)` and a leading `*` differently, and PCRE reads
+  `\<` as the character `<`. A pattern using any of them is no longer
+  answered; one all three read alike (`Foo|Bar`, `\bfoo\b`, `\<foo\>`, `x{2}`,
+  `(a|b)`, `[[:upper:]]`) still is. A quoted `"-E"` counts as the flag: the
+  shell strips the quotes before grep reads it.
+- **`--include` with `/` or `**`.** GNU grep matches the glob against the base
+  name, so `--include='src/*.js'` finds nothing there; cg's `-g` matches the
+  path.
+- **The files searched.** cg searches git-tracked files plus ripgrep's walk
+  (not hidden, not ignored). `grep -r` also reads untracked hidden and ignored
+  files, `git grep` reads tracked files only, and `rg` and `ag` skip tracked
+  hidden and tracked ignored files. Before a rewrite or an inject goes out, the
+  hook asks `git ls-files` whether the path holds such a file for that verb;
+  when it does, or git cannot tell, the grep runs as typed. Outside a git work
+  tree it looks for hidden entries and ignore files under the path instead.
+  The check runs only for a grep about to be answered and costs 4–10 ms on
+  this repo (median of 9: `git grep` 4.0, `grep -r` 8.3, `rg` 9.1 on `src/`).
+- **`grep -c`.** GNU grep and ugrep print `file:0` for every file without a
+  match; cg, `rg -c` and `git grep -c` print only files with matches. `grep -c`
+  is no longer rewritten; `rg -c` and `git grep -c` still are. A rewritten grep
+  now passes `-M 0`: cg cut each line at 512 characters, so a match past that
+  column was missing from the answer.
+- **`show` answers whole names.** `grep -A3 "fn foo"` also matches
+  `fn foobar`, `-i` matches `Foo`, `pub fn foo` misses a private `fn foo`, and
+  `def foo(` misses a Ruby `def foo`. A declaration grep is answered by `show`
+  only when every alternative is a keyword and a name that ends the word
+  (`\b`, `\>`, or `-w`): `grep -A3 "fn foo\b"`. The inject answers the others
+  with a grep answer over the same path, as it did for a file filter.
+- **The inject reads a grep with the rewrite's grammar.** It had no flag list
+  of its own, so a flag it did not know was dropped: `grep -rn Foo src/ "-v"`
+  (grep reads `-v`: the shell strips the quotes), `ag -n` (no recursion),
+  `rg --max-depth 1`, an abbreviated `--inv`, and `grep -n Foo src/*.js` (the
+  shell expands the glob one level deep; cg's `-g` matches every depth) were
+  answered as other searches. The inject now answers only a grep clause the rewrite's per-verb
+  allowlist reads, with the same pattern and path, the call graph included.
+- **A grep that never ran.** After `exit`, `return` or `set -e` the inject
+  answered an empty output the grep never produced. A grep after one of them,
+  `cd x || exit 1; grep …` included, gets no inject.
+
+Replayed through both hooks' processes (a stub binary, one fixture project)
+over 17,739 grep commands from this machine's session logs: the rewrite
+accepts the same 31 commands before and after, each now with `-M 0`; the
+inject accepts 787 instead of 951, and none it did not accept before. Of the
+164 it no longer answers, 107 search a glob path, 35 are `grep -c`, 14 hold
+shell syntax the grammar does not read (`$f`, `\"` inside double quotes), 5
+carry `-a` or `-o`, 1 names a second path, and 2 pass `--include` with a
+directory the fixture lacked (the grammar reads a missing path as a file).
+Declining these inject shapes is not always needed for the answer to be right
+(a `grep -c` of one file has no zero rows); the grammar is one rule for both
+hooks rather than a list of exceptions. The stub prints no `show` output, so
+the replay cannot see a `show` answer; replaying the rewrite's `show`
+decision in-process over the same commands, 1 was answered by `show` before
+(`rg -n "function seedUninstallHome" -A 20 …`, which also matches a longer
+name) and 0 after, and 321 of the 323 inject segments that asked for `show`
+now get a grep answer.
+
 ### Not covered
 
 - A renamed import of a re-export (`import { a as b } from './index'` where
@@ -545,6 +609,16 @@ answers for one command.
   through a string key is not one.
 - In a git worktree whose index lives in the main checkout, the edited path
   does not match the index's paths, and the Stop check says nothing.
+- The grep hooks' file check reads git's ignore rules, not ripgrep's: an
+  `.ignore` or `.rgignore` file inside a git work tree hides files from cg
+  that `grep -r` reads. A matching binary file is reported as `binary file
+  matches` by GNU grep and not printed by ugrep or cg, and `grep -R` follows
+  symbolic links, which cg does not; neither is checked.
+- A `show` answer prints definitions; `grep -A3 "fn foo\b"` also prints a
+  comment or string line holding `fn foo`. A grep after `false &&` or `true ||`
+  is still answered by the inject when its output is empty (as in 0.160.0).
+- `\b`, `\w` and a bracket on non-ASCII text can still differ between the
+  dialects, under `-E` and `-P` as under basic regex.
 - The SubagentStart matcher uses Claude Code's exact-name list form, which
   takes hyphenated names from 2.1.195. On older versions it is read as an
   unanchored regex, so `Plan` also matches a custom agent named `Planner`.

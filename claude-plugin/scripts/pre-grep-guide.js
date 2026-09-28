@@ -50,6 +50,8 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Pr
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
+const { hidden } = require('./proc-opts');
 const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const {
@@ -1315,8 +1317,8 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
       const attachedFilter = /^--(?:include|glob|type)=/.test(w.text) || (verb === 'rg' && /^-[gt]./.test(w.text));
       if (!attachedFilter || w.bareOp) return null;
       // GNU grep's --include has no `!` negation and no `{a,b}` alternatives;
-      // cg's -g has both (round 4 L2; review of D#78).
-      if (/^--include=(?:!|.*\{)/.test(w.text)) return null;
+      // cg's -g has both (round 4 L2; review of D#78). Checked with the other
+      // --include value rules below.
     }
     if (w.text === '--') { endOfFlags = true; continue; }
     if (w.text.startsWith('--')) {
@@ -1325,9 +1327,19 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
       if (!ALLOWED_LONG[verb].has(name)) return null;
       if (name === 'include') include = true;
       if (name === 'recursive') recursive = true;
+      // GNU grep and ugrep print a `file:0` row for every file searched; cg,
+      // rg and git grep print only files with matches (D#133 #12).
+      if (name === 'count' && verb === 'grep') return null;
       if (VALUE_LONG.has(name) && eq === -1) {
         const v = words[++i];
-        if (!valueWordOk(v, false) || (name === 'include' && /^!|\{/.test(v.text))) return null;
+        if (!valueWordOk(v, false)) return null;
+      }
+      // GNU grep matches --include against the file's base name, so a glob
+      // with `/` or `**` finds nothing there; cg's -g matches the path
+      // (D#133 #7). Checked however the value is quoted or attached.
+      if (name === 'include') {
+        const v = eq === -1 ? words[i].text : w.text.slice(eq + 1);
+        if (/^!|[{/]|\*\*/.test(v)) return null;
       }
       if (name === 'ignore-case' || name === 'case-sensitive') caseFlag = true;
       continue;
@@ -1335,6 +1347,7 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
     const letters = w.text.slice(1);
     for (let k = 0; k < letters.length; k++) {
       const ch = letters[k];
+      if (ch === 'c' && verb === 'grep') return null;  // D#133 #12, as --count above
       if (valueShort.includes(ch)) {
         const isCount = 'ABC'.includes(ch);
         if (isCount) context = true;
@@ -1373,29 +1386,88 @@ function rewritePlan(cmd, { isDir = looksLikeDir } = {}) {
   // ag is smart-case by default: an all-lowercase pattern matches any case,
   // and cg's search is case-sensitive, so the answer would find less.
   if (verb === 'ag' && !caseFlag && !/[A-Z]/.test(pattern.text)) return null;
-  return { pattern: pattern.text, target: target ? target.text : undefined, context };
+  return { verb, pattern: pattern.text, target: target ? target.text : undefined, context };
 }
 
-// D#125 #3 for the PostToolUse side, which has no rewrite grammar: a plain
-// `grep` with no recursion flag searches no directory ("Is a directory" under
-// GNU grep) and, with no path, reads its input.
-function grepSearchesNoDirectory(clause, target, isDir) {
-  const words = shellWords(clause || '');
-  if (!words || words.length === 0 || words[0].anyQuoted || words[0].text !== 'grep') return false;
-  for (let k = 1; k < words.length; k++) {
-    const w = words[k];
-    if (w.op || w.startsQuoted) continue;
-    if (w.text === '--') break;
-    if (/^--(?:recursive|dereference-recursive|directories=recurse)$/.test(w.text)) return false;
-    if (w.text === '-d' && words[k + 1] && words[k + 1].text === 'recurse') return false;
-    if (/^-[^-]/.test(w.text)) {
-      for (const ch of w.text.slice(1)) {
-        if (ch === 'r' || ch === 'R') return false;
-        if ('ABCefmdDg'.includes(ch)) break;  // the rest is that flag's value
-      }
+/**
+ * Does the answer search the same files the grep would (D#133 #8)?
+ *
+ * cg searches ripgrep's walk (not hidden, not ignored) plus every git-tracked
+ * file. The verbs it replaces each search another set, measured on one fixture
+ * with each tool:
+ *   - grep -r (GNU, and ugrep as Claude Code's shell runs it) also reads
+ *     untracked hidden and ignored files, and ugrep skips a tracked ignored
+ *     file when the .gitignore naming it sits inside the searched path;
+ *   - git grep reads tracked files only, not untracked ones;
+ *   - rg and ag skip tracked hidden and tracked ignored files.
+ * So the answer is equivalent only when the path holds none of the files that
+ * set the two apart. Outside a git work tree cg searches ripgrep's walk alone:
+ * a hidden entry, or an ignore file ripgrep, ag or ugrep reads, differs from
+ * grep -r. Any failure to tell (git missing, a timeout, a walk too large) is
+ * a difference: the grep runs.
+ * @param {{root: string, target?: string, verb: string}} opts `target` is
+ *   root-relative (undefined: the whole root).
+ */
+const HIDDEN_SEGMENT = /(?:^|\/)\.(?!\.?(?:\/|$))/;
+const IGNORE_FILES = ['.gitignore', '.ignore', '.rgignore', '.agignore'];
+const WALK_LIMIT = 20000;
+function searchesSameFiles({ root, target, verb } = {}) {
+  if (!root || !['grep', 'git', 'rg', 'ag'].includes(verb)) return false;
+  const rel = target === undefined ? '' : String(target).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+  if (rel.split('/').includes('..') || path.isAbsolute(rel)) return false;
+  const git = (args) => {
+    const budget = require('./hook-fail-open').remainingMs(1500);
+    if (budget === null) return { status: null, stdout: '' };
+    return spawnSync('git', args, hidden({
+      cwd: root, encoding: 'utf8', timeout: budget, killSignal: 'SIGKILL',
+      maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+    }));
+  };
+  const inside = git(['rev-parse', '--is-inside-work-tree']);
+  if (inside.status === 0 && String(inside.stdout).trim() === 'true') {
+    const ls = (...opts) => {
+      const r = git(['ls-files', '-z', ...opts, '--', rel || '.']);
+      return r.status === 0 ? String(r.stdout).split('\0').filter(Boolean) : null;
+    };
+    const checks = {
+      // untracked hidden, untracked ignored, tracked ignored
+      grep: () => [ls('--others', '--exclude-standard'), ls('--others', '--ignored', '--exclude-standard', '--directory'),
+        ls('--cached', '--ignored', '--exclude-standard')],
+      git: () => [ls('--others', '--exclude-standard')],
+      rg: () => [ls('--cached'), ls('--cached', '--ignored', '--exclude-standard')],
+    };
+    const [a, b, c] = checks[verb === 'ag' ? 'rg' : verb]();
+    if (verb === 'grep') return a !== null && b !== null && c !== null && !a.some((f) => HIDDEN_SEGMENT.test(f))
+      && b.length === 0 && c.length === 0;
+    if (verb === 'git') return a !== null && a.length === 0;
+    return a !== null && b !== null && !a.some((f) => HIDDEN_SEGMENT.test(f)) && b.length === 0;
+  }
+  // 128 is git's "not a git repository"; anything else is a failure to tell.
+  if (inside.status !== 128) return false;
+  // Not a work tree: ripgrep's walk. An ignore file from the root down to the
+  // path, or any hidden entry inside it, sets the verbs apart.
+  let dir = root;
+  for (const seg of ['', ...(rel ? rel.split('/') : [])]) {
+    if (seg) dir = path.join(dir, seg);
+    if (seg.startsWith('.')) return false;
+    for (const f of IGNORE_FILES) {
+      try { if (fs.existsSync(path.join(dir, f))) return false; } catch { return false; }
     }
   }
-  return target === undefined || isDir(target);
+  const start = path.join(root, rel);
+  let seen = 0;
+  const stack = [start];
+  while (stack.length) {
+    const d = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (++seen > WALK_LIMIT) return false;
+      if (e.name.startsWith('.')) return false;
+      if (e.isDirectory()) stack.push(path.join(d, e.name));
+    }
+  }
+  return true;
 }
 
 // Does `rootTarget`, run from the root, name the path the grep clause's own
@@ -1421,9 +1493,13 @@ const CWD_NEUTRAL = new Set([
   'dirname', 'perl', 'gh', 'curl', 'make', 'bash', 'sh', 'timeout', 'tar', 'sqlite3',
   'code-graph-mcp', 'nproc', 'rustc', 'go', 'wait', 'column', 'md5sum', 'sha256sum',
   'od', 'xxd', 'seq', 'paste', 'comm', 'uname', 'id', 'printenv',
-  // If an `exit` before the grep had run, the grep would not have.
-  'exit', 'return',
+  // Not `exit` or `return` (D#133 #10): if one before the grep ran, the grep
+  // did not, and its output is empty exactly when the inject fires. `set` is
+  // neutral only without errexit — see segmentCwd.
 ]);
+// `set -e`, `set -euo pipefail`, `set -o errexit`: from here a failing command
+// ends the script, so a later grep may not have run.
+const SET_ERREXIT = /(?:^|\s)(?:-[a-zA-Z]*e[a-zA-Z]*|errexit)(?=\s|$)/;
 // `X=1 Y=$(mktemp -d)`: a command substitution runs in a subshell.
 const PURE_ASSIGNMENTS =
   /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:\$\([^()]*\)|"[^"]*"|'[^']*'|[^\s;|&<>()'"]*)\s*)+$/;
@@ -1463,6 +1539,7 @@ function segmentCwd(segments, idx, shellCwd, { isDir = isDirectory, seps } = {})
     if (!words) return null;
     const head = words.find((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w.text));
     if (head && !(head.quotedFrom === -1 && CWD_NEUTRAL.has(head.text))) return null;
+    if (head && head.text === 'set' && SET_ERREXIT.test(clause.replace(/^\s*set\b/, ''))) return null;
   }
   return cwd;
 }
@@ -1492,35 +1569,157 @@ function rewriteMatchesBlock(plan, block, cmd, rawPattern) {
     if (all.includes('-g') || all.includes('-t')) return false;
     // show answers at most three symbols; a fourth would silently vanish.
     if (extractDeclSymbols(extractPatterns(cmd)).length > 3) return false;
+    if (!showAnswersPattern(plan.pattern, cmd)) return false;
   }
   return true;
+}
+
+// One alternative `show` answers: a declaration keyword, the name, and an end
+// of word (`\b`, or `\>` outside Perl) unless -w supplies it.
+const SHOW_ALT = /^(fn|def|class|function|struct|trait) +([A-Za-z_][A-Za-z0-9_]*)(\\b|\\>)?$/;
+
+/**
+ * Does `show` print exactly the definitions this grep's pattern matches?
+ * `show` answers whole names, case-sensitively, whatever surrounds them (0.161.0
+ * Not covered, D#133): `fn foo` also matches `fn foobar`, `-i` matches `Foo`,
+ * `pub fn foo` misses a private `fn foo`, `def foo(` misses a Ruby `def foo`,
+ * and an alternative without a keyword matches lines `show` never prints. So
+ * every alternative must be `KEYWORD NAME` ending the word, and nothing else.
+ */
+function showAnswersPattern(pattern, cmd) {
+  if (typeof pattern !== 'string') return false;
+  const flags = cgFlagSet(extractCgFlags(cmd));
+  if (flags.has('-i')) return false;
+  const fixed = flags.has('-F');
+  const word = flags.has('-w');
+  const dialect = patternDialect(cmd);
+  const alts = fixed ? [pattern] : pattern.split(dialect === 'basic' ? '\\|' : '|');
+  return alts.every((alt) => {
+    const m = SHOW_ALT.exec(alt);
+    if (!m) return false;
+    if (!m[3]) return word;
+    // -F reads `\b` as two characters; PCRE reads `\>` as `>`.
+    return !fixed && !(m[3] === '\\>' && dialect === 'perl');
+  });
 }
 
 // v0.49 — plain `grep` speaks BRE: alternation/grouping arrive escaped
 // (`a\|b`, `\(x\)`) and 0-hit against cg grep's rust-regex dialect, wasting
 // the answer on the ALLOW fallthrough (2026-06-12: both answered:false denies
-// were dialect/path-shape misses). Unescape for plain grep only — rg/ag and
-// grep -E/-P are already extended.
+// were dialect/path-shape misses). Unescape for plain grep only; an -E, -P or
+// ag pattern is passed on only when every dialect reads it alike; rg's is the
+// answer's own. null: no equivalent pattern, the grep runs.
 function translateBreToRg(cmd, pattern) {
   if (typeof pattern !== 'string' || !pattern) return pattern;
-  const verb = (cmd.match(GREP_HEAD) || [])[1];
-  // git grep speaks BRE like plain grep; rg/ag are already extended-regex.
-  if (!verb || !/grep$/.test(verb)) return pattern;
-  // The grep's OWN clause, not the whole command. This was the one flag check
-  // in this module that v0.96 did not clause-scope, and round 4 of pre-ship
-  // review found what it costs: `grep -rln "a\|b" src/ | xargs -P4 wc -l` read
-  // the tail's `-P4` as "this grep speaks Perl regex", so the pattern was left
-  // escaped. On its own that is a wrong dialect decision; it also desynchronised
-  // the two hooks, because post-grep-inject passes a SEGMENT here while the deny
-  // path passes the whole command — the same pattern then filed under two
-  // spellings and the funnel scored a verbatim re-grep as neutral.
-  // Read from the clause's words, like extractCgFlags: a pattern holding ` -E `
-  // is not the flag (review of D#62).
+  const dialect = patternDialect(cmd);
+  if (dialect === 'basic') return breToRustRegex(pattern);
+  // D#133 #5: an extended or Perl pattern was passed on unchecked, and the
+  // dialects read `\d`, `[\(]`, `a{,2}`, `a+?b` and `(?i)` differently (GNU
+  // grep 3.12, ugrep 7.8 and cg run on one fixture).
+  if (dialect === 'extended' || dialect === 'perl') {
+    return portableExtended(pattern, { perl: dialect === 'perl' });
+  }
+  return pattern;
+}
+
+/**
+ * The regex dialect a grep clause's pattern is written in: 'rust' (rg, the
+ * answer's own), 'perl' (ag, `-P`), 'extended' (`-E`) or 'basic' (plain grep
+ * and git grep). `-F` is the callers' to read, from extractCgFlags, which
+ * knows a flag's value slot (`--include -F`).
+ *
+ * The grep's OWN clause, not the whole command. This was the one flag check
+ * in this module that v0.96 did not clause-scope, and round 4 of pre-ship
+ * review found what it costs: `grep -rln "a\|b" src/ | xargs -P4 wc -l` read
+ * the tail's `-P4` as "this grep speaks Perl regex", so the pattern was left
+ * escaped. On its own that is a wrong dialect decision; it also desynchronised
+ * the two hooks, because post-grep-inject passes a SEGMENT here while the deny
+ * path passes the whole command — the same pattern then filed under two
+ * spellings and the funnel scored a verbatim re-grep as neutral.
+ * Read from the clause's words, like extractCgFlags: a pattern holding ` -E `
+ * is not the flag (review of D#62). A word that is only quoted (`"-E"`) IS the
+ * flag: the shell strips the quotes before grep reads its argv (D#133 M10).
+ */
+function patternDialect(cmd) {
+  const verb = (String(cmd).match(GREP_HEAD) || [])[1];
+  if (!verb) return 'basic';
+  if (verb === 'rg') return 'rust';
+  if (verb === 'ag') return 'perl';
   const words = clauseWords(firstShellClause(cmd).replace(VERB_STRIP, '')) || [];
-  const extended = words.some((w) => w.quotedFrom === -1
-    && (/^-[a-zA-Z]*[EP][a-zA-Z]*(?:=|\d|$)/.test(w.text) || /^--(?:extended-regexp|perl-regexp)$/.test(w.text)));
-  if (extended) return pattern;
-  return breToRustRegex(pattern);
+  const has = (letter, long) => words.some((w) => w.text === `--${long}`
+    || new RegExp(`^-[a-zA-Z]*${letter}[a-zA-Z]*(?:=|\\d|$)`).test(w.text));
+  if (has('P', 'perl-regexp')) return 'perl';
+  if (has('E', 'extended-regexp')) return 'extended';
+  return 'basic';
+}
+
+// An extended (ERE) or Perl pattern that GNU grep, ugrep and rust regex all
+// read alike, returned as is; anything else is null and the grep runs. Only
+// escapes of the word/space/boundary classes and of metacharacters pass, and
+// `\<` `\>` only in ERE (PCRE reads them as the characters `<` `>`) and `\d`
+// only in Perl (GNU ERE reads it as `d`). A quantifier with nothing to repeat
+// (so every `(?` group) or after another quantifier (`+?` is lazy in rust, a
+// repeated group in ERE), a brace that is not `{n}`, `{n,}` or `{n,m}`, and a
+// bracket holding an escape, a nested `[` or a set operator are refused.
+const EXT_SAME_ESCAPE = 'wWsSbB.[]^$*+?(){}|\\/';
+function portableExtended(pattern, { perl = false } = {}) {
+  let atomStart = true;    // a quantifier here would repeat nothing
+  let quantified = false;  // the previous token was a quantifier
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '\\') {
+      const n = pattern[i + 1];
+      const same = n !== undefined && (EXT_SAME_ESCAPE.includes(n)
+        || (!perl && (n === '<' || n === '>')) || (perl && (n === 'd' || n === 'D')));
+      if (!same) return null;
+      i++;
+      atomStart = false;
+      quantified = false;
+      continue;
+    }
+    if (c === '*' || c === '+' || c === '?' || c === '{') {
+      if (atomStart || quantified) return null;
+      if (c === '{') {
+        const m = /^\{\d+(?:,\d*)?\}/.exec(pattern.slice(i));
+        if (!m) return null;
+        i += m[0].length - 1;
+      }
+      quantified = true;
+      continue;
+    }
+    quantified = false;
+    // After `(`, `|` or `^` a quantifier repeats nothing; that also refuses
+    // every `(?` group (`(?i)`, `(?:`, a lookaround).
+    if (c === '(' || c === '|' || c === '^') { atomStart = true; continue; }
+    atomStart = false;
+    if (c !== '[') continue;
+    const end = bracketEnd(pattern, i);
+    if (end === -1) return null;
+    i = end;
+  }
+  return pattern;
+}
+
+// The index of the `]` closing the bracket expression opened at `i`, or -1
+// when the bracket reads differently in POSIX and rust regex: POSIX has no
+// escapes in a bracket, rust has escapes, `[` nesting and the `&&` `--` `~~`
+// set operators; a leading `]` is a member in POSIX. `[:alpha:]` is a POSIX
+// class in both. Unterminated: -1 (grep reports an error).
+function bracketEnd(pattern, i) {
+  let j = i + 1;
+  if (pattern[j] === '^') j++;
+  if (pattern[j] === ']') return -1;
+  for (; j < pattern.length && pattern[j] !== ']'; j++) {
+    if (pattern[j] === '[' && pattern[j + 1] === ':') {
+      const close = pattern.indexOf(':]', j + 2);
+      if (close === -1 || !POSIX_CLASSES.has(pattern.slice(j + 2, close))) return -1;
+      j = close + 1;
+      continue;
+    }
+    if (pattern[j] === '\\' || pattern[j] === '[') return -1;
+    if ('&-~'.includes(pattern[j]) && pattern[j + 1] === pattern[j]) return -1;
+  }
+  return j >= pattern.length ? -1 : j;
 }
 
 // The two dialects swap these characters' roles: in a basic regex `( ) { } + ?
@@ -1578,21 +1777,8 @@ function breToRustRegex(pattern) {
       && !pattern.startsWith('\\)', i + 1) && !pattern.startsWith('\\|', i + 1)) return null;
     if (BRE_SWAPPED.includes(c)) { out += '\\' + c; continue; }
     if (c !== '[') { out += c; continue; }
-    // `]` right after `[` or `[^` is a member, not the end.
-    let j = i + 1;
-    if (pattern[j] === '^') j++;
-    if (pattern[j] === ']') return null;
-    for (; j < pattern.length && pattern[j] !== ']'; j++) {
-      if (pattern[j] === '[' && pattern[j + 1] === ':') {
-        const close = pattern.indexOf(':]', j + 2);
-        if (close === -1 || !POSIX_CLASSES.has(pattern.slice(j + 2, close))) return null;
-        j = close + 1;
-        continue;
-      }
-      if (pattern[j] === '\\' || pattern[j] === '[') return null;
-      if ('&-~'.includes(pattern[j]) && pattern[j + 1] === pattern[j]) return null;
-    }
-    if (j >= pattern.length) return null;  // unterminated: grep reports an error
+    const j = bracketEnd(pattern, i);
+    if (j === -1) return null;
     out += pattern.slice(i, j + 1);
     i = j;
   }
@@ -1874,6 +2060,12 @@ function runMain() {
       return;
     }
 
+    // D#133 #8 — the answer searches tracked files plus ripgrep's walk; the
+    // grep's own file set differs when the path holds untracked hidden, ignored
+    // or (for git grep) untracked files. Checked only for an answer that would
+    // replace the command: it runs git. The grep runs as typed.
+    if (plan && !searchesSameFiles({ root, target: extractSearchPath(cmd), verb: plan.verb })) return;
+
     const answered = answer.status === 'hits';
     recordRecommendation(root, {
       // Still `deny` in the funnel: the event it counts — a raw grep intercepted
@@ -1911,11 +2103,13 @@ function runMain() {
     // Re-run exactly what answered: the resolved symbols for `show`, the same
     // argv for `grep`.
     // `-m 0`: cg caps matches at 100 per file by default and says so only on
-    // stderr; the grep being replaced has no cap (round 3 M4). Only here, not
+    // stderr; the grep being replaced has no cap (round 3 M4). `-M 0`: cg cuts
+    // each line at 512 characters, so a match past that column was not in the
+    // answer at all (D#133 #12); 0 is unlimited, as grep prints. Only here, not
     // in the in-hook answer, which is a has-hits probe.
     const argvList = answeredMode === 'show'
       ? answer.argvs
-      : [[...args.slice(0, 1), '-m', '0', ...args.slice(1)]];
+      : [[...args.slice(0, 1), '-m', '0', '-M', '0', ...args.slice(1)]];
     const command = buildRewriteCommand(argvList, {
       invocation: shellQuoteArg(resolveAnswerBinary({})),
       root,
@@ -1977,8 +2171,9 @@ module.exports = {
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
   rootOnlyInSearchPath, // D#125 #1
   isDirectory,
-  grepSearchesNoDirectory, // D#125 #3
   declKindsBySymbol, // D#125 #2 review
+  searchesSameFiles, // D#133 #8
+  showAnswersPattern, // D#133 — show answers whole names only
   resolveProjectRoot,    // v0.48 — subdir-cwd dark fix
   rebaseRelativePaths,   // v0.48 — subdir-cwd dark fix
   commandHasBypass,      // v0.48 — bypass funnel visibility

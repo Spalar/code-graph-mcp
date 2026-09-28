@@ -73,6 +73,7 @@ const {
   isSilenced,
   isBlockDisabled,
   isAnswerDisabled,
+  searchesSameFiles,
 } = require('./pre-grep-guide');
 
 // ── Should fire: bare grep/rg/ag on indexed source tree ─────────────
@@ -1155,17 +1156,17 @@ test('buildRewriteContext: no salience restatement — the answer is the output 
 
 test('rewritePlan: only the narrow shape the rewrite reproduces', () => {
   const plan = (c) => rewritePlan(c);
-  assert.deepEqual(plan('grep -rn "Foo" src/'), { pattern: 'Foo', target: 'src/', context: false });
+  assert.deepEqual(plan('grep -rn "Foo" src/'), { verb: 'grep', pattern: 'Foo', target: 'src/', context: false });
   // Parses; countNamedPaths then counts it as a second path, so only a
   // show-mode grep carrying it reaches a rewrite.
-  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null'), { pattern: 'Foo', target: 'src/', context: false });
-  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1'), { pattern: 'Foo', target: 'src/', context: false });
-  assert.deepEqual(plan('grep -rn "a|b" src/'), { pattern: 'a|b', target: 'src/', context: false }, 'a quoted | is pattern text');
-  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { pattern: 'describe\\|runHook', target: 'tests/a.mjs', context: false },
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>/dev/null'), { verb: 'grep', pattern: 'Foo', target: 'src/', context: false });
+  assert.deepEqual(plan('grep -rn "Foo" src/ 2>&1'), { verb: 'grep', pattern: 'Foo', target: 'src/', context: false });
+  assert.deepEqual(plan('grep -rn "a|b" src/'), { verb: 'grep', pattern: 'a|b', target: 'src/', context: false }, 'a quoted | is pattern text');
+  assert.deepEqual(plan('grep -n "describe\\|runHook" tests/a.mjs'), { verb: 'grep', pattern: 'describe\\|runHook', target: 'tests/a.mjs', context: false },
     'a backslash before | inside double quotes is literal — the BRE shape models write');
-  assert.deepEqual(plan('grep -rnA3 "fn foo" src/'), { pattern: 'fn foo', target: 'src/', context: true });
+  assert.deepEqual(plan('grep -rnA3 "fn foo" src/'), { verb: 'grep', pattern: 'fn foo', target: 'src/', context: true });
   // Flags cg honors or ignores, with their values.
-  for (const cmd of ['grep -rnw "Foo" src/', 'grep -rli "Foo" src/', 'grep -rc "Foo" src/',
+  for (const cmd of ['grep -rnw "Foo" src/', 'grep -rli "Foo" src/', 'rg -c "Foo" src/',
     'grep -rn --include=*.rs "Foo" src/', "grep -rn --include='*.rs' \"Foo\" src/",
     "grep -rn --include '*.rs' \"Foo\" src/", 'grep -rn --include -F "Foo" src/',
     'rg -t rust "Foo" src/', 'rg -trust "Foo" src/', "rg -g '*.rs' \"Foo\" src/", "rg -g'*.rs' \"Foo\" src/",
@@ -1240,10 +1241,10 @@ test('rewriteMatchesBlock: the plan must describe the search classifyBlock chose
   assert.equal(rewriteMatchesBlock({ pattern: 'FooBar', target: 'src/', context: true }, { mode: 'grep' },
     'grep -rn -A"3" "FooBar" src/', 'FooBar'), false);
   // show prints bodies; a file list or counts is a different question (round 3 M6).
-  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', target: 'src/', context: true }, { mode: 'show', symbols: ['foo'] },
-    'grep -rl -A3 "fn foo" src/', 'fn foo'), false);
-  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo', target: 'src/', context: true }, { mode: 'show', symbols: ['foo'] },
-    'grep -rn -A3 "fn foo" src/', 'fn foo'), true);
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo\\b', target: 'src/', context: true }, { mode: 'show', symbols: ['foo'] },
+    'grep -rl -A3 "fn foo\\b" src/', 'fn foo\\b'), false);
+  assert.equal(rewriteMatchesBlock({ pattern: 'fn foo\\b', target: 'src/', context: true }, { mode: 'show', symbols: ['foo'] },
+    'grep -rn -A3 "fn foo\\b" src/', 'fn foo\\b'), true);
   // The path must be the one the answer searched: a quoted pattern that looks
   // like a source path was taken as the scope (round 4 H1).
   assert.equal(rewriteMatchesBlock({ pattern: 'src/foo_mod', target: 'tmp/', context: false }, { mode: 'grep' },
@@ -1613,13 +1614,13 @@ test('e2e: cleanupFixture actually removes the cooldown flag the hook wrote', ()
 test('e2e: answerable grep → rewritten into the cg call that answers it + records answered:true', () => {
   const uniq = `StubHit${Date.now()}`;
   const fixture = e2eFixture(
-    `const a = process.argv.slice(2).filter((x, k, all) => !(x === '-m' || all[k - 1] === '-m'));\n` +
+    `const a = process.argv.slice(2).filter((x, k, all) => !(x === '-m' || all[k - 1] === '-m' || x === '-M' || all[k - 1] === '-M'));\n` +
     `process.stdout.write('src/foo.rs:7  fn ' + a[1] + '()\\n');`);
   const cmd = `grep -rn "${uniq}" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ grep -m 0 ${uniq} src/$`));
-    assert.match(rw.context, new RegExp(`\\$ code-graph-mcp grep -m 0 ${uniq} src/`));
+    assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ grep -m 0 -M 0 ${uniq} src/$`));
+    assert.match(rw.context, new RegExp(`\\$ code-graph-mcp grep -m 0 -M 0 ${uniq} src/`));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) assert.match(ran, new RegExp(`src/foo\\.rs:7  fn ${uniq}\\(\\)`));
     const recs = fsE2e.readFileSync(
@@ -1761,7 +1762,7 @@ test('e2e: a show-answerable grep asking for a file list is not rewritten into b
   const fixture = e2eFixture(
     `if (process.argv[2] !== 'show') process.exit(1);\n` +
     `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
-  const cmd = `grep -rl -A3 "fn ${uniq}" src/`;
+  const cmd = `grep -rl -A3 "fn ${uniq}\\b" src/`;
   try {
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
@@ -1810,13 +1811,13 @@ test('e2e: -l reaches the binary the rewrite runs AND the printed command', () =
   const cmd = `grep -rln "${uniq}" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` grep -m 0 -l ${uniq} src/$`));
+    assert.match(rw.command, new RegExp(` grep -m 0 -M 0 -l ${uniq} src/$`));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) {
-      assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -l ${uniq} src/\\]`),
+      assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -M 0 -l ${uniq} src/\\]`),
         `the rewrite ran without -l, so it returned hits where a file list was asked for: ${ran}`);
     }
-    assert.match(rw.context, /code-graph-mcp grep -m 0 -l /,
+    assert.match(rw.context, /code-graph-mcp grep -m 0 -M 0 -l /,
       'the printed command must show the flag that actually runs');
   } finally {
     cleanupFixture(fixture, cmd);
@@ -1835,10 +1836,10 @@ test('e2e: -F forwards the flag AND leaves the literal pattern unescaped', (t) =
   const cmd = `grep -rF "${uniq}\\|other_symbol" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.ok(rw.command.endsWith(` grep -m 0 -F '${uniq}\\|other_symbol' src/`), rw.command);
+    assert.ok(rw.command.endsWith(` grep -m 0 -M 0 -F '${uniq}\\|other_symbol' src/`), rw.command);
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) {
-      assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -F ${uniq}\\\\\\|other_symbol src/\\]`),
+      assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -M 0 -F ${uniq}\\\\\\|other_symbol src/\\]`),
         `-F must forward and must not unescape: ${ran}`);
     }
   } finally {
@@ -1858,10 +1859,10 @@ test('e2e: a `-F` sitting in a VALUE position does not trigger the literal guard
     fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
     const rw = rewriteOf(runHook(cmd, fixture));
     // -F is --include's value here, so the BRE unescape MUST still run.
-    assert.ok(rw.command.endsWith(` grep -m 0 -g -F '${uniq}|other_symbol' src/`),
+    assert.ok(rw.command.endsWith(` grep -m 0 -M 0 -g -F '${uniq}|other_symbol' src/`),
       `the guard fired on a filename glob and left the pattern escaped: ${rw.command}`);
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -g -F ${uniq}\\|other_symbol src/\\]`));
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -M 0 -g -F ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1912,9 +1913,9 @@ test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
   const cmd = `grep -rn "${uniq}\\|other_symbol" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.ok(rw.command.endsWith(` grep -m 0 '${uniq}|other_symbol' src/`), rw.command);
+    assert.ok(rw.command.endsWith(` grep -m 0 -M 0 '${uniq}|other_symbol' src/`), rw.command);
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -m 0 ${uniq}\\|other_symbol src/\\]`));
+    if (ran !== null) assert.match(ran, new RegExp(`ARGV\\[grep -m 0 -M 0 ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1930,7 +1931,7 @@ test('e2e: a show miss lets the context grep run — no grep answer that drops -
   const fixture = e2eFixture(
     `if (process.argv[2] === 'show') process.exit(1);\n` +
     `process.stdout.write('src/foo.rs:1  hit\\n');`);
-  const cmd = `grep -iA3 "fn ${uniq}" src/`;
+  const cmd = `grep -A3 "fn ${uniq}\\b" src/`;
   try {
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
@@ -1948,7 +1949,7 @@ test('e2e: show-mode rewrite re-runs only the symbols that resolved', () => {
   const fixture = e2eFixture(
     `if (process.argv[2] !== 'show' || !process.argv[3].endsWith('A')) process.exit(1);\n` +
     `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
-  const cmd = `grep -A5 "fn ${uniq}A\\|fn ${uniq}B" src/`;
+  const cmd = `grep -A5 "fn ${uniq}A\\b\\|fn ${uniq}B\\b" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
     assert.match(rw.command, new RegExp(`^CODE_GRAPH_INTERNAL=1 \\S+ show ${uniq}A$`),
@@ -1967,7 +1968,7 @@ test('e2e: show-mode rewrite re-runs EVERY symbol that resolved', () => {
   const fixture = e2eFixture(
     `if (process.argv[2] !== 'show') process.exit(1);\n` +
     `process.stdout.write('fn ' + process.argv[3] + '  src/foo.rs:1-3\\n');`);
-  const cmd = `grep -A5 "fn ${uniq}A\\|fn ${uniq}B" src/`;
+  const cmd = `grep -A5 "fn ${uniq}A\\b\\|fn ${uniq}B\\b" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
     assert.match(rw.command, new RegExp(` show ${uniq}A; echo; CODE_GRAPH_INTERNAL=1 \\S+ show ${uniq}B$`));
@@ -2005,7 +2006,7 @@ test('e2e: `git grep` identifier on src/ → rewritten to the cg call', () => {
   const cmd = `git grep -n "${uniq}" src/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` grep -m 0 ${uniq} src/$`));
+    assert.match(rw.command, new RegExp(` grep -m 0 -M 0 ${uniq} src/$`));
     assert.doesNotMatch(rw.command, /git /);
   } finally {
     cleanupFixture(fixture, cmd);
@@ -2106,9 +2107,9 @@ test('e2e: ABS-path grep under fixture root → rewrite fires, CLI argv gets rel
   const cmd = `grep -rn "${uniq}" ${realDir}/src/storage/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
-    assert.match(rw.command, new RegExp(` grep -m 0 ${uniq} src/storage/$`));
+    assert.match(rw.command, new RegExp(` grep -m 0 -M 0 ${uniq} src/storage/$`));
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.match(ran, /args=\["grep","-m","0","StubAbs\d+","src\/storage\/"\]/);
+    if (ran !== null) assert.match(ran, /args=\["grep","-m","0","-M","0","StubAbs\d+","src\/storage\/"\]/);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -2572,7 +2573,7 @@ test('e2e: subdir cwd — hook resolves root, rebases path, records at root, rew
     const ran = runRewrite(rw, sub);
     if (ran !== null) {
       assert.equal(ran.trim(),
-        `cwd=${fsE2e.realpathSync(fixture.dir)} args=grep -m 0 ${uniq}|max_retries backend/app`);
+        `cwd=${fsE2e.realpathSync(fixture.dir)} args=grep -m 0 -M 0 ${uniq}|max_retries backend/app`);
     }
     const recs = fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
@@ -3112,7 +3113,7 @@ test('e2e D#73: a bare dir from the project root is rewritten to the same dir', 
     fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
     const rw = rewriteOf(runHook(cmd, fixture));
     const ran = runRewrite(rw, fixture.dir);
-    if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 ${uniq} src`);
+    if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 -M 0 ${uniq} src`);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -3145,7 +3146,7 @@ test('e2e D#62: the rewrite of a pattern holding " -l " runs no -l', () => {
     const rw = rewriteOf(runHook(cmd, fixture));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) {
-      assert.deepEqual(JSON.parse(ran.trim()), ['grep', '-m', '0', `${uniq}Foo -l x`, 'src/']);
+      assert.deepEqual(JSON.parse(ran.trim()), ['grep', '-m', '0', '-M', '0', `${uniq}Foo -l x`, 'src/']);
     }
   } finally {
     cleanupFixture(fixture, cmd);
@@ -3181,8 +3182,10 @@ test('translateBreToRg: a bracket expression rust would read differently is untr
   assert.equal(t('Foo[a~~b]'), null);
   assert.equal(t('Foo[[x]'), null);
   assert.equal(t('Foo[[:alpha:]]'), 'Foo[[:alpha:]]', 'a POSIX class means the same in both');
-  // The extended dialects are not translated at all.
-  assert.equal(translateBreToRg('grep -rnE "Foo[\\(]" src/', 'Foo[\\(]'), 'Foo[\\(]');
+  // The extended dialects are not translated, but POSIX brackets are the same
+  // there: `[\(]` has no equivalent under -E either (D#133 #5).
+  assert.equal(translateBreToRg('grep -rnE "Foo[\\(]" src/', 'Foo[\\(]'), null);
+  assert.equal(translateBreToRg('grep -rnE "Foo[(]" src/', 'Foo[(]'), 'Foo[(]');
 });
 
 test('e2e D#65: a BRE pattern with bare parens is searched literally', () => {
@@ -3195,7 +3198,7 @@ test('e2e D#65: a BRE pattern with bare parens is searched literally', () => {
     const rw = rewriteOf(runHook(cmd, fixture));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) {
-      assert.deepEqual(JSON.parse(ran.trim()), ['grep', '-m', '0', `${uniq}Active\\(\\)`, 'src/']);
+      assert.deepEqual(JSON.parse(ran.trim()), ['grep', '-m', '0', '-M', '0', `${uniq}Active\\(\\)`, 'src/']);
     }
   } finally {
     cleanupFixture(fixture, cmd);
@@ -3290,7 +3293,7 @@ test('e2e D#76: an absolute path from a subdir shell still rewrites to that path
     try {
       const rw = rewriteOf(runHook(cmd, fixture, pathE2e.join(real, 'xtask')));
       const ran = runRewrite(rw, pathE2e.join(real, 'xtask'));
-      if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 ${uniq}Foo src/`);
+      if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 -M 0 ${uniq}Foo src/`);
     } finally {
       cleanupFixture(fixture, cmd);
     }
@@ -3410,7 +3413,9 @@ test('segmentCwd: a conditional or piped cd is not followed', () => {
   assert.equal(cwdOf('cd /a && grep x src/'), '/a');
   assert.equal(cwdOf('cd /a; grep x src/'), '/a');
   assert.equal(cwdOf('echo x && cd /a && grep x src/'), '/a', 'every step to the grep is &&');
-  assert.equal(cwdOf('cd /a || exit 1; grep x src/'), '/a', 'an exit that ran would have stopped the grep');
+  // An exit that ran stopped the grep, and the grep's empty output is exactly
+  // when the inject fires (D#133 #10): the cd cannot be vouched for.
+  assert.equal(cwdOf('cd /a || exit 1; grep x src/'), null);
   assert.equal(cwdOf('cd xtask; false && cd /a; grep x src/'), null);
   assert.equal(cwdOf('true || cd /a; grep x src/'), null);
   // `A || cd X && grep` is `(A || cd X) && grep`: the grep runs when A
@@ -3516,7 +3521,7 @@ test('e2e: a show rewrite with a definition outside the grep path runs as typed 
   const uniq = `StubShowScope${Date.now()}`;
   const fixture = e2eFixture(showStub(['src/b.rs', 'lib/a.rs']));
   fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
-  const cmd = `grep -rn -A3 "fn ${uniq}" lib/`;
+  const cmd = `grep -rn -A3 "fn ${uniq}\\b" lib/`;
   try {
     const out = runHook(cmd, fixture).stdout.trim();
     assert.ok(!out.startsWith('{'), `must run as typed, got ${out}`);
@@ -3528,8 +3533,8 @@ test('e2e: a show rewrite with a definition outside the grep path runs as typed 
 test('e2e: a show rewrite is declined when the grep path holds none, or several files and more outside', () => {
   const uniq = `StubShowOut${Date.now()}`;
   const cases = [
-    [['src/b.rs'], `grep -rn -A3 "fn ${uniq}" lib/`],
-    [['lib/a.rs', 'lib/c.rs', 'src/b.rs'], `grep -rn -A3 "fn ${uniq}X" lib/`],
+    [['src/b.rs'], `grep -rn -A3 "fn ${uniq}\\b" lib/`],
+    [['lib/a.rs', 'lib/c.rs', 'src/b.rs'], `grep -rn -A3 "fn ${uniq}X\\b" lib/`],
   ];
   for (const [defs, cmd] of cases) {
     const fixture = e2eFixture(showStub(defs));
@@ -3551,7 +3556,7 @@ test('e2e: a show rewrite whose definitions all sit in the grep path stays a pla
   const uniq = `StubShowIn${Date.now()}`;
   const fixture = e2eFixture(showStub(['lib/a.rs', 'lib/c.rs']));
   fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'lib'));
-  const cmd = `grep -rn -A3 "fn ${uniq}" lib/`;
+  const cmd = `grep -rn -A3 "fn ${uniq}\\b" lib/`;
   try {
     const rw = rewriteOf(runHook(cmd, fixture));
     assert.match(rw.command, new RegExp(` show ${uniq}$`), rw.command);
@@ -3656,19 +3661,19 @@ test('e2e: a show answer counts only definitions of the kind the grep searched',
   const uniq = `StubKind${Date.now()}`;
   const cases = [
     // only a struct inside lib/: the grep finds no `fn` there
-    [[['fn', 'src/a/x.rs'], ['struct', 'lib/z.rs']], `grep -rn -A3 "fn ${uniq}" lib/`, null],
+    [[['fn', 'src/a/x.rs'], ['struct', 'lib/z.rs']], `grep -rn -A3 "fn ${uniq}\\b" lib/`, null],
     // a struct beside the fn in the one file: `--file` would print both
-    [[['fn', 'lib/z.rs'], ['struct', 'lib/z.rs'], ['fn', 'src/a.rs']], `grep -rn -A3 "fn ${uniq}B" lib/`, null],
+    [[['fn', 'lib/z.rs'], ['struct', 'lib/z.rs'], ['fn', 'src/a.rs']], `grep -rn -A3 "fn ${uniq}B\\b" lib/`, null],
     // a struct inside the path the grep's `fn` does not match: declined
-    [[['fn', 'lib/z.rs'], ['struct', 'lib/w.rs']], `grep -rn -A3 "fn ${uniq}C" lib/`, null],
+    [[['fn', 'lib/z.rs'], ['struct', 'lib/w.rs']], `grep -rn -A3 "fn ${uniq}C\\b" lib/`, null],
     // a Swift `struct` is labelled `class`: declined, not narrowed away
-    [[['struct', 'lib/g.rs'], ['class', 'lib/e.swift']], `grep -rn -A3 "struct ${uniq}E" lib/`, null],
+    [[['struct', 'lib/g.rs'], ['class', 'lib/e.swift']], `grep -rn -A3 "struct ${uniq}E\\b" lib/`, null],
     // `fn` is Rust's keyword: a Python `def` labelled fn is no match
-    [[['fn', 'lib/a.rs'], ['fn', 'lib/b.py']], `grep -rn -A3 "fn ${uniq}F" lib/`, null],
+    [[['fn', 'lib/a.rs'], ['fn', 'lib/b.py']], `grep -rn -A3 "fn ${uniq}F\\b" lib/`, null],
     // every definition inside and matched: plain show
-    [[['fn', 'lib/a.rs'], ['fn', 'lib/c.rs']], `grep -rn -A3 "fn ${uniq}G" lib/`, 'plain'],
+    [[['fn', 'lib/a.rs'], ['fn', 'lib/c.rs']], `grep -rn -A3 "fn ${uniq}G\\b" lib/`, 'plain'],
     // `trait` answers a Rust trait (iface)
-    [[['iface', 'lib/t.rs']], `grep -rn -A3 "trait ${uniq}D" lib/`, 'plain'],
+    [[['iface', 'lib/t.rs']], `grep -rn -A3 "trait ${uniq}D\\b" lib/`, 'plain'],
   ];
   for (const [defs, cmd, want] of cases) {
     const fixture = e2eFixture(kindStub(defs));
@@ -3720,8 +3725,257 @@ test('e2e: a root-holding pattern spelled like the path runs as typed', () => {
       const out = runHook(cmd, fixture, root).stdout.trim();
       assert.ok(!out.startsWith('{'), `${cmd}: must run as typed, got ${out}`);
     }
-    assert.match(rewriteOf(runHook(control, fixture, root)).command, new RegExp(`grep -m 0 ${uniq} src/`));
+    assert.match(rewriteOf(runHook(control, fixture, root)).command, new RegExp(`grep -m 0 -M 0 ${uniq} src/`));
   } finally {
     for (const cmd of [...cmds, control]) cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── D#133: leftovers of the 0.160.0/0.161.0 reviews ─────────────────
+// Each shape below was REPRODUCED by review. The direction is to decline —
+// the grep runs as typed — unless the answer is exactly the same search.
+
+// #5: under -E / -P / ag the pattern went to rust regex unchecked. GNU grep
+// 3.12, ugrep 7.8 and cg 0.161.0 were run on one fixture: `\d`, `[\(]`,
+// `a{,2}`, `a+?b`, `(?i)` and a leading `*` read differently; PCRE's `\<` is a
+// literal `<`.
+test('translateBreToRg: an extended or perl pattern the dialects read differently has no translation (D#133 #5)', () => {
+  const E = (p) => translateBreToRg(`grep -rnE "${p}" src/`, p);
+  const P = (p) => translateBreToRg(`grep -rnP "${p}" src/`, p);
+  const A = (p) => translateBreToRg(`ag "${p}" src/`, p);
+  for (const p of ['FooBar\\d', 'FooBar[\\(]', 'a{,2}FooBar', 'FooBar+?x', '(?i)FooBar', '*FooBar',
+    'FooBar**', 'FooBar\\1', 'Foo(?:Bar)', 'FooBar{x}', '(*FooBar)', 'FooBar|*x']) {
+    assert.equal(E(p), null, `-E ${p}`);
+  }
+  assert.equal(translateBreToRg("grep -rnE 'FooBar\\' src/", 'FooBar\\'), null, 'a trailing backslash');
+  for (const p of ['\\<FooBar', 'FooBar\\>', 'FooBar[\\(]', '(?i)FooBar', 'FooBar++', 'FooBar\\Q']) {
+    assert.equal(P(p), null, `-P ${p}`);
+    assert.equal(A(p), null, `ag ${p}`);
+  }
+  // Look-alikes the three read alike keep their text.
+  for (const p of ['FooBar|BazQux', 'FooBar\\b', '\\<FooBar\\>', 'FooBar{2}', 'FooBar{2,}',
+    'Foo(Bar|Baz)', '^FooBar$', 'FooBar\\.x', '[[:upper:]]FooBar', 'FooBar|', 'a/b\\/FooBar']) {
+    assert.equal(E(p), p, `-E ${p}`);
+  }
+  for (const p of ['FooBar\\d', 'FooBar\\b', 'FooBar|BazQux', 'Foo(Bar)+']) {
+    assert.equal(P(p), p, `-P ${p}`);
+    assert.equal(A(p), p, `ag ${p}`);
+  }
+  // rg speaks the answer's own dialect; git grep -E follows the ERE rule.
+  assert.equal(translateBreToRg('rg "FooBar\\d" src/', 'FooBar\\d'), 'FooBar\\d');
+  assert.equal(translateBreToRg('git grep -E "FooBar\\d" -- src/', 'FooBar\\d'), null);
+  assert.equal(translateBreToRg('grep -rn --extended-regexp "FooBar\\d" src/', 'FooBar\\d'), null);
+});
+
+// M10 of the 0.160.0 review stayed green: dropping the "unquoted" condition on
+// the -E flag. The shell strips quotes before grep reads its argv, so `"-E"`
+// IS the flag; a pattern word that merely holds ` -E ` is not.
+test('translateBreToRg: a quoted -E word is the flag, a pattern holding -E is not (D#133 M10)', () => {
+  assert.equal(translateBreToRg('grep -rn "-E" "a+b" src/', 'a+b'), 'a+b');
+  assert.equal(translateBreToRg('grep -rn "a+b -E" src/', 'a+b -E'), 'a\\+b -E');
+});
+
+// #12: GNU grep and ugrep print a `file:0` row for every file under -c; cg, rg
+// and git grep print only files with matches. #7: GNU grep matches --include
+// against the base name, so a glob with `/` or `**` finds nothing there.
+test('rewritePlan: grep -c and an --include glob read against the path are not reproduced (D#133 #7 #12)', () => {
+  const dir = { isDir: () => true };
+  for (const cmd of [
+    'grep -rc "FooBar" src/',
+    'grep -rn --count "FooBar" src/',
+    `grep -rn --include='src/*.js' "FooBar" src/`,
+    `grep -rn --include='**/*.py' "FooBar" src/`,
+    `grep -rn --include '**.py' "FooBar" src/`,
+    'grep -rn --include=lib/b.js "FooBar" src/',
+    'grep -rn --include lib/b.js "FooBar" src/',
+  ]) assert.equal(rewritePlan(cmd, dir), null, cmd);
+  for (const cmd of [
+    'rg -c "FooBar" src/',
+    'git grep -c "FooBar" -- src/',
+    `grep -rn --include='*.py' "FooBar" src/`,
+    `grep -rn --include '*.py' "FooBar" src/`,
+    `rg -n -g 'src/*.js' "FooBar" src/`,
+  ]) assert.notEqual(rewritePlan(cmd, dir), null, cmd);
+  assert.equal(rewritePlan('git grep -n "FooBar" -- src/', dir).verb, 'git');
+  assert.equal(rewritePlan('rg -n "FooBar" src/', dir).verb, 'rg');
+});
+
+// 0.161.0 Not covered: `show` answers exact names. `fn foo` also matches
+// `fn foobar`, `-i` matches `Foo`, `pub fn foo` does not match a private one,
+// and a non-declaration alternative matches lines show never prints.
+test('rewriteMatchesBlock: show answers only a pattern naming whole definitions (D#133 show)', () => {
+  const ok = (cmd) => rewriteMatchesBlock(
+    rewritePlan(cmd, { isDir: () => true }), classifyBlock(cmd), cmd, pickBlockPattern(cmd));
+  for (const cmd of [
+    'grep -rn -A3 "fn foo_bar" src/',
+    'grep -rni -A3 "fn foo_bar\\b" src/',
+    'grep -rn -A3 "pub fn foo_bar\\b" src/',
+    'grep -rn -A3 "fn foo_bar\\b\\|baz_qux" src/',
+    'grep -rn -A3 "def foo_bar(" src/',
+    'grep -rnF -A3 "fn foo_bar\\b" src/',
+    'rg -n -A3 "fn foo_bar\\b|baz_qux" src/',
+    'grep -rnP -A3 "fn foo_bar\\>" src/',
+    'grep -rn -A3 "fn foo_bar\\b.*x" src/',
+  ]) assert.equal(ok(cmd), false, cmd);
+  for (const cmd of [
+    'grep -rn -A3 "fn foo_bar\\b" src/',
+    'grep -rn -A3 "fn foo_bar\\>" src/',
+    'grep -rnw -A3 "fn foo_bar" src/',
+    'grep -rn -A3 "fn foo_bar\\b\\|def baz_qux\\b" src/',
+    'rg -n -A3 "fn foo_bar\\b|class BazQux\\b" src/',
+    'grep -rnwF -A3 "fn foo_bar" src/',
+    'grep -rnE -A3 "fn foo_bar\\b|fn baz_qux\\b" src/',
+  ]) assert.equal(ok(cmd), true, cmd);
+});
+
+// #10: the inject answered a grep that never ran. Its output is empty exactly
+// then, which is when the inject fires.
+test('segmentCwd: a grep after exit, return or set -e may never have run (D#133 #10)', () => {
+  const at = (cmd) => {
+    const segs = splitTopLevelSegments(cmd);
+    const idx = segs.findIndex((s) => /^grep /.test(s));
+    return segmentCwd(segs, idx, '/r', { isDir: () => true, seps: segmentSeparators(cmd) });
+  };
+  for (const cmd of [
+    'exit 0; grep -rn "FooBar" src/',
+    'test -f x || exit 1; grep -rn "FooBar" src/',
+    'return 1; grep -rn "FooBar" src/',
+    'set -e; test -f nope.txt; grep -rn "FooBar" src/',
+    'set -euo pipefail; grep -rn "FooBar" src/',
+    'set -o errexit; false; grep -rn "FooBar" src/',
+    'set -x -e\ngrep -rn "FooBar" src/',
+  ]) assert.equal(at(cmd), null, cmd);
+  for (const cmd of [
+    'set -x; grep -rn "FooBar" src/',
+    'set +e; grep -rn "FooBar" src/',
+    'set -o pipefail; grep -rn "FooBar" src/',
+    'echo a; grep -rn "FooBar" src/',
+    'grep -rn "FooBar" src/; exit 0',
+  ]) assert.equal(at(cmd), '/r', cmd);
+});
+
+// M19 of the 0.160.0 review stayed green: never marking the unquoted part of a
+// word as expanding. `"FooBar"$X` is not the pattern `FooBar`.
+test('extractPatterns: a quoted pattern with an unquoted expansion has no readable pattern (D#133 M19)', () => {
+  assert.deepEqual(extractPatterns('grep -rn "FooBar"$SUFFIX src/'), []);
+  assert.equal(classifyBlock('echo x; grep -rn "FooBar"$SUFFIX src/'.split('; ')[1]), null);
+  assert.deepEqual(extractPatterns('grep -rn "FooBar"_x src/'), ['FooBar_x']);
+});
+
+// #8: cg searches git-tracked files plus what ripgrep's walk finds (not hidden,
+// not ignored). GNU grep -r and ugrep also search untracked hidden and ignored
+// files, git grep searches tracked files only, rg and ag skip tracked hidden
+// and tracked ignored ones. Measured on one fixture with each tool.
+function gitFixture() {
+  const dir = fsE2e.realpathSync(fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'pre-grep-files-')));
+  const git = (...a) => {
+    const r = spawnHook('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  git('init', '-q', '.');
+  fsE2e.mkdirSync(pathE2e.join(dir, 'src'));
+  fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'a.rs'), 'fn a() {}\n');
+  fsE2e.writeFileSync(pathE2e.join(dir, '.gitignore'), '.code-graph/\n');
+  git('add', '-A');
+  git('commit', '-qm', 'init');
+  return { dir, git };
+}
+
+test('searchesSameFiles: the answer searches the files each verb would (D#133 #8)', () => {
+  const cases = [
+    // [setup, verb, expected]
+    [() => {}, 'grep', true],
+    [() => {}, 'git', true],
+    [() => {}, 'rg', true],
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', '.x.js'), 'x\n'), 'grep', false],
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', '.x.js'), 'x\n'), 'rg', true],
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'new.py'), 'x\n'), 'git', false],
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'new.py'), 'x\n'), 'grep', true],
+    [({ dir }) => {
+      fsE2e.appendFileSync(pathE2e.join(dir, '.gitignore'), 'src/gen/\n');
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', 'gen'));
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'gen', 'x.js'), 'x\n');
+    }, 'grep', false],
+    [({ dir, git }) => {
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', '.hid'));
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', '.hid', 't.js'), 'x\n');
+      git('add', 'src/.hid/t.js');
+      git('commit', '-qm', 'hidden');
+    }, 'rg', false],
+    [({ dir, git }) => {
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', '.hid'));
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', '.hid', 't.js'), 'x\n');
+      git('add', 'src/.hid/t.js');
+      git('commit', '-qm', 'hidden');
+    }, 'grep', true],
+    [({ dir, git }) => {
+      fsE2e.appendFileSync(pathE2e.join(dir, '.gitignore'), 'src/gen/\n');
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', 'gen'));
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'gen', 'f.js'), 'x\n');
+      git('add', '-f', 'src/gen/f.js');
+      git('add', '.gitignore');
+      git('commit', '-qm', 'forced');
+    }, 'ag', false],
+    // ugrep skips a tracked file a .gitignore in the searched path names; cg reads it.
+    [({ dir, git }) => {
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', '.gitignore'), 'gen.js\n');
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'gen.js'), 'x\n');
+      git('add', '-f', 'src/gen.js', 'src/.gitignore');
+      git('commit', '-qm', 'forced');
+    }, 'grep', false],
+  ];
+  for (const [setup, verb, want] of cases) {
+    const fx = gitFixture();
+    try {
+      setup(fx);
+      assert.equal(searchesSameFiles({ root: fx.dir, target: 'src/', verb }), want,
+        `${verb} after ${setup.toString().slice(0, 80)}`);
+    } finally {
+      fsE2e.rmSync(fx.dir, { recursive: true, force: true });
+    }
+  }
+  // Outside a git work tree cg searches ripgrep's walk: a hidden entry or an
+  // ignore file ripgrep reads differs from grep -r.
+  const plain = fsE2e.realpathSync(fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'pre-grep-plain-')));
+  try {
+    fsE2e.mkdirSync(pathE2e.join(plain, 'src'));
+    fsE2e.writeFileSync(pathE2e.join(plain, 'src', 'a.rs'), 'x\n');
+    assert.equal(searchesSameFiles({ root: plain, target: 'src/', verb: 'grep' }), true);
+    fsE2e.writeFileSync(pathE2e.join(plain, 'src', '.b.rs'), 'x\n');
+    assert.equal(searchesSameFiles({ root: plain, target: 'src/', verb: 'grep' }), false);
+    fsE2e.rmSync(pathE2e.join(plain, 'src', '.b.rs'));
+    fsE2e.writeFileSync(pathE2e.join(plain, '.ignore'), 'src/a.rs\n');
+    assert.equal(searchesSameFiles({ root: plain, target: 'src/', verb: 'grep' }), false);
+  } finally {
+    fsE2e.rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test('e2e: a rewrite whose file set differs from the grep\'s runs as typed (D#133 #8)', () => {
+  const uniq = `StubFiles${Date.now()}`;
+  const stub = `process.stdout.write('src/a.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`;
+  const cases = [
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', '.untr.js'), 'x\n'), `grep -rn "${uniq}A" src/`],
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'untr.py'), 'x\n'), `git grep -n "${uniq}B" -- src/`],
+  ];
+  for (const [setup, cmd] of cases) {
+    const fx = gitFixture();
+    const fixture = { dir: fx.dir, stub: pathE2e.join(fx.dir, 'cg-stub.js') };
+    fsE2e.mkdirSync(pathE2e.join(fx.dir, '.code-graph'));
+    fsE2e.writeFileSync(pathE2e.join(fx.dir, '.code-graph', 'index.db'), '');
+    fsE2e.writeFileSync(fixture.stub, '#!/usr/bin/env node\n' + stub);
+    fsE2e.chmodSync(fixture.stub, 0o755);
+    fx.git('add', 'cg-stub.js');
+    fx.git('commit', '-qm', 'stub');
+    const control = cmd.replace(uniq, `${uniq}Ctl`);
+    try {
+      assert.match(rewriteOf(runHook(control, fixture)).command, / grep -m 0 -M 0 /, `control: ${control}`);
+      setup(fx);
+      const out = runHook(cmd, fixture).stdout.trim();
+      assert.ok(!out.startsWith('{'), `${cmd}: must run as typed, got ${out}`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+      cleanupFixture({ dir: fx.dir }, control);
+    }
   }
 });
