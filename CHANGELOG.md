@@ -3,11 +3,11 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 92 → 94 because the Rust fixes below change which `calls`
+`INDEX_VERSION` goes 92 → 95 because the Rust fixes below change which `calls`
 and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
 @sdsrs/code-graph@0.161.0`, or `cargo install code-graph-mcp --version
 0.161.0`; plugin users can set the version in the marketplace entry. An older
-binary leaves a v94 index intact and warns instead of rebuilding it; delete
+binary leaves a v95 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
 ### A Rust call resolves through the file's `use`
@@ -134,6 +134,49 @@ runs (+8%; both re-extract the same 3 files). tokio's pending-call buffer holds
 4,559 rows after a full index instead of 3,989. After those incremental runs,
 tokio's index matched a fresh one edge for edge (32,323 edges).
 
+### `crate::` in a package with both lib.rs and main.rs names its own crate
+
+A package with both `src/lib.rs` and `src/main.rs` builds two crates, and
+`crate::` means the root of the one the file is compiled into. The resolver
+read it as both roots: a library file's `use crate::run; run()` bound
+main.rs's `run` beside lib.rs's, a file of main.rs's module tree bound
+lib.rs's, a `use twin::serve` (the package's name) from main.rs's tree or a
+test bound main.rs's `serve`, and a `use crate::helper` that lib.rs re-exports
+(`pub use engine::helper`) bound only main.rs's `helper`, which the library
+cannot see. Now:
+
+- lib.rs and main.rs are their own roots. Any other file belongs to the root
+  that alone declares its top-level module (`mod user;`, or an inline
+  `mod deep { mod inner; }` for `deep/inner.rs`), read from the `mod` items at
+  the top of the two root files. A module both declare is compiled into both
+  crates and binds both roots, as before; so does one neither declares
+  visibly (no declaration, a `#[path]` one, or a root with a `mod` inside a
+  macro call or definition, which makes the whole package unknown).
+- A path rooted at the package's name is its library: lib.rs, never main.rs.
+- A name the root does not define (a re-export) is looked for elsewhere in the
+  crate as before, but never in the other crate's root file, for a path call
+  and for the import's own name lookup.
+- The index records each such package's root `mod` items, so an incremental
+  run that sees main.rs gain or lose `mod user;` re-extracts the files under
+  `user` (and, when the record appears, goes away, or is unknown, every file
+  of the package), as a rebuild would resolve them.
+
+On tokio-1.41.1 (no package there has both roots) and on this repo (whose
+main.rs declares only its `tests` module and defines nothing a library file
+imports through `crate::`), every edge is unchanged: 32,323 and 13,930 edges,
+identical to the previous commit's index line for line, and the SCIP oracle's
+numbers with them. The change shows on packages whose two roots define
+same-named items; the accepted shapes are pinned in
+`test_rust_crate_root_by_file_membership`.
+
+Measured cost (ms, previous commit → this): full index of tokio
+2,517/2,515/2,496 → 2,573/2,505/2,534, of this repo 1,872/1,854/1,815 →
+1,887/1,989/1,957; an incremental run on this repo after a body edit of
+`src/main.rs` 147.8 → 151.0 mean of 10 alternating runs, and of
+`src/domain.rs` 259.1 → 265.3. Adding `mod sandbox;` to this repo's main.rs
+re-extracts the 2 files under `src/sandbox/`, and the index after it, and
+after removing it again, matched a rebuild edge for edge.
+
 ### Not covered
 
 - An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
@@ -176,6 +219,11 @@ tokio's index matched a fresh one edge for edge (32,323 edges).
   function really calls and cannot pick among the project's `path` methods.
 - A typed call that no method answers waits in the pending-call buffer and
   ages out after 50 runs, like any buffered call.
+- Only `use` paths read a file's crate. `crate::run()` or `super::run()`
+  written in the call itself resolves by name, as the glob item above says,
+  and binds both roots' `run`. A `#[path]` or macro-made `mod` below the top
+  of a root file is not seen, and a `Cargo.toml` added or removed with no
+  source file changing is noticed only by the next run that indexes a file.
 
 ## 0.161.0
 

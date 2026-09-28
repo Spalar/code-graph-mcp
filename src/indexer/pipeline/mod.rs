@@ -129,7 +129,8 @@ pub fn run_full_index(
         .into_iter()
         .map(|(rel, _abs)| rel)
         .collect();
-    index_files(
+    let root_mods = resolve::collect_rust_crates(project_root).root_mods_json();
+    let result = index_files(
         db,
         project_root,
         &files,
@@ -137,7 +138,13 @@ pub fn run_full_index(
         model,
         &[],
         progress,
-    )
+    )?;
+    crate::storage::queries::set_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+        &root_mods,
+    )?;
+    Ok(result)
 }
 
 /// True when `rel_path` is a safe project-relative path: no absolute root and no
@@ -477,11 +484,34 @@ pub fn run_incremental_index_cached(
     // Same interrupted-run escalation as `run_incremental_index`. `current_hashes`
     // is complete here too — the merge above carries forward the stored hash of
     // every file in a directory the cache let us skip walking.
-    let to_index = to_index_after_interrupt_check(
-        db,
-        [diff.new_files, diff.changed_files].concat(),
-        &current_hashes,
-    )?;
+    // D#136: a root's `mod` edit moves files to the other crate of a lib.rs +
+    // main.rs package, and changes what their `crate::` names, without touching
+    // them. Only a run whose diff has a file can have edited a root.
+    let mut diff_files = [diff.new_files, diff.changed_files].concat();
+    let root_mods = if diff_files.is_empty() && deleted_files.is_empty() {
+        None
+    } else {
+        let crates = resolve::collect_rust_crates(project_root);
+        let stored = crate::storage::queries::get_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+        )?;
+        let known: HashSet<&String> = diff_files.iter().collect();
+        let moved: Vec<String> =
+            resolve::rust_root_mod_moves(stored.as_deref(), &crates, current_hashes.keys())
+                .into_iter()
+                .filter(|p| !known.contains(p))
+                .collect();
+        if !moved.is_empty() {
+            tracing::info!(
+                "[incremental] re-extracting {} Rust file(s) a crate root's `mod` edit moved",
+                moved.len()
+            );
+        }
+        diff_files.extend(moved);
+        Some(crates.root_mods_json()).filter(|now| stored.as_ref() != Some(now))
+    };
+    let to_index = to_index_after_interrupt_check(db, diff_files, &current_hashes)?;
 
     // CORE-12: deletions are dirty too. A file's removal cascade-deletes the
     // edges INTO it, but the callers live in files nobody touched, so their
@@ -528,6 +558,13 @@ pub fn run_incremental_index_cached(
 
     if fanout_possible {
         fan_out_to_new_duplicate_definitions(db, project_root, &current_hashes, model)?;
+    }
+    if let Some(root_mods) = root_mods {
+        crate::storage::queries::set_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+            &root_mods,
+        )?;
     }
 
     if !dirty_node_ids.is_empty() {

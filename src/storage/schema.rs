@@ -54,6 +54,18 @@ pub const META_KEY_PARSE_ERROR_FILES: &str = "parse_error_files";
 /// repairs the indexes already written that way.
 pub const META_KEY_PARSE_ERROR_FILES_VERIFIED: &str = "parse_error_files_verified";
 
+/// JSON object: for each Rust package with both `src/lib.rs` and `src/main.rs`,
+/// the top-level modules each root declared when the index last covered them
+/// (`indexer::pipeline::resolve::RustCrates::root_mods_json`, D#136). Which of
+/// the two crates a file is compiled into decides what its `crate::` names, and
+/// that is read from the root files' `mod` items, not from the file itself: an
+/// incremental run compares this record with the tree to find the files a
+/// root's `mod` edit moved, which the diff alone never names.
+///
+/// No SCHEMA_VERSION bump: absent or unreadable reads as "no package recorded",
+/// so the next incremental re-extracts every file of each such package once.
+pub const META_KEY_RUST_ROOT_MODS: &str = "rust_root_mods";
+
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
 const FTS5_TRIGGERS: &str = "

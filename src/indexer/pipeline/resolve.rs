@@ -1861,6 +1861,31 @@ pub(super) struct RustCrates {
     names: HashSet<String>,
     /// Package name → `<manifest dir>/src/`, root-relative, `/`-separated.
     src_dirs: HashMap<String, String>,
+    /// `src/` directory → the top-level modules its lib.rs and main.rs declare,
+    /// for each package that has both (D#136).
+    root_mods: std::collections::BTreeMap<String, RootMods>,
+}
+
+/// Which of a package's two crates a file is compiled into (D#136): the one
+/// whose root is `src/lib.rs`, the one whose root is `src/main.rs`, or both or
+/// not known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RootSide {
+    Lib,
+    Main,
+    Either,
+}
+
+/// The `mod` items at the top level of a package's lib.rs and main.rs, or
+/// `Opaque` when one of them may declare a module the resolver cannot see: a
+/// `mod` inside a macro call or definition, or a `#[path]` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootMods {
+    Known {
+        lib: std::collections::BTreeSet<String>,
+        main: std::collections::BTreeSet<String>,
+    },
+    Opaque,
 }
 
 impl RustCrates {
@@ -1871,6 +1896,188 @@ impl RustCrates {
     fn src_dir(&self, name: &str) -> Option<&str> {
         self.src_dirs.get(name).map(String::as_str)
     }
+
+    /// The crate of the package at `dir` that `path` is compiled into. lib.rs
+    /// and main.rs are their own roots whatever the manifest says; any other
+    /// file belongs to the root that alone declares its top-level module.
+    pub(super) fn side_of(&self, dir: &str, path: &str) -> RootSide {
+        let Some(rel) = path.strip_prefix(dir) else {
+            return RootSide::Either;
+        };
+        match rel {
+            "lib.rs" => return RootSide::Lib,
+            "main.rs" => return RootSide::Main,
+            _ => {}
+        }
+        let Some(RootMods::Known { lib, main }) = self.root_mods.get(dir) else {
+            return RootSide::Either;
+        };
+        let top = rel.split('/').next().unwrap_or(rel);
+        let top = top.strip_suffix(".rs").unwrap_or(top);
+        match (lib.contains(top), main.contains(top)) {
+            (true, false) => RootSide::Lib,
+            (false, true) => RootSide::Main,
+            _ => RootSide::Either,
+        }
+    }
+
+    /// [`Self::root_mods`] as the JSON the index stores
+    /// (`META_KEY_RUST_ROOT_MODS`), so the next incremental run can tell which
+    /// files a root's `mod` edit moved to another crate.
+    pub(super) fn root_mods_json(&self) -> String {
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .root_mods
+            .iter()
+            .map(|(dir, mods)| (dir.clone(), root_mods_value(mods)))
+            .collect();
+        serde_json::Value::Object(map).to_string()
+    }
+}
+
+fn root_mods_value(mods: &RootMods) -> serde_json::Value {
+    match mods {
+        RootMods::Known { lib, main } => serde_json::json!({ "lib": lib, "main": main }),
+        RootMods::Opaque => serde_json::json!({ "opaque": true }),
+    }
+}
+
+/// The files of `files` whose crate a change of root `mod` items moved between
+/// the stored [`RustCrates::root_mods_json`] and `current` (D#136): under a
+/// top-level module one root's set gained or lost, or anywhere in a package
+/// whose record appeared, went away, or is or was `Opaque`. An absent or
+/// unreadable record reads as no package recorded.
+pub(super) fn rust_root_mod_moves<'a>(
+    stored: Option<&str>,
+    current: &RustCrates,
+    files: impl Iterator<Item = &'a String>,
+) -> Vec<String> {
+    let stored: serde_json::Map<String, serde_json::Value> = stored
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    // Directory → the top-level modules moved, or None for the whole package.
+    let mut moved: HashMap<&str, Option<HashSet<String>>> = HashMap::new();
+    let dirs: std::collections::BTreeSet<&str> = stored
+        .keys()
+        .map(String::as_str)
+        .chain(current.root_mods.keys().map(String::as_str))
+        .collect();
+    for dir in dirs {
+        let now = current.root_mods.get(dir).map(root_mods_value);
+        let was = stored.get(dir);
+        if now.as_ref() == was {
+            continue;
+        }
+        let names = |v: &serde_json::Value, side: &str| -> Option<HashSet<String>> {
+            v.get(side)?
+                .as_array()?
+                .iter()
+                .map(|s| s.as_str().map(String::from))
+                .collect()
+        };
+        let tops = match (now.as_ref(), was) {
+            (Some(now), Some(was)) => (|| {
+                let mut tops = HashSet::new();
+                for side in ["lib", "main"] {
+                    let (a, b) = (names(now, side)?, names(was, side)?);
+                    tops.extend(a.symmetric_difference(&b).cloned());
+                }
+                Some(tops)
+            })(),
+            _ => None,
+        };
+        moved.insert(dir, tops);
+    }
+    if moved.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = files
+        .filter(|path| {
+            moved.iter().any(|(dir, tops)| {
+                let Some(rel) = path.strip_prefix(dir) else {
+                    return false;
+                };
+                if !rel.ends_with(".rs") || matches!(rel, "lib.rs" | "main.rs") {
+                    return false;
+                }
+                let top = rel.split('/').next().unwrap_or(rel);
+                let top = top.strip_suffix(".rs").unwrap_or(top);
+                tops.as_ref().is_none_or(|t| t.contains(top))
+            })
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// The top-level `mod` names a crate root file declares, or None when it may
+/// declare one the names do not show (see [`RootMods::Opaque`]).
+///
+/// Remembered by content for the process: an incremental run collects the
+/// crates up to three times (its record check, `index_files`, the fan-out
+/// round), and parsing a long main.rs again each time was most of what an edit
+/// of it cost.
+fn root_mod_names(source: &str) -> Option<std::collections::BTreeSet<String>> {
+    type Memo = HashMap<[u8; 32], Option<std::collections::BTreeSet<String>>>;
+    static MEMO: std::sync::Mutex<Option<Memo>> = std::sync::Mutex::new(None);
+    let key = *blake3::hash(source.as_bytes()).as_bytes();
+    if let Some(hit) = MEMO
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(&key).cloned()))
+    {
+        return hit;
+    }
+    let names = parse_root_mod_names(source);
+    if let Ok(mut memo) = MEMO.lock() {
+        let memo = memo.get_or_insert_with(HashMap::new);
+        if memo.len() >= 64 {
+            memo.clear();
+        }
+        memo.insert(key, names.clone());
+    }
+    names
+}
+
+fn parse_root_mod_names(source: &str) -> Option<std::collections::BTreeSet<String>> {
+    let tree = crate::parser::treesitter::parse_tree(source, "rust").ok()?;
+    let root = tree.root_node();
+    let mut names = std::collections::BTreeSet::new();
+    let mut path_attr = false;
+    let has_word = |text: &str, word: &str| {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| w == word)
+    };
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        let text = &source[item.byte_range()];
+        match item.kind() {
+            "attribute_item" => {
+                path_attr |= has_word(text, "path");
+                continue;
+            }
+            "mod_item" => {
+                if path_attr {
+                    return None;
+                }
+                let name = item.child_by_field_name("name")?;
+                let name = &source[name.byte_range()];
+                names.insert(name.strip_prefix("r#").unwrap_or(name).to_string());
+            }
+            "macro_invocation" | "macro_definition" | "expression_statement"
+                if has_word(text, "mod") =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        path_attr = false;
+    }
+    Some(names)
 }
 
 /// [`RustCrates`] of the project at `root`: one walk over its manifests.
@@ -1908,6 +2115,14 @@ pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
                         } else {
                             format!("{rel}/src/")
                         };
+                        let read = |f: &str| std::fs::read_to_string(dir.join("src").join(f));
+                        if let (Ok(lib), Ok(main)) = (read("lib.rs"), read("main.rs")) {
+                            let mods = match (root_mod_names(&lib), root_mod_names(&main)) {
+                                (Some(lib), Some(main)) => RootMods::Known { lib, main },
+                                _ => RootMods::Opaque,
+                            };
+                            out.root_mods.insert(src.clone(), mods);
+                        }
                         out.src_dirs.insert(pkg.clone(), src);
                         out.names.insert(pkg);
                     }
@@ -2223,6 +2438,13 @@ pub(super) fn rust_use_files(
     } else {
         rust_crate_layout(importer)?
     };
+    // A crate name is the package's library; `crate`/`self`/`super` the root
+    // of the crate the importer is compiled into (D#136).
+    let side = if root == "ext" {
+        RootSide::Lib
+    } else {
+        crates.side_of(&dir, importer)
+    };
     let module: Vec<String> = match root {
         "ext" => written,
         "crate" => written,
@@ -2246,10 +2468,58 @@ pub(super) fn rust_use_files(
             .filter(|f| all_file_paths.contains(f))
             .collect();
         if !files.is_empty() {
-            return Some(files);
+            return Some(if len == 0 {
+                own_root(files, &dir, side)
+            } else {
+                files
+            });
         }
     }
     None
+}
+
+/// The root file of the crate a Rust `use` (the `{"ru",…}` import metadata)
+/// cannot reach (D#136): in a package with both `src/lib.rs` and `src/main.rs`,
+/// main.rs for a `use` rooted at the package's name or made in lib.rs's module
+/// tree, lib.rs for one made in main.rs's. None when the importer's crate is not
+/// known.
+pub(super) fn rust_use_other_root(
+    meta: &serde_json::Value,
+    importer: &str,
+    crates: &RustCrates,
+) -> Option<String> {
+    let (dir, side) = match meta.get("ru")?.as_str()? {
+        "ext" => (
+            crates.src_dir(meta.get("c")?.as_str()?)?.to_string(),
+            RootSide::Lib,
+        ),
+        "crate" | "file" => {
+            let (dir, _, _) = rust_crate_layout(importer)?;
+            let side = crates.side_of(&dir, importer);
+            (dir, side)
+        }
+        _ => return None,
+    };
+    match side {
+        RootSide::Lib => Some(format!("{dir}main.rs")),
+        RootSide::Main => Some(format!("{dir}lib.rs")),
+        RootSide::Either => None,
+    }
+}
+
+/// The root file of `side`'s crate among the existing `roots` of the package at
+/// `dir`, or all of them when the side is not known or its root is missing.
+fn own_root(roots: Vec<String>, dir: &str, side: RootSide) -> Vec<String> {
+    let own = match side {
+        RootSide::Lib => format!("{dir}lib.rs"),
+        RootSide::Main => format!("{dir}main.rs"),
+        RootSide::Either => return roots,
+    };
+    if roots.contains(&own) {
+        vec![own]
+    } else {
+        roots
+    }
 }
 
 /// Where a Rust path call a `use` spelled out (D#132, the parser's `"u"` key,
@@ -2276,6 +2546,8 @@ pub(super) struct CrateModule {
     pub(super) dir: String,
     pub(super) roots: Vec<String>,
     pub(super) module: Vec<String>,
+    /// Which of a lib.rs + main.rs package's crates the path is in (D#136).
+    pub(super) side: RootSide,
 }
 
 /// Roots whose items are never the project's.
@@ -2306,6 +2578,7 @@ pub(super) fn rust_use_anchor(
                     dir: dir.to_string(),
                     roots: vec![format!("{dir}lib.rs"), format!("{dir}main.rs")],
                     module: rest.to_vec(),
+                    side: RootSide::Lib,
                 })
             } else if RUST_FOREIGN_ROOTS.contains(&first.as_str()) {
                 UseAnchor::Foreign
@@ -2333,7 +2606,13 @@ pub(super) fn rust_use_anchor(
                 _ => return UseAnchor::Unplaced(tail),
             };
             module.extend(tail);
-            UseAnchor::At(CrateModule { dir, roots, module })
+            let side = crates.side_of(&dir, caller);
+            UseAnchor::At(CrateModule {
+                dir,
+                roots,
+                module,
+                side,
+            })
         }
         _ => UseAnchor::None,
     }
@@ -2373,7 +2652,11 @@ fn crate_module_files(
             .filter(|f| all_file_paths.contains(f))
             .collect();
         if !files.is_empty() {
-            return files;
+            return if len == 0 {
+                own_root(files, &anchor.dir, anchor.side)
+            } else {
+                files
+            };
         }
     }
     Vec::new()
@@ -2384,6 +2667,15 @@ fn crate_module_files(
 /// bench / example target (`tests/other.rs`; its modules sit in
 /// subdirectories, `tests/support/mpsc.rs`).
 fn crate_file_module(anchor: &CrateModule, path: &str) -> Option<Vec<String>> {
+    // The other crate's root: its items are not this crate's (D#136).
+    let other_root = match anchor.side {
+        RootSide::Lib => Some("main.rs"),
+        RootSide::Main => Some("lib.rs"),
+        RootSide::Either => None,
+    };
+    if other_root.is_some_and(|r| path.strip_prefix(anchor.dir.as_str()) == Some(r)) {
+        return None;
+    }
     if anchor.roots.iter().any(|r| r == path) {
         return Some(Vec::new());
     }

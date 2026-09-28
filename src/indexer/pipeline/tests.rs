@@ -8940,3 +8940,292 @@ fn test_rust_receiver_types_incremental_matches_rebuild() {
         "{want:#?}"
     );
 }
+
+/// D#136: a package with both `src/lib.rs` and `src/main.rs` builds two crates.
+/// `twin` declares `user`, `engine`, `deep` (inline, holding the file
+/// `deep/inner.rs`) and `shared` from lib.rs; `cli` and `shared` from main.rs;
+/// `orphan.rs` from neither. Each root re-exports an item the other root
+/// defines under that name. `veiled`'s lib.rs declares `gated` inside a macro
+/// the resolver cannot read; `pathy`'s main.rs declares `a.rs` through `#[path]`.
+fn d136_twin_roots() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"twin\", \"veiled\", \"pathy\"]\n",
+        ),
+        (
+            "twin/Cargo.toml",
+            "[package]\nname = \"twin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "twin/src/lib.rs",
+            "pub mod user;\npub mod shared;\nmod engine;\nmod deep {\n    pub mod inner;\n}\n\
+             pub use engine::{helper, Cog};\npub fn run() {}\npub fn serve() {}\npub fn start() {}\n\
+             pub struct Gear;\nimpl Gear {\n    pub fn new() -> Gear {\n        Gear\n    }\n}\n\
+             mod t {\n    use crate::run;\n    use crate::helper;\n    fn lib_inline() {\n        run();\n    }\n\
+             \x20   fn lib_reexport() {\n        helper();\n    }\n}\n",
+        ),
+        (
+            "twin/src/main.rs",
+            "mod cli;\nmod shared;\npub use cli::start;\nfn run() {}\npub fn helper() {}\nfn serve() {}\n\
+             fn main() {}\nstruct Gear;\nimpl Gear {\n    fn new() -> Gear {\n        Gear\n    }\n}\n\
+             struct Cog;\nimpl Cog {\n    fn spin() {}\n}\n\
+             mod tests {\n    use crate::run;\n    use crate::start;\n    fn main_inline() {\n        run();\n    }\n\
+             \x20   fn main_reexport() {\n        start();\n    }\n}\n",
+        ),
+        (
+            "twin/src/user.rs",
+            "use crate::run;\nuse crate::helper;\nuse crate::Gear;\nuse crate::Cog;\n\
+             fn u_use() {\n    run();\n}\nfn u_reexport() {\n    helper();\n}\n\
+             fn u_path() {\n    Gear::new();\n}\nfn u_reexport_path() {\n    Cog::spin();\n}\n",
+        ),
+        (
+            "twin/src/engine.rs",
+            "use super::run;\npub fn helper() {}\npub struct Cog;\nimpl Cog {\n    pub fn spin() {}\n}\n\
+             fn e_super() {\n    run();\n}\n",
+        ),
+        (
+            "twin/src/deep/inner.rs",
+            "use crate::run;\nfn d_use() {\n    run();\n}\n",
+        ),
+        (
+            "twin/src/shared.rs",
+            "use crate::run;\nfn s_use() {\n    run();\n}\n",
+        ),
+        (
+            "twin/src/orphan.rs",
+            "use crate::run;\nfn o_use() {\n    run();\n}\n",
+        ),
+        (
+            "twin/src/cli.rs",
+            "use crate::run;\nuse crate::Gear;\nuse twin::serve;\npub fn start() {}\n\
+             fn c_use() {\n    run();\n}\nfn c_ext() {\n    serve();\n}\nfn c_path() {\n    Gear::new();\n}\n",
+        ),
+        (
+            "twin/tests/it.rs",
+            "use twin::run;\nuse twin::helper;\nfn it_use() {\n    run();\n}\n\
+             fn it_reexport() {\n    helper();\n}\n",
+        ),
+        (
+            "veiled/Cargo.toml",
+            "[package]\nname = \"veiled\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "veiled/src/lib.rs",
+            "macro_rules! gate {\n    ($($i:item)*) => { $($i)* };\n}\ngate! {\n    pub mod gated;\n}\n\
+             pub fn run() {}\n",
+        ),
+        ("veiled/src/main.rs", "mod gated;\nfn run() {}\nfn main() {}\n"),
+        (
+            "veiled/src/gated.rs",
+            "use crate::run;\nfn g_use() {\n    run();\n}\n",
+        ),
+        (
+            "pathy/Cargo.toml",
+            "[package]\nname = \"pathy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("pathy/src/lib.rs", "pub mod a;\npub fn run() {}\n"),
+        (
+            "pathy/src/main.rs",
+            "#[path = \"a.rs\"]\nmod alias;\nfn run() {}\nfn main() {}\n",
+        ),
+        ("pathy/src/a.rs", "use crate::run;\nfn p_use() {\n    run();\n}\n"),
+    ]
+}
+
+/// D#136, the accepted shapes: `crate::` (and `super::`/`self::` reaching the
+/// root) names the root of the crate the caller's file is compiled into, and a
+/// package's crate name names its library.
+///
+/// A file's crate is read from the `mod` items at the top level of lib.rs and
+/// main.rs: lib.rs and main.rs themselves are their own; a file under a module
+/// only one root declares is that root's. A module both declare is compiled into
+/// both crates, and one neither declares visibly (`#[path]`, no declaration, a
+/// root with a `mod` inside a macro call) is unknown: both roots, as before.
+#[test]
+fn test_rust_crate_root_by_file_membership() {
+    const LIB_RUN: &str = "twin/src/lib.rs.run";
+    const MAIN_RUN: &str = "twin/src/main.rs.run";
+    #[rustfmt::skip]
+    let rows: &[(&str, &[&str], &[&str])] = &[
+        // lib.rs's module tree.
+        ("twin/src/user.rs.u_use", &[LIB_RUN], &[MAIN_RUN]),
+        ("twin/src/engine.rs.e_super", &[LIB_RUN], &[MAIN_RUN]),
+        ("twin/src/deep/inner.rs.d_use", &[LIB_RUN], &[MAIN_RUN]),
+        ("twin/src/lib.rs.lib_inline", &[LIB_RUN], &[MAIN_RUN]),
+        // A path through a type at the root, and through a re-exported one.
+        ("twin/src/user.rs.u_path", &["twin/src/lib.rs.new"], &["twin/src/main.rs.new"]),
+        ("twin/src/user.rs.u_reexport_path", &["twin/src/engine.rs.spin"], &["twin/src/main.rs.spin"]),
+        // A re-export at lib.rs's root: found elsewhere in the library, never
+        // in main.rs.
+        ("twin/src/user.rs.u_reexport", &["twin/src/engine.rs.helper"], &["twin/src/main.rs.helper"]),
+        ("twin/src/lib.rs.lib_reexport", &["twin/src/engine.rs.helper"], &["twin/src/main.rs.helper"]),
+        // main.rs's module tree.
+        ("twin/src/main.rs.main_inline", &[MAIN_RUN], &[LIB_RUN]),
+        ("twin/src/cli.rs.c_use", &[MAIN_RUN], &[LIB_RUN]),
+        ("twin/src/cli.rs.c_path", &["twin/src/main.rs.new"], &["twin/src/lib.rs.new"]),
+        ("twin/src/main.rs.main_reexport", &["twin/src/cli.rs.start"], &["twin/src/lib.rs.start"]),
+        // The package's name is its library, from main.rs's tree or a test.
+        ("twin/src/cli.rs.c_ext", &["twin/src/lib.rs.serve"], &["twin/src/main.rs.serve"]),
+        ("twin/tests/it.rs.it_use", &[LIB_RUN], &[MAIN_RUN]),
+        ("twin/tests/it.rs.it_reexport", &["twin/src/engine.rs.helper"], &["twin/src/main.rs.helper"]),
+        // Compiled into both crates, or unknown: both, as before.
+        ("twin/src/shared.rs.s_use", &[LIB_RUN, MAIN_RUN], &[]),
+        ("twin/src/orphan.rs.o_use", &[LIB_RUN, MAIN_RUN], &[]),
+        ("veiled/src/gated.rs.g_use", &["veiled/src/lib.rs.run", "veiled/src/main.rs.run"], &[]),
+        ("pathy/src/a.rs.p_use", &["pathy/src/lib.rs.run", "pathy/src/main.rs.run"], &[]),
+    ];
+    let (_p, _d, db) = fresh_index_of(&d136_twin_roots());
+    let edges = edge_set(&db);
+    let mut bad = Vec::new();
+    for (caller, want, wrong) in rows {
+        let calls: Vec<&str> = edges
+            .iter()
+            .filter_map(|e| e.strip_prefix(&format!("{caller} --calls--> ")))
+            .collect();
+        for w in *want {
+            if !calls.contains(w) {
+                bad.push(format!("{caller}: missing {w} (has {calls:?})"));
+            }
+        }
+        for w in *wrong {
+            if calls.contains(w) {
+                bad.push(format!("{caller}: wrong {w}"));
+            }
+        }
+    }
+    // The `use` itself imports the same root's item.
+    for (importer, target, want) in [
+        ("twin/src/user.rs", LIB_RUN, true),
+        ("twin/src/user.rs", MAIN_RUN, false),
+        ("twin/src/cli.rs", MAIN_RUN, true),
+        ("twin/src/cli.rs", LIB_RUN, false),
+        ("twin/src/cli.rs", "twin/src/lib.rs.serve", true),
+        ("twin/src/cli.rs", "twin/src/main.rs.serve", false),
+        ("twin/tests/it.rs", LIB_RUN, true),
+        ("twin/tests/it.rs", MAIN_RUN, false),
+        ("twin/tests/it.rs", "twin/src/engine.rs.helper", true),
+        ("twin/tests/it.rs", "twin/src/main.rs.helper", false),
+        ("twin/src/shared.rs", LIB_RUN, true),
+        ("twin/src/shared.rs", MAIN_RUN, true),
+    ] {
+        let edge = format!("{importer}.<module> --imports--> {target}");
+        if edges.contains(&edge) != want {
+            bad.push(format!("import {edge}: want {want}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// D#136 parity: a root gaining or losing a `mod` moves the files under that
+/// module to another crate, and an incremental run re-resolves them as a
+/// rebuild does, re-extracting only those files.
+#[test]
+fn test_rust_crate_root_membership_incremental_matches_rebuild() {
+    const LIB: &str = "pub mod user;\npub fn run() {}\n";
+    const MAIN: &str = "mod cli;\nfn run() {}\nfn main() {}\n";
+    const MAIN_USER: &str = "mod cli;\nmod user;\nfn run() {}\nfn main() {}\n";
+    let tree = |lib: &'static str, main: Option<&'static str>| {
+        let mut t = vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"twin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", lib),
+            ("src/user.rs", "use crate::run;\nfn u() {\n    run();\n}\n"),
+            ("src/cli.rs", "use crate::run;\nfn c() {\n    run();\n}\n"),
+        ];
+        if let Some(m) = main {
+            t.push(("src/main.rs", m));
+        }
+        t
+    };
+    let has = |edges: &[String], e: &str| edges.iter().any(|x| x == e);
+    const U_LIB: &str = "src/user.rs.u --calls--> src/lib.rs.run";
+    const U_MAIN: &str = "src/user.rs.u --calls--> src/main.rs.run";
+    const C_LIB: &str = "src/cli.rs.c --calls--> src/lib.rs.run";
+
+    // main.rs gains `mod user;`: user.rs is in both crates now.
+    let want =
+        assert_all_edges_match_rebuild(&tree(LIB, Some(MAIN)), &[("src/main.rs", Some(MAIN_USER))]);
+    assert!(has(&want, U_LIB) && has(&want, U_MAIN), "{want:#?}");
+    // ...and loses it.
+    let want =
+        assert_all_edges_match_rebuild(&tree(LIB, Some(MAIN_USER)), &[("src/main.rs", Some(MAIN))]);
+    assert!(has(&want, U_LIB) && !has(&want, U_MAIN), "{want:#?}");
+    // lib.rs drops `mod user;` while main.rs declares it: main's only.
+    let want = assert_all_edges_match_rebuild(
+        &tree(LIB, Some(MAIN_USER)),
+        &[("src/lib.rs", Some("pub fn run() {}\n"))],
+    );
+    assert!(!has(&want, U_LIB) && has(&want, U_MAIN), "{want:#?}");
+    // main.rs appears in a library, and goes away again.
+    let want = assert_all_edges_match_rebuild(&tree(LIB, None), &[("src/main.rs", Some(MAIN))]);
+    assert!(has(&want, U_LIB) && !has(&want, U_MAIN), "{want:#?}");
+    let want = assert_all_edges_match_rebuild(&tree(LIB, Some(MAIN)), &[("src/main.rs", None)]);
+    assert!(has(&want, U_LIB) && has(&want, C_LIB), "{want:#?}");
+    // main.rs appears and claims `cli`, defining nothing it names: `cli.rs`
+    // leaves the library, and only the record of the roots says so.
+    let want = assert_all_edges_match_rebuild(
+        &tree(LIB, None),
+        &[("src/main.rs", Some("mod cli;\nfn main() {}\n"))],
+    );
+    assert!(has(&want, U_LIB) && !has(&want, C_LIB), "{want:#?}");
+    // lib.rs hides its modules in a macro call: every file is unknown.
+    let want = assert_all_edges_match_rebuild(
+        &tree(LIB, Some(MAIN)),
+        &[(
+            "src/lib.rs",
+            Some("macro_rules! m {\n    ($($i:item)*) => { $($i)* };\n}\nm! {\n    pub mod user;\n}\npub fn run() {}\n"),
+        )],
+    );
+    assert!(has(&want, U_LIB) && has(&want, U_MAIN), "{want:#?}");
+    // main.rs gains an item named like one lib.rs re-exports: the library's
+    // `use` of it does not move there.
+    let reexport = |main: &'static str| {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"twin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod user;\nmod engine;\npub use engine::helper;\n",
+            ),
+            ("src/engine.rs", "pub fn helper() {}\n"),
+            (
+                "src/user.rs",
+                "use crate::helper;\nfn u() {\n    helper();\n}\n",
+            ),
+            ("src/main.rs", main),
+        ]
+    };
+    let want = assert_all_edges_match_rebuild(
+        &reexport("fn main() {}\n"),
+        &[("src/main.rs", Some("fn helper() {}\nfn main() {}\n"))],
+    );
+    assert!(
+        has(&want, "src/user.rs.u --calls--> src/engine.rs.helper")
+            && !has(&want, "src/user.rs.u --calls--> src/main.rs.helper"),
+        "{want:#?}"
+    );
+
+    // Only the files a membership change moved are re-extracted, once: each
+    // run records what it resolved against.
+    let reindexed = |edits: &[&'static str]| -> Vec<usize> {
+        let (project, _d, db) = fresh_index_of(&tree(LIB, Some(MAIN)));
+        edits
+            .iter()
+            .map(|after| {
+                fs::write(project.path().join("src/main.rs"), after).unwrap();
+                run_incremental_index(&db, project.path(), None, None)
+                    .unwrap()
+                    .files_indexed
+            })
+            .collect()
+    };
+    const MAIN_EXTRA: &str = "mod cli;\nfn run() {}\nfn main() {}\nfn extra() {}\n";
+    const MAIN_USER_EXTRA: &str = "mod cli;\nmod user;\nfn run() {}\nfn main() {}\nfn extra() {}\n";
+    assert_eq!(reindexed(&[MAIN_EXTRA]), [1]);
+    assert_eq!(reindexed(&[MAIN_USER, MAIN_USER_EXTRA]), [2, 1]);
+}

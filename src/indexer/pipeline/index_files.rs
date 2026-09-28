@@ -3530,7 +3530,11 @@ fn resolve_deferred_relations(
 
         // 4b. Rust `use crate::a::b::name` / `use super::name`: the module path
         //     names the item's file (D#71). No such item there (a re-export, a
-        //     macro-made item) → the name-based chain below, as before.
+        //     macro-made item) → the name-based chain below, as before, without
+        //     the root of the other crate of a lib.rs + main.rs package (D#136).
+        let other_root = import_meta
+            .as_ref()
+            .and_then(|meta| super::resolve::rust_use_other_root(meta, &d.rel_path, crate_roots));
         if let Some(files) = import_meta.as_ref().and_then(|meta| {
             super::resolve::rust_use_files(meta, &d.rel_path, all_file_paths, crate_roots)
         }) {
@@ -3990,6 +3994,9 @@ fn resolve_deferred_relations(
         // 7. Default name chain: same-file → same-language (refined) →
         //    (references: drop) / (structural: family pool → sentinel/drop).
         let mut all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+        if let Some(other) = other_root.as_deref() {
+            all_target_ids.retain(|id| node_id_to_path.get(id).map(String::as_str) != Some(other));
+        }
         // A supertype is a type, as at batch time.
         if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {
             if callable_ids.is_none() {
