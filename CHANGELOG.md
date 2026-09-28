@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.163.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 99 → 103 because the Rust fixes below change which
