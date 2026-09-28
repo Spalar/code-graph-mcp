@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.162.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 92 → 99 because the Rust and JavaScript fixes below change
@@ -10,6 +10,11 @@ code-graph-mcp --version 0.161.0`; plugin users can set the version in the
 marketplace entry. An older binary leaves a v99 index intact and warns instead
 of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
+
+**Plugin users: the update registers two new hooks** in
+`~/.claude/settings.json` (SubagentStart and Stop, see below). They add text
+to a subagent's context and after a turn that changed a signature;
+`CODE_GRAPH_QUIET_HOOKS=1` silences both, and `uninstall` removes them.
 
 ### A Rust call resolves through the file's `use`
 
