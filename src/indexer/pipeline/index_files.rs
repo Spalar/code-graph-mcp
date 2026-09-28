@@ -1192,7 +1192,7 @@ struct BatchRelations {
     /// project file — the caller mints `<external>` sentinels for them.
     external_python_imports: Vec<(i64, String)>,
     /// `(source_id, target_name, relation)` likewise, for non-import targets.
-    unresolved_externals: Vec<(i64, String, String)>,
+    unresolved_externals: Vec<ExternalRef>,
 }
 
 /// Record the typed fields of a C++ file's class bodies against their class
@@ -1298,7 +1298,7 @@ fn resolve_batch_relations(
     let mut external_python_imports: Vec<(i64, String)> = Vec::new();
     // Track unresolved external symbols for sentinel node creation:
     // (source_id, target_name, relation) — e.g., implements edges to external traits
-    let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
+    let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
 
     // Loaded on the first supertype relation: this batch's nodes are inserted.
     let mut callable_ids: Option<HashSet<i64>> = None;
@@ -1922,6 +1922,7 @@ fn resolve_batch_relations(
                         src_id,
                         rel.target_name.clone(),
                         rel.relation.clone(),
+                        None,
                     ));
                 }
                 continue;
@@ -2136,7 +2137,7 @@ Restart every code-graph server on this project so they run one version.",
     // run (a handful of `Cargo.toml` reads) and handed to every Path-qualifier
     // filter so `my_crate::module::f()` strips its crate root the way
     // `crate::module::f()` already does. See `resolve::path_filter_candidates`.
-    let crate_roots = super::resolve::collect_crate_root_names(root);
+    let crate_roots = super::resolve::collect_rust_crates(root);
 
     // Every caller derives `files` from HashMap iteration — `run_full_index`
     // from `scan_directory`'s hash map keys, both incremental entries from
@@ -2828,6 +2829,10 @@ Restart every code-graph server on this project so they run one version.",
     })
 }
 
+/// A relation left for an `<external>` sentinel: (source id, target name,
+/// relation, the edge's metadata).
+type ExternalRef = (i64, String, String, Option<String>);
+
 /// Phases 2b / 2b-ext: mint the `<external>` pseudo-file's sentinel nodes.
 ///
 /// Two channels feed it. Python `import flask` with no project file behind it
@@ -2842,7 +2847,7 @@ Restart every code-graph server on this project so they run one version.",
 fn mint_external_sentinels(
     db: &Database,
     external_python_imports: &[(i64, String)],
-    unresolved_externals: &[(i64, String, String)],
+    unresolved_externals: &[ExternalRef],
 ) -> Result<(usize, usize)> {
     let mut nodes_created = 0usize;
     let mut edges_created = 0usize;
@@ -2950,7 +2955,7 @@ fn mint_external_sentinels(
         // Sorted before insert so the ids are stable too.
         let unique_targets: Vec<(&str, &str)> = {
             let mut by_name: HashMap<&str, &str> = HashMap::new();
-            for (_, name, rel) in unresolved_externals {
+            for (_, name, rel, _) in unresolved_externals {
                 let node_type = if rel == REL_IMPLEMENTS {
                     "trait"
                 } else {
@@ -3011,9 +3016,10 @@ fn mint_external_sentinels(
             }
         }
 
-        for (source_id, target_name, relation) in unresolved_externals {
+        for (source_id, target_name, relation, metadata) in unresolved_externals {
             if let Some(&ext_id) = ext_node_ids.get(target_name.as_str()) {
-                if insert_edge_cached(db.conn(), *source_id, ext_id, relation, None)? {
+                if insert_edge_cached(db.conn(), *source_id, ext_id, relation, metadata.as_deref())?
+                {
                     edges_created += 1;
                 }
             }
@@ -3252,7 +3258,7 @@ fn resolve_deferred_relations(
     global_name_map: &HashMap<String, Vec<crate::storage::queries::NameEntry>>,
     all_file_paths: &HashSet<String>,
     python_module_map: &HashMap<String, Vec<String>>,
-    crate_roots: &HashSet<String>,
+    crate_roots: &super::resolve::RustCrates,
 ) -> Result<(usize, usize)> {
     use super::resolve::{
         method_candidates, parse_callee_metadata, path_filter_candidates, recv_type_targets,
@@ -3324,7 +3330,7 @@ fn resolve_deferred_relations(
     };
 
     let mut edges_created = 0usize;
-    let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
+    let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
 
     // Calls last: a typed receiver's call also binds overrides, found through
     // `inherits` edges that may themselves be among the deferred.
@@ -3508,10 +3514,9 @@ fn resolve_deferred_relations(
         // 4b. Rust `use crate::a::b::name` / `use super::name`: the module path
         //     names the item's file (D#71). No such item there (a re-export, a
         //     macro-made item) → the name-based chain below, as before.
-        if let Some(files) = import_meta
-            .as_ref()
-            .and_then(|meta| super::resolve::rust_use_files(meta, &d.rel_path, all_file_paths))
-        {
+        if let Some(files) = import_meta.as_ref().and_then(|meta| {
+            super::resolve::rust_use_files(meta, &d.rel_path, all_file_paths, crate_roots)
+        }) {
             let targets: Vec<i64> = name_to_ids
                 .get(&d.target_name)
                 .map(|ids| {
@@ -3756,7 +3761,75 @@ fn resolve_deferred_relations(
                     }
                 }
                 Some(CalleeMeta::Path(segments)) => {
+                    use super::resolve::{Anchored, UseAnchor};
                     let same_lang = same_lang_of(&all, &d.language, &[]);
+                    // A path a `use` spelled out (D#132): std's binds nothing, a
+                    // project crate's is looked for in that crate.
+                    let segments = match super::resolve::rust_use_anchor(
+                        call_meta,
+                        &segments,
+                        &d.rel_path,
+                        crate_roots,
+                    ) {
+                        UseAnchor::None => segments,
+                        UseAnchor::Unplaced(stripped) => stripped,
+                        UseAnchor::Foreign => continue,
+                        UseAnchor::At(anchor) => {
+                            match super::resolve::rust_anchored_targets(
+                                &anchor,
+                                &same_lang,
+                                &node_id_to_path,
+                                db,
+                                all_file_paths,
+                            )? {
+                                Anchored::Named(ids) => {
+                                    edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &ids,
+                                        &d.relation,
+                                        call_meta,
+                                        false,
+                                    )?;
+                                }
+                                Anchored::Elsewhere(ids) => {
+                                    let ids = if ids.len() > 1 {
+                                        refine_ambiguous_targets(
+                                            &ids,
+                                            &d.rel_path,
+                                            &node_id_to_path,
+                                        )
+                                    } else {
+                                        ids
+                                    };
+                                    let meta = call_meta.map(|m| {
+                                        super::resolve::reexport_meta(m, &anchor.dir, ids.len() > 1)
+                                    });
+                                    edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &ids,
+                                        &d.relation,
+                                        meta.as_deref(),
+                                        false,
+                                    )?;
+                                }
+                                // Buffered: the run that adds the item binds it.
+                                Anchored::Nothing => {
+                                    for &src_id in &source_ids {
+                                        crate::storage::queries::insert_pending_unresolved_call(
+                                            db.conn(),
+                                            src_id,
+                                            &d.target_name,
+                                            &d.language,
+                                            call_meta,
+                                        )?;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     let filtered = path_filter_candidates(
                         &segments,
                         &same_lang,
@@ -3917,8 +3990,20 @@ fn resolve_deferred_relations(
         };
 
         if target_ids.is_empty() && (d.relation == REL_IMPLEMENTS || d.relation == REL_IMPORTS) {
+            // A Rust `use` path keeps its module path on the sentinel edge, so a
+            // later definition in the module it names re-extracts the importer
+            // (`bare_name_callers_of_new_duplicates`).
+            let metadata = d
+                .metadata
+                .clone()
+                .filter(|m| d.relation == REL_IMPORTS && m.contains(r#""ru""#));
             for &src_id in &source_ids {
-                unresolved_externals.push((src_id, d.target_name.clone(), d.relation.clone()));
+                unresolved_externals.push((
+                    src_id,
+                    d.target_name.clone(),
+                    d.relation.clone(),
+                    metadata.clone(),
+                ));
             }
         } else {
             edges_created += insert_relation_edges(

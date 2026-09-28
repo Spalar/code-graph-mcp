@@ -1538,7 +1538,9 @@ mod tests {
         ("f7", Some(r#"{"m":[],"ru":"file","up":1}"#)),
         ("f8", Some(r#"{"m":["h"],"ru":"file","up":2}"#)),
         ("f9", Some(r#"{"m":["i"],"ru":"file"}"#)),
-        ("f10", None),
+        // A crate name's path (D#132): the resolver names the file when the
+        // crate is a package of this project.
+        ("f10", Some(r#"{"c":"somecrate","m":["j"],"ru":"ext"}"#)),
         ("f11", Some(r#"{"m":[],"ru":"file"}"#)),
         ("f12", Some(r#"{"m":[],"ru":"file","up":1}"#)),
         ("f13", Some(r#"{"m":["tests","l"],"ru":"file"}"#)),

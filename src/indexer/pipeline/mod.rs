@@ -636,7 +636,10 @@ fn fan_out_to_new_duplicate_definitions(
 ) -> Result<usize> {
     // Typed callers first: the bare-name half drops the snapshot both read.
     let typed = resolve::typed_callers_of_class_drift(db.conn())?;
-    let bare = resolve::bare_name_callers_of_new_duplicates(db.conn())?;
+    let bare = resolve::bare_name_callers_of_new_duplicates(
+        db.conn(),
+        &resolve::collect_rust_crates(project_root),
+    )?;
     let callers: Vec<String> = typed
         .iter()
         .chain(bare.iter())

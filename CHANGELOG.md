@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 92 → 93 because the Rust fix below changes which `calls`
+and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
+@sdsrs/code-graph@0.161.0`, or `cargo install code-graph-mcp --version
+0.161.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v93 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning back to get its graph back.
+
+### A Rust call resolves through the file's `use`
+
+Rust call resolution never read the calling file's `use` declarations, so a
+call bound whatever project item shared its name:
+`use std::sync::Mutex; Mutex::new()` bound the project's own `Mutex::new`,
+`use tokio::sync::oneshot::channel; channel()` bound broadcast's and watch's
+`channel` too, `use tempfile::tempdir; tempdir()` bound a test helper named
+`tempdir`, and `use crate::sync::batch_semaphore::Semaphore; Semaphore::new(1)`
+bound `sync/semaphore.rs`. A call whose first name a `use` binds now resolves
+through the path the `use` writes:
+
+- A path rooted at `std`, `core`, `alloc` or `proc_macro` binds no project
+  item. One rooted at a crate that is not a package of the project resolves as
+  that path written in the call does: only through a project module of the
+  crate's name, which there usually is none of.
+- A path rooted at a package of the workspace (by its crate name, `-` read as
+  `_`, or an `extern crate x as y` alias) or at this crate (`crate::`,
+  `self::`, `super::`, a module the file declares) is looked for in that crate
+  only: in the module file the path names, else among the crate's items of that
+  name and owner type whose module shares the most leading path with it (a
+  `pub use` re-export). Several such items bind as `ambiguous`. None at all
+  waits in the pending-call buffer for a later run.
+- A renamed project import (`use crate::a::f as g; g()`) is called by its own
+  name.
+- The `use` counts where it stands: one inside `mod tests { … }` or a function
+  body applies there only, a file-level one does not reach into `mod tests`
+  unless it holds `use super::*`, a local item of the call's namespace wins
+  over a `use` (`use tokio::task` beside `async fn task`: `task()` is the
+  local function), and a glob between the call and the `use` stops the lookup
+  (the name may come from the glob).
+
+A path opening with a module name a `use` binds now splits onto that module's
+file and type (`use crate::runtime::task; task::Notified::<T>::from_raw`),
+which 0.161.0 left unsplit for std-named modules (the lost
+`task::Notified::<T>::from_raw` pair is back); a std module stays unsplit.
+
+A `use` rooted at another package's name (`use mycrate::a::widget`) now binds
+the item in the file its path names, as `crate::` paths did, and follows it
+when that file gains the item later; so does an import that found no item at
+all and was left on the `<external>` sentinel, whose call an incremental run
+kept pruned until a rebuild (for `crate::` paths too). Both were listed under
+0.161.0's Not covered or found while fixing it.
+
+On tokio-1.41.1 (SCIP oracle, gold 7,908 call pairs; both arms indexed the same
+corpus copy): `inferred` precision 2,461/2,889 (85.2%) → 2,551/2,788 (91.5%),
+recall at the default floor 4,072 → 4,162; wrong `extracted` edges 366 → 366,
+wrong `ambiguous` 1,626 → 1,632. Of the call pairs the oracle can judge, 129
+correct ones gained and none lost; 194 wrong ones removed and 9 added (listed
+under Not covered). On this repo (a snapshot with gold 7,177): wrong edges
+unchanged (16 extracted, 7 inferred, 1 ambiguous), recall at the default floor
+6,996 → 6,998. Full index of tokio, 3 runs each (ms): 2,514/2,484/2,498 →
+2,480/2,560/2,484.
+
+### Not covered
+
+- An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
+  tokio's runtime) is no node, so a call the `use` sends there binds nothing
+  (it waits in the pending-call buffer). When the named module defines only
+  the owner type and the method sits in such a macro, the re-export reading
+  binds a same-named method of another type in the crate: 6 tokio calls of
+  `scheduler::Handle::current()` bound `runtime::Handle::current`, and 3 of
+  `sys::run(f)` (a `use … as run` in an inline module) bound a scheduler `run`.
+- A glob import other than `use super::*` is no proof of anything: a call whose
+  name only a glob can bind resolves by name, as before. So does a path
+  written in the call itself (`crate::sync::Mutex::new`, `io::Error::new` with
+  no `use`), and a bare call of a project item under its own name, which
+  resolves through its import edge as before.
+- A crate whose library is not at `<package>/src/lib.rs` (a `[lib] path`) is
+  not found by its name; such a path resolves as a path written in the call.
+
 ## 0.161.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**

@@ -225,7 +225,7 @@ pub(super) fn refine_ambiguous_targets(
 ///
 /// Returns the number of edges inserted by this sweep.
 #[cfg(test)]
-pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>) -> Result<usize> {
+pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &RustCrates) -> Result<usize> {
     resolve_pending_calls_touching(db, crate_roots, &mut std::collections::BTreeSet::new())
 }
 
@@ -234,7 +234,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
 /// scope must classify, and their caller may be a file this run never opened.
 pub(super) fn resolve_pending_calls_touching(
     db: &Database,
-    crate_roots: &HashSet<String>,
+    crate_roots: &RustCrates,
     touched: &mut std::collections::BTreeSet<String>,
 ) -> Result<usize> {
     let pending = list_pending_unresolved_calls(db.conn())?;
@@ -291,6 +291,8 @@ pub(super) fn resolve_pending_calls_touching(
     let mut edges_added = 0usize;
     let mut to_delete: Vec<i64> = Vec::new();
     let mut classes = ProjectClassNames::default();
+    // Every file path, read at the first call a `use` anchors in a crate.
+    let mut all_file_paths: Option<HashSet<String>> = None;
 
     for row in &pending {
         let candidates: Vec<i64> = name_to_lang_targets
@@ -441,8 +443,64 @@ pub(super) fn resolve_pending_calls_touching(
                 self_filter_candidates(&t, &candidates, db)?
             }
             Some(CalleeMeta::Path(segments)) => {
-                // Drop on empty (drain the row without binding), never bare-fall-back.
-                path_filter_candidates(&segments, &candidates, &node_id_to_path, db, crate_roots)?
+                // A path a `use` spelled out (D#132), as the deferred pass reads it.
+                match rust_use_anchor(row.metadata.as_deref(), &segments, caller_path, crate_roots)
+                {
+                    UseAnchor::Foreign => Vec::new(),
+                    UseAnchor::At(anchor) => {
+                        if all_file_paths.is_none() {
+                            all_file_paths = Some(
+                                db.conn()
+                                    .prepare("SELECT path FROM files")?
+                                    .query_map([], |r| r.get::<_, String>(0))?
+                                    .collect::<rusqlite::Result<_>>()?,
+                            );
+                        }
+                        let files = all_file_paths.as_ref().expect("loaded above");
+                        match rust_anchored_targets(
+                            &anchor,
+                            &candidates,
+                            &node_id_to_path,
+                            db,
+                            files,
+                        )? {
+                            Anchored::Named(ids) => {
+                                refine = false;
+                                ids
+                            }
+                            Anchored::Elsewhere(ids) => {
+                                let ids = if ids.len() > 1 {
+                                    refine_ambiguous_targets(&ids, caller_path, &node_id_to_path)
+                                } else {
+                                    ids
+                                };
+                                guessed = row
+                                    .metadata
+                                    .as_deref()
+                                    .map(|m| reexport_meta(m, &anchor.dir, ids.len() > 1));
+                                refine = false;
+                                ids
+                            }
+                            // Stays buffered: only a new item in that crate answers it.
+                            Anchored::Nothing => continue,
+                        }
+                    }
+                    // Drop on empty (drain the row without binding), never bare-fall-back.
+                    UseAnchor::Unplaced(stripped) => path_filter_candidates(
+                        &stripped,
+                        &candidates,
+                        &node_id_to_path,
+                        db,
+                        crate_roots,
+                    )?,
+                    UseAnchor::None => path_filter_candidates(
+                        &segments,
+                        &candidates,
+                        &node_id_to_path,
+                        db,
+                        crate_roots,
+                    )?,
+                }
             }
             // Member call: the same free-function exclusion as Phase 2.
             Some(CalleeMeta::Member) => {
@@ -1095,6 +1153,7 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
 /// Drops its own temps: unlike the scope tables, nothing downstream reads these.
 pub(super) fn bare_name_callers_of_new_duplicates(
     conn: &rusqlite::Connection,
+    crates: &RustCrates,
 ) -> Result<Vec<String>> {
     use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
 
@@ -1172,6 +1231,46 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CROSS JOIN files f ON f.id = src.file_id
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
     );
+    // The same import bound to the `<external>` sentinel because no item of
+    // that name existed when it was resolved: re-extract the importer when the
+    // module file its path names now defines one. A rebuild binds that item,
+    // and until the importer is re-extracted the sentinel import also prunes
+    // its bare calls (`prune_import_contradicted_call_edges`).
+    let sentinel_use_sql = format!(
+        "SELECT DISTINCT f.path, u.nm, e.metadata
+         FROM cg_fanout_up u
+         CROSS JOIN nodes tgt ON tgt.name = u.nm
+         CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.path = '<external>'
+         CROSS JOIN edges e ON e.target_id = tgt.id
+                           AND e.relation = '{REL_IMPORTS}'
+                           AND e.metadata LIKE '%\"ru\"%'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id AND f.language IS u.lang
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
+    );
+    // A Rust call a `use` anchored in a crate and bound outside the module its
+    // path names (`Anchored::Elsewhere`, marked `"rx"` with the crate's
+    // directory, D#132): a new definition of that name in the same crate may be
+    // the one the path names, or a closer re-export; a rebuild binds that one.
+    let reexport_sql = format!(
+        "SELECT DISTINCT f.path
+         FROM cg_fanout_up u
+         CROSS JOIN nodes tgt ON tgt.name = u.nm
+         CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
+         CROSS JOIN edges e ON e.target_id = tgt.id
+                           AND e.relation = '{REL_CALLS}'
+                           AND e.metadata LIKE '%\"rx\"%'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)
+           AND EXISTS (
+               SELECT 1 FROM cg_fanout_paths p
+               CROSS JOIN files nf ON nf.path = p.path
+               CROSS JOIN nodes nn ON nn.file_id = nf.id AND nn.name = u.nm
+               WHERE substr(p.path, 1, length(json_extract(e.metadata, '$.rx')))
+                     = json_extract(e.metadata, '$.rx')
+           )"
+    );
     // Collected into a Result first so the temps are dropped on the error path
     // too, not only on success — `?` here would leak all four.
     let collected = (|| -> Result<Vec<String>> {
@@ -1179,21 +1278,53 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         let mut paths: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let reexported: Vec<String> = conn
+            .prepare(&reexport_sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !reexported.is_empty() {
+            paths.extend(reexported);
+            paths.sort_unstable();
+            paths.dedup();
+        }
         let uses: Vec<(String, String, String)> = conn
             .prepare(&stale_use_sql)?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if !uses.is_empty() {
+        let unbound: Vec<(String, String, String)> = conn
+            .prepare(&sentinel_use_sql)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !uses.is_empty() || !unbound.is_empty() {
             let all_file_paths: HashSet<String> = conn
                 .prepare("SELECT path FROM files")?
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<_, _>>()?;
-            for (importer, target_file, metadata) in uses {
-                let named = serde_json::from_str::<serde_json::Value>(&metadata)
+            let named_files = |importer: &str, metadata: &str| {
+                serde_json::from_str::<serde_json::Value>(metadata)
                     .ok()
-                    .and_then(|meta| rust_use_files(&meta, &importer, &all_file_paths));
-                if named.is_some_and(|files| !files.contains(&target_file)) {
+                    .and_then(|meta| rust_use_files(&meta, importer, &all_file_paths, crates))
+            };
+            for (importer, target_file, metadata) in uses {
+                if named_files(&importer, &metadata)
+                    .is_some_and(|files| !files.contains(&target_file))
+                {
                     paths.push(importer);
+                }
+            }
+            let mut defines = conn.prepare(
+                "SELECT 1 FROM nodes n JOIN files f ON f.id = n.file_id
+                 WHERE n.name = ?1 AND f.path = ?2 LIMIT 1",
+            )?;
+            for (importer, name, metadata) in unbound {
+                let Some(files) = named_files(&importer, &metadata) else {
+                    continue;
+                };
+                for file in files {
+                    if defines.exists(rusqlite::params![name, file])? {
+                        paths.push(importer);
+                        break;
+                    }
                 }
             }
             paths.sort_unstable();
@@ -1554,19 +1685,39 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     Ok(downgraded)
 }
 
-/// Rust crate-root identifiers for this project: every `[package] name` found
-/// in a `Cargo.toml` at or under `root`, with `-` normalized to `_` (the module
-/// path spelling). Scanned once per index run; see
-/// [`path_filter_candidates`] for why the set is needed.
+/// This project's Cargo packages (D#132): every `[package] name` found in a
+/// `Cargo.toml` at or under the root, with `-` normalized to `_` (the module
+/// path spelling; see [`path_filter_candidates`] for why the names are needed),
+/// and each one's library directory, so a path a `use` roots at a package name
+/// (`use tokio::sync::oneshot::channel` from `tests/` or another package) is
+/// looked for in that package only. Scanned once per index run.
+#[derive(Debug, Default, Clone)]
+pub(super) struct RustCrates {
+    names: HashSet<String>,
+    /// Package name → `<manifest dir>/src/`, root-relative, `/`-separated.
+    src_dirs: HashMap<String, String>,
+}
+
+impl RustCrates {
+    pub(super) fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn src_dir(&self, name: &str) -> Option<&str> {
+        self.src_dirs.get(name).map(String::as_str)
+    }
+}
+
+/// [`RustCrates`] of the project at `root`: one walk over its manifests.
 ///
 /// The walk is depth-limited (a crate manifest lives at the project root or one
 /// or two directories down — `crates/foo/`, `scripts/poc/`) and skips build /
 /// dependency directories, so it never becomes a full-tree scan.
-pub(super) fn collect_crate_root_names(root: &Path) -> HashSet<String> {
+pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
     const MAX_DEPTH: usize = 3;
     const SKIP_DIRS: &[&str] = &["node_modules", "vendor", "target", "bower_components"];
 
-    fn walk(dir: &Path, depth: usize, out: &mut HashSet<String>) {
+    fn walk(dir: &Path, root: &Path, depth: usize, out: &mut RustCrates) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -1579,19 +1730,29 @@ pub(super) fn collect_crate_root_names(root: &Path) -> HashSet<String> {
                 {
                     continue;
                 }
-                walk(&entry.path(), depth + 1, out);
+                walk(&entry.path(), root, depth + 1, out);
             } else if name == "Cargo.toml" {
                 if let Ok(text) = std::fs::read_to_string(entry.path()) {
                     if let Some(pkg) = parse_cargo_package_name(&text) {
-                        out.insert(pkg);
+                        let rel = dir
+                            .strip_prefix(root)
+                            .map(|r| r.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_default();
+                        let src = if rel.is_empty() {
+                            "src/".to_string()
+                        } else {
+                            format!("{rel}/src/")
+                        };
+                        out.src_dirs.insert(pkg.clone(), src);
+                        out.names.insert(pkg);
                     }
                 }
             }
         }
     }
 
-    let mut out = HashSet::new();
-    walk(root, 0, &mut out);
+    let mut out = RustCrates::default();
+    walk(root, root, 0, &mut out);
     out
 }
 
@@ -1653,7 +1814,7 @@ pub(super) fn path_filter_candidates(
     candidates: &[i64],
     node_id_to_path: &std::collections::HashMap<i64, String>,
     db: &crate::storage::db::Database,
-    crate_roots: &HashSet<String>,
+    crate_roots: &RustCrates,
 ) -> anyhow::Result<Vec<i64>> {
     if candidates.is_empty() || segments.is_empty() {
         return Ok(candidates.to_vec());
@@ -1700,9 +1861,10 @@ pub(super) fn path_filter_candidates(
 }
 
 /// Top-level modules of `std`/`core`/`alloc`. A path that opens with one
-/// (`io::Error::new`, `sync::Mutex::new`) is usually std's through a `use`, which
-/// the resolver does not read (D#132), so it is not split onto a project module
-/// of the same name plus a type there (review of D#119: `io::Error::new(..)`
+/// (`io::Error::new`, `sync::Mutex::new`) and that no `use` of the file explains
+/// (a `use` spells the path out, D#132: `parser::relations::rust_use`) is
+/// usually std's through a glob or a macro, so it is not split onto a project
+/// module of the same name plus a type there (review of D#119: `io::Error::new(..)`
 /// bound the project's `io/error.rs`). A path through `std::`/`core::`/`alloc::`
 /// itself is not split either: `std::fmt::Error::new` matched `src/fmt.rs`.
 const RUST_STD_MODULES: &[&str] = &[
@@ -1878,6 +2040,7 @@ pub(super) fn rust_use_files(
     meta: &serde_json::Value,
     importer: &str,
     all_file_paths: &HashSet<String>,
+    crates: &RustCrates,
 ) -> Option<Vec<String>> {
     let root = meta.get("ru")?.as_str()?;
     let written: Vec<String> = meta
@@ -1886,8 +2049,17 @@ pub(super) fn rust_use_files(
         .iter()
         .map(|s| s.as_str().map(String::from))
         .collect::<Option<_>>()?;
-    let (dir, root_files, file_module) = rust_crate_layout(importer)?;
+    // `{"ru":"ext","c":<crate>}`: a path rooted at a crate name, which names a
+    // file only when that crate is a package of this project (D#132).
+    let (dir, root_files, file_module) = if root == "ext" {
+        let dir = crates.src_dir(meta.get("c")?.as_str()?)?.to_string();
+        let roots = vec![format!("{dir}lib.rs"), format!("{dir}main.rs")];
+        (dir, roots, Vec::new())
+    } else {
+        rust_crate_layout(importer)?
+    };
     let module: Vec<String> = match root {
+        "ext" => written,
         "crate" => written,
         "file" => {
             let up = meta.get("up").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -1913,6 +2085,257 @@ pub(super) fn rust_use_files(
         }
     }
     None
+}
+
+/// Where a Rust path call a `use` spelled out (D#132, the parser's `"u"` key,
+/// `parser::relations::rust_use`) is to be looked for.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum UseAnchor {
+    /// Not written by a `use`, or rooted at a crate name that is neither std's
+    /// nor a package of this project: the path filter as before.
+    None,
+    /// std's, core's, alloc's or proc_macro's item: no project code runs.
+    Foreign,
+    /// A module of a crate of this project.
+    At(CrateModule),
+    /// A path from this crate the caller's file layout cannot place (a `src/bin/`
+    /// file, `super` above the crate root): the path filter over the path
+    /// without its root, as the same path written in the call gets.
+    Unplaced(Vec<String>),
+}
+
+/// A module path inside one crate: its directory (`tokio/src/`), the file(s) its
+/// root module is, and the path below the root (`[sync, Mutex]`).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CrateModule {
+    pub(super) dir: String,
+    pub(super) roots: Vec<String>,
+    pub(super) module: Vec<String>,
+}
+
+/// Roots whose items are never the project's.
+const RUST_FOREIGN_ROOTS: &[&str] = &["std", "core", "alloc", "proc_macro"];
+
+/// Read the `"u"` of a Rust path call: `"x"` roots the path at a crate name
+/// (`segments[0]`), `"c"` at this crate (`crate`, `self` = the caller's file's
+/// module, `super` = one above it).
+pub(super) fn rust_use_anchor(
+    metadata: Option<&str>,
+    segments: &[String],
+    caller: &str,
+    crates: &RustCrates,
+) -> UseAnchor {
+    let Some(tag) = metadata
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get("u").and_then(|u| u.as_str()).map(String::from))
+    else {
+        return UseAnchor::None;
+    };
+    let Some((first, rest)) = segments.split_first() else {
+        return UseAnchor::None;
+    };
+    match tag.as_str() {
+        "x" => {
+            if let Some(dir) = crates.src_dir(first) {
+                UseAnchor::At(CrateModule {
+                    dir: dir.to_string(),
+                    roots: vec![format!("{dir}lib.rs"), format!("{dir}main.rs")],
+                    module: rest.to_vec(),
+                })
+            } else if RUST_FOREIGN_ROOTS.contains(&first.as_str()) {
+                UseAnchor::Foreign
+            } else {
+                UseAnchor::None
+            }
+        }
+        "c" => {
+            let supers = segments.iter().take_while(|s| *s == "super").count();
+            let tail: Vec<String> = segments
+                .iter()
+                .skip_while(|s| matches!(s.as_str(), "crate" | "self" | "super"))
+                .cloned()
+                .collect();
+            let Some((dir, roots, file_module)) = rust_crate_layout(caller) else {
+                return UseAnchor::Unplaced(tail);
+            };
+            let mut module = match first.as_str() {
+                "crate" => Vec::new(),
+                "self" => file_module,
+                "super" => match file_module.len().checked_sub(supers) {
+                    Some(keep) => file_module[..keep].to_vec(),
+                    None => return UseAnchor::Unplaced(tail),
+                },
+                _ => return UseAnchor::Unplaced(tail),
+            };
+            module.extend(tail);
+            UseAnchor::At(CrateModule { dir, roots, module })
+        }
+        _ => UseAnchor::None,
+    }
+}
+
+/// What a path call anchored in one crate ([`UseAnchor::At`]) binds.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Anchored {
+    /// Items in the module file the path names (the longest leading part of it
+    /// that is a file; the rest are inline `mod` blocks).
+    Named(Vec<i64>),
+    /// None there: a re-export (`pub use mutex::Mutex` in `sync/mod.rs`), or a
+    /// `pub use` from further away. The crate's items of that name and owner
+    /// whose module shares the longest leading part with the path.
+    Elsewhere(Vec<i64>),
+    /// No item of that name and owner in the crate (a macro-made item, or one a
+    /// later edit adds).
+    Nothing,
+}
+
+/// The files a module path below `anchor`'s root can be: the longest leading
+/// part of `module` that is a file.
+fn crate_module_files(
+    anchor: &CrateModule,
+    module: &[String],
+    all_file_paths: &HashSet<String>,
+) -> Vec<String> {
+    for len in (0..=module.len()).rev() {
+        let candidates = if len == 0 {
+            anchor.roots.clone()
+        } else {
+            let stem = format!("{}{}", anchor.dir, module[..len].join("/"));
+            vec![format!("{stem}.rs"), format!("{stem}/mod.rs")]
+        };
+        let files: Vec<String> = candidates
+            .into_iter()
+            .filter(|f| all_file_paths.contains(f))
+            .collect();
+        if !files.is_empty() {
+            return files;
+        }
+    }
+    Vec::new()
+}
+
+/// The module a file under `anchor`'s directory is in that crate, or None when
+/// the file is a crate of its own: a `src/bin/` target, or beside a test /
+/// bench / example target (`tests/other.rs`; its modules sit in
+/// subdirectories, `tests/support/mpsc.rs`).
+fn crate_file_module(anchor: &CrateModule, path: &str) -> Option<Vec<String>> {
+    if anchor.roots.iter().any(|r| r == path) {
+        return Some(Vec::new());
+    }
+    let stem = path
+        .strip_prefix(anchor.dir.as_str())?
+        .strip_suffix(".rs")?;
+    let own_root = anchor.roots.len() == 1;
+    if stem.starts_with("bin/") || (own_root && !stem.contains('/')) {
+        return None;
+    }
+    let mut module: Vec<String> = stem.split('/').map(String::from).collect();
+    if module.last().is_some_and(|m| m == "mod") {
+        module.pop();
+    }
+    Some(module)
+}
+
+/// Resolve a path call anchored in one crate. A candidate must live in that
+/// crate, and the path must end with the candidate's owner type (`Mutex` for
+/// `Mutex.new`); a free function is reached only through a path of modules
+/// (no segment naming a type). What is left of the path is the module.
+pub(super) fn rust_anchored_targets(
+    anchor: &CrateModule,
+    candidates: &[i64],
+    node_id_to_path: &HashMap<i64, String>,
+    db: &Database,
+    all_file_paths: &HashSet<String>,
+) -> Result<Anchored> {
+    let in_crate: Vec<i64> = candidates
+        .iter()
+        .copied()
+        .filter(|id| {
+            node_id_to_path
+                .get(id)
+                .is_some_and(|p| p.starts_with(anchor.dir.as_str()))
+        })
+        .collect();
+    if in_crate.is_empty() {
+        return Ok(Anchored::Nothing);
+    }
+    let id_to_qn = get_node_qualified_names_by_ids(db.conn(), &in_crate)?;
+    let mut files_of: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut named = Vec::new();
+    let mut ranked: Vec<(usize, i64)> = Vec::new();
+    for id in in_crate {
+        let path = node_id_to_path.get(&id).map(String::as_str).unwrap_or("");
+        let owner: Vec<&str> = match id_to_qn.get(&id).and_then(|qn| qn.rsplit_once('.')) {
+            Some((owner, _)) => owner.split('.').collect(),
+            None => Vec::new(),
+        };
+        let module = &anchor.module;
+        let modpart = if owner.is_empty() {
+            if module
+                .iter()
+                .any(|s| s.starts_with(|c: char| c.is_uppercase()))
+            {
+                continue;
+            }
+            &module[..]
+        } else {
+            let Some(keep) = module.len().checked_sub(owner.len()) else {
+                continue;
+            };
+            if !module[keep..].iter().zip(&owner).all(|(a, b)| a == b) {
+                continue;
+            }
+            &module[..keep]
+        };
+        let files = files_of
+            .entry(modpart.len())
+            .or_insert_with(|| crate_module_files(anchor, modpart, all_file_paths));
+        if files.iter().any(|f| f == path) {
+            named.push(id);
+            continue;
+        }
+        let Some(file_module) = crate_file_module(anchor, path) else {
+            continue; // another crate under the same directory
+        };
+        let shared = file_module
+            .iter()
+            .zip(modpart)
+            .take_while(|(a, b)| a == b)
+            .count();
+        ranked.push((shared, id));
+    }
+    if !named.is_empty() {
+        return Ok(Anchored::Named(named));
+    }
+    let Some(best) = ranked.iter().map(|(n, _)| *n).max() else {
+        return Ok(Anchored::Nothing);
+    };
+    Ok(Anchored::Elsewhere(
+        ranked
+            .into_iter()
+            .filter(|(n, _)| *n == best)
+            .map(|(_, id)| id)
+            .collect(),
+    ))
+}
+
+/// The metadata of an edge [`Anchored::Elsewhere`] bound: the call's own, with
+/// `"rx"` = the crate directory it was looked for in, so a later definition in
+/// that crate re-resolves the caller (`bare_name_callers_of_new_duplicates`),
+/// and [`ambiguous_meta`]'s mark when it bound more than one.
+pub(super) fn reexport_meta(metadata: &str, dir: &str, several: bool) -> String {
+    let marked = match serde_json::from_str::<serde_json::Value>(metadata) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("rx".into(), serde_json::Value::from(dir));
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => metadata.to_string(),
+    };
+    if several {
+        ambiguous_meta(&marked)
+    } else {
+        marked
+    }
 }
 
 /// Whether a Rust function's signature (`(&mut self, x: T) -> R`, as the parser
@@ -3263,7 +3686,7 @@ mod tests {
                 "[package]\nname = \"vendored\"\n",
             );
 
-            let names = collect_crate_root_names(root);
+            let names = collect_rust_crates(root);
             assert!(names.contains("top_level"), "got: {names:?}");
             assert!(names.contains("nested_poc"), "got: {names:?}");
             assert!(!names.contains("build_artifact"), "got: {names:?}");

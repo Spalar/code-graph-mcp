@@ -60,6 +60,7 @@ mod receiver;
 pub use receiver::{cpp_class_fields, CppField};
 mod routes;
 mod rust;
+mod rust_use;
 mod typescript;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
@@ -166,6 +167,7 @@ pub fn extract_relations_from_tree(
     // Unconditional (not gated on `language == "rust"`) so a non-Rust file can
     // never carry a previous Rust file's entries into the next Rust one.
     rust::reset_fn_local_names_cache();
+    rust_use::reset();
     member::reset_import_bound(tree.root_node(), source, config.name);
     receiver::reset();
     walk_for_relations(

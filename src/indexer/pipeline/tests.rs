@@ -7595,7 +7595,8 @@ fn a_second_fanout_round_finds_nothing_to_do() {
         before_ids > 0 && node_count_of(&db, "src/b.py") == before_ids,
         "precondition: b.py was re-extracted and still holds the same symbols"
     );
-    let next = super::resolve::bare_name_callers_of_new_duplicates(db.conn()).unwrap();
+    let next = super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default())
+        .unwrap();
     assert!(
         next.is_empty(),
         "the fan-out round is not a fixed point — a third round would re-extract {next:?}"
@@ -8034,5 +8035,357 @@ fn a_verified_entry_leaves_with_its_verdict() {
     assert_eq!(
         run.files_indexed, 1,
         "the old verified entry must not vouch for the new listing"
+    );
+}
+
+/// D#132: the Rust files of a two-package workspace whose calls go through
+/// `use`. `other` depends on `my-crate` (spelled `my_crate` in paths).
+fn d132_workspace() -> Vec<(&'static str, &'static str)> {
+    let same = "pub struct Semaphore;\nimpl Semaphore {\n    pub fn new(n: u8) -> Semaphore { Semaphore }\n}\n";
+    vec![
+        ("Cargo.toml", "[workspace]\nmembers = [\"mycrate\", \"other\"]\n"),
+        (
+            "mycrate/Cargo.toml",
+            "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "mycrate/src/lib.rs",
+            "pub mod sync;\npub mod time;\nmod util;\nmod a;\nmod a2;\nmod a3;\nmod a4;\nmod a5;\n\
+             mod a6;\nmod b;\nmod blk;\nmod re;\nmod m;\n",
+        ),
+        (
+            "mycrate/src/sync/mod.rs",
+            "mod mutex;\npub use mutex::Mutex;\npub mod oneshot;\npub mod broadcast;\npub mod batch;\n\
+             pub mod semaphore;\n",
+        ),
+        (
+            "mycrate/src/sync/mutex.rs",
+            "pub struct Mutex;\nimpl Mutex {\n    pub fn new(v: u8) -> Mutex { Mutex }\n}\n",
+        ),
+        ("mycrate/src/sync/oneshot.rs", "pub fn channel() {}\n"),
+        ("mycrate/src/sync/broadcast.rs", "pub fn channel() {}\n"),
+        ("mycrate/src/sync/batch.rs", same),
+        ("mycrate/src/sync/semaphore.rs", same),
+        (
+            "mycrate/src/time.rs",
+            "pub struct Instant;\nimpl Instant {\n    pub fn now() -> Instant { Instant }\n}\n",
+        ),
+        ("mycrate/src/util.rs", "pub fn tempdir() {}\n"),
+        (
+            "mycrate/src/a.rs",
+            "use std::sync::Mutex;\nuse std::time::Instant;\n\
+             fn std_mutex() {\n    Mutex::new(1);\n}\nfn std_instant() {\n    Instant::now();\n}\n",
+        ),
+        (
+            "mycrate/src/a2.rs",
+            "use std::sync;\nfn std_module() {\n    sync::Mutex::new(1);\n}\n",
+        ),
+        (
+            "mycrate/src/a3.rs",
+            "use crate::sync;\nfn own_module() {\n    sync::Mutex::new(1);\n}\n",
+        ),
+        (
+            "mycrate/src/a4.rs",
+            "use crate::sync::batch::Semaphore;\nfn own_semaphore() {\n    Semaphore::new(1);\n}\n",
+        ),
+        (
+            "mycrate/src/a5.rs",
+            "use crate::sync::oneshot::channel as oneshot_channel;\n\
+             fn renamed() {\n    oneshot_channel();\n}\n",
+        ),
+        (
+            "mycrate/src/a6.rs",
+            "use crate::sync::batch::Semaphore;\nfn glob_block() {\n    use crate::sync::semaphore::*;\n    \
+             Semaphore::new(1);\n}\n",
+        ),
+        (
+            "mycrate/src/b.rs",
+            "use crate::sync::Mutex;\nfn own_file_level() {\n    Mutex::new(1);\n}\n\
+             mod tests {\n    use std::sync::Mutex;\n    fn std_in_tests() {\n        Mutex::new(1);\n    }\n}\n\
+             mod tests2 {\n    use super::*;\n    fn inherited() {\n        Mutex::new(1);\n    }\n}\n",
+        ),
+        (
+            "mycrate/src/blk.rs",
+            "fn block_use() {\n    use std::sync::Mutex;\n    Mutex::new(1);\n}\n",
+        ),
+        (
+            "mycrate/src/re.rs",
+            "pub use std::sync::Mutex;\nfn reexport_std() {\n    Mutex::new(1);\n}\n",
+        ),
+        (
+            "mycrate/src/m.rs",
+            "use tempfile::tempdir;\nfn in_macro() {\n    assert!(tempdir() == ());\n}\n",
+        ),
+        (
+            "mycrate/tests/it.rs",
+            "use my_crate::sync::Mutex;\nfn it_type() {\n    Mutex::new(1);\n}\n\
+             mod support {\n    pub(crate) mod helpers;\n}\nuse support::helpers;\n\
+             fn it_support() {\n    helpers::assist();\n}\n",
+        ),
+        ("mycrate/tests/support/helpers.rs", "pub fn assist() {}\n"),
+        (
+            "other/Cargo.toml",
+            "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "other/src/lib.rs",
+            "mod chan;\nmod local;\nextern crate my_crate as mc;\nuse my_crate::sync::oneshot::channel;\n\
+             use my_crate::sync::{oneshot, broadcast};\nuse my_crate::sync::Mutex;\n\
+             use tempfile::tempdir;\nuse mc::sync::oneshot as os2;\n\
+             fn ws_bare() {\n    channel();\n}\nfn ws_module() {\n    oneshot::channel();\n}\n\
+             fn ws_type() {\n    Mutex::new(1);\n}\nfn foreign() {\n    tempdir();\n}\n\
+             fn via_extern_alias() {\n    os2::channel();\n}\n",
+        ),
+        (
+            "other/src/chan.rs",
+            "pub fn channel() {}\npub fn tempdir() {}\npub fn assist() {}\n",
+        ),
+        (
+            "other/src/local.rs",
+            "use my_crate::sync;\nfn sync() {}\nfn local_fn() {\n    sync();\n}\n",
+        ),
+    ]
+}
+
+/// D#132, the accepted shapes: a call through a name a `use` binds resolves
+/// through the path the `use` writes. Each row names the caller, the edges it
+/// must have, and the edges the name alone used to give it.
+///
+/// Deliberately left as before (no row): a glob other than `use super::*`
+/// (`use a::b::*` proves nothing about a name), a path opening with a name no
+/// `use` binds (`io::Error::new` with no `use`), `crate::`/`self::`/`super::`
+/// written in the call itself, and a bare call of a project item under its own
+/// name (resolved through the import edge, as before).
+#[test]
+fn test_rust_calls_resolve_through_use() {
+    const MUTEX_NEW: &str = "mycrate/src/sync/mutex.rs.new";
+    const ONESHOT: &str = "mycrate/src/sync/oneshot.rs.channel";
+    const BROADCAST: &str = "mycrate/src/sync/broadcast.rs.channel";
+    #[rustfmt::skip]
+    let rows: &[(&str, &[&str], &[&str])] = &[
+        // Foreign roots bind no project item.
+        ("mycrate/src/a.rs.std_mutex", &[], &[MUTEX_NEW]),
+        ("mycrate/src/a.rs.std_instant", &[], &["mycrate/src/time.rs.now"]),
+        ("mycrate/src/a2.rs.std_module", &[], &[MUTEX_NEW]),
+        ("mycrate/src/blk.rs.block_use", &[], &[MUTEX_NEW]),
+        ("mycrate/src/re.rs.reexport_std", &[], &[MUTEX_NEW]),
+        ("mycrate/src/m.rs.in_macro", &[], &["mycrate/src/util.rs.tempdir"]),
+        ("other/src/lib.rs.foreign", &[], &["other/src/chan.rs.tempdir", "mycrate/src/util.rs.tempdir"]),
+        // Project roots bind the item the path names.
+        ("mycrate/src/a3.rs.own_module", &[MUTEX_NEW], &[]),
+        ("mycrate/src/a4.rs.own_semaphore", &["mycrate/src/sync/batch.rs.new"], &["mycrate/src/sync/semaphore.rs.new"]),
+        ("mycrate/src/a5.rs.renamed", &[ONESHOT], &[BROADCAST]),
+        // Scope: a `use` binds in its own module or block.
+        ("mycrate/src/b.rs.own_file_level", &[MUTEX_NEW], &[]),
+        ("mycrate/src/b.rs.std_in_tests", &[], &[MUTEX_NEW]),
+        ("mycrate/src/b.rs.inherited", &[MUTEX_NEW], &[]),
+        // Another package of the workspace, by its crate name.
+        ("other/src/lib.rs.ws_bare", &[ONESHOT], &[BROADCAST, "other/src/chan.rs.channel"]),
+        ("other/src/lib.rs.ws_module", &[ONESHOT], &[BROADCAST, "other/src/chan.rs.channel"]),
+        ("other/src/lib.rs.ws_type", &[MUTEX_NEW], &[]),
+        ("other/src/lib.rs.via_extern_alias", &[ONESHOT], &[BROADCAST, "other/src/chan.rs.channel"]),
+        ("mycrate/tests/it.rs.it_type", &[MUTEX_NEW], &[]),
+        // A test crate's module in a subdirectory.
+        ("mycrate/tests/it.rs.it_support", &["mycrate/tests/support/helpers.rs.assist"], &["other/src/chan.rs.assist"]),
+        // A local item of the call's namespace beats a `use` of the name.
+        ("other/src/local.rs.local_fn", &["other/src/local.rs.sync"], &[]),
+        // A glob between the call and a `use` may be where the name comes from:
+        // resolved by name, as before.
+        ("mycrate/src/a6.rs.glob_block", &["mycrate/src/sync/semaphore.rs.new"], &[]),
+    ];
+    let (_p, _d, db) = fresh_index_of(&d132_workspace());
+    let edges = edge_set(&db);
+    let mut bad = Vec::new();
+    for (caller, want, wrong) in rows {
+        let calls: Vec<&str> = edges
+            .iter()
+            .filter_map(|e| e.strip_prefix(&format!("{caller} --calls--> ")))
+            .collect();
+        for w in *want {
+            if !calls.contains(w) {
+                bad.push(format!("{caller}: missing {w} (has {calls:?})"));
+            }
+        }
+        for w in *wrong {
+            if calls.contains(w) {
+                bad.push(format!("{caller}: wrong {w}"));
+            }
+        }
+        if want.is_empty() && !calls.is_empty() {
+            bad.push(format!("{caller}: a foreign item's call bound {calls:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Index `before`, apply `after` (None deletes), index incrementally, and
+/// require every edge (with metadata and confidence for calls) a fresh index of
+/// the result has. Returns the rebuild's edge set for the caller's control
+/// assertions.
+fn assert_all_edges_match_rebuild(
+    before: &[(&str, &str)],
+    after: &[(&str, Option<&str>)],
+) -> Vec<String> {
+    let (project, _d, db) = fresh_index_of(before);
+    let mut tree: Vec<(String, String)> = before
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    for (path, body) in after {
+        tree.retain(|(p, _)| p != path);
+        match body {
+            Some(b) => {
+                let full = project.path().join(path);
+                fs::create_dir_all(full.parent().unwrap()).unwrap();
+                fs::write(full, b).unwrap();
+                tree.push((path.to_string(), b.to_string()));
+            }
+            None => fs::remove_file(project.path().join(path)).unwrap(),
+        }
+    }
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        call_edges_with_confidence(&control),
+        "calls after {after:?} must equal a rebuild"
+    );
+    let want = edge_set(&control);
+    assert_eq!(
+        edge_set(&db),
+        want,
+        "edges after {after:?} must equal a rebuild"
+    );
+    want
+}
+
+/// D#132 parity: each rule that reads a `use` gives an incremental run the
+/// edges a rebuild gives, when the caller changes and when the crate the `use`
+/// names gains or loses the item.
+#[test]
+fn test_rust_use_anchoring_incremental_matches_rebuild() {
+    fn tree(wa: &'static str, wc: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"mycrate\", \"other\"]\n",
+            ),
+            (
+                "mycrate/Cargo.toml",
+                "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "mycrate/src/lib.rs",
+                "pub mod wa;\npub mod wc;\npub mod sync;\n",
+            ),
+            ("mycrate/src/wa.rs", wa),
+            ("mycrate/src/wc.rs", wc),
+            (
+                "mycrate/src/sync.rs",
+                "pub struct Mutex;\nimpl Mutex {\n    pub fn new(v: u8) -> Mutex { Mutex }\n}\n",
+            ),
+            (
+                "mycrate/src/user.rs",
+                "use crate::sync::Mutex;\nfn own() {\n    Mutex::new(1);\n}\n",
+            ),
+            (
+                "other/Cargo.toml",
+                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "other/src/lib.rs",
+                "use my_crate::wa::widget;\nfn go() {\n    widget();\n}\n",
+            ),
+        ]
+    }
+    const WA_WITHOUT: &str = "pub fn other() {}\n";
+    const WA_WITH: &str = "pub fn other() {}\npub fn widget() {}\n";
+    const WC_WITH: &str = "pub fn widget() {}\n";
+    const WC_WITHOUT: &str = "pub fn unrelated() {}\n";
+    let go_to = |edges: &[String], file: &str| {
+        edges.contains(&format!("other/src/lib.rs.go --calls--> {file}.widget"))
+    };
+
+    // The named module gains the item: the call moves off the other module's.
+    let want = assert_all_edges_match_rebuild(
+        &tree(WA_WITHOUT, WC_WITH),
+        &[("mycrate/src/wa.rs", Some(WA_WITH))],
+    );
+    assert!(
+        go_to(&want, "mycrate/src/wa.rs") && !go_to(&want, "mycrate/src/wc.rs"),
+        "{want:#?}"
+    );
+    // ...and loses it again.
+    let want = assert_all_edges_match_rebuild(
+        &tree(WA_WITH, WC_WITH),
+        &[("mycrate/src/wa.rs", Some(WA_WITHOUT))],
+    );
+    assert!(go_to(&want, "mycrate/src/wc.rs"), "{want:#?}");
+    // No such item in the crate yet, then the named module gains it.
+    let want = assert_all_edges_match_rebuild(
+        &tree(WA_WITHOUT, WC_WITHOUT),
+        &[("mycrate/src/wa.rs", Some(WA_WITH))],
+    );
+    assert!(go_to(&want, "mycrate/src/wa.rs"), "{want:#?}");
+    // Another module of the crate gains it while the named one has none.
+    let want = assert_all_edges_match_rebuild(
+        &tree(WA_WITHOUT, WC_WITHOUT),
+        &[("mycrate/src/wc.rs", Some(WC_WITH))],
+    );
+    assert!(go_to(&want, "mycrate/src/wc.rs"), "{want:#?}");
+    // The same through `crate::`, which bound the importer to the `<external>`
+    // sentinel for good: its call stayed pruned until a rebuild.
+    let single = |a: &'static str| -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "mod a;\nmod user;\n"),
+            ("src/a.rs", a),
+            (
+                "src/user.rs",
+                "use crate::a::widget;\nfn go() {\n    widget();\n}\n",
+            ),
+        ]
+    };
+    let want = assert_all_edges_match_rebuild(&single(WA_WITHOUT), &[("src/a.rs", Some(WA_WITH))]);
+    assert!(
+        want.contains(&"src/user.rs.go --calls--> src/a.rs.widget".to_string()),
+        "{want:#?}"
+    );
+    // The caller's `use` turns to std's: the call leaves the project.
+    let want = assert_all_edges_match_rebuild(
+        &tree(WA_WITHOUT, WC_WITH),
+        &[(
+            "mycrate/src/user.rs",
+            Some("use std::sync::Mutex;\nfn own() {\n    Mutex::new(1);\n}\n"),
+        )],
+    );
+    assert!(
+        !want
+            .iter()
+            .any(|e| e.starts_with("mycrate/src/user.rs.own --calls-->")),
+        "{want:#?}"
+    );
+    // ...and back.
+    let want = assert_all_edges_match_rebuild(
+        &[
+            tree(WA_WITHOUT, WC_WITH),
+            vec![(
+                "mycrate/src/user.rs",
+                "use std::sync::Mutex;\nfn own() {\n    Mutex::new(1);\n}\n",
+            )],
+        ]
+        .concat(),
+        &[(
+            "mycrate/src/user.rs",
+            Some("use crate::sync::Mutex;\nfn own() {\n    Mutex::new(1);\n}\n"),
+        )],
+    );
+    assert!(
+        want.contains(&"mycrate/src/user.rs.own --calls--> mycrate/src/sync.rs.new".to_string()),
+        "{want:#?}"
     );
 }

@@ -167,7 +167,7 @@ pub(super) fn extract_rust_use_imports(
             let metadata = if external {
                 Some(crate::domain::IMPORT_EXTERNAL_META.to_string())
             } else {
-                use_module_metadata(&segments, &inline_mods)
+                import_metadata(node, source, &name, &segments, &inline_mods)
             };
             results.push(ParsedRelation {
                 source_name: scope_name.to_string(),
@@ -181,8 +181,40 @@ pub(super) fn extract_rust_use_imports(
     }
 }
 
+/// The metadata of an import `name` written after `segments` (D#71, D#132).
+/// The path's root is read as the file's `use` reads it
+/// ([`super::rust_use::normalize_use_path`]): a module this module declares
+/// (`mod util; use util::f;`) or a name another `use` binds is followed. A path
+/// rooted at a crate name carries `{"ru":"ext","c":<crate>,"m":[…]}`: the
+/// resolver names its file when the crate is a package of this project; a
+/// std path reached through another `use` is the external marker.
+fn import_metadata(
+    node: &tree_sitter::Node,
+    source: &str,
+    name: &str,
+    segments: &[String],
+    inline_mods: &[String],
+) -> Option<String> {
+    let mut full = segments.to_vec();
+    full.push(name.to_string());
+    let Some((normalized, root)) = super::rust_use::normalize_use_path(node, source, &full) else {
+        return use_module_metadata(segments, inline_mods);
+    };
+    let (_, module) = normalized.split_last()?;
+    match root {
+        super::rust_use::UseRoot::Project => use_module_metadata(module, &[]),
+        super::rust_use::UseRoot::Extern => {
+            let (krate, rest) = module.split_first()?;
+            if matches!(krate.as_str(), "std" | "core" | "alloc" | "proc_macro") {
+                return Some(crate::domain::IMPORT_EXTERNAL_META.to_string());
+            }
+            Some(serde_json::json!({ "ru": "ext", "c": krate, "m": rest }).to_string())
+        }
+    }
+}
+
 /// Names of the inline `mod name { … }` blocks around `node`, outermost first.
-fn enclosing_inline_mods(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+pub(super) fn enclosing_inline_mods(node: &tree_sitter::Node, source: &str) -> Vec<String> {
     let mut mods = Vec::new();
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -575,11 +607,26 @@ pub(super) fn extract_rust_macro_token_call(
     if shadowed_by_enclosing_local(node, source, name) {
         return None;
     }
+    // What the file's `use` makes of the name, as for a call outside a macro
+    // (D#132): `assert!(tempdir().is_ok())` after `use tempfile::tempdir`.
+    use super::rust_use::UseRewrite;
+    let (target_name, metadata) = match super::rust_use::rewrite_call(node, source, name, None) {
+        Some(UseRewrite::Rename(own)) => (own, None),
+        Some(UseRewrite::Path {
+            name,
+            segments,
+            root,
+        }) => {
+            let meta = serde_json::json!({ "q": "path", "v": segments.join("::") }).to_string();
+            (name, Some(super::calls::with_use_root(meta, Some(root))))
+        }
+        None => (name.to_string(), None),
+    };
     Some(ParsedRelation {
         source_name: scope.to_string(),
-        target_name: name.to_string(),
+        target_name,
         relation: REL_CALLS.into(),
-        metadata: None,
+        metadata,
         source_language: String::new(),
         source_line: None,
     })

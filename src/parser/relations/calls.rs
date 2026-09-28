@@ -323,7 +323,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
         None => None,
     };
     if let Some(scope) = call_scope {
-        if let Some((callee, mut qualifier)) =
+        if let Some((mut callee, mut qualifier)) =
             extract_callee(&node, source, ctx.language, ctx.current_rust_impl)
         {
             // A BARE Rust callee whose name is a local binding of the
@@ -346,6 +346,13 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             let shadowed = ctx.language == "rust"
                 && bare_call
                 && super::rust::shadowed_by_enclosing_local(&node, source, &callee);
+            // The file's `use` names what the call's leading name stands for
+            // (D#132): `use std::sync::Mutex; Mutex::new()` is std's.
+            let use_root = if ctx.language == "rust" && !shadowed {
+                rust_use_rewrite(node, source, &mut callee, &mut qualifier)
+            } else {
+                None
+            };
             if !shadowed {
                 // Fill SelfRecv/SelfType payload from current impl context.
                 // The helper emits these with empty payload because it
@@ -423,7 +430,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 // overloading, default or variadic parameters, it reaches only a
                 // function taking that many (`resolve::rust_call_shape_admits`).
                 let metadata = if ctx.language == "rust" {
-                    metadata.map(|m| with_rust_arity(m, node))
+                    metadata.map(|m| with_use_root(with_rust_arity(m, node), use_root))
                 } else {
                     metadata
                 };
@@ -438,6 +445,66 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             }
         }
     }
+}
+
+/// Apply what the file's `use` declarations make of a Rust call (see
+/// [`super::rust_use`]) to its callee and qualifier: a renamed project import is
+/// called by its own name, and a name bound to a path becomes a path call
+/// through it. Returns the root kind of a rewritten path, for [`with_use_root`].
+/// Only a callee spelled with a plain leading name is looked up: `crate::`,
+/// `self::`, `super::`, `Self::`, a leading `::` and `<T as Tr>::` bind nothing.
+pub(super) fn rust_use_rewrite(
+    node: tree_sitter::Node,
+    source: &str,
+    callee: &mut String,
+    qualifier: &mut helpers::CalleeQualifier,
+) -> Option<super::rust_use::UseRoot> {
+    use super::rust_use::{leftmost_name, rewrite_call, UseRewrite};
+    let function = node.child_by_field_name("function")?;
+    let lead = leftmost_name(&function)?;
+    let lead = node_text(&lead, source);
+    let rewrite = match &*qualifier {
+        helpers::CalleeQualifier::Bare if lead == callee => {
+            rewrite_call(&node, source, callee, None)
+        }
+        helpers::CalleeQualifier::Path(path) if path.first().is_some_and(|f| f == lead) => {
+            rewrite_call(&node, source, callee, Some(path))
+        }
+        _ => None,
+    }?;
+    match rewrite {
+        UseRewrite::Rename(name) => {
+            *callee = name;
+            None
+        }
+        UseRewrite::Path {
+            name,
+            segments,
+            root,
+        } => {
+            *callee = name;
+            *qualifier = helpers::CalleeQualifier::Path(segments);
+            Some(root)
+        }
+    }
+}
+
+/// `metadata` with `"u"`: a path a `use` spelled out, rooted at this crate
+/// (`"c"`: `crate`/`self`/`super`, counted from the file's module) or at a crate
+/// name (`"x"`). See `resolve::rust_use_anchor`.
+pub(super) fn with_use_root(metadata: String, root: Option<super::rust_use::UseRoot>) -> String {
+    let Some(root) = root else {
+        return metadata;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    let tag = match root {
+        super::rust_use::UseRoot::Project => "c",
+        super::rust_use::UseRoot::Extern => "x",
+    };
+    map.insert("u".into(), tag.into());
+    serde_json::Value::Object(map).to_string()
 }
 
 /// The name of the `trait` whose body holds `node`, stopping at an `impl`.
