@@ -3,11 +3,11 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 92 → 97 because the Rust and JavaScript fixes below change
+`INDEX_VERSION` goes 92 → 98 because the Rust and JavaScript fixes below change
 which `calls`, `imports` and `exports` edges a file produces. Nothing to run. To
 pin back: `npm i -g @sdsrs/code-graph@0.161.0`, or `cargo install
 code-graph-mcp --version 0.161.0`; plugin users can set the version in the
-marketplace entry. An older binary leaves a v97 index intact and warns instead
+marketplace entry. An older binary leaves a v98 index intact and warns instead
 of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
@@ -247,19 +247,22 @@ of that name. It now binds the export in the file the specifier names:
   class declaration, a catch or loop variable or a hoisted `var` of the same
   name keeps the call bare, and a `require` rename inside one function is
   invisible to a sibling function's own `loadModel()`.
-- It binds a top-level function only: never a class method or a nested
-  function that shares the name, nor a constant. A CommonJS export map that
-  publishes a function under another name is followed
-  (`module.exports = { load: realLoad }`, `exports.load = realLoad` bind
-  `realLoad`; those `exports` edges now record the published name), and when
-  the map publishes something else as `load`, the file's own `load` is not
-  bound.
+- It binds only a top-level function the file exports under that name: never
+  a class method or a nested function that shares the name, nor a constant,
+  nor a function the file keeps private (a `function load` beside
+  `export { realLoad as load }`, or beside a CommonJS map without a `load`
+  key). A CommonJS export map that publishes a function under another name is
+  followed (`module.exports = { load: realLoad }`, `exports.load = realLoad`
+  bind `realLoad`; those `exports` edges now record the published name), and
+  when the map publishes something else as `load`, the file's own `load` is
+  not bound.
 - A package's export (`import { resolve as r } from 'path'`) binds nothing.
 - An incremental run agrees with a rebuild: when the export is renamed away
   the call binds nothing (it no longer binds a same-named function elsewhere);
   when the file gains the export later, or its export map moves to another
-  function, the call binds it; when the file is deleted and comes back, it
-  binds again.
+  function, the call binds it; when the file appears only after the caller,
+  or is deleted and comes back, it binds, for an ESM import as for a
+  `require`.
 
 This is the design of the change withdrawn before 0.160.0, redone against the
 four defects its review reproduced, each now a named test that fails on the
@@ -273,8 +276,11 @@ precision 519/519 → 523/523; hono 801 → 805 of 896, inferred precision
 unjudged by the oracle and correct on reading); express unchanged (892 edges,
 identical line for line), and this repo's Python scores unchanged. No correct
 pair lost, no edge removed on any of the three. Full index time, median of 5
-alternating runs: this repo 1.88 s → 1.89 s, hono 0.54 s → 0.55 s, express
-0.19 s → 0.18 s.
+alternating runs: this repo 2.10 s → 2.05 s, hono 0.56 s → 0.54 s, express
+0.18 s → 0.18 s; a synthetic 5,000-file tree with 999 renamed-import calls
+over 20,999 `exports` edges 1.50 s → 1.54 s. An incremental run carrying
+10,000 buffered renamed-import calls takes 78 ms → 87 ms (median of 7). Each
+file's exports are read once per pass, not once per call.
 
 ### An empty caller list names the lines that dispatch by name
 
@@ -385,15 +391,24 @@ same always-on figure before and after.
   (`import b from './x'; b()`), a dynamic `import()`, a nested or defaulted
   destructuring (`{ a: { c } }`, `{ a: b = f }`), and a call that is not a
   bare call (`new B()` through `import { A as B }`, `b.call()`, `b` passed as
-  a callback) bind as before. So does a renamed ESM export
-  (`export { realLoad as load }`), which records no export map.
-- A renamed-import call whose file lacks the export waits in the pending-call
-  buffer and ages out after 50 runs, like any buffered call; an export added
-  after that binds on a rebuild only. A specifier that starts resolving to a
+  a callback) bind as before. So does an ESM export list
+  (`export { load }`, `export { realLoad as load }`), which records no
+  `exports` edge: the call binds nothing.
+- A renamed-import call whose file lacks the export, or whose relative
+  specifier names no file yet, waits in the pending-call buffer and ages out
+  after 50 runs, like any buffered call; an export or a file added after that
+  binds on a rebuild only. A specifier that starts resolving to a
   different file (`./x` from `x/index.js` to a new `x.js`) keeps the old edge
   until the caller's file changes.
 - Two top-level functions on one line, or a function nested on its parent's
   line, both read as nested: the call binds neither.
+- Two bindings do not shadow a renamed import, so its call still binds the
+  export: a `const` in one `case` of a `switch` seen from another `case`, and
+  a class expression's own name inside its body (`const K = class m { … }`).
+  A `let` alias reassigned later still binds the export.
+- A CommonJS map that publishes one function under several keys
+  (`{ first: a, second: a }`) records one `exports` edge per key, so that
+  function appears once per key in its file's `<module>` context text.
 - An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
   tokio's runtime) is no node, so a call the `use` sends there binds nothing
   (it waits in the pending-call buffer). Parsing a `cfg_*! { … }` body as the

@@ -414,9 +414,11 @@ fn binding_in(
 fn declares(stmt: tree_sitter::Node, name: &str, source: &str) -> Option<Option<(String, String)>> {
     match stmt.kind() {
         "lexical_declaration" | "variable_declaration" => declarators(stmt, name, source),
+        // No `function_signature`: a TS overload signature is valid only
+        // beside its implementation, a `function_declaration` of the same
+        // name in the same scope, or in an ambient context, where no call runs.
         "function_declaration"
         | "generator_function_declaration"
-        | "function_signature"
         | "class_declaration"
         | "abstract_class_declaration"
         | "enum_declaration" => stmt

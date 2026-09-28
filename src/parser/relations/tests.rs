@@ -4229,6 +4229,58 @@ fn test_js_renamed_import_call_shapes() {
             "import type { Load as L } from './x';\nfunction go() { L(); }",
             vec![("go", "L", None)],
         ),
+        // Review MEDIUM-2: one row per guard no other row pinned (M9-M13).
+        (
+            "specifier-level type-only import (M9)",
+            "typescript",
+            "import { type other as TO } from './y';\nfunction go() { TO(); }",
+            vec![("go", "TO", None)],
+        ),
+        (
+            "a var in a nested function does not hoist out of it (M10)",
+            "javascript",
+            "import { load as m } from './x';\n\
+             function go() { function inner() { var m = 1; } m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "a var in a class static block does not hoist out of it (M10)",
+            "javascript",
+            "import { load as m } from './x';\n\
+             function go() { class K { static { var m = 1; } } m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "local class shadows (M11)",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { class m {} m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "local abstract class shadows (M11)",
+            "typescript",
+            "import { load as m } from './x';\nfunction go() { abstract class m {} m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "local enum shadows (M11)",
+            "typescript",
+            "import { load as m } from './x';\nfunction go() { enum m { A } m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "local overloads shadow through their implementation (M16)",
+            "typescript",
+            "import { load as m } from './x';\n\
+             function go(): void { function m(a: string): void; function m(a: any) {} m(1); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "a parameter's type annotation binds nothing (M13)",
+            "typescript",
+            "import { load as m } from './x';\nfunction go(a: typeof m): void { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, language, code, want) in table {

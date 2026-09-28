@@ -9800,6 +9800,8 @@ fn check_d120_edges(edges: &[String], when: &str) {
         "src/use.js.go --calls--> src/other.js.m1",
         "src/use.js.go --calls--> src/dup.js.realLoad",
         "src/use.js.go --calls--> src/map2.js.load",
+        // Nor the class the map does publish as `load` (review M1).
+        "src/use.js.go --calls--> src/map2.js.Real",
         // A nested function is no export; a constant is not callable code.
         "src/use.js.go --calls--> src/x2.js.load",
         "src/use.js.go --calls--> src/val.js.load",
@@ -9975,4 +9977,196 @@ fn test_js_renamed_import_is_scoped() {
     ] {
         assert!(!edges.contains(&wrong.to_string()), "{wrong}: {edges:#?}");
     }
+}
+
+/// D#120 review BLOCKER: the export-map lookup runs once per renamed-import
+/// call, on a full index before any `ANALYZE`. Driven from `idx_edges_relation`
+/// it scanned every `exports` edge in the repo per call — 999 calls over
+/// 20,000 `exports` edges took a 5,000-file index from 1.83 s to 3.89 s. With
+/// no statistics (every fresh index), it must seek the file's `<module>` edges.
+#[test]
+fn test_js_export_map_query_seeks_the_module_node_edges() {
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let stats: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if stats > 0 {
+        db.conn().execute_batch("DELETE FROM sqlite_stat1").unwrap();
+    }
+    let sql = format!("EXPLAIN QUERY PLAN {}", super::resolve::js_export_map_sql());
+    let mut stmt = db.conn().prepare(&sql).unwrap();
+    let n = stmt.parameter_count();
+    let plan: Vec<String> = stmt
+        .query_map(
+            rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
+            |r| r.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|l| l.starts_with("SEARCH e ") && l.contains("(source_id=? AND relation=?)")),
+        "{plan:#?}"
+    );
+    assert!(
+        !plan.iter().any(|l| l.contains("idx_edges_relation")),
+        "{plan:#?}"
+    );
+}
+
+/// D#120 review HIGH-1: an ESM renamed import whose file is missing at index
+/// time. Its `<external>` sentinel is named after the symbol, not the
+/// specifier, so a file appearing later never re-extracts the importer: the
+/// call must wait in the buffer, since a rebuild binds it.
+#[test]
+fn test_js_renamed_import_file_appearing_later_matches_rebuild() {
+    let x = "export function load() {}\n";
+    let a = (
+        "a.js",
+        "import { load as m } from './x';\nfunction go() { m(); }\n",
+    );
+    let want = "a.js.go --calls--> x.js.load".to_string();
+    // Added after the first index.
+    let before: &[(&str, &str)] = &[a, ("b.js", "export function other() {}\n")];
+    assert_incremental_matches_rebuild(before, &[("x.js", Some(x))]);
+    let (project, _d, db) = fresh_index_of(before);
+    fs::write(project.path().join("x.js"), x).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert!(edge_set(&db).contains(&want), "added: {:#?}", edge_set(&db));
+    // Deleted, then restored.
+    let (project, _d, db) = fresh_index_of(&[a, ("x.js", x)]);
+    assert!(edge_set(&db).contains(&want));
+    fs::remove_file(project.path().join("x.js")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert!(!edge_set(&db)
+        .iter()
+        .any(|e| e.starts_with("a.js.go --calls-->")));
+    fs::write(project.path().join("x.js"), x).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert!(
+        edge_set(&db).contains(&want),
+        "restored: {:#?}",
+        edge_set(&db)
+    );
+    // A package names no file of the project: nothing to wait for.
+    let (_p, _d, db) = fresh_index_of(&[(
+        "p.js",
+        "import { resolve as r } from 'path';\nfunction go() { r(); }\n",
+    )]);
+    assert_eq!(
+        crate::storage::queries::count_pending_unresolved_calls(db.conn()).unwrap(),
+        0
+    );
+}
+
+/// D#120 review MEDIUM-1: the import reaches what the file exports under that
+/// name, never a same-named function the file keeps private — beside an ESM
+/// `export { realLoad as load }` (no export map recorded), a CommonJS map that
+/// omits the key, a key published from another file, or no export at all.
+#[test]
+fn test_js_renamed_import_binds_only_what_the_file_exports() {
+    let tree: &[(&str, &str)] = &[
+        (
+            "esm.js",
+            "function realLoad() {}\nfunction load() {}\nexport { realLoad as load };\n",
+        ),
+        (
+            "map.js",
+            "function load() {}\nclass K {}\nmodule.exports = { other: K };\n",
+        ),
+        ("impl.js", "function go() {}\nmodule.exports = { go };\n"),
+        (
+            "fwd.js",
+            "const impl = require('./impl').go;\nfunction load() {}\nexports.load = impl;\n",
+        ),
+        ("plain.js", "function load() {}\n"),
+        // `load` is published, but as `other`.
+        (
+            "key.js",
+            "function load() {}\nmodule.exports = { other: load };\n",
+        ),
+        // The export names a nested function only by name resolution.
+        (
+            "nested.js",
+            "const load = require('./ok').load;\n\
+             function outer() { function load() {} return load; }\n\
+             module.exports = { load, outer };\n",
+        ),
+        // The map is reassigned: `load` publishes `realLoad`, not `load`.
+        (
+            "remap.js",
+            "function load() {}\nfunction realLoad() {}\n\
+             module.exports = { load };\nmodule.exports = { load: realLoad };\n",
+        ),
+        ("ok.js", "export function load() {}\n"),
+        (
+            "a.js",
+            "import { load as e } from './esm';\n\
+             const { load: m } = require('./map');\n\
+             const { load: f } = require('./fwd');\n\
+             import { load as p } from './plain';\n\
+             const { load: k } = require('./key');\n\
+             const { load: n } = require('./nested');\n\
+             const { load: r } = require('./remap');\n\
+             import { load as o } from './ok';\n\
+             function go() { e(); m(); f(); p(); k(); n(); r(); o(); }\n",
+        ),
+    ];
+    let want = [
+        "a.js.go --calls--> ok.js.load",
+        "a.js.go --calls--> remap.js.realLoad",
+    ];
+    let calls = |db: &Database| -> Vec<String> {
+        edge_set(db)
+            .into_iter()
+            .filter(|e| e.starts_with("a.js.go --calls-->"))
+            .collect()
+    };
+    let (project, _d, db) = fresh_index_of(tree);
+    assert_eq!(calls(&db), want);
+    for (f, body) in tree {
+        fs::write(project.path().join(f), format!("{body}\n")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        assert_eq!(calls(&db), want, "after {f}");
+    }
+}
+
+/// D#120 review MEDIUM-2 (M20): a self-import only the sweep resolves. `../x`
+/// named `x.js` (no `load`: buffered); deleting `x.js` makes it name the
+/// caller's own file, which the deletion does not re-extract. A rebuild's
+/// deferred pass never binds a function to itself; the sweep must not either.
+#[test]
+fn test_js_renamed_import_sweep_binds_no_self_call() {
+    let before: &[(&str, &str)] = &[
+        ("x.js", "export function other() {}\n"),
+        (
+            "x/index.js",
+            "import { load as m } from '../x';\nexport function load() { m(); }\n",
+        ),
+        ("z.js", "export function z() {}\n"),
+    ];
+    let after: &[(&str, Option<&str>)] =
+        &[("x.js", None), ("z.js", Some("export function z() {}\n\n"))];
+    assert_incremental_matches_rebuild(before, after);
+    let (project, _d, db) = fresh_index_of(before);
+    assert_eq!(
+        crate::storage::queries::count_pending_unresolved_calls(db.conn()).unwrap(),
+        1,
+        "not vacuous: the call waits for x.js to export `load`"
+    );
+    fs::remove_file(project.path().join("x.js")).unwrap();
+    fs::write(project.path().join("z.js"), "export function z() {}\n\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert!(
+        !edge_set(&db).contains(&"x/index.js.load --calls--> x/index.js.load".to_string()),
+        "{:#?}",
+        edge_set(&db)
+    );
 }

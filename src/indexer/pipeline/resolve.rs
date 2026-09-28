@@ -240,22 +240,28 @@ pub(super) fn js_import_pending_name(metadata: Option<&str>, target_name: &str) 
 }
 
 /// The node a call through a renamed import binds (D#120): in the file the
-/// specifier names, the top-level function published under `export` — the
-/// symbol an export map renames to it (`module.exports = { load: realLoad }`,
-/// `exports.load = realLoad`, stamped `{"as": …}` by the parser) when the file
-/// has one, else its top-level function of that name. Never a method or a
-/// nested function sharing the name, and never anything outside that file.
+/// specifier names, the top-level function its `exports` edges publish under
+/// `export` — the symbol an export map renames to it
+/// (`module.exports = { load: realLoad }`, `exports.load = realLoad`, stamped
+/// `{"as": …}` by the parser) when the file has one, else the exported
+/// function of that name. Never a method, a nested function or a function the
+/// file does not export under that name, and never anything outside that file.
 ///
-/// `None` when the specifier names no indexed file (a package, a missing
-/// file): nothing to bind and nothing to wait for — a file appearing later
-/// re-extracts the importer (`existence_change_dependents`). `Some(empty)`
-/// when the file is there without such a function yet: the caller buffers the
-/// call, so the export binds when the file gains it.
+/// `None` when the specifier is a package's: it never names a file of the
+/// project, so there is nothing to bind and nothing to wait for. `Some(empty)`
+/// when a relative specifier names no indexed file yet, or its file does not
+/// export such a function yet: the caller buffers the call, so it binds when
+/// the file appears or gains the export, as a rebuild would. (An ESM import of
+/// a missing file leaves an `<external>` sentinel named after the symbol, not
+/// the specifier, so no file appearing later re-extracts the importer.)
 ///
 /// Read from the database, after every batch's nodes and `exports` edges are
-/// in: the batch pass always defers these calls.
+/// in: the batch pass always defers these calls, and a file's `exports` edges
+/// to its own nodes are all bound in its own batch, so `exports` may memoize a
+/// file for the whole pass.
 pub(super) fn js_import_targets(
     conn: &rusqlite::Connection,
+    exports: &mut JsExports,
     caller_path: &str,
     module: &str,
     export: &str,
@@ -264,52 +270,127 @@ pub(super) fn js_import_targets(
     let Some(file) =
         super::js_modules::resolve_js_specifier_path(module, caller_path, all_file_paths)
     else {
-        return Ok(None);
+        let relative = module.starts_with("./") || module.starts_with("../");
+        return Ok(relative.then(Vec::new));
     };
-    // A candidate is a top-level function: no other function, method or class
-    // of its file spans its lines. (Two functions sharing one line both fail
-    // it: a missed edge, never a method's.)
-    const TOP_LEVEL: &str = "n.type = 'function'
-        AND NOT EXISTS (
-            SELECT 1 FROM nodes o
-            WHERE o.file_id = n.file_id AND o.id <> n.id
-              AND o.type IN ('function', 'method', 'class')
-              AND o.start_line <= n.start_line AND o.end_line >= n.end_line)";
-    // Every symbol the file exports under this name; the filter applies after,
-    // so an export map naming a class or a method binds nothing rather than a
-    // same-named function the map does not publish.
-    let mut mapped = conn.prepare_cached(&format!(
-        "SELECT n.id, ({TOP_LEVEL}) FROM files f
-         JOIN nodes m ON m.file_id = f.id AND m.name = '<module>'
-         JOIN edges e ON e.source_id = m.id AND e.relation = ?3
-         JOIN nodes n ON n.id = e.target_id AND n.file_id = f.id
-         WHERE f.path = ?1 AND json_extract(e.metadata, '$.as') = ?2"
-    ))?;
-    let rows: Vec<(i64, bool)> = mapped
-        .query_map(
-            rusqlite::params![file, export, crate::domain::REL_EXPORTS],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?
-        .collect::<rusqlite::Result<_>>()?;
-    if !rows.is_empty() {
-        let mut ids: Vec<i64> = rows
-            .into_iter()
-            .filter(|(_, f)| *f)
-            .map(|(id, _)| id)
+    if !exports.by_file.contains_key(&file) {
+        let loaded = JsFileExports::load(conn, &file)?;
+        exports.by_file.insert(file.clone(), loaded);
+    }
+    Ok(Some(exports.by_file[&file].targets(export)))
+}
+
+/// Per-pass memo for [`js_import_targets`]: each file's exports, read once.
+///
+/// A query per call was the D#120 review's BLOCKER: it runs for every
+/// renamed-import call of a full index, and the pending sweep re-runs it for
+/// every buffered call on every incremental run. Besides the plan (see
+/// [`js_export_map_sql`]), the bundled SQLite is built with `STAT4`, under
+/// which a statement whose parameters meet an indexed column is re-prepared
+/// each time they are re-bound: measured ~33 µs a call through rusqlite against
+/// ~2.5 µs for the same query and plan in a `STAT4`-less build.
+#[derive(Default)]
+pub(super) struct JsExports {
+    by_file: HashMap<String, JsFileExports>,
+}
+
+/// `(node, name, published as, is a function, start line, end line)`.
+type JsExported = (i64, String, Option<String>, bool, i64, i64);
+
+/// What one file's `<module>` exports, and the spans that make a function
+/// nested.
+struct JsFileExports {
+    exported: Vec<JsExported>,
+    /// `(node, start line, end line)` of the file's functions, methods, classes.
+    spans: Vec<(i64, i64, i64)>,
+}
+
+impl JsFileExports {
+    fn load(conn: &rusqlite::Connection, file: &str) -> Result<Self> {
+        let exported = conn
+            .prepare_cached(&js_export_map_sql())?
+            .query_map([file], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let spans = conn
+            .prepare_cached(
+                "SELECT n.id, n.start_line, n.end_line
+                 FROM files f CROSS JOIN nodes n ON n.file_id = f.id
+                 WHERE f.path = ?1 AND n.type IN ('function', 'method', 'class')",
+            )?
+            .query_map([file], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Self { exported, spans })
+    }
+
+    /// The top-level functions published as `export`: through an export map
+    /// (`{"as": export}`) when the file has one for that name — even one that
+    /// publishes a class or a method, so a same-named function the map does
+    /// not publish is never reached — else under their own name (no `as`). An
+    /// `exports` edge naming a function under another key (`{ other: load }`)
+    /// does not publish it as `load`.
+    fn targets(&self, export: &str) -> Vec<i64> {
+        let mapped = self
+            .exported
+            .iter()
+            .any(|(_, _, key, ..)| key.as_deref() == Some(export));
+        let mut ids: Vec<i64> = self
+            .exported
+            .iter()
+            .filter(|(_, name, key, ..)| match key {
+                Some(key) => key == export,
+                None => !mapped && name == export,
+            })
+            .filter(|(id, _, _, function, start, end)| {
+                *function && self.top_level(*id, *start, *end)
+            })
+            .map(|(id, ..)| *id)
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        return Ok(Some(ids));
+        ids
     }
-    let mut named = conn.prepare_cached(&format!(
-        "SELECT n.id FROM files f JOIN nodes n ON n.file_id = f.id
-         WHERE f.path = ?1 AND n.name = ?2 AND {TOP_LEVEL}
-         ORDER BY n.id"
-    ))?;
-    let ids: Vec<i64> = named
-        .query_map(rusqlite::params![file, export], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(Some(ids))
+
+    /// No other function, method or class of the file spans its lines. (Two
+    /// functions sharing one line both fail it: a missed edge, never a
+    /// method's.)
+    fn top_level(&self, id: i64, start: i64, end: i64) -> bool {
+        !self
+            .spans
+            .iter()
+            .any(|(o, s, e)| *o != id && *s <= start && *e >= end)
+    }
+}
+
+/// [`JsFileExports::load`]'s query: every node the `<module>` of file `?1`
+/// exports, with the key it is published under (`{"as": …}`), whether it is a
+/// function, and its lines. Only exports to the file's own nodes: an export map
+/// naming another file's symbol binds nothing.
+///
+/// `CROSS JOIN` fixes the loop order file → `<module>` → its `exports` edges.
+/// Without statistics — a full index runs this before any `ANALYZE` — SQLite
+/// drove the D#120 version from `idx_edges_relation`, scanning every `exports`
+/// edge of the repo per call (review BLOCKER: +113% on a 5,000-file tree).
+/// Pinned by `test_js_export_map_query_seeks_the_module_node_edges`.
+pub(super) fn js_export_map_sql() -> String {
+    format!(
+        "SELECT n.id, n.name, json_extract(e.metadata, '$.as'), n.type = 'function',
+                n.start_line, n.end_line
+         FROM files f
+         CROSS JOIN nodes m ON m.file_id = f.id AND m.name = '<module>'
+         CROSS JOIN edges e ON e.source_id = m.id AND e.relation = '{}'
+         CROSS JOIN nodes n ON n.id = e.target_id AND n.file_id = f.id
+         WHERE f.path = ?1",
+        crate::domain::REL_EXPORTS
+    )
 }
 
 /// Sweep `pending_unresolved_calls` against the current node state. Rows whose
@@ -392,6 +473,7 @@ pub(super) fn resolve_pending_calls_touching(
     let mut classes = ProjectClassNames::default();
     // Every file path, read at the first call a `use` anchors in a crate.
     let mut all_file_paths: Option<HashSet<String>> = None;
+    let mut js_exports = JsExports::default();
 
     for row in &pending {
         // A call through a renamed import (D#120) binds what the file its
@@ -413,7 +495,14 @@ pub(super) fn resolve_pending_calls_touching(
                 .map(String::as_str)
                 .unwrap_or_default();
             let files = all_file_paths.as_ref().expect("loaded above");
-            match js_import_targets(db.conn(), caller_path, &module, &export, files)? {
+            match js_import_targets(
+                db.conn(),
+                &mut js_exports,
+                caller_path,
+                &module,
+                &export,
+                files,
+            )? {
                 // Still waiting for the file to define it: stays buffered.
                 Some(ids) if ids.is_empty() => continue,
                 Some(ids) => {

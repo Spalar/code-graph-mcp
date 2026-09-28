@@ -3305,6 +3305,7 @@ fn resolve_deferred_relations(
     let mut classes = ProjectClassNames::default();
     let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
     let mut callable_ids: Option<HashSet<i64>> = None;
+    let mut js_exports = super::resolve::JsExports::default();
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
     // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
@@ -3441,6 +3442,7 @@ fn resolve_deferred_relations(
             {
                 match super::resolve::js_import_targets(
                     db.conn(),
+                    &mut js_exports,
                     &d.rel_path,
                     &module,
                     &export,
