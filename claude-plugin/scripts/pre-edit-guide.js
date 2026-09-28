@@ -49,6 +49,22 @@ try {
   input = JSON.parse(fs.readFileSync(0, 'utf8'));
 } catch { process.exit(0); }
 
+// P1 #3 — the Stop hook (stop-impact.js) checks, at the end of the turn, which
+// edited symbols changed signature and which of their callers were left alone.
+// It needs to know what was edited in THIS session, so every Edit is logged
+// here — first file-only (so "files touched this turn" is complete even for
+// edits the signature extraction below gives up on), then again with the
+// symbol once one is known. Append-only, best-effort: it cannot fail the Edit.
+const sessionEdits = require('./session-edits');
+const editedAbs = (input.tool_input && input.tool_input.file_path) || '';
+const editedRel = editedAbs ? path.relative(cwd, path.resolve(cwd, editedAbs)) : '';
+const logEdit = (symbol) => {
+  if (editedRel && !editedRel.startsWith('..') && !path.isAbsolute(editedRel)) {
+    sessionEdits.recordEdit(cwd, input.session_id, { file: editedRel.split(path.sep).join('/'), symbol });
+  }
+};
+logEdit(null);
+
 const oldStr = (input.tool_input && input.tool_input.old_string) || '';
 if (!oldStr || oldStr.length < 10) process.exit(0);
 
@@ -158,6 +174,11 @@ if (isCommonKeyword(symbol)) {
 function isCommonKeyword(s) {
   return /^(if|for|while|switch|catch|else|return|new|get|set|try)$/i.test(s);
 }
+
+// Before the cooldown: the cooldown throttles the impact PUSH, not the record
+// of what was edited — a second signature edit inside two minutes is exactly
+// the one the Stop check must still see.
+logEdit(symbol);
 
 // --- Per-symbol cooldown: 2 minutes ---
 // Project-scoped (see cwdHash in tmp-dir.js). A symbol name is the LEAST

@@ -384,6 +384,50 @@ The four tools' descriptions are unchanged. Each of the four tool schemas gains
 bytes. `claude plugin details` does not count MCP tool schemas; it reports the
 same always-on figure before and after.
 
+### Explore and Plan subagents are told the index exists, and a turn that changed a signature lists the callers it left
+
+Two hooks join the six that `install`, `update` and `doctor` register in
+`~/.claude/settings.json`; `uninstall` removes them with the others.
+
+- **SubagentStart** (`subagent-start.js`, matcher `Explore|Plan|general-purpose`,
+  3 s budget). Explore and Plan subagents do not load `CLAUDE.md`, so the
+  adopted block never reached them. The hook runs `health-check` once and
+  returns `additionalContext` stating the file count, the index age, a pending
+  rebuild if there is one, and the `callgraph`, `show` and `overview` commands.
+  Facts only, capped at 400 characters: 321 bytes on this repo, 389 at the
+  longest input the builder accepts. Nothing is injected when no index is found
+  up the tree, when no binary resolves, when the index has 0 files, or with
+  `CODE_GRAPH_QUIET_HOOKS=1`. Median 125 ms per subagent spawn (20 runs).
+- **Stop** (`stop-impact.js`, 5 s budget). `pre-edit-guide.js` now appends
+  each Edit (file, and the symbol it extracted) to a per-session log in the
+  plugin's tmp dir. At the end of a turn, for each symbol edited in that turn
+  whose definition header differs between `HEAD` and the working tree, the
+  hook lists its callers (`refs --relation calls --min-confidence inferred`)
+  in files not edited this turn, as `file:line` of the call. A file counts as
+  edited when an Edit to it was logged since the previous Stop or its mtime is
+  after the turn began. Each symbol is reported once per session. The text goes
+  out as Stop `additionalContext`, not `decision: "block"`. Nothing is injected
+  on `stop_hook_active`, outside a git work tree, without an index or binary,
+  for a body-only change, or with `CODE_GRAPH_QUIET_HOOKS=1`. One caller is 185
+  bytes; 8 symbols × 8 callers is 3,314 bytes (the shared 4,000-byte cap
+  applies). A session with no Edit exits in 34 ms median and writes nothing.
+
+The event names, input fields and output shapes were checked against the hooks
+reference (code.claude.com/docs/en/hooks) for Claude Code 2.1.283. A headless
+2.1.283 session confirmed that a SubagentStart `additionalContext` reaches the
+subagent and that Stop `additionalContext` continues the turn, with
+`stop_hook_active: true` on the next Stop.
+
+Not added: a handler-level `"if"` filter on the two Bash hooks. It is supported
+(Claude Code 2.1.85+), and would skip the 34 ms (`pre-grep-guide.js`) and 35 ms
+(`post-grep-inject.js`) median each Bash call pays today, of which about 22 ms
+is node startup. But `if` takes one rule, and the two parsers accept `grep`,
+`rg`, `ag`, `git grep` and `env …` prefixes (plus `sed -n` reads for the
+PreToolUse hook), so each hook would need one handler per verb. In the same
+headless session, two handlers with the same command and different `if` rules
+both ran for one `grep …; sed …` call, which would emit two rewrites or two
+answers for one command.
+
 ### Not covered
 
 - A renamed import of a re-export (`import { a as b } from './index'` where
@@ -491,6 +535,21 @@ same always-on figure before and after.
   and binds both roots' `run`. A `#[path]` or macro-made `mod` below the top
   of a root file is not seen, and a `Cargo.toml` added or removed with no
   source file changing is noticed only by the next run that indexes a file.
+- The Stop check sees only symbols `pre-edit-guide.js` could name: an Edit
+  whose `old_string` holds no definition header and no identifier it can place
+  in a function is logged as a file edit only, and `Write` is not logged at
+  all (its file still counts as edited by mtime). The header comparison is
+  textual: a header split across lines before a `{` (a Rust `where` clause, a
+  return type on its own line) is compared as written, and a signature change
+  made in a macro or a decorator is not seen. Callers are the index's; a call
+  through a string key is not one.
+- In a git worktree whose index lives in the main checkout, the edited path
+  does not match the index's paths, and the Stop check says nothing.
+- The SubagentStart matcher uses Claude Code's exact-name list form, which
+  takes hyphenated names from 2.1.195. On older versions it is read as an
+  unanchored regex, so `Plan` also matches a custom agent named `Planner`.
+  In `claude -p` on 2.1.283 the subagents in our probe ran as type `worker`,
+  which the matcher does not include.
 
 ## 0.161.0
 

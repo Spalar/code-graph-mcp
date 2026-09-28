@@ -154,7 +154,33 @@ function emitPostToolContext(text) {
   });
 }
 
+/**
+ * additionalContext envelope for the two non-tool events the plugin answers
+ * (P1 #3). Both carry no decision:
+ *   - SubagentStart: "Context only" — the text is added to the subagent's
+ *     context before its first prompt.
+ *   - Stop: `hookSpecificOutput.additionalContext` is the documented
+ *     non-error form — the turn continues so Claude can act on it, labelled
+ *     "Stop hook feedback", instead of `decision: "block"`'s hook error.
+ * Source: https://code.claude.com/docs/en/hooks (SubagentStart / Stop
+ * decision control), checked against Claude Code 2.1.283.
+ * @param {'SubagentStart'|'Stop'} eventName
+ * @param {string} text
+ * @returns {string} JSON line
+ */
+function emitEventContext(eventName, text) {
+  if (eventName !== 'SubagentStart' && eventName !== 'Stop') {
+    throw new Error(`emitEventContext: unsupported event ${eventName}`);
+  }
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: eventName,
+      additionalContext: capContext(text),
+    },
+  });
+}
+
 module.exports = {
   emitPreToolContext, emitPreToolAllowContext, emitPreToolRewrite, emitPostToolContext,
-  capContext, MAX_INJECTED_BYTES,
+  emitEventContext, capContext, MAX_INJECTED_BYTES,
 };

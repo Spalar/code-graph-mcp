@@ -322,7 +322,7 @@ test('registered PreToolUse/PostToolUse/UserPromptSubmit timeouts come from HOOK
       }
     }
   }
-  assert.equal(checked, 6, `expected all six settings.json hooks; checked ${checked}`);
+  assert.equal(checked, 8, `expected all eight settings.json hooks; checked ${checked}`);
 });
 
 // The coupling the whole deadline mechanism rests on, and the one that can
@@ -357,7 +357,7 @@ function registeredHookScripts() {
 test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a deadline', () => {
   const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
   const registered = registeredHookScripts();
-  assert.ok(registered.size >= 7, `only ${registered.size} hook scripts found: ${[...registered]}`);
+  assert.ok(registered.size >= 9, `only ${registered.size} hook scripts found: ${[...registered]}`);
 
   for (const script of registered) {
     assert.ok(
@@ -453,13 +453,14 @@ test('a registered hook that spawns a child must spend the budget, not a literal
 
   // Anti-vacuity floor, absolute rather than derived from the set it guards: if
   // every registered hook stopped spawning directly, the loop above would assert
-  // nothing at all and stay green. Four is exactly today's count
-  // (incremental-index, pre-edit-guide, session-init, user-prompt-context), so
-  // this catches a total collapse of the detector, NOT four-of-eight going dark
-  // — raise it alongside any hook that starts spawning.
+  // nothing at all and stay green. Six is exactly today's count
+  // (incremental-index, pre-edit-guide, session-init, user-prompt-context,
+  // subagent-start, stop-impact), so this catches a total collapse of the
+  // detector, NOT six-of-ten going dark — raise it alongside any hook that
+  // starts spawning.
   assert.ok(
-    spawners >= 4,
-    `expected at least 4 registered hooks to start a child directly; saw ${spawners}. ` +
+    spawners >= 6,
+    `expected at least 6 registered hooks to start a child directly; saw ${spawners}. ` +
     `Either the corpus shrank or the spawn detector stopped matching — both make this guard vacuous`
   );
 });
@@ -554,8 +555,9 @@ function allRegisteredHookCommands() {
 
 test('every registered hook script exists on disk', () => {
   const commands = allRegisteredHookCommands();
-  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit + 1 SessionStart = 7
-  assert.ok(commands.length >= 7, `expected >=7 registered hook commands, got ${commands.length}`);
+  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit
+  // + 1 SubagentStart + 1 Stop + 1 SessionStart = 9
+  assert.ok(commands.length >= 9, `expected >=9 registered hook commands, got ${commands.length}`);
   for (const cmd of commands) {
     const p = resolveHookScript(cmd);
     assert.ok(p, `could not extract a .js path from hook command: ${JSON.stringify(cmd)}`);
@@ -597,7 +599,13 @@ test('buildSettingsHookEntries: matcher surface is exactly the intended set', ()
     'PostToolUse matcher set changed — incremental-index (Write|Edit) + compound-grep inject (Bash) trigger surface must be deliberate');
   assert.deepEqual(setOf('UserPromptSubmit'), [''],
     'UserPromptSubmit matcher set changed unexpectedly');
-  assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'UserPromptSubmit'],
+  // P1 #3: SubagentStart matches on agent TYPE — the built-in names that do
+  // not load CLAUDE.md (Explore, Plan) plus the default Agent type. Stop has
+  // no matcher.
+  assert.deepEqual(setOf('SubagentStart'), ['Explore|Plan|general-purpose'],
+    'SubagentStart matcher changed — which agent types receive the index facts must be deliberate');
+  assert.deepEqual(setOf('Stop'), [''], 'Stop takes no matcher');
+  assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'Stop', 'SubagentStart', 'UserPromptSubmit'],
     'a new top-level hook event is registered into settings.json — confirm it is intended (SessionStart belongs in hooks.json)');
 });
 

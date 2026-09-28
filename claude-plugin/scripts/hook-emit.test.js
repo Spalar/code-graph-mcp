@@ -93,7 +93,7 @@ test('no hook hand-rolls an allow decision outside hook-emit.js', () => {
 // every direct caller's `name (file)` onto one line — so editing a heavily-called
 // symbol pushed a multi-kilobyte wall into the model's context on every Edit.
 test('injected context is capped, on every envelope, with the cut announced', () => {
-  const { capContext, MAX_INJECTED_BYTES, emitPreToolContext, emitPreToolAllowContext, emitPreToolRewrite, emitPostToolContext } =
+  const { capContext, MAX_INJECTED_BYTES, emitPreToolContext, emitPreToolAllowContext, emitPreToolRewrite, emitPostToolContext, emitEventContext } =
     require('./hook-emit');
 
   // Under the cap: byte-identical passthrough. Without this the cap could be a
@@ -107,6 +107,8 @@ test('injected context is capped, on every envelope, with the cut announced', ()
     ['PreToolUse allow', emitPreToolAllowContext],
     ['PostToolUse', emitPostToolContext],
     ['PreToolUse rewrite', (t) => emitPreToolRewrite({ updatedInput: { command: 'x' }, reason: 'r', context: t })],
+    ['SubagentStart', (t) => emitEventContext('SubagentStart', t)],
+    ['Stop', (t) => emitEventContext('Stop', t)],
   ]) {
     const ctx = JSON.parse(emit(huge)).hookSpecificOutput.additionalContext;
     assert.ok(
@@ -122,4 +124,21 @@ test('injected context is capped, on every envelope, with the cut announced', ()
   const cut = capContext(cjk);
   assert.ok(Buffer.byteLength(cut, 'utf8') <= MAX_INJECTED_BYTES);
   assert.ok(!cut.includes('�'), 'must not slice through a multi-byte codepoint');
+});
+
+// P1 #3: the two non-tool envelopes. Shape per the hooks reference
+// (https://code.claude.com/docs/en/hooks): SubagentStart is "Context only";
+// Stop's non-error form is hookSpecificOutput.additionalContext — never a
+// top-level `decision`, which would render as a hook error and block.
+test('emitEventContext: SubagentStart/Stop carry context and no decision; other events refused', () => {
+  const { emitEventContext } = require('./hook-emit');
+  for (const ev of ['SubagentStart', 'Stop']) {
+    const out = JSON.parse(emitEventContext(ev, 'ctx'));
+    assert.deepEqual(Object.keys(out), ['hookSpecificOutput']);
+    assert.equal(out.hookSpecificOutput.hookEventName, ev);
+    assert.equal(out.hookSpecificOutput.additionalContext, 'ctx');
+    assert.equal(out.decision, undefined);
+    assert.equal(out.hookSpecificOutput.permissionDecision, undefined);
+  }
+  assert.throws(() => emitEventContext('PreToolUse', 'x'), /unsupported event/);
 });

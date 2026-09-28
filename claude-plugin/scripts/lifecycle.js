@@ -923,6 +923,8 @@ const OUR_HOOK_SCRIPTS = [
   'pre-grep-guide.js',   // v0.32.0 — was in plugin-cache only, never fired
   'pre-read-guide.js',   // v0.32.0 — was in plugin-cache only, never fired
   'post-grep-inject.js', // compound-grep — PostToolUse(Bash) permission-neutral answer inject
+  'subagent-start.js',   // P1 #3 — SubagentStart index facts for Explore/Plan/general-purpose
+  'stop-impact.js',      // P1 #3 — Stop: changed signatures with untouched callers
 ];
 
 // Description markers — primary cleanup discriminator (immune to env/path
@@ -933,6 +935,8 @@ const SETTINGS_HOOK_DESC = {
   postToolUseEdit:  '[code-graph-mcp v0.32+] PostToolUse Write|Edit incremental-index update',
   postToolUseInject:'[code-graph-mcp v0.32+] PostToolUse Bash compound-grep answer inject (permission-neutral additionalContext)',
   userPromptSubmit: '[code-graph-mcp v0.32+] UserPromptSubmit context push',
+  subagentStart:    '[code-graph-mcp v0.32+] SubagentStart index facts for Explore/Plan/general-purpose subagents',
+  stop:             '[code-graph-mcp v0.32+] Stop signature-change check (callers in files not edited this turn)',
 };
 
 const OUR_DESCRIPTIONS = [
@@ -946,6 +950,8 @@ const OUR_DESCRIPTIONS = [
   SETTINGS_HOOK_DESC.postToolUseEdit,
   SETTINGS_HOOK_DESC.postToolUseInject,
   SETTINGS_HOOK_DESC.userPromptSubmit,
+  SETTINGS_HOOK_DESC.subagentStart,
+  SETTINGS_HOOK_DESC.stop,
 ];
 
 function isOurHookEntry(entry) {
@@ -1023,6 +1029,18 @@ function buildSettingsHookEntries() {
     ],
     UserPromptSubmit: [
       { description: SETTINGS_HOOK_DESC.userPromptSubmit, matcher: '', hooks: [scriptCmd('user-prompt-context.js')] },
+    ],
+    // P1 #3. SubagentStart matches on the agent TYPE (built-in names per the
+    // hooks reference); Explore and Plan skip CLAUDE.md, general-purpose is
+    // the default Agent type. Custom/plugin agents are left alone — their
+    // own frontmatter decides what they know.
+    SubagentStart: [
+      { description: SETTINGS_HOOK_DESC.subagentStart, matcher: 'Explore|Plan|general-purpose', hooks: [scriptCmd('subagent-start.js')] },
+    ],
+    // Stop takes no matcher; '' keys the coverage survey as `Stop:*`, the same
+    // way UserPromptSubmit's does.
+    Stop: [
+      { description: SETTINGS_HOOK_DESC.stop, matcher: '', hooks: [scriptCmd('stop-impact.js')] },
     ],
   };
 }
@@ -1212,7 +1230,17 @@ function surveyHookCoverage(settings) {
 // payload is engaging (a source-tree search → a deny/hint IS emitted); the Edit
 // payload's short old_string short-circuits before any binary spawn; the rest
 // just exercise the require-chain + stdin parse.
-function hookFirePayload(matcher) {
+function hookFirePayload(matcher, event = '') {
+  // Non-tool events are keyed by EVENT: Stop shares UserPromptSubmit's ''
+  // matcher, and a prompt payload would drive the wrong path. Both new hooks
+  // stay silent on these (no session edit log / no health report in the
+  // throwaway fixture); the probe proves they load and exit 0.
+  if (event === 'Stop') {
+    return { hook_event_name: 'Stop', session_id: 'hook-fire-probe', stop_hook_active: false };
+  }
+  if (event === 'SubagentStart') {
+    return { hook_event_name: 'SubagentStart', agent_id: 'hook-fire-probe', agent_type: 'Explore' };
+  }
   switch (matcher) {
     case 'Bash':
       // A QUOTED, identifier-like pattern → classifyBlock-positive → the
@@ -1251,7 +1279,7 @@ function defaultHookFireProbes() {
       const cmd = e.hooks && e.hooks[0] && e.hooks[0].command;
       const m = (cmd || '').match(/"([^"]+\.js)"/);
       if (!m) continue;
-      probes.push({ label: `${event}:${e.matcher || '*'}`, script: m[1], payload: hookFirePayload(e.matcher || '') });
+      probes.push({ label: `${event}:${e.matcher || '*'}`, script: m[1], payload: hookFirePayload(e.matcher || '', event) });
     }
   }
   return probes;

@@ -1,6 +1,6 @@
 ---
-status: approved
-revision: 1
+status: implemented
+revision: 2
 ---
 
 # P1 #3 — SubagentStart steering + Stop impact check (+ handler `if` filter)
@@ -55,5 +55,61 @@ number and skip.
 - Whether SubagentStart supports `additionalContext` in the installed CC
   version — verify against docs/changelog before building (a).
 
+## Decisions (r2)
+- Open question answered: SubagentStart supports `additionalContext`. Docs
+  (code.claude.com/docs/en/hooks, "SubagentStart"): "SubagentStart hooks can't
+  block subagent creation, but they can inject context into the subagent";
+  decision table row "SessionStart, SubagentStart, PostModelSwitch | Context
+  only". Event added in CC 2.0.43; installed 2.1.283. A headless 2.1.283 probe
+  (`claude -p --setting-sources project --settings …`) returned the injected
+  token from the subagent.
+- Stop uses `hookSpecificOutput.additionalContext` (CC 2.1.163+), documented as
+  non-error feedback that continues the turn through the same loop protections
+  as `decision: "block"`. Probe: the model answered with the injected token and
+  the next Stop carried `stop_hook_active: true`.
+- Registration follows the other six: lifecycle.js writes both into
+  settings.json (hooks.json stays SessionStart-only). Descriptions keep the
+  `[code-graph-mcp v0.32+]` settings-registration prefix, which
+  lifecycle.test.js pins on every entry. Budgets: `subagent-start.js` 3 s,
+  `stop-impact.js` 5 s in `HOOK_TIMEOUT_SECONDS`.
+- Freshness for (a) = `health-check`'s `index_age` plus its
+  `index_version_stale` flag; the three commands are `callgraph`, `show`,
+  `overview`. Silent under `CODE_GRAPH_QUIET_HOOKS=1`, like the SessionStart
+  project map.
+- (b) records from pre-edit-guide.js into an append-only JSONL per
+  (project, session) in cgTmpDir(): one file-only record per Edit, then one
+  with the symbol when extracted (before the cooldown). The Stop hook keeps
+  `{lastStopAt, reported}` in a second file. "Signature changed" = the sorted
+  whitespace-free definition headers of the symbol differ between
+  `git show HEAD:./file` and the working tree (text heuristics applied to both
+  sides). Callers = `refs --relation calls --min-confidence inferred`, `file:line`
+  of the first mention at or after the caller's start line. "Touched this
+  turn" = Edit logged since the previous Stop, or mtime ≥ turn start (the
+  previous Stop; the first logged Edit for the session's first turn). Both
+  only suppress output.
+- (c) skipped after measuring: `if` is supported (CC 2.1.85+) and filtered a
+  non-matching call in the probe, but it takes one rule; the Bash parsers
+  accept grep/rg/ag/git grep/env (+ `sed -n` for PreToolUse), so each hook needs
+  ~5 handlers, and the probe ran two same-command handlers twice for one
+  `grep …; sed …` call (same tool_use_id). Double rewrites/answers would
+  follow. A per-tool_use_id claim inside the hooks would make it safe; not in
+  this scope.
+
+## Results (r2)
+- Byte counts: SubagentStart 321 bytes on this repo (418 files), 389 at the
+  builder's worst accepted input; Stop 185 bytes for one caller, 3,314 for
+  8 symbols × 8 callers.
+- Latency (20 runs, median/p90): subagent-start 125/178 ms; stop-impact with
+  no Edit log 33.6/44.2 ms. Bash hooks today (30 runs, `cargo build`
+  payload): pre-grep-guide 34.0/45.1 ms, post-grep-inject 35.3/45.5 ms,
+  bare `node -e 0` 22.3/30.4 ms.
+- Tests: new subagent-start.test.js (6), stop-impact.test.js (14, 3 of them
+  e2e with real git + binary), session-edits.test.js (4), one lifecycle e2e
+  (install/doctor-repair/update/uninstall on a sandbox HOME); hooks.test.js,
+  hook-emit.test.js, hook-fire.test.js pins updated. 19 mutations
+  (neutralize + invert) all red.
+
 # Change log
 - r1 2026-09-28: created; approved under the user's batch AUTH.
+- r2 2026-09-28: implemented (a) and (b); (c) measured and skipped with the
+  reason above.

@@ -41,6 +41,11 @@ const HOOK_TIMEOUT_SECONDS = {
   'post-grep-inject.js': 5,
   'user-prompt-context.js': 5,
   'session-init.js': 5,
+  // P1 #3. SubagentStart delays the subagent's first turn: one health-check
+  // (~125 ms here) is all it spends. Stop delays the end of the turn: one
+  // `git rev-parse`, then per changed symbol one `git show` + one `refs`.
+  'subagent-start.js': 3,
+  'stop-impact.js': 5,
 };
 
 // Left for the hook to render its answer and exit after the last child returns.
