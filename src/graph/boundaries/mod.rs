@@ -35,7 +35,8 @@
 //! json, html, css, bash). An answer that left something unread says so
 //! (`not scanned: …`) instead of printing the complete "none" line: a
 //! definition in a language without a table, a file over 2 MB or not UTF-8,
-//! files the query did not reach within [`SCAN_TIME_LIMIT`].
+//! files the query did not reach within [`SCAN_TIME_LIMIT`], a Rust value
+//! `Q::name` whose `Q` is not known to be where the name is defined.
 //!
 //! Rust has no member-value shape: `a.b` not followed by `(` is a field read
 //! there (a method is passed as `Self::b` / `Type::b`).
@@ -203,7 +204,9 @@ struct Syntax {
     member_value: bool,
     /// `Q::save` names a function only when `Q` is where one of the
     /// definitions lives (Rust: `thread::JoinHandle::join` is std's, not a
-    /// `join` of this project's).
+    /// `join` of this project's). Any other `Q` is not a site, but it is
+    /// counted as undecided: the crate's own name, an inline `mod`, a
+    /// `use … as` alias or a trait can be where the name lives.
     check_path_qualifier: bool,
 }
 
@@ -935,12 +938,18 @@ fn is_binding(src: &Src, s: usize, e: usize, syn: &Syntax) -> bool {
 /// Is the identifier at `[s, e)` a function used as a value? `qualifiers`,
 /// when known, are the path segments that can precede the name and still
 /// mean one of its definitions (see [`Syntax::check_path_qualifier`]).
+/// `unresolved` is set when the answer is yes except that the path's own
+/// qualifier is not among them, or is a generic or qualified-self path
+/// (`Wrapper::<u8>::save`, `<Db as Store>::save`): the crate's own name, an
+/// inline `mod`, a `use … as` alias and a trait all look like that, so such a
+/// value is neither a site nor proof that none exists.
 fn is_function_reference(
     src: &Src,
     s: usize,
     e: usize,
     syn: &Syntax,
     qualifiers: Option<&[String]>,
+    unresolved: &mut bool,
 ) -> bool {
     let m = src.m;
     // `logerror.bind(this)`, `handler.call(ctx)`: the function object itself
@@ -983,11 +992,24 @@ fn is_function_reference(
         if own_qualifier && b == b':' && syn.check_path_qualifier && !word.is_empty() {
             if let Some(known) = qualifiers {
                 if !known.contains(&word) {
-                    return false;
+                    *unresolved = true;
                 }
             }
         }
         if word.is_empty() {
+            if own_qualifier
+                && b == b':'
+                && syn.check_path_qualifier
+                && qualifiers.is_some()
+                && matches!(prev_non_ws(m, sep_start), Some((_, b'>')))
+            {
+                // Rust `Wrapper::<u8>::save`, `<Db as Store>::save`.
+                *unresolved = true;
+                let line = src.line_of(s);
+                return !(is_import_line(line)
+                    || line.starts_with(b"#[")
+                    || line.starts_with(b"#!["));
+            }
             if b == b':' {
                 // Kotlin/C++ `::save` — the chain starts at the separator.
                 q = sep_start;
@@ -1152,7 +1174,18 @@ pub fn scan_source_with_defs(
     name: &str,
     def_lines: &[usize],
 ) -> Vec<ShapeHit> {
-    scan_source_until(language, source, name, def_lines, None, None).unwrap_or_default()
+    scan_source_until(language, source, name, def_lines, None, None)
+        .map(|s| s.hits)
+        .unwrap_or_default()
+}
+
+/// What one source text holds: its sites, and the lines of values that name
+/// the function through a qualifier not known to be its own (see
+/// [`is_function_reference`]) — undecided, so neither sites nor absent.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SourceScan {
+    hits: Vec<ShapeHit>,
+    unresolved_lines: Vec<usize>,
 }
 
 /// [`scan_source_with_defs`] that gives up at `deadline` (`None` when it
@@ -1164,12 +1197,12 @@ fn scan_source_until(
     def_lines: &[usize],
     qualifiers: Option<&[String]>,
     deadline: Option<Instant>,
-) -> Option<Vec<ShapeHit>> {
+) -> Option<SourceScan> {
     let Some(syn) = syntax_for(language) else {
-        return Some(Vec::new());
+        return Some(SourceScan::default());
     };
     if name.is_empty() || !source.contains(name) {
-        return Some(Vec::new());
+        return Some(SourceScan::default());
     }
     let Lexed { masked: m, strings } = lex(source.as_bytes(), &syn);
     let src = Src::new(&m);
@@ -1193,6 +1226,7 @@ fn scan_source_until(
         }
     }
 
+    let mut unresolved_lines: Vec<usize> = Vec::new();
     let nb = name.as_bytes();
     let mut occurrences = Vec::new();
     let mut from = 0;
@@ -1254,16 +1288,27 @@ fn scan_source_until(
         if shadowed && is_bare(&m, s) {
             continue;
         }
-        if is_function_reference(&src, s, e, &syn, qualifiers) {
-            add(s, Shape::FunctionReference, None);
+        let mut unresolved = false;
+        if is_function_reference(&src, s, e, &syn, qualifiers, &mut unresolved) {
+            if unresolved {
+                let line = src.line_no(s);
+                if !unresolved_lines.contains(&line) {
+                    unresolved_lines.push(line);
+                }
+            } else {
+                add(s, Shape::FunctionReference, None);
+            }
         }
     }
+    unresolved_lines.retain(|l| !hits.contains_key(l));
 
-    Some(
-        hits.into_iter()
+    Some(SourceScan {
+        hits: hits
+            .into_iter()
             .map(|(line, (shape, via))| ShapeHit { line, shape, via })
             .collect(),
-    )
+        unresolved_lines,
+    })
 }
 
 /// One reported site.
@@ -1291,12 +1336,19 @@ pub struct Boundaries {
     pub skipped_files: usize,
     /// Files not reached within [`SCAN_TIME_LIMIT`].
     pub files_past_limit: usize,
+    /// Rust lines passing the name as a value through a path whose qualifier
+    /// is not known to be its own (`myapp::save`, `inner::save`, `h::save`,
+    /// `Store::save`, `<Db as Store>::save`): not sites, and not absences.
+    pub unresolved_paths: usize,
 }
 
 impl Boundaries {
     /// Whether every file that could hold a site was read.
     pub fn complete(&self) -> bool {
-        self.unscanned_languages.is_empty() && self.skipped_files == 0 && self.files_past_limit == 0
+        self.unscanned_languages.is_empty()
+            && self.skipped_files == 0
+            && self.files_past_limit == 0
+            && self.unresolved_paths == 0
     }
 
     /// The follow-up that shows every textual occurrence, comments and tests
@@ -1333,6 +1385,12 @@ impl Boundaries {
             parts.push(format!(
                 "{} past the scan time limit",
                 plural(self.files_past_limit, "file", "files")
+            ));
+        }
+        if self.unresolved_paths > 0 {
+            parts.push(format!(
+                "{} with an unrecognized qualifier",
+                plural(self.unresolved_paths, "Rust path", "Rust paths")
             ));
         }
         parts.join(", ")
@@ -1384,6 +1442,12 @@ impl Boundaries {
                 ns.insert(
                     "files_past_time_limit".into(),
                     serde_json::json!(self.files_past_limit),
+                );
+            }
+            if self.unresolved_paths > 0 {
+                ns.insert(
+                    "unresolved_paths".into(),
+                    serde_json::json!(self.unresolved_paths),
                 );
             }
             v["not_scanned"] = serde_json::Value::Object(ns);
@@ -1502,6 +1566,7 @@ fn scan_project_with(
         unscanned_languages: Vec::new(),
         skipped_files: 0,
         files_past_limit: 0,
+        unresolved_paths: 0,
     };
     for (path, language) in files {
         if !scannable(&path, language.as_deref()) {
@@ -1544,13 +1609,18 @@ fn scan_project_with(
             .map(|(_, l)| *l)
             .collect();
         let language = language.as_deref().unwrap_or_default();
-        let Some(hits) =
+        let Some(scan) =
             scan_source_until(language, text, name, &def_lines, qualifiers, Some(deadline))
         else {
             out.files_past_limit += 1;
             continue;
         };
-        for hit in hits {
+        out.unresolved_paths += scan
+            .unresolved_lines
+            .iter()
+            .filter(|l| !def_lines.contains(l))
+            .count();
+        for hit in scan.hits {
             if def_lines.contains(&hit.line) {
                 continue;
             }

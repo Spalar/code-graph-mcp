@@ -989,6 +989,7 @@ fn a_rust_path_counts_only_through_a_qualifier_that_owns_the_name() {
     let scan = |src: &str| -> Vec<(usize, Shape)> {
         super::scan_source_until("rust", src, "join", &[], Some(&q), None)
             .unwrap()
+            .hits
             .into_iter()
             .map(|h| (h.line, h.shape))
             .collect()
@@ -1010,6 +1011,53 @@ fn a_rust_path_counts_only_through_a_qualifier_that_owns_the_name() {
         scan_source("rust", "x.map(thread::JoinHandle::join);\n", "join").len(),
         1
     );
+    // Pre-tag review H1: a qualifier not known to be the definition's is not a
+    // site, but it is recorded as undecided — it can be the crate's own name,
+    // an inline `mod`, a `use … as` alias or a trait — and so are generic and
+    // qualified-self paths. A call, a known qualifier and an import are not.
+    let unresolved = |lang: &str, src: &str| -> Vec<usize> {
+        super::scan_source_until(lang, src, "join", &[], Some(&q), None)
+            .unwrap()
+            .unresolved_lines
+    };
+    for undecided in [
+        "x.map(thread::JoinHandle::join);\n",
+        "x.map(myapp::join);\n",
+        "x.map(inner::join);\n",
+        "x.map(h::join);\n",
+        "x.map(Joiner::join);\n",
+        "x.map(Wrapper::<u8>::join);\n",
+        "x.map(<Db as Joiner>::join);\n",
+        "let f = h::join;\n",
+    ] {
+        assert_eq!(unresolved("rust", undecided), vec![1], "{undecided}");
+    }
+    for decided in [
+        "h::join(x);\n",
+        "x.map(Store::join);\n",
+        "use h::join;\n",
+        "#[doc(alias = h::join)]\n",
+        "x.map(join);\n",
+        "// x.map(h::join);\n",
+        "x.map(<Db as Joiner>::join(a));\n",
+    ] {
+        assert_eq!(
+            unresolved("rust", decided),
+            Vec::<usize>::new(),
+            "{decided}"
+        );
+    }
+    // Only Rust checks the qualifier: other languages report the site as
+    // before and record nothing undecided.
+    for (lang, src) in [
+        ("cpp", "run(Other::join);\n"),
+        ("php", "run(Other::join);\n"),
+        ("javascript", "run(other.join);\n"),
+    ] {
+        let s = super::scan_source_until(lang, src, "join", &[], Some(&q), None).unwrap();
+        assert_eq!(s.hits.len(), 1, "{lang}: {s:?}");
+        assert!(s.unresolved_lines.is_empty(), "{lang}: {s:?}");
+    }
 }
 
 /// The bracket index answers what the scans it replaced answered: the

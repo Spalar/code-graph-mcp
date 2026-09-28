@@ -441,3 +441,109 @@ fn a_definition_in_an_unscanned_language_says_so() {
         "{v}"
     );
 }
+
+/// Pre-tag review H1: a Rust `Q::name` value whose `Q` the scan cannot tie
+/// to a definition (the crate's own name, an inline `mod`, a `use … as`
+/// alias, a trait, a generic or qualified-self path) is not reported as a
+/// site, so the answer must not claim that no site exists either.
+#[test]
+fn a_rust_path_through_an_unknown_qualifier_is_not_answered_none() {
+    let p = TempDir::new().unwrap();
+    let root = p.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub mod handlers;
+pub fn register(f: fn()) {}
+pub fn on_tick() {}
+mod inner {
+    pub fn on_ping() {}
+}
+pub trait Store {
+    fn persist(&self);
+    fn flush(&self);
+}
+pub struct Db;
+impl Store for Db {
+    fn persist(&self) {}
+    fn flush(&self) {}
+}
+pub struct Wrapper<T>(T);
+impl<T> Wrapper<T> {
+    pub fn keep(&self) {}
+}
+pub fn lonely() {}
+pub fn setup(v: Vec<Db>, w: Vec<Wrapper<u8>>) {
+    register(inner::on_ping);
+    v.iter().for_each(Store::persist);
+    v.iter().for_each(<Db as Store>::flush);
+    w.iter().for_each(Wrapper::<u8>::keep);
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/handlers.rs"),
+        "pub fn on_load() {}\npub fn on_save() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "use myapp::handlers as h;
+fn main() {
+    myapp::register(myapp::on_tick);
+    myapp::register(h::on_load);
+    myapp::register(myapp::handlers::on_save);
+}
+",
+    )
+    .unwrap();
+    let db_dir = root.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, root, None, None).unwrap();
+
+    for name in ["on_tick", "on_ping", "on_load", "persist", "flush", "keep"] {
+        let (out, code) = cli(&p, &["callgraph", name]);
+        assert_eq!(code, 0, "{name}: {out}");
+        assert!(
+            !out.contains(&format!("(no dynamic-dispatch site names '{name}')")),
+            "{name}: {out}"
+        );
+        assert!(
+            out.ends_with(&format!(
+                "  (no dynamic-dispatch site names '{name}' in the files scanned; not scanned: 1 Rust path with an unrecognized qualifier)\n    next: code-graph-mcp grep -w -F {name}\n"
+            )),
+            "{name}: {out}"
+        );
+        let v = cli_json(&p, &["callgraph", name, "--json"]);
+        assert_eq!(
+            v["boundaries"]["not_scanned"],
+            serde_json::json!({"unresolved_paths": 1}),
+            "{name}: {v}"
+        );
+    }
+    // A qualifier that names the definition's module still reports the site.
+    let (out, _) = cli(&p, &["callgraph", "on_save"]);
+    assert!(
+        out.contains("1 dynamic-dispatch site(s) name 'on_save'") && out.contains("src/main.rs:5"),
+        "{out}"
+    );
+    assert!(!out.contains("not scanned"), "{out}");
+    // A Rust function nothing names keeps the complete line.
+    let (out, _) = cli(&p, &["callgraph", "lonely"]);
+    assert!(
+        out.ends_with("  (no dynamic-dispatch site names 'lonely')\n"),
+        "{out}"
+    );
+    let v = cli_json(&p, &["callgraph", "lonely", "--json"]);
+    assert_eq!(
+        v["boundaries"],
+        serde_json::json!({"sites": [], "total": 0})
+    );
+}
