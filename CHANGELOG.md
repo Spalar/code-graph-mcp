@@ -3,11 +3,27 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 99 → 100 because the Rust fixes below change which
-`calls` and `implements` edges a file produces, and the names of some Rust
-methods. Nothing to run.
+`INDEX_VERSION` goes 99 → 101 because the Rust fixes below change which
+`calls` and `implements` edges a file produces, the names of some Rust
+methods, and the confidence label of one class of Rust call. Nothing to run.
+**`callgraph` and `impact` on Rust code show fewer callers by default:** a
+method call whose receiver the source leaves untyped is no longer labelled
+`extracted` when its name has another definition (see below). Those edges are
+still in the graph; both commands say how many they hid, and
+`--min-confidence ambiguous` (MCP `min_confidence: "ambiguous"`) shows them.
+To pin back: `npm i -g @sdsrs/code-graph@0.162.0`, or `cargo install
+code-graph-mcp --version 0.162.0`; plugin users can set the version in the
+marketplace entry. An older binary leaves a v101 index intact and warns
+instead of rebuilding it; delete `.code-graph/index.db*` after pinning back to
+get its graph back.
 
-Measured against 0.162.0 on the same checkouts: on tokio-1.41.1 the SCIP
+At the default confidence floor on tokio-1.41.1, the SCIP oracle counts 4,433
+correct call edges against 0.162.0's 4,191 and 203 wrong ones against 422: no
+wrong edge is shown that 0.162.0 did not show, and 48 correct ones 0.162.0
+showed are now below the floor (listed under the label change below).
+
+The resolution fixes, measured against 0.162.0 on the same checkouts before
+the label change: on tokio-1.41.1 the SCIP
 oracle finds 290 more correct call edges and 37 fewer wrong ones, with no
 correct edge lost and no wrong edge added; the 30 new calls it cannot judge
 are each a `self.m()` / `Self::m()` written in the caller's own body, and the
@@ -69,10 +85,69 @@ binds nothing, as before, and a trait is never the source of a Rust impl's
 edge (tokio's `impl Semaphore for bounded::Semaphore` beside `trait
 Semaphore`).
 
+### A Rust method call on an untyped receiver is labelled by its name's count
+
+`self.io.poll_write(cx, buf)` names only `poll_write`. When the source does not
+fix the receiver's type (a tuple field `self.0`, a field of a struct written
+inside a `cfg_*!` macro, the result of another call), the resolver binds the
+caller's own file's `poll_write` — and labelled that edge `extracted`, the
+tier meant for bindings a language rule decides. Method dispatch follows the
+receiver's type, not the caller's file, so this is a guess by name, and a
+skewed one: a wrapper type forwards `self.inner.m()` to a field of another type
+while its own file defines `m` for the wrapper. On tokio-1.41.1 the SCIP oracle
+judged 233 such edges whose name has another definition: 48 right (21%, below
+the `ambiguous` tier's 50%). These edges are now labelled like a cross-file
+call: `ambiguous` when the name has another definition, `inferred` when it has
+none (49 of 54 right). The `extracted` tier on tokio goes from 1,931 of 2,163
+right (89.3%) to 1,834 of 1,876 (97.8%); at the default floor, wrong edges go
+388 → 203 and correct ones 4,481 → 4,433 against the resolution fixes alone.
+
+The 48 correct edges now below the floor are calls on receivers the index
+does not type yet (D#150): `self.as_mut()`, `Pin::into_inner(self)`, a tuple
+field (`self.0.header()`), a pin projection, a closure parameter, another
+method's result. Nothing is deleted: `refs`, which has no floor, and dead-code
+detection see every edge as before.
+
+Rust only, and only calls on a field or a call's result: on hono, flask and
+leveldb the same class was 75%, 91% and 48% right, and relabelling it would
+have hidden about as many correct edges as wrong ones, or more; a call on a
+local variable was 53 of 76 right on tokio. On hono, express, flask and leveldb
+every node, edge, label and buffered call is identical to the previous commit's.
+A full index of tokio takes as long as before (medians of three runs, 2,547 ms
+before and 2,559 ms after), and an edit adding a file whose methods share the
+names of the most frequent of these calls (`poll_write`, `is_closed`,
+`try_io`) took 744 ms against 800 ms, one run each. The index grown by that
+edit matches a rebuild of the same tree edge for edge.
+
+### The Stop and SubagentStart hooks record what they did
+
+Both hooks added in 0.162.0 wrote nothing to `.code-graph/recommendations.jsonl`,
+so their roadmap measures had no data. The Stop check now records each report
+and, at the next Stop — the end of the continuation the report starts, or of
+the next turn — whether a caller file it listed was edited after it.
+SubagentStart records each delivery with the agent type. `code-graph-mcp
+stats` prints both once either has fired (`Stop check: …`, `Subagent context:
+…`), and `stats --json` carries `stop_checks`, `stop_followups`,
+`stop_adopted` and `subagent_contexts`. The lines leave the re-search funnel
+exactly as it was. Nothing is recorded under `CODE_GRAPH_QUIET_HOOKS=1` or with
+`.code-graph/.no-metrics`.
+
+Whether a subagent then used the index is in its transcript, not in that file:
+`scripts/subagent_share.py [PROJECT]` reads the subagent transcripts Claude
+Code keeps beside a session and prints each agent type's share of code-search
+calls that went through code-graph, split by whether the hook delivered.
+
 **Not covered:** a method whose Rust impl is written inside a macro
 (`cfg_rt! { … }`, D#149) is still no node, so a typed receiver of a type
 defined that way keeps every candidate; so does one reached through a type
-alias or a `Deref` the index cannot follow.
+alias or a `Deref` the index cannot follow. A `Deref` written by a macro is
+invisible too, so the typed-receiver rule above can still drop a correct edge
+through one (none on tokio). A Rust file under `src/bin/` or `examples/`
+belongs to no crate the index can name, so its `self` calls still look across
+the whole workspace. In `claude plugin eval` runs, where the plugin registers
+its hooks during the run's own SessionStart, the SubagentStart hook reached no
+subagent in 3 of 3 runs, for a reason not yet known, so the `subagent-callers`
+eval measures the parent's prompt, not the hook.
 
 ## 0.162.0
 
