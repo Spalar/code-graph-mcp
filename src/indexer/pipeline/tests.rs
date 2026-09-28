@@ -8443,3 +8443,85 @@ fn test_rust_use_anchoring_incremental_matches_rebuild() {
         "{want:#?}"
     );
 }
+
+/// D#132: the re-export fan-out re-extracts a caller only when the new
+/// definition could change its answer. Every caller of a re-exported
+/// `Mutex::new` used to be re-extracted when any `new` appeared in the crate
+/// (141 files on tokio for one `Probe::new`).
+#[test]
+fn test_rust_reexport_fanout_only_for_an_admissible_definition() {
+    let tree =
+        |extra: (&'static str, &'static str)| -> Vec<(&'static str, &'static str)> {
+            vec![
+            ("Cargo.toml", "[workspace]\nmembers = [\"mycrate\", \"other\"]\n"),
+            (
+                "mycrate/Cargo.toml",
+                "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("mycrate/src/lib.rs", "pub mod sync;\npub mod probe;\n"),
+            ("mycrate/src/sync/mod.rs", "mod mutex;\npub use mutex::Mutex;\n"),
+            (
+                "mycrate/src/sync/mutex.rs",
+                "pub struct Mutex;\nimpl Mutex {\n    pub fn new(v: u8) -> Mutex { Mutex }\n}\n",
+            ),
+            ("mycrate/src/probe.rs", "pub fn other() {}\n"),
+            (
+                "other/Cargo.toml",
+                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "other/src/lib.rs",
+                // Through the module, so no import names `Mutex` (an import's own
+                // fan-out would re-extract the file whatever this one decides).
+                "use my_crate::sync;\nfn go() {\n    sync::Mutex::new(1);\n}\n",
+            ),
+            extra,
+        ]
+        };
+    let base = tree(("mycrate/src/unused.rs", "\n"));
+    let refresh_from = |base: &[(&str, &str)], path: &str, body: &str| -> Vec<String> {
+        let (project, _d, db) = fresh_index_of(base);
+        assert!(
+            edge_set(&db).contains(
+                &"other/src/lib.rs.go --calls--> mycrate/src/sync/mutex.rs.new".to_string()
+            ),
+            "precondition: the call binds the re-exported Mutex::new"
+        );
+        let paths = vec![path.to_string()];
+        super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+        let full = project.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, body).unwrap();
+        index_files(
+            &db,
+            project.path(),
+            &paths,
+            &std::collections::HashMap::new(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        super::resolve::bare_name_callers_of_new_duplicates(
+            db.conn(),
+            &super::resolve::collect_rust_crates(project.path()),
+        )
+        .unwrap()
+    };
+    let refresh = |path: &str, body: &str| refresh_from(&base, path, body);
+    // Another type's `new`: the path `sync::Mutex` cannot reach it.
+    const PROBE: &str =
+        "pub fn other() {}\npub struct Probe;\nimpl Probe {\n    pub fn new(v: u8) -> Probe { Probe }\n}\n";
+    let unrelated = refresh("mycrate/src/probe.rs", PROBE);
+    assert!(unrelated.is_empty(), "{unrelated:?}");
+    // A `Mutex::new` as close to the path as the bound one: the answer changes.
+    let second = "pub struct Mutex;\nimpl Mutex {\n    pub fn new(v: u8) -> Mutex { Mutex }\n}\n";
+    // Bound to two re-exports at once (`ambiguous`), the call is still judged by
+    // its path, not re-extracted for every new `new` as a bare-name guess is.
+    let tied = tree(("mycrate/src/sync/rival.rs", second));
+    let unrelated = refresh_from(&tied, "mycrate/src/probe.rs", PROBE);
+    assert!(unrelated.is_empty(), "{unrelated:?}");
+    let rival = refresh("mycrate/src/sync/rival.rs", second);
+    assert_eq!(rival, vec!["other/src/lib.rs".to_string()]);
+    assert_all_edges_match_rebuild(&base, &[("mycrate/src/sync/rival.rs", Some(second))]);
+}

@@ -1211,7 +1211,10 @@ pub(super) fn bare_name_callers_of_new_duplicates(
                            AND e.confidence = '{CONF_AMBIGUOUS}'
          CROSS JOIN nodes src ON src.id = e.source_id
          CROSS JOIN files f ON f.id = src.file_id
-         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)
+           -- A re-export's several targets (`\"rx\"`, D#132) are decided by
+           -- the path, not the bare name: the re-export arm below judges them.
+           AND (e.metadata IS NULL OR e.metadata NOT LIKE '%\"rx\"%')"
     );
     // A Rust `use crate::a::widget` bound by name to another file's `widget`,
     // because `a` had none (D#124 F9): the import edge is no `calls` edge and
@@ -1253,7 +1256,7 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     // directory, D#132): a new definition of that name in the same crate may be
     // the one the path names, or a closer re-export; a rebuild binds that one.
     let reexport_sql = format!(
-        "SELECT DISTINCT f.path
+        "SELECT DISTINCT f.path, e.metadata, tgt.id, tgt.name, tf.path, tgt.qualified_name
          FROM cg_fanout_up u
          CROSS JOIN nodes tgt ON tgt.name = u.nm
          CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
@@ -1278,12 +1281,21 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         let mut paths: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let reexported: Vec<String> = conn
+        let reexported: Vec<ReexportRow> = conn
             .prepare(&reexport_sql)?
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| {
+                Ok(ReexportRow {
+                    caller: row.get(0)?,
+                    metadata: row.get(1)?,
+                    target: row.get(2)?,
+                    name: row.get(3)?,
+                    target_path: row.get(4)?,
+                    target_qn: row.get(5)?,
+                })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if !reexported.is_empty() {
-            paths.extend(reexported);
+            paths.extend(reexport_callers_to_refresh(conn, &reexported, crates)?);
             paths.sort_unstable();
             paths.dedup();
         }
@@ -1334,6 +1346,109 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     })();
     drop_fanout_temps(conn)?;
     collected
+}
+
+/// One `calls` edge an [`Anchored::Elsewhere`] resolution produced, into a name
+/// that gained a definition this run.
+struct ReexportRow {
+    caller: String,
+    metadata: String,
+    target: i64,
+    name: String,
+    target_path: String,
+    target_qn: Option<String>,
+}
+
+/// The callers of `rows` whose resolution a definition this run added would
+/// change: one the call's path admits (owner, arity, visibility) that is in the
+/// module file the path names, or shares at least as much of the path as the
+/// item the call bound. Re-extracting every caller of a re-exported `new`
+/// whenever any `new` appeared in the crate cost 141 files on tokio.
+fn reexport_callers_to_refresh(
+    conn: &rusqlite::Connection,
+    rows: &[ReexportRow],
+    crates: &RustCrates,
+) -> Result<Vec<String>> {
+    // Every Rust function in this run's files, shaped as the resolver reads them.
+    let fns = conn
+        .prepare(
+            "SELECT n.id, n.name, n.signature, n.qualified_name, f.path, n.start_line,
+                    n.end_line, substr(n.code_content, 1, 64)
+             FROM cg_fanout_paths p
+             CROSS JOIN files f ON f.path = p.path AND f.language = 'rust'
+             CROSS JOIN nodes n ON n.file_id = f.id AND n.type = 'function'
+             ORDER BY f.path",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                (row.get::<_, u32>(5)?, row.get::<_, u32>(6)?),
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut shapes: HashMap<i64, RustFnShape> = HashMap::new();
+    for file in fns.chunk_by(|a, b| a.4 == b.4) {
+        let rows: Vec<RustFnRow> = file
+            .iter()
+            .map(|(id, _, signature, qn, _, lines, code)| RustFnRow {
+                id: *id,
+                signature: signature.as_deref(),
+                qualified_name: qn.as_deref(),
+                lines: *lines,
+                code,
+            })
+            .collect();
+        shapes.extend(rust_fn_shapes_of_file(&file[0].4, &rows));
+    }
+    let all_file_paths: HashSet<String> = conn
+        .prepare("SELECT path FROM files")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(CalleeMeta::Path(segments)) = parse_callee_metadata(Some(&row.metadata)) else {
+            continue;
+        };
+        let UseAnchor::At(anchor) =
+            rust_use_anchor(Some(&row.metadata), &segments, &row.caller, crates)
+        else {
+            continue;
+        };
+        let mut files_of = HashMap::new();
+        let bound = match anchor_rank(
+            &anchor,
+            &row.target_path,
+            row.target_qn.as_deref(),
+            &all_file_paths,
+            &mut files_of,
+        ) {
+            Some(AnchorRank::Shared(n)) => n,
+            _ => usize::MAX,
+        };
+        let changes = fns.iter().any(|(id, name, _, qn, path, _, _)| {
+            *id != row.target
+                && *name == row.name
+                && path.starts_with(anchor.dir.as_str())
+                && shapes.get(id).is_some_and(|shape| {
+                    rust_call_shape_admits(Some(&row.metadata), shape)
+                        && rust_crate_admits(Some(&row.caller), shape)
+                })
+                && match anchor_rank(&anchor, path, qn.as_deref(), &all_file_paths, &mut files_of) {
+                    Some(AnchorRank::Named) => true,
+                    Some(AnchorRank::Shared(n)) => n >= bound,
+                    None => false,
+                }
+        });
+        if changes {
+            out.push(row.caller.clone());
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn bind_calls_to_imported_targets(
@@ -2236,6 +2351,61 @@ fn crate_file_module(anchor: &CrateModule, path: &str) -> Option<Vec<String>> {
     Some(module)
 }
 
+/// Where an item stands for a path anchored in one crate: in the module file the
+/// path names, or elsewhere in the crate with this many leading module segments
+/// in common. None when the path cannot reach it: another crate, an owner type
+/// the path does not end with, or a free function through a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorRank {
+    Named,
+    Shared(usize),
+}
+
+/// [`AnchorRank`] of the item at `path` whose qualified name is `qn`. `files_of`
+/// memoizes the named module file per module-path length.
+fn anchor_rank(
+    anchor: &CrateModule,
+    path: &str,
+    qn: Option<&str>,
+    all_file_paths: &HashSet<String>,
+    files_of: &mut HashMap<usize, Vec<String>>,
+) -> Option<AnchorRank> {
+    let owner: Vec<&str> = match qn.and_then(|qn| qn.rsplit_once('.')) {
+        Some((owner, _)) => owner.split('.').collect(),
+        None => Vec::new(),
+    };
+    let module = &anchor.module;
+    let modpart = if owner.is_empty() {
+        if module
+            .iter()
+            .any(|s| s.starts_with(|c: char| c.is_uppercase()))
+        {
+            return None;
+        }
+        &module[..]
+    } else {
+        let keep = module.len().checked_sub(owner.len())?;
+        if !module[keep..].iter().zip(&owner).all(|(a, b)| a == b) {
+            return None;
+        }
+        &module[..keep]
+    };
+    let files = files_of
+        .entry(modpart.len())
+        .or_insert_with(|| crate_module_files(anchor, modpart, all_file_paths));
+    if files.iter().any(|f| f == path) {
+        return Some(AnchorRank::Named);
+    }
+    let file_module = crate_file_module(anchor, path)?;
+    Some(AnchorRank::Shared(
+        file_module
+            .iter()
+            .zip(modpart)
+            .take_while(|(a, b)| a == b)
+            .count(),
+    ))
+}
+
 /// Resolve a path call anchored in one crate. A candidate must live in that
 /// crate, and the path must end with the candidate's owner type (`Mutex` for
 /// `Mutex.new`); a free function is reached only through a path of modules
@@ -2265,44 +2435,12 @@ pub(super) fn rust_anchored_targets(
     let mut ranked: Vec<(usize, i64)> = Vec::new();
     for id in in_crate {
         let path = node_id_to_path.get(&id).map(String::as_str).unwrap_or("");
-        let owner: Vec<&str> = match id_to_qn.get(&id).and_then(|qn| qn.rsplit_once('.')) {
-            Some((owner, _)) => owner.split('.').collect(),
-            None => Vec::new(),
-        };
-        let module = &anchor.module;
-        let modpart = if owner.is_empty() {
-            if module
-                .iter()
-                .any(|s| s.starts_with(|c: char| c.is_uppercase()))
-            {
-                continue;
-            }
-            &module[..]
-        } else {
-            let Some(keep) = module.len().checked_sub(owner.len()) else {
-                continue;
-            };
-            if !module[keep..].iter().zip(&owner).all(|(a, b)| a == b) {
-                continue;
-            }
-            &module[..keep]
-        };
-        let files = files_of
-            .entry(modpart.len())
-            .or_insert_with(|| crate_module_files(anchor, modpart, all_file_paths));
-        if files.iter().any(|f| f == path) {
-            named.push(id);
-            continue;
+        let qn = id_to_qn.get(&id).map(String::as_str);
+        match anchor_rank(anchor, path, qn, all_file_paths, &mut files_of) {
+            Some(AnchorRank::Named) => named.push(id),
+            Some(AnchorRank::Shared(shared)) => ranked.push((shared, id)),
+            None => {}
         }
-        let Some(file_module) = crate_file_module(anchor, path) else {
-            continue; // another crate under the same directory
-        };
-        let shared = file_module
-            .iter()
-            .zip(modpart)
-            .take_while(|(a, b)| a == b)
-            .count();
-        ranked.push((shared, id));
     }
     if !named.is_empty() {
         return Ok(Anchored::Named(named));

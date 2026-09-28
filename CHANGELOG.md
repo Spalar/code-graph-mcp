@@ -58,16 +58,31 @@ corpus copy): `inferred` precision 2,461/2,889 (85.2%) → 2,551/2,788 (91.5%),
 recall at the default floor 4,072 → 4,162; wrong `extracted` edges 366 → 366,
 wrong `ambiguous` 1,626 → 1,632. Of the call pairs the oracle can judge, 129
 correct ones gained and none lost; 194 wrong ones removed and 9 added (listed
-under Not covered). On this repo (a snapshot with gold 7,177): wrong edges
-unchanged (16 extracted, 7 inferred, 1 ambiguous), recall at the default floor
-6,996 → 6,998. Full index of tokio, 3 runs each (ms): 2,514/2,484/2,498 →
-2,480/2,560/2,484.
+under Not covered); 29 correct ones moved from `inferred` to `ambiguous`,
+bound together with a `#[cfg]` twin (loom's mock `Mutex` beside the std one,
+the metrics mock beside the real metrics). On this repo (a snapshot with gold
+7,177): wrong edges unchanged (16 extracted, 7 inferred, 1 ambiguous), recall
+at the default floor 6,996 → 6,998.
+
+Measured cost, 3 runs each (ms, 0.161.0 → this): full index of tokio
+2,464/2,532/2,523 → 2,534/2,471/2,498, of this repo 1,834/1,812/1,850 →
+1,931/1,915/1,857; an incremental run on tokio after adding a `Probe::new`
+to `tokio/src/sync/mod.rs` 338/349/335 → 376/404/421, and after editing its
+body 219/228/218 → 238/234/236. The re-export follow-up re-extracts a caller
+only when the new definition is one its path could reach: an earlier cut that
+re-extracted every caller of a re-exported `new` took 141 files and 1,931 ms
+for that edit. Re-indexing the edited file, then removing and restoring
+oneshot's `channel`, matched a rebuild edge for edge (32,643 edges).
 
 ### Not covered
 
 - An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
   tokio's runtime) is no node, so a call the `use` sends there binds nothing
-  (it waits in the pending-call buffer). When the named module defines only
+  (it waits in the pending-call buffer). Parsing a `cfg_*! { … }` body as the
+  items it holds was tried and withdrawn: on tokio it made 124 files' hidden
+  code visible, and the oracle judged 273 more edges wrong (83 `extracted`,
+  mostly same-file calls among sealed-trait impls) against 78 fewer, with 26
+  correct pairs lost. When the named module defines only
   the owner type and the method sits in such a macro, the re-export reading
   binds a same-named method of another type in the crate: 6 tokio calls of
   `scheduler::Handle::current()` bound `runtime::Handle::current`, and 3 of
