@@ -1555,6 +1555,10 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CROSS JOIN nodes src ON src.id = e.source_id
          CROSS JOIN files f ON f.id = src.file_id
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)
+           -- A same-file edge can be `ambiguous` too (a Rust call on an untyped
+           -- receiver, D#162), but its target was chosen from the caller's own
+           -- file, which a definition elsewhere does not change.
+           AND src.file_id <> tgt.file_id
            -- A re-export's several targets (`\"rx\"`, D#132) are decided by
            -- the path, not the bare name: the re-export arm below judges them.
            AND (e.metadata IS NULL OR e.metadata NOT LIKE '%\"rx\"%')"
@@ -2007,7 +2011,9 @@ pub(super) fn prune_import_contradicted_call_edges(
 /// The column defaults to `extracted`, so every precise insert (same-file
 /// resolution + the structural relations imports/inherits/implements/routes_to/
 /// exports) is correct without touching its insert site. This pass only
-/// DOWNGRADES cross-file `calls`/`references` edges — the by-name-resolved class:
+/// DOWNGRADES cross-file `calls`/`references` edges, and the same-file Rust
+/// method calls on an untyped receiver (D#162, see `CONF_WHERE`) — the
+/// by-name-resolved class:
 ///   - `inferred`  when the target name is unique among same-language nodes;
 ///   - `ambiguous` when >1 same-language node shares the target name (the
 ///     by-name resolution could not pick uniquely — the known false-positive
@@ -2071,9 +2077,25 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                            OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp')
                            OR json_extract(e.metadata, '$.amb') IS NOT NULL)
                  THEN ?3 ELSE ?4 END";
+    // Cross-file edges, plus one same-file class (D#162): a Rust method call
+    // whose receiver the source leaves untyped (`q` member / chain with no
+    // `rt`, or a typed call its type did not decide, `amb`). Method dispatch
+    // follows the receiver's type, not the caller's file, so binding the file's
+    // own `m` is a by-name guess like a cross-file one — and a skewed one, since
+    // a wrapper forwards `self.inner.m()` to a field of another type while its
+    // file defines `m` for the wrapper. Measured on tokio-1.41.1 by the SCIP
+    // oracle: 48 of 233 such edges right when the name has another definition
+    // (below the `ambiguous` tier's 50%), 49 of 54 when it has none. Rust only:
+    // the same class was 75% right on hono, 91% on flask and 48% on leveldb,
+    // where relabelling it hid as many correct edges as wrong ones or more. A
+    // local-variable receiver (`recv`) stays out for the same reason (53 of 76).
     const CONF_WHERE: &str = "
              WHERE e.relation IN (?1, ?2)
-               AND src.file_id <> tgt.file_id";
+               AND (src.file_id <> tgt.file_id
+                    OR (tf.language = 'rust'
+                        AND json_extract(e.metadata, '$.q') IN ('member', 'chain')
+                        AND (json_extract(e.metadata, '$.rt') IS NULL
+                             OR json_extract(e.metadata, '$.amb') IS NOT NULL)))";
     // Which edges to reconsider. The scoped form is three arms — the caller
     // moved, the callee moved, or the callee's NAME changed how many nodes
     // share it. Only the third needs `cg_scope_names`, and only this pass has
@@ -5872,6 +5894,82 @@ mod tests {
                 conf_of(conn, e, f_target, REL_CALLS),
                 "inferred",
                 "removing the duplicate must flip ambiguous→inferred"
+            );
+        }
+
+        /// D#162: a same-file Rust method call on a receiver the source leaves
+        /// untyped (`self.0.poll()`, `f().m()`) is bound by its name alone, so it
+        /// is labelled by the name's count like a cross-file call. Every other
+        /// same-file edge keeps `extracted`: a typed receiver, a bare call, a
+        /// local-variable receiver (`recv`), and the same shape in another
+        /// language.
+        #[test]
+        fn classify_labels_rust_untyped_same_file_member_call_by_name_count() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("c.db")).unwrap();
+            let conn = db.conn();
+            let wrap = file(conn, "src/wrap.rs", "rust");
+            let inner = file(conn, "src/inner.rs", "rust");
+            let js = file(conn, "src/wrap.js", "javascript");
+            let js2 = file(conn, "src/inner.js", "javascript");
+
+            let get = insert_node(conn, &node("get", wrap)).unwrap();
+            let poll = insert_node(conn, &node("poll", wrap)).unwrap();
+            insert_node(conn, &node("poll", inner)).unwrap(); // the name is duplicated
+            let spin = insert_node(conn, &node("spin", wrap)).unwrap(); // unique
+            let edge = |s: i64, t: i64, meta: Option<&str>| {
+                conn.execute("DELETE FROM edges", []).unwrap();
+                insert_edge(conn, s, t, REL_CALLS, meta).unwrap();
+                classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
+                conf_of(conn, s, t, REL_CALLS)
+            };
+            assert_eq!(
+                edge(get, poll, Some(r#"{"n":0,"q":"member"}"#)),
+                "ambiguous",
+                "untyped member call, duplicated name: a by-name guess among several"
+            );
+            assert_eq!(
+                edge(get, poll, Some(r#"{"n":0,"q":"chain"}"#)),
+                "ambiguous",
+                "untyped chain call, duplicated name"
+            );
+            assert_eq!(
+                edge(get, spin, Some(r#"{"n":0,"q":"member"}"#)),
+                "inferred",
+                "untyped member call, unique name: stays above the default floor"
+            );
+            assert_eq!(
+                edge(
+                    get,
+                    poll,
+                    Some(r#"{"n":0,"q":"member","rk":"p","rt":"Wrap"}"#)
+                ),
+                "extracted",
+                "a typed receiver chose the candidate by its type"
+            );
+            assert_eq!(
+                edge(
+                    get,
+                    poll,
+                    Some(r#"{"amb":1,"n":0,"q":"member","rk":"p","rt":"Wrap"}"#)
+                ),
+                "ambiguous",
+                "a typed call its type did not decide is a by-name guess again"
+            );
+            assert_eq!(edge(get, poll, None), "extracted", "a bare same-file call");
+            assert_eq!(
+                edge(get, poll, Some(r#"{"n":0,"q":"recv","v":"x"}"#)),
+                "extracted",
+                "a local-variable receiver keeps the same-file label"
+            );
+
+            let jget = insert_node(conn, &node("get", js)).unwrap();
+            let jpoll = insert_node(conn, &node("poll", js)).unwrap();
+            insert_node(conn, &node("poll", js2)).unwrap();
+            assert_eq!(
+                edge(jget, jpoll, Some(r#"{"n":0,"q":"member"}"#)),
+                "extracted",
+                "only Rust: another language's same-file member call keeps its label"
             );
         }
     }

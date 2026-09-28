@@ -7238,6 +7238,111 @@ fn a_third_file_reclassifies_an_edge_between_two_files_it_never_touched() {
 }
 
 #[test]
+fn a_rust_untyped_same_file_method_call_is_labelled_by_its_name_count() {
+    // D#162. `self.0.poll()` names only `poll`: a tuple field is untyped, so the
+    // resolver binds the file's own `poll` — here another type's, the wrapper
+    // pattern that made 185 of 233 such tokio edges wrong. Its label follows the
+    // name's count as a cross-file guess does, and a definition appearing in a
+    // file this run never opens relabels it through the name arm alone. The
+    // bind itself is decided from the caller's own file, so that run has no
+    // reason to re-extract the caller.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "pub mod inner;\npub mod wrap;\n").unwrap();
+    fs::write(
+        src.join("inner.rs"),
+        "pub struct Inner;\nimpl Inner {\n    pub fn poll(&self) -> i32 { 1 }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("wrap.rs"),
+        "use crate::inner::Inner;\npub struct Wrapper(Inner);\npub struct Other;\n\
+         impl Other {\n    pub fn poll(&self) -> i32 { 2 }\n    pub fn spin(&self) -> i32 { 3 }\n}\n\
+         impl Wrapper {\n    pub fn get(&self) -> i32 { self.0.poll() }\n    \
+         pub fn turn(&self) -> i32 { self.0.spin() }\n    pub fn first(&self) -> Other { Other }\n    \
+         pub fn head(&self) -> i32 { self.first().poll() }\n}\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let conf = |rows: &[(String, String, String, String)], s: &str, t: &str| -> Option<String> {
+        rows.iter()
+            .find(|(a, r, b, _)| a == s && r == REL_CALLS && b == t)
+            .map(|(_, _, _, c)| c.clone())
+    };
+    let before = graph_projection_with_confidence(&db);
+    assert_eq!(
+        conf(&before, "src/wrap.rs:get", "src/wrap.rs:poll").as_deref(),
+        Some("ambiguous"),
+        "`poll` has two definitions, so a by-name member call is ambiguous: {before:?}"
+    );
+    assert_eq!(
+        conf(&before, "src/wrap.rs:head", "src/wrap.rs:poll").as_deref(),
+        Some("ambiguous"),
+        "a call on a call's result (`q` chain) is the same guess: {before:?}"
+    );
+    assert_eq!(
+        conf(&before, "src/wrap.rs:turn", "src/wrap.rs:spin").as_deref(),
+        Some("inferred"),
+        "`spin` has one definition: {before:?}"
+    );
+    assert_eq!(
+        conf(&before, "src/wrap.rs:head", "src/wrap.rs:first").as_deref(),
+        Some("extracted"),
+        "a `self` call chose its target by the impl's type: {before:?}"
+    );
+
+    let wrap_ids = |db: &Database| -> Vec<i64> {
+        let mut v: Vec<i64> = db
+            .conn()
+            .prepare("SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = 'src/wrap.rs'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let wrap_before = wrap_ids(&db);
+
+    // A second `spin`, in a file this run is the only one to see.
+    fs::write(
+        src.join("other.rs"),
+        "pub struct C;\nimpl C {\n    pub fn spin(&self) -> i32 { 4 }\n}\n",
+    )
+    .unwrap();
+    // lib.rs is left alone on purpose: a crate root's edit re-resolves through
+    // its own path (D#136), which would re-extract wrap.rs for another reason.
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+    let inc = graph_projection_with_confidence(&db);
+    let full = graph_projection_with_confidence(&control);
+    assert_eq!(
+        conf(&inc, "src/wrap.rs:turn", "src/wrap.rs:spin").as_deref(),
+        Some("ambiguous"),
+        "a second `spin` elsewhere relabels the untouched same-file edge: {inc:?}"
+    );
+    assert_eq!(
+        inc, full,
+        "incremental edge set diverged from a rebuild of the same tree"
+    );
+    assert_eq!(
+        wrap_ids(&db),
+        wrap_before,
+        "the same-file bind does not depend on other files, so the new `spin` must not \
+         re-extract wrap.rs"
+    );
+}
+
+#[test]
 fn deleting_the_duplicate_puts_the_untouched_edge_back() {
     // The other direction, and the reason the name scope is a symmetric
     // difference rather than "names this run inserted": removing the second
