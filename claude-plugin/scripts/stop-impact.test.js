@@ -47,6 +47,26 @@ test('extractSignatures: JS function, arrow binding and class method; calls are 
   assert.deepEqual(extractSignatures(src, 'render', '.js'), ['render(props)']);
 });
 
+test('extractSignatures: a match on a line over 2,000 characters gives no reading (pre-tag review H2)', () => {
+  const head = 'function abc(t) {';
+  const withLine = (n) => head + ' '.repeat(n - head.length) + '\n  return t;\n}\n';
+  assert.equal(withLine(2000).indexOf('\n'), 2000);
+  assert.deepEqual(extractSignatures(withLine(2000), 'abc', '.js'), ['functionabc(t)']);
+  assert.equal(extractSignatures(withLine(2001), 'abc', '.js'), null);
+  // A long line without a match does not matter.
+  assert.deepEqual(extractSignatures('x'.repeat(5000) + '\n' + withLine(20), 'abc', '.js'), ['functionabc(t)']);
+  // A one-line 1.5 MB bundle is refused at its first match instead of
+  // re-finding its line per match (1ffc45c: about 9 s of CPU here).
+  const unit = 'function abc(t){return t+1}var a=abc(1);';
+  const bundle = unit.repeat(Math.ceil((1536 * 1024) / unit.length));
+  const t0 = process.cpuUsage();
+  const got = extractSignatures(bundle, 'abc', '.js');
+  const d = process.cpuUsage(t0);
+  assert.equal(got, null);
+  const ms = (d.user + d.system) / 1e3;
+  assert.ok(ms < 1000, `1.5 MB one-line bundle took ${ms.toFixed(0)} ms of CPU`);
+});
+
 test('extractSignatures: comments and absent symbols yield nothing', () => {
   assert.deepEqual(extractSignatures('// fn compute(x: i32) {\n', 'compute', '.rs'), []);
   assert.deepEqual(extractSignatures('fn other() {}\n', 'compute', '.rs'), []);

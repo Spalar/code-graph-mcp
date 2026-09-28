@@ -51,6 +51,12 @@ const MAX_CALLERS_LISTED = 8;
 // (no verdict), rather than cut: a cut header can run into the body, and a
 // body edit would then read as a signature change.
 const MAX_SIGNATURE_CHARS = 600;
+// A match on a line longer than this gives no reading (null): minified and
+// generated one-line files. Re-finding the line per match made such a file
+// quadratic (pre-tag review H2: a 1.5 MB one-line bundle took 9 s, past
+// pre-edit-guide's 4 s budget); with the cap a 2 MB file of 1,999-character
+// lines of definitions takes about 0.2 s.
+const MAX_DEFINITION_LINE_CHARS = 2000;
 
 const COMMENT_LINE = /^\s*(?:\/\/|#|\*|\/\*|--|;)/;
 // First words that make a C-family `Type name(` line a statement, not a
@@ -121,8 +127,9 @@ function definitionPatterns(S, lang) {
 
 /**
  * Normalized signatures of every definition of `symbol` in `text`, sorted —
- * or null when there is no exact reading: the language is not in LANGS, or a
- * header did not end within MAX_SIGNATURE_CHARS.
+ * or null when there is no exact reading: the language is not in LANGS, a
+ * header did not end within MAX_SIGNATURE_CHARS, or a match of a definition
+ * pattern sits on a line longer than MAX_DEFINITION_LINE_CHARS.
  *
  * A definition is located by the line it starts on (LANGS) and runs from that
  * line's start to the first end character at bracket depth 0. The key drops
@@ -140,6 +147,9 @@ function extractSignatures(text, symbol, ext = '') {
       const at = text.lastIndexOf('\n', m.index) + 1;
       const lineEnd = text.indexOf('\n', at);
       const line = text.slice(at, lineEnd === -1 ? text.length : lineEnd);
+      // Checked first: finding the line is the per-match cost, so a match on
+      // a long line must end the scan, or a one-line bundle is quadratic.
+      if (line.length > MAX_DEFINITION_LINE_CHARS) return null;
       if (COMMENT_LINE.test(line)) continue;
       if (typed) {
         const first = (line.trim().match(/^[A-Za-z_]\w*/) || [''])[0];

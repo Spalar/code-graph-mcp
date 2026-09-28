@@ -146,3 +146,43 @@ test('pre-edit-guide logs the edited file and the extracted symbol per session',
     { file: 'src/a.rs', symbol: 'helper_one' },
   ]);
 });
+
+// Pre-tag review H2: the baseline capture runs inside pre-edit-guide, whose
+// registered timeout is 4 s. On a 1.5 MB one-line bundle it took 9 s at
+// 1ffc45c; a definition on a line over 2,000 characters now records no
+// baseline (null), and the hook is done well inside its budget.
+test('pre-edit-guide on a 1.5 MB one-line bundle records no baseline and stays inside its timeout', { skip: process.platform === 'win32' && 'POSIX shell fixture' }, (t) => {
+  const sb = sandbox(t);
+  const cache = path.join(sb.home, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cache, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cache, 'install-manifest.json'), '{"version":"9.9.9","config":{}}');
+  const fake = path.join(cache, 'bin', 'code-graph-mcp');
+  fs.writeFileSync(fake, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(cache, 'binary-path'), fake);
+  const project = path.join(sb.root, 'project');
+  fs.mkdirSync(path.join(project, '.code-graph'), { recursive: true });
+  fs.mkdirSync(path.join(project, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(project, '.code-graph', 'index.db'), '');
+  const unit = 'function abc(t){return t+1}var a=abc(1);';
+  const bundle = unit.repeat(Math.ceil((1536 * 1024) / unit.length));
+  assert.ok(bundle.length > 1.5 * 1024 * 1024 && !bundle.includes('\n'));
+  fs.writeFileSync(path.join(project, 'dist', 'bundle.js'), bundle);
+
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'pre-edit-guide.js')], {
+    input: JSON.stringify({
+      session_id: 'S1', tool_name: 'Edit',
+      tool_input: { file_path: path.join(project, 'dist', 'bundle.js'), old_string: 'function abc(t){return t+1}', new_string: 'x' },
+    }),
+    cwd: project, env: sb.env, encoding: 'utf8', timeout: 30000,
+  });
+  const ms = Date.now() - t0;
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(ms < 3000, `pre-edit-guide took ${ms} ms on the bundle (timeout 4000 ms)`);
+  const recs = inChild(sb, `return se.readEdits(${JSON.stringify(project)}, 'S1');`)
+    .map(({ file, symbol, sigs }) => ({ file, symbol, sigs }));
+  assert.deepEqual(recs, [
+    { file: 'dist/bundle.js', symbol: null, sigs: null },
+    { file: 'dist/bundle.js', symbol: 'abc', sigs: null },
+  ]);
+});
