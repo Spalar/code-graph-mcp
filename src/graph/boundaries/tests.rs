@@ -570,6 +570,70 @@ const CORPUS: &[Row] = &[
     // ---- languages with no shape table: never report -------------------------
     ("markdown", "handlers[\"save\"]\n", "save", &[]),
     ("bash", "trap save EXIT\n", "save", &[]),
+    // ---- review of afffd6b: tokio's false positives ---------------------------
+    // Rust `a.b` not followed by `(` is a field read: a method cannot be named
+    // through `.` (`Self::b` / `Type::b` is how one is passed).
+    ("rust", "data: me.data,\n", "data", &[]),
+    ("rust", "let delay = me.delay;\n", "delay", &[]),
+    ("rust", "Some(self.status)\n", "status", &[]),
+    (
+        "rust",
+        "g(&self.shared.worker_metrics);\n",
+        "worker_metrics",
+        &[],
+    ),
+    // A parameter of a generic fn binds its name (`(` follows `>`, not the name).
+    (
+        "rust",
+        "fn map<T, F>(self, f: F) -> Map<Self, F> {\n    Map::new(self, f)\n}\n",
+        "f",
+        &[],
+    ),
+    (
+        "rust",
+        "pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) {\n    self.std.arg(arg);\n}\n",
+        "arg",
+        &[],
+    ),
+    (
+        "rust",
+        "fn run<F: Fn(u8) -> u8>(f: F) {\n    g(f)\n}\n",
+        "f",
+        &[],
+    ),
+    // An attribute argument is not a value.
+    ("rust", "#[inline(never)]\nfn g() {}\n", "never", &[]),
+    ("rust", "#![allow(dead)]\n", "dead", &[]),
+    // A macro metavariable is not the function.
+    (
+        "rust",
+        "macro_rules! m { ($save:expr) => { g($save) } }\n",
+        "save",
+        &[],
+    ),
+    // What tokio really dispatches by value still reports.
+    (
+        "rust",
+        "RawWakerVTable::new(clone_waker, wake_by_val);\n",
+        "clone_waker",
+        &[(1, F)],
+    ),
+    (
+        "rust",
+        "x.local_addr().and_then(convert_address)\n",
+        "convert_address",
+        &[(1, F)],
+    ),
+    (
+        "rust",
+        "let rc = f(Some(callback), 1);\n",
+        "callback",
+        &[(1, F)],
+    ),
+    // An import list separated by commas, on one line.
+    ("python", "from store import load, save\n", "save", &[]),
+    // A decorator is not a value, even one that binds.
+    ("typescript", "@save.bind(this)\nclass A {}\n", "save", &[]),
 ];
 
 #[test]
@@ -659,6 +723,41 @@ fn a_binding_on_a_definition_line_does_not_shadow() {
     );
 }
 
+/// Only the definition's own name on its line is the definition: a parameter
+/// of the same name there (`fn append(&mut self, append: bool)`, tokio's
+/// `open_options.rs`) still binds the name, so the body's `append` is the
+/// parameter, not the function.
+#[test]
+fn a_parameter_on_the_definition_line_still_shadows() {
+    let src = "impl O {\n    pub fn append(&mut self, append: bool) -> &mut Self {\n        self.0.append(append);\n        self\n    }\n}\n";
+    assert_eq!(scan_source_with_defs("rust", src, "append", &[2]), vec![]);
+    let src = "def save(self, save):\n    register(save)\n";
+    assert_eq!(scan_source_with_defs("python", src, "save", &[1]), vec![]);
+}
+
+/// A deeply nested file (the review's `var a = [get,[get,…0]]…;`) scans in
+/// linear time. Every occurrence's innermost opener is one byte back and its
+/// matching close at the end of the file, so a forward scan per occurrence
+/// was quadratic: 240 KB took 21 s in release. The bound is generous (debug
+/// build, loaded machine); the quadratic scan misses it by minutes.
+#[test]
+fn a_deeply_nested_file_scans_in_linear_time() {
+    let n = 40_000;
+    let one_line = format!("var a = {}0{};\n", "[get,".repeat(n), "]".repeat(n));
+    let many_lines = format!("var a = {}0{};\n", "[get,\n".repeat(n), "]".repeat(n));
+    assert!(one_line.len() >= 240_000, "{}", one_line.len());
+    let t = std::time::Instant::now();
+    let a = scan_source("javascript", &one_line, "get");
+    let b = scan_source("javascript", &many_lines, "get");
+    let took = t.elapsed();
+    assert_eq!(a.len(), 1, "one line, one site");
+    assert_eq!(b.len(), n, "one site per line");
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "two 240 KB nested files took {took:?}"
+    );
+}
+
 /// One site per line: a line carrying several shapes reports the most specific.
 #[test]
 fn one_line_reports_one_site() {
@@ -669,4 +768,329 @@ fn one_line_reports_one_site() {
     );
     assert_eq!(h.len(), 1);
     assert_eq!(h[0].shape, R);
+}
+
+// ---- the project scan: what it reads, what it skips, and saying so ----------
+
+/// A project of `(path, language, bytes)` files on disk, with the one table
+/// [`super::scan_project`] reads.
+fn project(files: &[(&str, &str, Vec<u8>)]) -> (tempfile::TempDir, rusqlite::Connection) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE files (path TEXT, language TEXT);")
+        .unwrap();
+    for (path, lang, body) in files {
+        let p = dir.path().join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        conn.execute("INSERT INTO files VALUES (?1, ?2)", [path, lang])
+            .unwrap();
+    }
+    (dir, conn)
+}
+
+/// `register(save);` padded with a comment to exactly `len` bytes.
+fn padded_site(len: u64) -> Vec<u8> {
+    let mut s = b"register(save);\n//".to_vec();
+    s.resize(len as usize - 1, b'x');
+    s.push(b'\n');
+    s
+}
+
+fn site_list(b: &super::Boundaries) -> Vec<(String, usize)> {
+    b.sites
+        .iter()
+        .map(|s| (s.file_path.clone(), s.line))
+        .collect()
+}
+
+/// A file over [`super::MAX_SCAN_BYTES`] is not read, and the answer counts
+/// it instead of reading as a complete "none"; one at the cap is read.
+#[test]
+fn a_file_over_the_size_cap_is_skipped_and_counted() {
+    let cap = super::MAX_SCAN_BYTES;
+    let (dir, conn) = project(&[
+        ("at_cap.js", "javascript", padded_site(cap)),
+        ("over_cap.js", "javascript", padded_site(cap + 1)),
+    ]);
+    let b = super::scan_project(&conn, dir.path(), "save", &[]).unwrap();
+    assert_eq!(site_list(&b), vec![("at_cap.js".to_string(), 1)]);
+    assert_eq!(b.skipped_files, 1);
+    let mut text = Vec::new();
+    b.render_text(&mut text, "").unwrap();
+    let text = String::from_utf8(text).unwrap();
+    assert!(
+        text.contains("not scanned: 1 file over 2 MB or not UTF-8"),
+        "{text}"
+    );
+    assert_eq!(b.to_json()["not_scanned"]["skipped_files"], 1);
+
+    // Not UTF-8: counted when the bytes hold the name, not otherwise.
+    let (dir, conn) = project(&[
+        (
+            "latin1.js",
+            "javascript",
+            b"register(save); // caf\xe9\n".to_vec(),
+        ),
+        ("other.js", "javascript", b"x(); // caf\xe9\n".to_vec()),
+    ]);
+    let b = super::scan_project(&conn, dir.path(), "save", &[]).unwrap();
+    assert!(b.sites.is_empty());
+    assert_eq!(b.skipped_files, 1);
+}
+
+/// A site on a line that defines the name is not reported: that line is where
+/// the function is written, not where it is dispatched from.
+#[test]
+fn a_definition_line_is_not_its_own_site() {
+    let (dir, conn) = project(&[(
+        "a.js",
+        "javascript",
+        b"bus.on(\"save\", function save(doc) { return doc; });\nbus.on(\"save\", other);\n"
+            .to_vec(),
+    )]);
+    let b = super::scan_project(&conn, dir.path(), "save", &[("a.js".to_string(), 1)]).unwrap();
+    assert_eq!(site_list(&b), vec![("a.js".to_string(), 2)]);
+}
+
+/// The review's F-M2: bash has functions and dispatches by name (`trap cleanup
+/// EXIT`), but no shape table, so its files are never scanned. A definition in
+/// such a language must not get the complete "none" line.
+#[test]
+fn a_definition_in_an_unscanned_language_is_named_not_scanned() {
+    let (dir, conn) = project(&[(
+        "run.sh",
+        "bash",
+        b"cleanup() {\n  rm -f x\n}\ntrap cleanup EXIT\n".to_vec(),
+    )]);
+    let b = super::scan_project_with(
+        &conn,
+        dir.path(),
+        "cleanup",
+        &[("run.sh".to_string(), 1)],
+        &["run.sh".to_string()],
+        None,
+        super::SCAN_TIME_LIMIT,
+    )
+    .unwrap();
+    assert!(b.sites.is_empty());
+    assert_eq!(b.unscanned_languages, vec!["bash".to_string()]);
+    let mut text = Vec::new();
+    b.render_text(&mut text, "  ").unwrap();
+    assert_eq!(
+        String::from_utf8(text).unwrap(),
+        "  (no dynamic-dispatch site names 'cleanup' in the files scanned; not scanned: bash files)\n    next: code-graph-mcp grep -w -F cleanup\n"
+    );
+    assert_eq!(
+        b.to_json(),
+        serde_json::json!({
+            "total": 0,
+            "sites": [],
+            "not_scanned": {"languages": ["bash"]},
+            "next": "code-graph-mcp grep -w -F cleanup",
+        })
+    );
+    // A complete scan keeps the one short line and the two-key JSON: a bash
+    // file that defines nothing of the name, and a definition in a test file
+    // (a scanned language, skipped by rule) are not named.
+    let (dir, conn) = project(&[
+        ("a.py", "python", b"def cleanup():\n    pass\n".to_vec()),
+        ("other.sh", "bash", b"trap cleanup EXIT\n".to_vec()),
+        (
+            "tests/test_a.py",
+            "python",
+            b"def cleanup():\n    pass\n".to_vec(),
+        ),
+    ]);
+    let b = super::scan_project_with(
+        &conn,
+        dir.path(),
+        "cleanup",
+        &[("a.py".to_string(), 1), ("tests/test_a.py".to_string(), 1)],
+        &["a.py".to_string(), "tests/test_a.py".to_string()],
+        None,
+        super::SCAN_TIME_LIMIT,
+    )
+    .unwrap();
+    assert!(b.unscanned_languages.is_empty(), "{b:?}");
+    let mut text = Vec::new();
+    b.render_text(&mut text, "  ").unwrap();
+    assert_eq!(
+        String::from_utf8(text).unwrap(),
+        "  (no dynamic-dispatch site names 'cleanup')\n"
+    );
+    assert_eq!(b.to_json(), serde_json::json!({"total": 0, "sites": []}));
+}
+
+/// The per-query time limit stops the scan, and the answer says how many
+/// files it did not reach instead of reading as complete — every one past the
+/// limit, since a file not read may hold the name.
+#[test]
+fn the_scan_stops_at_its_time_limit_and_says_so() {
+    let files = [
+        ("a.js", "javascript", b"register(save);\n".to_vec()),
+        ("b.js", "javascript", b"register(save);\n".to_vec()),
+        ("c.js", "javascript", b"other();\n".to_vec()),
+    ];
+    let (dir, conn) = project(&files);
+    let b = super::scan_project_with(
+        &conn,
+        dir.path(),
+        "save",
+        &[],
+        &[],
+        None,
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    assert!(b.sites.is_empty());
+    assert_eq!(b.files_past_limit, 3);
+    let mut text = Vec::new();
+    b.render_text(&mut text, "").unwrap();
+    let text = String::from_utf8(text).unwrap();
+    assert!(
+        text.contains("not scanned: 3 files past the scan time limit"),
+        "{text}"
+    );
+    assert_eq!(b.to_json()["not_scanned"]["files_past_time_limit"], 3);
+    // A file already being read stops at the deadline too.
+    assert_eq!(
+        super::scan_source_until(
+            "javascript",
+            "register(save);\n",
+            "save",
+            &[],
+            None,
+            Some(std::time::Instant::now()),
+        ),
+        None
+    );
+    // The same project with the real limit reads both.
+    let b = super::scan_project(&conn, dir.path(), "save", &[]).unwrap();
+    assert_eq!(b.sites.len(), 2);
+    assert_eq!(b.files_past_limit, 0);
+}
+
+/// A Rust path names this project's function only through a qualifier where
+/// one of its definitions lives: `thread::JoinHandle::join` and `Result::ok`
+/// are std's (tokio's `join` is a free function in `io/join.rs`).
+#[test]
+fn a_rust_path_counts_only_through_a_qualifier_that_owns_the_name() {
+    let q = super::path_qualifiers(
+        [
+            ("tokio/src/io/join.rs", Some("join")),
+            ("src/store/mod.rs", Some("Store::join")),
+        ]
+        .into_iter(),
+    );
+    for want in ["Self", "self", "super", "crate", "join", "Store", "store"] {
+        assert!(q.iter().any(|x| x == want), "{want} missing from {q:?}");
+    }
+    let scan = |src: &str| -> Vec<(usize, Shape)> {
+        super::scan_source_until("rust", src, "join", &[], Some(&q), None)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.line, h.shape))
+            .collect()
+    };
+    assert_eq!(scan("x.map(thread::JoinHandle::join);\n"), vec![]);
+    assert_eq!(scan("x.map(Result::join);\n"), vec![]);
+    for ok in [
+        "x.map(join::join);\n",
+        "x.map(Self::join);\n",
+        "x.map(crate::io::join::join);\n",
+        "x.map(Store::join);\n",
+        "x.map(store::join);\n",
+        "x.map(join);\n",
+    ] {
+        assert_eq!(scan(ok), vec![(1, F)], "{ok}");
+    }
+    // Without definition facts (the corpus) any qualifier counts.
+    assert_eq!(
+        scan_source("rust", "x.map(thread::JoinHandle::join);\n", "join").len(),
+        1
+    );
+}
+
+/// The bracket index answers what the scans it replaced answered: the
+/// innermost unmatched opener at most 4 KB back, and an opener's matching
+/// close (any closer closes any opener). Checked against those scans, kept
+/// here as the reference, over generated text with unbalanced brackets.
+#[test]
+fn the_bracket_index_matches_the_scans_it_replaced() {
+    fn enclosing_scan(m: &[u8], pos: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let floor = pos.saturating_sub(4096);
+        let mut j = pos;
+        while j > floor {
+            j -= 1;
+            match m[j] {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' | b'[' | b'{' => {
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    fn close_scan(m: &[u8], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (j, &b) in m.iter().enumerate().skip(open) {
+            match b {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    // xorshift: deterministic, no dependency.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let alphabet = b"([{)]}a\n";
+    let mut checked = 0usize;
+    for round in 0..40 {
+        // Long enough in some rounds to cross the 4 KB floor.
+        let len = if round % 4 == 0 { 9000 } else { 300 };
+        let m: Vec<u8> = (0..len)
+            .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+            .collect();
+        let src = super::Src::new(&m);
+        for pos in 0..=m.len() {
+            assert_eq!(
+                src.enclosing_opener(pos),
+                enclosing_scan(&m, pos),
+                "round {round} pos {pos}"
+            );
+            if pos < m.len() && matches!(m[pos], b'(' | b'[' | b'{') {
+                assert_eq!(
+                    src.matching_close(pos),
+                    close_scan(&m, pos),
+                    "round {round} open {pos}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 10_000, "{checked}");
+    // Non-vacuity: the 4 KB floor is exercised — a deep opener far back.
+    let mut m = b"(".to_vec();
+    m.resize(5000, b'a');
+    let src = super::Src::new(&m);
+    assert_eq!(src.enclosing_opener(100), Some(0));
+    assert_eq!(src.enclosing_opener(4999), None);
 }

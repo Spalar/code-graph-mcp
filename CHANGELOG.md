@@ -298,23 +298,52 @@ or stored as a value (`register(save)`, `.map(Self::save)`, `{ save, load }`,
 `file:line  shape` lines, a count of the rest, and
 `code-graph-mcp grep -w -F <name>` to see every occurrence. `--json` and the
 MCP tools add a `boundaries` object (`total`, `sites`, `note`, `next`). When
-nothing matches, the block is one line (`(no dynamic-dispatch site names 'x')`)
-and the field is `{"sites":[],"total":0}`. No edge is added, and a non-empty
-answer is unchanged byte for byte.
+nothing matches and every file that could hold a site was read, the block is
+one line (`(no dynamic-dispatch site names 'x')`) and the field is
+`{"sites":[],"total":0}`. When something was not read, the answer says what:
+a definition in a language with no shape table (bash, where `trap cleanup
+EXIT` dispatches by name), files over 2 MB or not UTF-8 that hold the name,
+files not reached within the scan's 1-second limit. The block is then
+`(no dynamic-dispatch site names 'x' in the files scanned; not scanned: bash
+files)` followed by the `grep` command (a block with sites gets a
+`not scanned: …` line), and the field gains `not_scanned` (`languages`,
+`skipped_files`, `files_past_time_limit`) and `next`. No edge is added, and a
+non-empty answer is unchanged byte for byte.
 
 The scan reads comments and string contents as blank (a string counts only
 where it is the key), skips test files, and in a file that declares a local,
 parameter or pattern of the name reads that file's bare uses as the local's.
-The shape table is in `src/graph/boundaries/mod.rs`; 182 corpus rows over 14
-languages pin what counts and what does not. There is no block on a
-`--direction callees` query, on `refs --relation` other than `calls` or
-`references`, or for a symbol that is not a function.
+In Rust, `a.b` not followed by `(` is a field read and never counts (a method
+is passed as `Self::b` / `Type::b`); `Q::b` counts only when `Q` is where a
+definition of `b` lives (its type, its module, or `Self`, `self`, `super`,
+`crate`), so `Result::ok` and `thread::JoinHandle::join` are not a project
+`ok` / `join`; a parameter of a generic function binds its name
+(`fn map<T, F>(self, f: F)`), and so does a parameter named like the
+function on the definition's own line (`fn append(&mut self, append: bool)`);
+an attribute's arguments (`#[inline(never)]`) are not values. The scan is
+linear in the file's size: it answered each occurrence's "which bracket
+encloses this" by scanning, which made a nested file quadratic (the review's
+240 KB `[get,[get,…]]` took 22.6 s for an empty `callgraph get`, now 45 ms,
+with the same answer). The shape table is in `src/graph/boundaries/mod.rs`;
+197 corpus rows over 14 languages pin what counts and what does not. There is
+no block on a `--direction callees` query, on `refs --relation` other than
+`calls` or `references`, or for a symbol that is not a function.
 
 Measured on this repo, 20 interleaved runs each: an empty `callgraph` p50
 3.3 → 7.2 ms (`--direction callers` 17.9 → 21.8 ms), `refs` 2.3 → 6.2 ms,
 `impact` 2.6 → 6.5 ms; a non-empty `callgraph` 7.2 → 7.2 ms (40 runs). Of the
 functions with no caller, 68 of 120 on this repo now show at least one site,
 17 of 55 on express and 23 of 107 on hono.
+
+After the pre-release review's repairs, over every function name of tokio
+(1,786; `callgraph <name> --json`, sites listed per name): 42 names showed a
+site before, 5 of them real dispatch (`clone_waker` in a `RawWakerVTable`,
+`convert_address` in `.and_then(…)`, `callback`, `handler`,
+`globals_init`), the rest field reads (`data: me.data`), parameters
+(`self.0.append(append)`, `Map::new(self, f)`), `#[inline(never)]` and std
+paths (`Result::ok`); now 5 names show a site, those 5. On hono (517 names)
+and express (120) the listed sites are identical; on this repo's `src/` 61 →
+58 names show a site (field reads such as `&ctx.db`, `stats.count` gone).
 
 ### An answer can be asked for at a size, and every cut names a command
 
@@ -329,8 +358,17 @@ type. Then they are left out, and a call-graph node always goes before its
 parent. An item is printed whole or not at all. In `overview` of a directory
 (CLI and MCP) one file gets at most 70% of the budget. Text answers end with
 `… budget N tokens: …` and `next: <command>`. MCP answers carry a `budget`
-object (`max_tokens`, `omitted`, what was shortened, `next`). Without a budget
-nothing changes. With a budget the start is the uncapped answer, so a large
+object (`max_tokens`, `omitted`, what was shortened, `next`). Every section
+counts against the budget, the ones a flag folds in too: `module_overview`'s
+`hot_paths` (the last to go: it repeats the most-called exports),
+`dependencies` and `dead_code` (they lose entries with the inactive names),
+and `project_map`'s `centrality`. A section that lost entries adds its own
+command to `next` (`deps <file> --direction … --depth …`, `dead-code <path>`,
+`centrality --limit N`), several joined by `; `. When even the fixed part
+(headers, summary, notices) is larger than the budget, `budget.over_budget`
+is `true` on these two tools. A path that starts with `-` is written `./-x`
+in a next command, so it is not read as a flag. Without a budget nothing
+changes. With a budget the start is the uncapped answer, so a large
 budget can return more than the default (every dependency in `map`, every
 export in `module_overview`, the flat call graph instead of the rollup).
 `--budget` cannot be combined with `--json` or `--compact`. MCP `compact` has no
@@ -372,6 +410,13 @@ means the unbudgeted answer was already smaller than the budget:
 | hono, MCP `project_map` | 0.994 | 0.989 | 1.023 |
 | express, `map` | 1.000 | 1.000 | whole (5.0 KB) |
 | express, MCP `module_overview lib` | 0.998 | 0.998 | whole (4.8 KB) |
+
+With the flags that fold sections in, before the pre-release review's repair
+they were outside the budget; on this repo's `src/` (bytes over budget×3,
+before → after): `module_overview src/mcp/server/mod.rs include_deps
+include_dead` 1.954 → 0.997 at 1000 tokens and 19.5 → 2.70 at 100 (with
+`over_budget`: with every entry left out the answer is 809 bytes), `module_overview src include_dead` 2.794 → 0.964 at 500, and
+`project_map include_centrality` 1.292 → 0.989 at 500.
 
 The MCP answers at 4000 tokens exceed 1.0 by the `freshness` note (about 280
 bytes), which is attached after the budget is applied. One case lands under
@@ -602,11 +647,33 @@ now get a grep answer.
 - The dispatch-site scan is lexical. A local named like the function still
   reads as a function reference where the scan sees no declaration of it (a
   Java or C typed local `String url = …`, a TypeScript method parameter
-  followed by a return type), and so does a qualified property read
-  (`options.executionCtx`, `req.method` for a getter). A key computed at run
-  time (`obj[name]()`, `getattr(o, f"on_{x}")`) names nothing and is not
-  found; neither is a registration by decorator or annotation (`@app.route`),
-  an HTML inline handler, or a shell `trap`. Files over 2 MB are skipped.
+  followed by a return type), and so does a qualified property read outside
+  Rust (`options.executionCtx`, `req.method` for a getter, `request.url`:
+  about 20 of hono's 57 sites; Java, C, Kotlin and PHP field reads were not
+  measured). A Rust `json["key"]` read counts as a string key. A key computed
+  at run time (`obj[name]()`, `getattr(o, f"on_{x}")`) names nothing and is
+  not found; neither is a registration by decorator or annotation
+  (`@app.route`) or an HTML inline handler. A shell `trap` is not scanned
+  (bash has no shape table), which the answer now says. Files over 2 MB are
+  skipped and counted in the answer.
+- Other look-alikes found by the review, not repaired: a JavaScript regex
+  literal holding a backtick or quote is read as a string opening,
+  which can hide a later site or report one from text; a Python keyword
+  argument on its own line of a multi-line call (`f(\n    save=True,\n)`)
+  reads as a binding and hides the file's bare uses; `res.send("save")`,
+  `page.invoke("save")`, an i18n label table (`{ "save": "Save changes" }`),
+  a regex `/x["save"]/` and Ruby `attr_reader :save` are reported as sites.
+- The dispatch block still prints when the caller traversal stopped at its
+  row limit, and it scans the bare name: `callgraph Store::save --file a.rs`
+  lists `save` sites on any object.
+- A budgeted MCP `module_overview` of a directory can drop signatures
+  (`active_exports_without_signature`) that its `next` command,
+  `overview <dir>`, does not print either: the directory text form has no
+  signatures (`overview <dir> --json` has them).
+- At the smallest budgets the fixed part does not fit and nothing marks it on
+  the CLI (`map --budget 100` is 361 bytes, 1.20×) or on MCP `get_call_graph`
+  and `get_ast_node` (a 100-token answer of 429 and 527 bytes); MCP
+  `project_map` and `module_overview` set `budget.over_budget`.
 - Only `use` paths read a file's crate. `crate::run()` or `super::run()`
   written in the call itself resolves by name, as the glob item above says,
   and binds both roots' `run`. A `#[path]` or macro-made `mod` below the top

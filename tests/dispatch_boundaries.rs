@@ -399,4 +399,45 @@ fn mcp_rollup_arm_carries_the_field() {
         v["boundaries"]["sites"][0]["shape"], "function_reference",
         "{v}"
     );
+    // A callees-only question gets no field on this arm either.
+    let v = mcp_call(
+        &server,
+        "get_call_graph",
+        serde_json::json!({"symbol_name": "hub", "depth": 1, "direction": "callees"}),
+    );
+    assert_eq!(v["mode"], "rollup_call_graph", "precondition: {v}");
+    assert!(v.get("boundaries").is_none(), "{v}");
+}
+
+/// A bash function is never scanned (bash has no shape table), and bash is
+/// exactly where names are dispatched as words (`trap cleanup EXIT`). The
+/// answer says the file was not scanned instead of the complete "none".
+#[test]
+fn a_definition_in_an_unscanned_language_says_so() {
+    let p = TempDir::new().unwrap();
+    std::fs::write(
+        p.path().join("run.sh"),
+        "#!/bin/bash\ncleanup() {\n  rm -f \"$TMPF\"\n}\ntrap cleanup EXIT\n",
+    )
+    .unwrap();
+    let db_dir = p.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, p.path(), None, None).unwrap();
+    let block = "  (no dynamic-dispatch site names 'cleanup' in the files scanned; not scanned: bash files)\n    next: code-graph-mcp grep -w -F cleanup\n";
+    for cmd in ["callgraph", "refs", "impact"] {
+        let (out, code) = cli(&p, &[cmd, "cleanup"]);
+        assert_eq!(code, 0, "{cmd}: {out}");
+        assert!(
+            !out.contains("(no dynamic-dispatch site names 'cleanup')"),
+            "{cmd}: {out}"
+        );
+        assert!(out.ends_with(block), "{cmd}: {out}");
+    }
+    let v = cli_json(&p, &["callgraph", "cleanup", "--json"]);
+    assert_eq!(
+        v["boundaries"]["not_scanned"],
+        serde_json::json!({"languages": ["bash"]}),
+        "{v}"
+    );
 }

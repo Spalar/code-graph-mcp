@@ -729,7 +729,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             }
         };
         next = next
-            .opt("--file", args.file.clone())
+            .opt_path("--file", args.file.clone())
             .flag_if(include_refs, "--refs")
             .flag_if(include_impact, "--impact")
             .flag_if(args.include_tests, "--include-tests")

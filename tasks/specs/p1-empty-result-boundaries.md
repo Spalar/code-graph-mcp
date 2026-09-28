@@ -69,3 +69,12 @@ through a shape we don't see".
 # Change log
 - r1 2026-09-28: created from the analysis doc; approved under the user's batch AUTH.
 - r2 2026-09-28: implemented (`src/graph/boundaries/`, `tests/dispatch_boundaries.rs`); open question resolved; implementation decisions recorded.
+- r3 2026-09-28: pre-release review repairs. The scan is linear (a bracket
+  index per file replaces a scan per occurrence; the 240 KB nested repro went
+  22.6 s → 45 ms) and stops at a 1-second per-query limit. The "none" line is
+  printed only for a complete scan; otherwise the answer names what was not
+  read (`not_scanned`: a definition's language with no shape table such as
+  bash, files over 2 MB or not UTF-8, files past the time limit). Rust shapes
+  narrowed: no `a.b` member value, `Q::b` only through a qualifier that owns
+  a definition, generic-fn and same-line parameters bind, attributes are not
+  values (tokio: 42 names with a site, 5 real → 5, all real).

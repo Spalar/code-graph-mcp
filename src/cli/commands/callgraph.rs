@@ -432,7 +432,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         ) as usize;
         let next = crate::budget::NextCommand::new("callgraph")
             .arg(raw_symbol)
-            .opt("--file", args.file.clone())
+            .opt_path("--file", args.file.clone())
             .opt(
                 "--direction",
                 (args.direction != "both").then(|| args.direction.clone()),

@@ -883,6 +883,192 @@ fn mcp_budget_next_returns_what_it_left_out() {
     }
 }
 
+/// Every section of a budgeted answer is inside the budget, the ones a flag
+/// folds in too: `module_overview`'s `hot_paths`, `dependencies` and
+/// `dead_code`, `project_map`'s `centrality` (review F-M3: `include_deps` at
+/// 100 tokens came back at 20.9× the budget, undisclosed). What they lose is
+/// counted, and the next step names the command that returns it.
+#[test]
+fn mcp_budget_covers_every_section() {
+    let p = fixture();
+    let dir = p.path();
+    let server = common::init_server(&p);
+    let cases = [
+        (
+            "module_overview",
+            json!({"path": "util/helpers.py", "include_deps": true, "include_dead": true}),
+        ),
+        (
+            "module_overview",
+            json!({"path": "core/api.py", "include_deps": true, "include_dead": true}),
+        ),
+        (
+            "project_map",
+            json!({"include_centrality": true, "centrality_limit": 100}),
+        ),
+    ];
+    for (tool, args) in &cases {
+        for tokens in [500u64, 1000] {
+            let mut a = args.clone();
+            a["max_tokens"] = json!(tokens);
+            let (v, bytes) = mcp(&server, tool, a);
+            let cut = v.get("budget").is_some();
+            assert!(
+                cut,
+                "{tool} {args} @{tokens}: expected a cut, got {bytes} B"
+            );
+            assert_size(&format!("{tool} {args}"), bytes, cut, tokens);
+        }
+        // At the smallest budget the fixed part may not fit; then the answer
+        // says so rather than passing as sized.
+        let mut a = args.clone();
+        a["max_tokens"] = json!(100);
+        let (v, bytes) = mcp(&server, tool, a);
+        assert!(
+            bytes <= 345 || v["budget"]["over_budget"] == true,
+            "{tool} {args} @100: {bytes} B, no over_budget: {v}"
+        );
+    }
+
+    // `hot_paths` is a unit too, and the last to go: it repeats the most
+    // called exports, so every export is cut before a hot path is.
+    for path in ["util/helpers.py", "core/api.py"] {
+        let (v, bytes) = mcp(
+            &server,
+            "module_overview",
+            json!({"path": path, "max_tokens": 200}),
+        );
+        assert!(bytes <= 690, "{path} @200: {bytes} B: {v}");
+        assert!(v["budget"].get("over_budget").is_none(), "{path} @200: {v}");
+        assert!(
+            v["budget"]["omitted"]["hot_paths"].as_u64().unwrap_or(0) > 0,
+            "{path} @200: {v}"
+        );
+    }
+    let (v, _) = mcp(
+        &server,
+        "module_overview",
+        json!({"path": "util/helpers.py", "max_tokens": 400}),
+    );
+    assert!(
+        v["budget"]["omitted"]["active_exports"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "precondition: exports cut @400: {v}"
+    );
+    assert_eq!(v["hot_paths"].as_array().unwrap().len(), 5, "{v}");
+
+    // What the folded sections lost comes back from the named commands.
+    let (v, _) = mcp(
+        &server,
+        "module_overview",
+        json!({"path": "util/helpers.py", "include_deps": true, "max_tokens": 500}),
+    );
+    let omitted = v["budget"]["omitted"]["dependencies"].as_u64().unwrap_or(0);
+    assert!(omitted > 0, "precondition: dependencies cut: {v}");
+    let next = v["budget"]["next"].as_str().unwrap();
+    let deps_cmd = next
+        .split("; ")
+        .find(|c| c.starts_with("code-graph-mcp deps "))
+        .unwrap_or_else(|| panic!("no deps command in {next}"));
+    let text = run_next(dir, deps_cmd);
+    for i in 0..40 {
+        assert!(
+            text.contains(&format!("pkg_{i:02}/mod.py")),
+            "pkg_{i:02}/mod.py missing from `{deps_cmd}`:\n{text}"
+        );
+    }
+
+    let (v, _) = mcp(
+        &server,
+        "module_overview",
+        json!({"path": ".", "include_dead": true, "max_tokens": 500}),
+    );
+    assert!(
+        v["budget"]["omitted"]["dead_code"].as_u64().unwrap_or(0) > 0,
+        "precondition: dead code cut: {v}"
+    );
+    let next = v["budget"]["next"].as_str().unwrap();
+    let dead_cmd = next
+        .split("; ")
+        .find(|c| c.starts_with("code-graph-mcp dead-code "))
+        .unwrap_or_else(|| panic!("no dead-code command in {next}"));
+    let text = run_next(dir, dead_cmd);
+    for i in 0..40 {
+        let line = format!("class C_{i} pkg_{i:02}/mod.py");
+        assert!(text.contains(&line), "{line}:\n{text}");
+    }
+
+    let (v, _) = mcp(
+        &server,
+        "project_map",
+        json!({"include_centrality": true, "centrality_limit": 100, "max_tokens": 500}),
+    );
+    assert!(
+        v["budget"]["omitted"]["centrality"].as_u64().unwrap_or(0) > 0,
+        "precondition: centrality cut: {v}"
+    );
+    let next = v["budget"]["next"].as_str().unwrap();
+    assert!(
+        next.split("; ")
+            .any(|c| c == "code-graph-mcp centrality --limit 100"),
+        "{next}"
+    );
+}
+
+/// A next step over a path that starts with `-` runs (review F-L1: `show foo3
+/// --file --json.js` exited 2): the path goes out as `./-x/b.js`.
+#[test]
+fn a_next_step_over_a_dash_path_runs() {
+    let p = TempDir::new().unwrap();
+    let mut body = String::from("export function baz() {\n");
+    for n in 0..80 {
+        body.push_str(&format!("  const v{n} = {n};\n"));
+    }
+    body.push_str("  return 0;\n}\n");
+    std::fs::create_dir_all(p.path().join("-x")).unwrap();
+    std::fs::write(p.path().join("-x/b.js"), &body).unwrap();
+    index(p.path());
+    let server = common::init_server(&p);
+    let (v, _) = mcp(
+        &server,
+        "get_ast_node",
+        json!({"symbol_name": "baz", "max_tokens": 100}),
+    );
+    let next = v["budget"]["next"]
+        .as_str()
+        .unwrap_or_else(|| panic!("precondition: cut: {v}"));
+    assert!(next.contains(" --file ./-x/b.js"), "{next}");
+    let text = run_next(p.path(), next);
+    assert!(text.contains("const v79 = 79;"), "{text}");
+    let (v, _) = mcp(
+        &server,
+        "module_overview",
+        json!({"path": "-x/b.js", "include_deps": true, "include_dead": true, "max_tokens": 100}),
+    );
+    for cmd in v["budget"]["next"].as_str().unwrap().split("; ") {
+        assert!(cmd.contains(" ./-x/b.js"), "{cmd}");
+        run_next(p.path(), cmd);
+    }
+}
+
+/// The CLI call graph's next step keeps the flags that shaped the answer.
+#[test]
+fn cli_callgraph_budget_next_keeps_include_tests() {
+    let p = fixture();
+    let out = cli(
+        p.path(),
+        &["callgraph", "h_0", "--include-tests", "--budget", "500"],
+    );
+    let (_, next) = strip_next_lines(&out);
+    assert_eq!(
+        next,
+        vec!["code-graph-mcp callgraph h_0 --include-tests".to_string()],
+        "{out}"
+    );
+}
+
 #[test]
 fn mcp_compact_is_reported_inert_beside_max_tokens() {
     let p = fixture();
@@ -968,6 +1154,13 @@ fn budget_on_this_repo_lands_within_fifteen_percent() {
             "get_ast_node",
             json!({"symbol_name": hot_name, "file_path": hot_file, "include_references": true}),
         ),
+        // Non-default parameters: the sections they fold in are budgeted too
+        // (review F-M3 measured this file at 2.09× the budget at 1000 tokens).
+        (
+            "module_overview",
+            json!({"path": "src/mcp/server/mod.rs", "include_deps": true, "include_dead": true}),
+        ),
+        ("project_map", json!({"include_centrality": true})),
     ];
     let mut cut_at = std::collections::BTreeMap::<u64, usize>::new();
     for tokens in [500u64, 1000, 4000] {
@@ -992,8 +1185,8 @@ fn budget_on_this_repo_lands_within_fifteen_percent() {
     // alone is small enough that five answers are whole (2026-09-28: map 6.4 KB,
     // the largest file's outline 6.2 KB, `show new --refs` 8.6 KB,
     // project_map 9.1 KB, get_ast_node 11.2 KB), so four are cut.
-    assert_eq!(cut_at[&500], 9, "{cut_at:?}");
-    assert_eq!(cut_at[&1000], 9, "{cut_at:?}");
+    assert_eq!(cut_at[&500], 11, "{cut_at:?}");
+    assert_eq!(cut_at[&1000], 11, "{cut_at:?}");
     assert!(cut_at[&4000] >= 4, "{cut_at:?}");
 }
 

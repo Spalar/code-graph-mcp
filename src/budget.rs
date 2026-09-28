@@ -315,6 +315,23 @@ impl NextCommand {
             None => self,
         }
     }
+    /// A project-relative path argument. One starting with `-` would parse as
+    /// a flag (`--json.js`, `-x/b.js`); `./` in front names the same file.
+    pub fn path(self, p: impl Into<String>) -> Self {
+        let p = p.into();
+        if p.starts_with('-') {
+            self.arg(format!("./{p}"))
+        } else {
+            self.arg(p)
+        }
+    }
+    /// [`Self::opt`] for a path value (see [`Self::path`]).
+    pub fn opt_path(self, flag: &str, value: Option<impl Into<String>>) -> Self {
+        match value {
+            Some(v) => self.arg(flag).path(v),
+            None => self,
+        }
+    }
     /// The words, unquoted (what a shell passes to the program).
     pub fn words(&self) -> &[String] {
         &self.words
@@ -483,6 +500,43 @@ mod tests {
             c.to_string(),
             "code-graph-mcp callgraph Foo.bar --file 'src/a b.rs' --include-tests 'it'\\''s'"
         );
+    }
+
+    /// A path that starts with `-` keeps naming a file: `./` in front, which
+    /// every command that takes a path accepts (review F-L1: `show foo3
+    /// --file --json.js` exited 2).
+    #[test]
+    fn a_path_starting_with_a_dash_is_not_a_flag() {
+        let c = NextCommand::new("show")
+            .arg("foo3")
+            .opt_path("--file", Some("--json.js"))
+            .path("-x/b.js")
+            .path("src/a.rs")
+            .opt_path("--file", None::<String>);
+        assert_eq!(
+            c.to_string(),
+            "code-graph-mcp show foo3 --file ./--json.js ./-x/b.js src/a.rs"
+        );
+    }
+
+    /// Every byte a POSIX shell treats specially is quoted, so a path or name
+    /// carrying one cannot run anything when the command is pasted: `$(…)`,
+    /// backticks, `;`, `|`, `&`, redirections, globs, `!`, `~`, `#`, quotes,
+    /// backslash, whitespace, braces and brackets.
+    #[test]
+    fn shell_word_quotes_every_metacharacter() {
+        for c in "$()`;|&<>*?!~#\"'\\ \t\n{}[]".chars() {
+            let w = format!("a{c}b");
+            let q = shell_word(&w);
+            assert!(
+                q.starts_with('\'') && q.ends_with('\''),
+                "{c:?} left unquoted: {q}"
+            );
+        }
+        for w in ["src/a-b_c.rs", "Foo::bar", "x=1", "a@b+c,d"] {
+            assert_eq!(shell_word(w), w, "{w} needs no quotes");
+        }
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]

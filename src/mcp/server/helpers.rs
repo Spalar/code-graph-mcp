@@ -488,7 +488,7 @@ pub(crate) fn cli_next_command(
         "project_map" => Some(NextCommand::new("map").arg("--json")),
         "module_overview" => {
             let path = s("path").map(|p| normalize_path_arg_for_cli(&p))?;
-            Some(NextCommand::new("overview").arg(path))
+            Some(NextCommand::new("overview").path(path))
         }
         "get_call_graph" => {
             if let Some(route) = s("route_path") {
@@ -511,7 +511,7 @@ pub(crate) fn cli_next_command(
             Some(
                 NextCommand::new("callgraph")
                     .arg(name)
-                    .opt("--file", s("file_path"))
+                    .opt_path("--file", s("file_path"))
                     .opt("--direction", direction.filter(|d| d != "both"))
                     .opt("--depth", args["depth"].as_u64().map(|d| d.to_string()))
                     .flag_if(on("include_tests"), "--include-tests")
@@ -532,8 +532,7 @@ pub(crate) fn cli_next_command(
             Some(
                 NextCommand::new("show")
                     .arg(name)
-                    .arg("--file")
-                    .arg(file)
+                    .opt_path("--file", Some(file))
                     .flag_if(on("include_references"), "--refs")
                     .flag_if(on("include_impact"), "--impact")
                     .flag_if(on("include_tests"), "--include-tests")
@@ -583,7 +582,7 @@ pub(super) fn attach_compression_next(
             if value.get("dead_code").is_some_and(subtree_truncated) {
                 cmds.push(
                     crate::budget::NextCommand::new("dead-code")
-                        .arg(path.clone())
+                        .path(path.clone())
                         .to_string(),
                 );
             }
@@ -595,7 +594,7 @@ pub(super) fn attach_compression_next(
                 let depth = args["deps_depth"].as_u64().unwrap_or(2).clamp(1, 10);
                 cmds.push(
                     crate::budget::NextCommand::new("deps")
-                        .arg(path)
+                        .path(path)
                         .arg("--direction")
                         .arg(dir)
                         .arg("--depth")
@@ -1043,5 +1042,65 @@ mod tests {
         assert_eq!(strip_outer_generic("String"), None);
         assert_eq!(strip_outer_generic("&[T]"), None);
         assert_eq!(strip_outer_generic(""), None);
+    }
+
+    /// A `get_call_graph` in route mode takes no budget: its `max_tokens` is
+    /// reported ignored, so the threshold tier must still size the answer.
+    #[test]
+    fn route_mode_is_not_a_budgeted_call() {
+        assert!(is_budgeted_call(
+            "get_call_graph",
+            &json!({"symbol_name": "f", "max_tokens": 500})
+        ));
+        assert!(!is_budgeted_call(
+            "get_call_graph",
+            &json!({"route_path": "/api/x", "max_tokens": 500})
+        ));
+        assert!(is_budgeted_call(
+            "get_call_graph",
+            &json!({"route_path": "  ", "symbol_name": "f", "max_tokens": 500})
+        ));
+        assert!(!is_budgeted_call(
+            "get_call_graph",
+            &json!({"symbol_name": "f"})
+        ));
+        assert!(!is_budgeted_call(
+            "find_references",
+            &json!({"symbol_name": "f", "max_tokens": 500})
+        ));
+    }
+
+    /// The CLI path is the one a shell passes from the project root: `./x`,
+    /// `x\\y` and an empty path are rewritten.
+    #[test]
+    fn module_overview_path_is_normalized_for_the_cli() {
+        assert_eq!(normalize_path_arg_for_cli("./src/mcp"), "src/mcp");
+        assert_eq!(normalize_path_arg_for_cli("src\\mcp"), "src/mcp");
+        assert_eq!(normalize_path_arg_for_cli("./"), ".");
+        assert_eq!(normalize_path_arg_for_cli(""), ".");
+        assert_eq!(normalize_path_arg_for_cli("src"), "src");
+    }
+
+    /// A threshold-tier cut inside the folded `dependencies` / `dead_code`
+    /// names the command that returns each, beside the overview's own.
+    #[test]
+    fn a_cut_folded_section_names_its_own_command() {
+        let cut = json!({"_array_truncations": {"depended_by": 40}});
+        let v = json!({"_truncated": true, "dependencies": cut, "dead_code": {"results": []}});
+        let args = json!({"path": "./a/b.py", "include_deps": true, "deps_depth": 3});
+        let out = attach_compression_next("module_overview", &args, v);
+        assert_eq!(
+            out["next"],
+            "code-graph-mcp overview a/b.py; code-graph-mcp deps a/b.py --direction both --depth 3"
+        );
+        let v = json!({"_truncated": true, "dead_code": cut});
+        let out = attach_compression_next("module_overview", &json!({"path": "a"}), v);
+        assert_eq!(
+            out["next"],
+            "code-graph-mcp overview a; code-graph-mcp dead-code a"
+        );
+        // Nothing cut: no `next`.
+        let out = attach_compression_next("module_overview", &args, json!({"dependencies": {}}));
+        assert!(out.get("next").is_none(), "{out}");
     }
 }

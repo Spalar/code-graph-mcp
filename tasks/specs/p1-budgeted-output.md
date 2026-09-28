@@ -112,3 +112,10 @@ The spec left these open; each is the conservative reading.
 - r2 2026-09-28: implemented (`src/budget.rs`, the four CLI commands, the four
   MCP tools, `tests/budgeted_output.rs`, `tests/data/budget_base/`); decisions
   and results above.
+- r3 2026-09-28: pre-release review repairs. The "Budget scope" decision now
+  covers every section: `module_overview`'s `hot_paths` / folded
+  `dependencies` / `dead_code` and `project_map`'s `centrality` are units
+  (were kept whole: 19.5× the budget at 100 tokens with `include_deps`), each
+  naming its own command in `next` (joined by `; `); `budget.over_budget`
+  when the fixed part alone does not fit (these two tools). A path argument
+  starting with `-` is written `./-x` in every next command.

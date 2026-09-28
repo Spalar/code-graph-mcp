@@ -164,7 +164,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
             crate::budget::MIN_BUDGET_TOKENS,
             crate::budget::MAX_BUDGET_TOKENS,
         ) as usize;
-        let next = crate::budget::NextCommand::new("overview").arg(raw_path);
+        let next = crate::budget::NextCommand::new("overview").path(raw_path);
         let text = overview_budget_text(&by_file, disclosure.as_deref(), tokens, &next);
         write!(stdout, "{}", text)?;
         return Ok(());

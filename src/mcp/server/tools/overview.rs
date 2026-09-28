@@ -229,11 +229,25 @@ impl McpServer {
         }
 
         if let Some(tokens) = max_tokens {
-            let next = crate::budget::NextCommand::new("overview").arg(if raw_path.is_empty() {
-                "."
-            } else {
-                raw_path
-            });
+            use crate::budget::NextCommand;
+            let cli_path = if path.is_empty() { "." } else { path };
+            let next = SectionNext {
+                overview: NextCommand::new("overview").path(if raw_path.is_empty() {
+                    "."
+                } else {
+                    raw_path
+                }),
+                dependencies: NextCommand::new("deps")
+                    .path(cli_path)
+                    .arg("--direction")
+                    .arg(deps_direction.to_string())
+                    .arg("--depth")
+                    .arg(deps_depth.to_string()),
+                dead_code: NextCommand::new("dead-code").path(cli_path).opt(
+                    "--min-lines",
+                    (dead_min_lines != 3).then(|| dead_min_lines.to_string()),
+                ),
+            };
             return Ok(module_overview_budgeted(&result, tokens, &next));
         }
         if compact {
@@ -394,7 +408,7 @@ impl McpServer {
             .is_some_and(|a| a.iter().any(|g| g.get("more").is_some()));
         if active_capped || names_cut {
             result["next"] = json!(crate::budget::NextCommand::new("overview")
-                .arg(if raw_path.is_empty() { "." } else { raw_path })
+                .path(if raw_path.is_empty() { "." } else { raw_path })
                 .to_string());
         }
         Ok(result)
@@ -479,34 +493,44 @@ impl McpServer {
     }
 }
 
+/// The commands that return what a budgeted `module_overview` left out, one
+/// per section: the overview itself (exports, names, hot paths) and the two
+/// folded tools.
+struct SectionNext {
+    overview: crate::budget::NextCommand,
+    dependencies: crate::budget::NextCommand,
+    dead_code: crate::budget::NextCommand,
+}
+
 /// `module_overview` with `max_tokens`: the uncapped envelope fitted to the
 /// budget.
 ///
 /// Units: each active export (ranked by caller count; shorter form drops
-/// `signature` / `end_line`) and each inactive name (all rank below every
+/// `signature` / `end_line`), each inactive name (all rank below every
 /// active export; each type group loses names from its tail, the groups in
-/// proportion). One file's active exports are first held to
-/// [`crate::budget::FILE_SHARE_PERCENT`] of the budget. `hot_paths`,
-/// `summary` and the folded `dependencies` / `dead_code` are kept whole.
+/// proportion), each folded `dependencies` entry (nearest first) and
+/// `dead_code` result (in listing order) — these two lose entries in
+/// proportion with the inactive names — and each `hot_paths` entry, which
+/// goes last (it repeats the most-called exports). One file's active exports
+/// are first held to [`crate::budget::FILE_SHARE_PERCENT`] of the budget.
+/// `budget` counts what each section lost and names the command per section
+/// that returns it; `over_budget` says the fixed part alone did not fit.
 fn module_overview_budgeted(
     full: &serde_json::Value,
     tokens: usize,
-    next: &crate::budget::NextCommand,
+    next: &SectionNext,
 ) -> serde_json::Value {
     use crate::budget::{self, Level};
     use std::cmp::Reverse;
-    let active = full["active_exports"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let groups = full["inactive_summary"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let names: Vec<Vec<serde_json::Value>> = groups
-        .iter()
-        .map(|g| g["names"].as_array().cloned().unwrap_or_default())
-        .collect();
+    let list = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
+    let active = list(&full["active_exports"]);
+    let groups = list(&full["inactive_summary"]);
+    let names: Vec<Vec<serde_json::Value>> = groups.iter().map(|g| list(&g["names"])).collect();
+    let hot = list(&full["hot_paths"]);
+    let deps_out = list(&full["dependencies"]["depends_on"]);
+    let deps_in = list(&full["dependencies"]["depended_by"]);
+    let deps: Vec<serde_json::Value> = deps_out.iter().chain(deps_in.iter()).cloned().collect();
+    let dead = list(&full["dead_code"]["results"]);
     let na = active.len();
     // Inactive names: unit index na + offset[g] + j.
     let mut offset = Vec::with_capacity(names.len());
@@ -515,6 +539,9 @@ fn module_overview_budgeted(
         offset.push(n);
         n += g.len();
     }
+    // Then the hot paths, the dependencies (outgoing first), the dead code.
+    let (oh, od, ox) = (n, n + hot.len(), n + hot.len() + deps.len());
+    let n = ox + dead.len();
     let skeleton = |e: &serde_json::Value| {
         let mut s = e.clone();
         if let Some(o) = s.as_object_mut() {
@@ -526,20 +553,30 @@ fn module_overview_budgeted(
     let size = |v: &serde_json::Value| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) + 1;
     let callers = |i: usize| active[i]["caller_count"].as_i64().unwrap_or(0);
     let active_order = budget::order_by_importance(na, |i| (callers(i), Reverse(i)));
-    let inactive_order = budget::interleave(
-        &names
-            .iter()
-            .enumerate()
-            .map(|(g, list)| {
-                budget::order_by_importance(list.len(), Reverse)
-                    .into_iter()
-                    .map(|j| offset[g] + j)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>(),
-    );
-    let mut order = inactive_order;
+    let shift = |v: Vec<usize>, by: usize| v.into_iter().map(|x| x + by).collect::<Vec<_>>();
+    let mut lower: Vec<Vec<usize>> = names
+        .iter()
+        .enumerate()
+        .map(|(g, list)| shift(budget::order_by_importance(list.len(), Reverse), offset[g]))
+        .collect();
+    let u = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap_or(0);
+    lower.push(shift(
+        budget::order_by_importance(deps.len(), |i| {
+            (
+                Reverse(u(&deps[i], "depth")),
+                u(&deps[i], "symbols"),
+                Reverse(i),
+            )
+        }),
+        od,
+    ));
+    lower.push(shift(budget::order_by_importance(dead.len(), Reverse), ox));
+    let mut order = budget::interleave(&lower);
     order.extend(active_order.iter().copied());
+    order.extend(shift(
+        budget::order_by_importance(hot.len(), |i| (u(&hot[i], "caller_count"), Reverse(i))),
+        oh,
+    ));
     let has_skeleton = |u: usize| u < na;
     let steps = budget::standard_steps(&order, has_skeleton);
 
@@ -569,7 +606,17 @@ fn module_overview_budgeted(
     }
     let past_share = initial.iter().filter(|l| **l != Level::Full).count();
 
-    let render = |levels: &[Level]| -> serde_json::Value {
+    let render = |levels: &[Level], over_budget: bool| -> serde_json::Value {
+        let keep = |items: &[serde_json::Value], off: usize| -> Vec<serde_json::Value> {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| levels[off + i] != Level::Dropped)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        let dropped =
+            |r: std::ops::Range<usize>| r.filter(|&x| levels[x] == Level::Dropped).count();
         let mut out = full.clone();
         out["active_exports"] = json!(active
             .iter()
@@ -586,12 +633,7 @@ fn module_overview_budgeted(
             .iter()
             .enumerate()
             .map(|(g, grp)| {
-                let kept: Vec<serde_json::Value> = names[g]
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| levels[offset[g] + j] != Level::Dropped)
-                    .map(|(_, v)| v.clone())
-                    .collect();
+                let kept = keep(&names[g], offset[g]);
                 let mut o = grp.clone();
                 let total = grp["count"].as_u64().unwrap_or(names[g].len() as u64) as usize;
                 names_omitted += names[g].len() - kept.len();
@@ -606,16 +648,35 @@ fn module_overview_budgeted(
             })
             .collect();
         out["inactive_summary"] = json!(new_groups);
-        let active_omitted = (0..na).filter(|&i| levels[i] == Level::Dropped).count();
+        if full.get("hot_paths").is_some() {
+            out["hot_paths"] = json!(keep(&hot, oh));
+        }
+        if full["dependencies"].is_object() {
+            out["dependencies"]["depends_on"] = json!(keep(&deps_out, od));
+            out["dependencies"]["depended_by"] = json!(keep(&deps_in, od + deps_out.len()));
+        }
+        if full["dead_code"].is_object() {
+            out["dead_code"]["results"] = json!(keep(&dead, ox));
+        }
+        let active_omitted = dropped(0..na);
         let short = (0..na).filter(|&i| levels[i] == Level::Skeleton).count();
-        if active_omitted + names_omitted + short > 0 {
+        let hot_omitted = dropped(oh..od);
+        let deps_omitted = dropped(od..ox);
+        let dead_omitted = dropped(ox..n);
+        let overview_cut = active_omitted + names_omitted + short + hot_omitted > 0;
+        if overview_cut || deps_omitted + dead_omitted > 0 || over_budget {
             let mut b = json!({ "max_tokens": tokens });
             let mut omitted = serde_json::Map::new();
-            if active_omitted > 0 {
-                omitted.insert("active_exports".into(), json!(active_omitted));
-            }
-            if names_omitted > 0 {
-                omitted.insert("inactive_names".into(), json!(names_omitted));
+            for (k, c) in [
+                ("active_exports", active_omitted),
+                ("inactive_names", names_omitted),
+                ("hot_paths", hot_omitted),
+                ("dependencies", deps_omitted),
+                ("dead_code", dead_omitted),
+            ] {
+                if c > 0 {
+                    omitted.insert(k.into(), json!(c));
+                }
             }
             if !omitted.is_empty() {
                 b["omitted"] = serde_json::Value::Object(omitted);
@@ -626,15 +687,33 @@ fn module_overview_budgeted(
             if past_share > 0 {
                 b["cut_for_file_share"] = json!(past_share);
             }
-            b["next"] = json!(next.to_string());
+            if over_budget {
+                b["over_budget"] = json!(true);
+            }
+            let mut cmds = Vec::new();
+            if overview_cut || deps_omitted + dead_omitted == 0 {
+                cmds.push(next.overview.to_string());
+            }
+            if deps_omitted > 0 {
+                cmds.push(next.dependencies.to_string());
+            }
+            if dead_omitted > 0 {
+                cmds.push(next.dead_code.to_string());
+            }
+            b["next"] = json!(cmds.join("; "));
             out["budget"] = b;
         }
         out
     };
-    budget::fit(&initial, &steps, budget::budget_bytes(tokens), |levels| {
-        let v = render(levels);
+    let fitted = budget::fit(&initial, &steps, budget::budget_bytes(tokens), |levels| {
+        let v = render(levels, false);
         let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
         (v, len)
-    })
-    .output
+    });
+    if fitted.over_budget {
+        // Even with every unit left out the fixed part is larger than asked:
+        // say so, rather than pass as sized.
+        return render(&fitted.levels, true);
+    }
+    fitted.output
 }
