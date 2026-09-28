@@ -338,6 +338,24 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
 const MAX_FOLLOWUP_FILES = 64;
 
 /**
+ * What a report leaves behind (D#163): the `stop_check` record — for every
+ * report the model is shown, the one made only of the "more changed, callers
+ * not checked" line included — and the follow-up to judge at the next Stop,
+ * only when the report named caller files. `callers` counts every caller file
+ * the report found, the ones past the text's per-symbol cap included.
+ * @param {{lines:string[], state:{lastStopAt:number}, symbols?:number, files?:string[]}} report
+ * @returns {{check: object|null, pending: {at:number, files:string[]}|null}}
+ */
+function reportRecords(report) {
+  if (!report.lines.length) return { check: null, pending: null };
+  const files = report.files || [];
+  return {
+    check: { hook: 'stop', action: 'stop_check', symbols: report.symbols || 0, callers: files.length },
+    pending: files.length ? { at: report.state.lastStopAt, files: files.slice(0, MAX_FOLLOWUP_FILES) } : null,
+  };
+}
+
+/**
  * Whether a report was acted on: a caller file it listed was edited after it —
  * an Edit logged since `pending.at`, or an mtime at or after it (Write, `sed
  * -i`, formatters; the same reading as "touched this turn"). Judged at the
@@ -459,11 +477,9 @@ function runMain() {
       mtimeMs,
     });
   }
-  const now = report.state.lastStopAt;
-  if (report.lines.length > 0 && report.files && report.files.length > 0) {
-    recordRecommendation(root, { hook: 'stop', action: 'stop_check', symbols: report.symbols, callers: report.files.length });
-    report.state.pending = { at: now, files: report.files.slice(0, MAX_FOLLOWUP_FILES) };
-  }
+  const rec = reportRecords(report);
+  if (rec.check) recordRecommendation(root, rec.check);
+  if (rec.pending) report.state.pending = rec.pending;
   sessionEdits.writeStopState(root, input.session_id, report.state);
 
   const text = formatStopContext(report.lines);
@@ -476,5 +492,5 @@ if (require.main === module) runMain();
 
 module.exports = {
   extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
-  followUpOf, MAX_SYMBOLS_CHECKED, MAX_CALLERS_LISTED,
+  followUpOf, reportRecords, MAX_SYMBOLS_CHECKED, MAX_CALLERS_LISTED, MAX_FOLLOWUP_FILES,
 };

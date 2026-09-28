@@ -149,9 +149,13 @@ test('e2e: a delivered context is recorded once with its agent type; a silent ru
   assert.equal(records().length, 1, 'a silenced run delivers nothing and records nothing');
 
   // The agent type is harness input: anything but a plain name is left out.
-  assert.equal(run(sb, { ...payload, agent_type: 'x\n{"hook":"grep"}' }).status, 0);
-  const last = records().at(-1);
-  assert.deepEqual([last.hook, last.action, 'agent' in last], ['subagent', 'subagent_context', false]);
+  for (const junk of ['x\n{"hook":"grep"}', 'a'.repeat(65), 'two words']) {
+    assert.equal(run(sb, { ...payload, agent_type: junk }).status, 0);
+    const last = records().at(-1);
+    assert.deepEqual([last.hook, last.action, 'agent' in last], ['subagent', 'subagent_context', false], junk);
+  }
+  assert.equal(run(sb, { ...payload, agent_type: 'code-graph-mcp:code-explorer' }).status, 0);
+  assert.equal(records().at(-1).agent, 'code-graph-mcp:code-explorer', 'a plugin-scoped name is a plain name');
 });
 
 test('e2e: silent with no index, with a failing health check, and under CODE_GRAPH_QUIET_HOOKS=1', { skip: posixOnly }, (t) => {

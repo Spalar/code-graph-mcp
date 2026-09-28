@@ -526,7 +526,7 @@ fn render_stats_text(
     // D#163 — the two P1 #3 hooks. Printed only once either has fired.
     if recs.stop_checks > 0 || recs.stop_followups > 0 {
         sout!(
-            "Stop check: {} report(s) of callers left behind; {} of {} followed by an edit to a listed caller file",
+            "Stop check: {} report(s) of callers left behind; {} of {} followed by a change to a listed caller file",
             recs.stop_checks,
             recs.stop_adopted,
             recs.stop_followups

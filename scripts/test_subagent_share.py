@@ -21,6 +21,14 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(ss.classify_bash("LC_ALL=C rg foo | head -5"), "search")
         self.assertEqual(ss.classify_bash("cargo test && echo ok"), None)
         self.assertEqual(ss.classify_bash("git log -- code-graph-mcp.md"), None, "a file name is not the command")
+        # Only the command word counts: a repo directory named code-graph-mcp is not a call.
+        self.assertEqual(ss.classify_bash("cd /home/u/code-graph-mcp && grep -rn foo src/"), "search")
+        self.assertEqual(ss.classify_bash("git -C /home/u/code-graph-mcp log --oneline"), None)
+        self.assertEqual(ss.classify_bash("cargo run --bin code-graph-mcp -- search x"), None)
+        self.assertEqual(ss.classify_bash("ls /home/u/code-graph-mcp"), "search")
+        self.assertEqual(ss.classify_bash("timeout 30 code-graph-mcp impact f | head -5"), "cg")
+        self.assertEqual(ss.classify_bash("CODE_GRAPH_QUIET=1 npx @sdsrs/code-graph show f"), "cg")
+        self.assertEqual(ss.classify_bash("git -C repo grep -n foo"), "search")
 
     def test_tools(self):
         self.assertEqual(ss.classify_tool("Grep", {}), "search")
@@ -38,7 +46,7 @@ class CollectTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def agent(self, name, atype, records, cwd=None, ts="2026-09-28T17:00:00Z", hook=None):
+    def agent(self, name, atype, records, cwd=None, ts="2026-09-28T17:00:00Z", hook=None, meta=None):
         d = os.path.join(self.projects, "-repo", "sess", "subagents")
         os.makedirs(d, exist_ok=True)
         head = {"type": "user", "cwd": cwd or self.repo, "timestamp": ts, "message": {"content": "go"}}
@@ -48,7 +56,7 @@ class CollectTest(unittest.TestCase):
         with open(os.path.join(d, f"agent-{name}.jsonl"), "w") as f:
             f.write("\n".join(json.dumps(r) for r in lines + records) + "\n")
         with open(os.path.join(d, f"agent-{name}.meta.json"), "w") as f:
-            json.dump({"agentType": atype}, f)
+            json.dump(meta or {"agentType": atype}, f)
 
     def test_groups_by_type_and_delivery(self):
         facts = '{"hookSpecificOutput":{"additionalContext":"This repository has a code-graph AST index of 9 files."}}'
@@ -62,6 +70,14 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(dict(g[("Explore", False)]), {"subagents": 2, "used_cg": 0, "cg": 0, "search": 3})
         self.assertEqual(g[("Plan", False)]["subagents"], 1)
         self.assertNotIn(("Plan", False), ss.collect(self.repo, self.projects, since="2026-09-28"))
+
+    def test_a_named_teammate_is_not_grouped_under_its_name(self):
+        self.agent("f", None, [tool("Grep")], meta={"agentType": "rev-1", "name": "rev-1"})
+        self.agent("g", None, [tool("Grep")], meta={"agentType": "rev-2", "name": "rev-2", "customAgentType": "reviewer"})
+        g = ss.collect(self.repo, self.projects)
+        self.assertEqual(g[("(named teammate)", False)]["subagents"], 1)
+        self.assertEqual(g[("reviewer", False)]["subagents"], 1)
+        self.assertNotIn(("rev-1", False), g)
 
 
 if __name__ == "__main__":

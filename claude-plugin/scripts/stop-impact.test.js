@@ -13,6 +13,7 @@ delete process.env.CLAUDE_CONFIG_DIR;
 
 const {
   extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext, followUpOf,
+  reportRecords, MAX_FOLLOWUP_FILES,
 } = require('./stop-impact');
 
 // --- extractSignatures ------------------------------------------------------
@@ -388,6 +389,48 @@ test('followUpOf: a listed file edited after the report is adoption; earlier or 
     { adopted: false, listed: 2, edited: 0 }, 'an edit before the report, or of a file it did not list');
   assert.deepEqual(followUpOf(pending, [], mtimes({ 'src/c.rs': 9000 })),
     { adopted: true, listed: 2, edited: 1 }, 'an mtime at the report counts (Write, sed -i)');
+});
+
+test('report symbols/files: newly reported symbols only, every untouched caller file, none touched this turn', () => {
+  const refs = [{ file: 'src/b.rs', line: 5, name: 'x' }, { file: 'src/c.rs', line: 2, name: 'y' },
+    { file: 'src/d.rs', line: 9, name: 'z' }];
+  const w = world({ refs, mtimes: { 'src/d.rs': 6000 } }); // d.rs changed inside this turn
+  const r = computeStopReport({ edits: EDIT_A, state: { lastStopAt: null, reported: ['src/q.rs#other'] }, now: 9000, ...w });
+  assert.equal(r.lines.length, 1);
+  assert.equal(r.symbols, 1, 'a symbol reported by an earlier Stop is not counted again');
+  assert.deepEqual(r.files, ['src/b.rs', 'src/c.rs'], 'one entry per caller file; d.rs was touched this turn');
+});
+
+test('reportRecords: every shown report is recorded; only one naming caller files leaves a follow-up', () => {
+  assert.deepEqual(reportRecords({ lines: [], state: { lastStopAt: 9 } }), { check: null, pending: null });
+  const onlyUnchecked = reportRecords({ lines: ['  1 more changed, callers not checked: g() in a.rs'],
+    state: { lastStopAt: 9 }, symbols: 0, files: [] });
+  assert.deepEqual(onlyUnchecked, { check: { hook: 'stop', action: 'stop_check', symbols: 0, callers: 0 }, pending: null });
+  const many = Array.from({ length: MAX_FOLLOWUP_FILES + 6 }, (_, i) => `src/m${i}.rs`);
+  const r = reportRecords({ lines: ['x'], state: { lastStopAt: 9 }, symbols: 2, files: many });
+  assert.deepEqual(r.check, { hook: 'stop', action: 'stop_check', symbols: 2, callers: MAX_FOLLOWUP_FILES + 6 });
+  assert.equal(r.pending.at, 9);
+  assert.equal(r.pending.files.length, MAX_FOLLOWUP_FILES, 'the follow-up keeps a bounded list');
+});
+
+test('e2e: adoption is read from the edit log alone and from the mtime alone', { skip: e2eSkip }, (t) => {
+  const past = new Date(Date.now() - 3600 * 1000);
+  // Log only: an Edit is logged, then the file's mtime is put back before the report.
+  const a = sandboxRepo(t);
+  edit(a, 's', 'src/a.rs', 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  assert.ok(stop(a, 's'));
+  edit(a, 's', 'src/b.rs', '    compute(v)', '    compute(v, 1)');
+  fs.utimesSync(path.join(a.repo, 'src/b.rs'), past, past);
+  stop(a, 's', { stop_hook_active: true });
+  assert.deepEqual(stopRecords(a).map((r) => [r.action, r.adopted]), [['stop_check', undefined], ['stop_followup', true]]);
+  // Mtime only: the file is written with no Edit (Write, sed -i).
+  const b = sandboxRepo(t);
+  edit(b, 's', 'src/a.rs', 'pub fn compute(x: i32) -> i32 {', 'pub fn compute(x: i32, y: i32) -> i32 {');
+  assert.ok(stop(b, 's'));
+  const bf = path.join(b.repo, 'src/b.rs');
+  fs.writeFileSync(bf, fs.readFileSync(bf, 'utf8').replace('compute(v)', 'compute(v, 1)'));
+  stop(b, 's', { stop_hook_active: true });
+  assert.deepEqual(stopRecords(b).map((r) => [r.action, r.adopted]), [['stop_check', undefined], ['stop_followup', true]]);
 });
 
 test('e2e: caller also edited in the same turn → silent', { skip: e2eSkip }, (t) => {

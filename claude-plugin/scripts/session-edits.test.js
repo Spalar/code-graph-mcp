@@ -107,6 +107,24 @@ test('stop state: missing/corrupt reads as empty; write is atomic and leaves no 
   assert.deepEqual(names.filter((n) => n.endsWith('.tmp')), []);
 });
 
+test('stop state: a pending follow-up survives a round trip; a malformed one is dropped', (t) => {
+  const sb = sandbox(t);
+  const got = inChild(sb, `
+    const read = (pending) => {
+      se.writeStopState('/p', 'S', { lastStopAt: 7, reported: [], pending });
+      return se.readStopState('/p', 'S');
+    };
+    return [
+      read({ at: 9, files: ['src/b.rs', 3, 'src/c.rs'] }),
+      read({ at: 'x', files: ['src/b.rs'] }),
+      read({ at: 9, files: 'src/b.rs' }),
+    ];
+  `);
+  assert.deepEqual(got[0], { lastStopAt: 7, reported: [], pending: { at: 9, files: ['src/b.rs', 'src/c.rs'] } });
+  assert.deepEqual(got[1], { lastStopAt: 7, reported: [] }, 'a non-numeric time is no follow-up');
+  assert.deepEqual(got[2], { lastStopAt: 7, reported: [] }, 'a non-list of files is no follow-up');
+});
+
 // The writer side, through the real hook: pre-edit-guide logs every Edit
 // (file-only first, then with the symbol it extracted), before its cooldown
 // and whether or not the impact query answers. The fake binary fails every

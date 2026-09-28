@@ -122,20 +122,29 @@ edit matches a rebuild of the same tree edge for edge.
 ### The Stop and SubagentStart hooks record what they did
 
 Both hooks added in 0.162.0 wrote nothing to `.code-graph/recommendations.jsonl`,
-so their roadmap measures had no data. The Stop check now records each report
-and, at the next Stop — the end of the continuation the report starts, or of
-the next turn — whether a caller file it listed was edited after it.
-SubagentStart records each delivery with the agent type. `code-graph-mcp
-stats` prints both once either has fired (`Stop check: …`, `Subagent context:
-…`), and `stats --json` carries `stop_checks`, `stop_followups`,
-`stop_adopted` and `subagent_contexts`. The lines leave the re-search funnel
-exactly as it was. Nothing is recorded under `CODE_GRAPH_QUIET_HOOKS=1` or with
+so their roadmap measures had no data. The Stop check now records every report
+it shows, and, at the next Stop — the end of the continuation the report
+starts, or of the next turn — whether any caller file it found (the ones past
+the text's eight per symbol included) changed after it: an Edit logged by this
+session, or a newer modification time. Any change counts, one from a
+formatter, a checkout or another session too; a fix made elsewhere (the
+signature reverted, the caller moved to another file) does not. SubagentStart
+records each delivery, with the agent type when it is a plain name. In the
+hook section of `code-graph-mcp stats`, which needs MCP usage data, each prints
+a line once it has fired (`Stop check: …`, `Subagent context: …`); `stats
+--json` always carries `stop_checks`, `stop_followups`, `stop_adopted` and
+`subagent_contexts`. The lines leave the re-search funnel exactly as it was.
+Nothing is recorded under `CODE_GRAPH_QUIET_HOOKS=1` or with
 `.code-graph/.no-metrics`.
 
 Whether a subagent then used the index is in its transcript, not in that file:
 `scripts/subagent_share.py [PROJECT]` reads the subagent transcripts Claude
-Code keeps beside a session and prints each agent type's share of code-search
-calls that went through code-graph, split by whether the hook delivered.
+Code keeps beside a session and prints, per agent type and by whether the hook
+delivered, the share of code-search calls (Grep, Glob, Read, and Bash `grep` /
+`rg` / `find` / `cat` / … / `git grep`) that ran `code-graph-mcp` or a
+code-graph MCP tool. A named teammate's transcript records its name, not its
+type, so those share one row. On this repository before the hook existed,
+general-purpose subagents sent 111 of 4,162 such calls to code-graph (2.7%).
 
 **Not covered:** a method whose Rust impl is written inside a macro
 (`cfg_rt! { … }`, D#149) is still no node, so a typed receiver of a type

@@ -4822,6 +4822,65 @@ fn test_cli_stats_recommendations_dark_when_absent() {
 }
 
 #[test]
+fn test_cli_stats_reports_the_stop_and_subagent_hook_records() {
+    // D#163: the two P1 #3 hooks' records reach both outputs, adoption is
+    // counted only from an explicit `adopted: true`, and neither kind is a
+    // recommendation.
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::write(
+        cg.join("usage.jsonl"),
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cg.join("recommendations.jsonl"),
+        "{\"hook\":\"stop\",\"action\":\"stop_check\",\"symbols\":1,\"callers\":2}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_followup\",\"adopted\":true,\"listed\":2,\"edited\":1}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_check\",\"symbols\":1,\"callers\":1}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_followup\",\"adopted\":false,\"listed\":1,\"edited\":0}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_followup\",\"listed\":1}\n\
+         {\"hook\":\"subagent\",\"action\":\"subagent_context\",\"agent\":\"Explore\"}\n",
+    )
+    .unwrap();
+    let (stdout, _, code) = run_cli(&project, &["stats"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains(
+            "Stop check: 2 report(s) of callers left behind; 1 of 3 followed by a change to a listed caller file"
+        ),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Subagent context: index facts handed to 1 subagent(s) at SubagentStart"),
+        "got: {stdout}"
+    );
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    let r = &v["recommendations"];
+    assert_eq!(
+        (
+            &r["stop_checks"],
+            &r["stop_followups"],
+            &r["stop_adopted"],
+            &r["subagent_contexts"]
+        ),
+        (
+            &serde_json::json!(2),
+            &serde_json::json!(3),
+            &serde_json::json!(1),
+            &serde_json::json!(1)
+        ),
+        "got: {jstdout}"
+    );
+    assert_eq!(
+        r["total"], 0,
+        "none of these is a recommendation: {jstdout}"
+    );
+}
+
+#[test]
 fn test_cli_stats_recommendations_empty_distinct_from_absent() {
     let project = setup_indexed_project();
     let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);

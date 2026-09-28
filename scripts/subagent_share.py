@@ -30,24 +30,54 @@ import sys
 from collections import defaultdict
 
 SEARCH_TOOLS = {"Grep", "Glob", "Read"}
-# First word of a Bash command (or of any `|` / `&&` / `;` stage) that reads or
+# Command word of a Bash stage (`|` / `&&` / `;` separated) that reads or
 # searches code.
 SEARCH_COMMANDS = {"grep", "rg", "egrep", "fgrep", "find", "fd", "cat", "head", "tail", "sed", "awk", "ls", "tree", "ag"}
-CG_BASH = re.compile(r"(?:^|[\s/;&|(])code-graph-mcp(?:\s|$)")
+# Words that run the next word as the command.
+WRAPPERS = {"timeout", "time", "env", "npx", "nice", "command", "exec"}
 HOOK_MARK = "code-graph AST index"
 
 
+def command_words(stage):
+    """A stage's words from its command word on: environment assignments and
+    wrappers (with their options and a timeout's duration) are skipped."""
+    words = stage.strip().split()
+    i = 0
+    while i < len(words):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i]):
+            i += 1
+        elif os.path.basename(words[i]) in WRAPPERS:
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or re.match(r"^[0-9.]+[smhd]?$", words[i])):
+                i += 1
+        else:
+            break
+    return words[i:]
+
+
+def git_subcommand(words):
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in ("-C", "-c") else 1
+    return words[i] if i < len(words) else None
+
+
 def classify_bash(command):
-    """'cg', 'search' or None for one Bash command."""
-    if CG_BASH.search(command):
-        return "cg"
+    """'cg' when a stage runs code-graph-mcp, else 'search' when a stage runs a
+    search command, else None. Only the command word counts: a path or a file
+    named code-graph-mcp (`cd ~/code-graph-mcp`, `cargo run --bin
+    code-graph-mcp`) is not a code-graph call."""
+    kinds = set()
     for stage in re.split(r"\|\||&&|[|;\n]", command):
-        words = stage.strip().split()
-        while words and "=" in words[0] and not words[0].startswith("="):
-            words = words[1:]  # FOO=bar cmd
-        if words and os.path.basename(words[0]) in SEARCH_COMMANDS:
-            return "search"
-    return None
+        words = command_words(stage)
+        if not words:
+            continue
+        head = os.path.basename(words[0])
+        if head == "code-graph-mcp" or words[0] == "@sdsrs/code-graph":
+            return "cg"
+        if head in SEARCH_COMMANDS or (head == "git" and git_subcommand(words) == "grep"):
+            kinds.add("search")
+    return "search" if kinds else None
 
 
 def classify_tool(name, tool_input):
@@ -88,12 +118,20 @@ def read_subagent(path):
 
 
 def agent_type(jsonl_path):
+    """The subagent's type from its .meta.json. A named teammate's `agentType`
+    holds its NAME; its type is `customAgentType` when recorded, and is
+    otherwise unknown, so all of them share one row."""
     meta = jsonl_path[: -len(".jsonl")] + ".meta.json"
     try:
         with open(meta, encoding="utf-8") as f:
-            return json.load(f).get("agentType") or "unknown"
+            m = json.load(f)
     except (OSError, ValueError):
         return "unknown"
+    if m.get("customAgentType"):
+        return m["customAgentType"]
+    if m.get("name") and m.get("agentType") == m.get("name"):
+        return "(named teammate)"
+    return m.get("agentType") or "unknown"
 
 
 def collect(project, projects_dir, since=None):
