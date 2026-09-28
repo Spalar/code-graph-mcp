@@ -8051,12 +8051,13 @@ fn d132_workspace() -> Vec<(&'static str, &'static str)> {
         (
             "mycrate/src/lib.rs",
             "pub mod sync;\npub mod time;\nmod util;\nmod a;\nmod a2;\nmod a3;\nmod a4;\nmod a5;\n\
-             mod a6;\nmod b;\nmod blk;\nmod re;\nmod m;\n",
+             mod a6;\nmod a7;\nmod b;\nmod blk;\nmod re;\nmod m;\npub mod deep;\npub mod shallow;\n\
+             mod mem;\n",
         ),
         (
             "mycrate/src/sync/mod.rs",
             "mod mutex;\npub use mutex::Mutex;\npub mod oneshot;\npub mod broadcast;\npub mod batch;\n\
-             pub mod semaphore;\n",
+             pub mod semaphore;\npub fn new(v: u8) {}\n",
         ),
         (
             "mycrate/src/sync/mutex.rs",
@@ -8071,10 +8072,13 @@ fn d132_workspace() -> Vec<(&'static str, &'static str)> {
             "pub struct Instant;\nimpl Instant {\n    pub fn now() -> Instant { Instant }\n}\n",
         ),
         ("mycrate/src/util.rs", "pub fn tempdir() {}\n"),
+        // A project file named like the std module a `use` names.
+        ("mycrate/src/mem.rs", "pub fn swap(a: u8, b: u8) {}\n"),
         (
             "mycrate/src/a.rs",
-            "use std::sync::Mutex;\nuse std::time::Instant;\n\
-             fn std_mutex() {\n    Mutex::new(1);\n}\nfn std_instant() {\n    Instant::now();\n}\n",
+            "use std::sync::Mutex;\nuse std::time::Instant;\nuse std::mem::swap;\n\
+             fn std_mutex() {\n    Mutex::new(1);\n}\nfn std_instant() {\n    Instant::now();\n}\n\
+             fn std_swap() {\n    swap(1, 2);\n}\n",
         ),
         (
             "mycrate/src/a2.rs",
@@ -8098,6 +8102,20 @@ fn d132_workspace() -> Vec<(&'static str, &'static str)> {
             "use crate::sync::batch::Semaphore;\nfn glob_block() {\n    use crate::sync::semaphore::*;\n    \
              Semaphore::new(1);\n}\n",
         ),
+        (
+            "mycrate/src/a7.rs",
+            "use crate::deep::Thing;\nfn rank() {\n    Thing::make(1);\n}\n",
+        ),
+        ("mycrate/src/deep/mod.rs", "mod thing;\npub use thing::Thing;\n"),
+        (
+            "mycrate/src/deep/thing.rs",
+            "pub struct Thing;\nimpl Thing {\n    pub fn make(n: u8) {}\n}\n",
+        ),
+        (
+            "mycrate/src/shallow/thing.rs",
+            "pub struct Thing;\nimpl Thing {\n    pub fn make(n: u8) {}\n}\n",
+        ),
+        ("mycrate/src/shallow/mod.rs", "mod thing;\n"),
         (
             "mycrate/src/b.rs",
             "use crate::sync::Mutex;\nfn own_file_level() {\n    Mutex::new(1);\n}\n\
@@ -8166,6 +8184,7 @@ fn test_rust_calls_resolve_through_use() {
         // Foreign roots bind no project item.
         ("mycrate/src/a.rs.std_mutex", &[], &[MUTEX_NEW]),
         ("mycrate/src/a.rs.std_instant", &[], &["mycrate/src/time.rs.now"]),
+        ("mycrate/src/a.rs.std_swap", &[], &["mycrate/src/mem.rs.swap"]),
         ("mycrate/src/a2.rs.std_module", &[], &[MUTEX_NEW]),
         ("mycrate/src/blk.rs.block_use", &[], &[MUTEX_NEW]),
         ("mycrate/src/re.rs.reexport_std", &[], &[MUTEX_NEW]),
@@ -8175,6 +8194,8 @@ fn test_rust_calls_resolve_through_use() {
         ("mycrate/src/a3.rs.own_module", &[MUTEX_NEW], &[]),
         ("mycrate/src/a4.rs.own_semaphore", &["mycrate/src/sync/batch.rs.new"], &["mycrate/src/sync/semaphore.rs.new"]),
         ("mycrate/src/a5.rs.renamed", &[ONESHOT], &[BROADCAST]),
+        // A re-export: the item whose module shares the most of the path.
+        ("mycrate/src/a7.rs.rank", &["mycrate/src/deep/thing.rs.make"], &["mycrate/src/shallow/thing.rs.make"]),
         // Scope: a `use` binds in its own module or block.
         ("mycrate/src/b.rs.own_file_level", &[MUTEX_NEW], &[]),
         ("mycrate/src/b.rs.std_in_tests", &[], &[MUTEX_NEW]),
@@ -8182,7 +8203,9 @@ fn test_rust_calls_resolve_through_use() {
         // Another package of the workspace, by its crate name.
         ("other/src/lib.rs.ws_bare", &[ONESHOT], &[BROADCAST, "other/src/chan.rs.channel"]),
         ("other/src/lib.rs.ws_module", &[ONESHOT], &[BROADCAST, "other/src/chan.rs.channel"]),
-        ("other/src/lib.rs.ws_type", &[MUTEX_NEW], &[]),
+        ("other/src/lib.rs.ws_type", &[MUTEX_NEW], &[
+            "mycrate/src/sync/mod.rs.new", "mycrate/src/sync/batch.rs.new", "mycrate/src/sync/semaphore.rs.new",
+        ]),
         ("other/src/lib.rs.via_extern_alias", &[ONESHOT], &[BROADCAST, "other/src/chan.rs.channel"]),
         ("mycrate/tests/it.rs.it_type", &[MUTEX_NEW], &[]),
         // A test crate's module in a subdirectory.
@@ -8213,6 +8236,25 @@ fn test_rust_calls_resolve_through_use() {
         }
         if want.is_empty() && !calls.is_empty() {
             bad.push(format!("{caller}: a foreign item's call bound {calls:?}"));
+        }
+    }
+    // The import of a crate-name path binds the file the path names.
+    for (edge, want) in [
+        (
+            "other/src/lib.rs.<module> --imports--> mycrate/src/sync/oneshot.rs.channel",
+            true,
+        ),
+        (
+            "other/src/lib.rs.<module> --imports--> other/src/chan.rs.channel",
+            false,
+        ),
+        (
+            "other/src/lib.rs.<module> --imports--> mycrate/src/sync/broadcast.rs.channel",
+            false,
+        ),
+    ] {
+        if edges.iter().any(|e| e == edge) != want {
+            bad.push(format!("import {edge}: want {want}"));
         }
     }
     assert!(bad.is_empty(), "{bad:#?}");
@@ -8295,7 +8337,14 @@ fn test_rust_use_anchoring_incremental_matches_rebuild() {
             ),
             (
                 "other/src/lib.rs",
-                "use my_crate::wa::widget;\nfn go() {\n    widget();\n}\n",
+                "mod own;\nmod modpath;\nuse my_crate::wa::widget;\nfn go() {\n    widget();\n}\n",
+            ),
+            ("other/src/own.rs", "pub fn widget() {}\n"),
+            // No import names `widget` here: only the call's own resolution
+            // (the pending buffer, the re-export fan-out) can follow it.
+            (
+                "other/src/modpath.rs",
+                "use my_crate::wa;\nfn go_module() {\n    wa::widget();\n}\n",
             ),
         ]
     }
@@ -8305,6 +8354,9 @@ fn test_rust_use_anchoring_incremental_matches_rebuild() {
     const WC_WITHOUT: &str = "pub fn unrelated() {}\n";
     let go_to = |edges: &[String], file: &str| {
         edges.contains(&format!("other/src/lib.rs.go --calls--> {file}.widget"))
+            && edges.contains(&format!(
+                "other/src/modpath.rs.go_module --calls--> {file}.widget"
+            ))
     };
 
     // The named module gains the item: the call moves off the other module's.
@@ -8322,7 +8374,9 @@ fn test_rust_use_anchoring_incremental_matches_rebuild() {
         &[("mycrate/src/wa.rs", Some(WA_WITHOUT))],
     );
     assert!(go_to(&want, "mycrate/src/wc.rs"), "{want:#?}");
-    // No such item in the crate yet, then the named module gains it.
+    // No such item in the crate yet (only another package's), then the named
+    // module gains it: through the import, and through a module path the
+    // import names no item for (`wa::widget()`: only the pending buffer).
     let want = assert_all_edges_match_rebuild(
         &tree(WA_WITHOUT, WC_WITHOUT),
         &[("mycrate/src/wa.rs", Some(WA_WITH))],
