@@ -378,6 +378,14 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         seen.len()
     };
 
+    // No production caller: disclose where the name is dispatched dynamically
+    // (P1 #4). Not folded into any count above — these are not edges.
+    let boundaries = if prod_callers.is_empty() {
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+    } else {
+        None
+    };
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
@@ -421,6 +429,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         if let Some(note) = caller_set.truncation_note() {
             result["callers_truncated"] = serde_json::json!(true);
             result["callers_truncated_note"] = serde_json::json!(note);
+        }
+        if let Some(b) = &boundaries {
+            result["boundaries"] = b.to_json();
         }
         fresh_outcome.attach_partial(&mut result);
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
@@ -486,6 +497,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 indent, c.name, c.node_type, c.file_path
             )?;
         }
+    }
+    if let Some(b) = &boundaries {
+        b.render_text(&mut stdout, "  ")?;
     }
 
     Ok(())

@@ -61,6 +61,23 @@ pub(super) fn attach_suppressed_ambiguous(
 }
 
 impl McpServer {
+    /// `boundaries` for an empty caller result (P1 #4): the dynamic-dispatch
+    /// sites naming `symbol`, shared by `get_call_graph`, `find_references` and
+    /// `get_ast_node include_impact`. `None` when it does not apply (no project
+    /// root, not a function, not an identifier).
+    pub(in crate::mcp::server) fn empty_result_boundaries(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(root) = self.project_root.as_deref() else {
+            return Ok(None);
+        };
+        Ok(
+            crate::graph::boundaries::for_empty_result(self.db.conn(), root, symbol)?
+                .map(|b| b.to_json()),
+        )
+    }
+
     pub(in crate::mcp::server) fn tool_get_call_graph(
         &self,
         args: &serde_json::Value,
@@ -404,6 +421,11 @@ impl McpServer {
             attach_test_filtered(&mut rollup);
             attach_truncation_flags(&mut rollup, results);
             attach_suppressed_ambiguous(&mut rollup, results);
+            if direction != "callees" && caller_total == 0 {
+                if let Some(b) = self.empty_result_boundaries(function_name)? {
+                    rollup["boundaries"] = b;
+                }
+            }
             return Ok(rollup);
         }
 
@@ -425,6 +447,13 @@ impl McpServer {
         attach_test_filtered(&mut result);
         attach_truncation_flags(&mut result, results);
         attach_suppressed_ambiguous(&mut result, results);
+        // Empty caller side: disclose dynamic-dispatch sites, never as edges.
+        // Both response shapes owe it (the rollup arm above attaches the same).
+        if direction != "callees" && caller_nodes.is_empty() {
+            if let Some(b) = self.empty_result_boundaries(function_name)? {
+                result["boundaries"] = b;
+            }
+        }
         Ok(result)
     }
 }

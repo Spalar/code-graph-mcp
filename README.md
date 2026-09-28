@@ -151,6 +151,14 @@ known boundaries, not bugs to report:
   `impact` reports separately as `value reference(s) — callbacks / fn-pointers /
   type positions`. Together with the row above, this is why `include_dead`
   results are candidates to verify rather than a verdict.
+- **Dispatch by name.** A function reached through a string key, a reflection
+  call or an event name (`handlers["save"]`, `getattr(obj, "save")`,
+  `send(:save)`, `bus.on("save", …)`) has no edge. When `callgraph`, `impact`
+  or `refs` finds no caller for a function, the answer lists up to 5 lines
+  where the name appears in such a shape or is passed as a value (`boundaries`
+  in `--json` and MCP), and a `code-graph-mcp grep` that shows every
+  occurrence. It is a disclosure, not an edge, and a lexical one: a line it
+  does not list is not proof that nothing dispatches to the function.
 
 ## Architecture
 

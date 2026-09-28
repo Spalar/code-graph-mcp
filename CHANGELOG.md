@@ -220,6 +220,40 @@ pair lost, no edge removed on any of the three. Full index time, median of 5
 alternating runs: this repo 1.88 s → 1.89 s, hono 0.54 s → 0.55 s, express
 0.19 s → 0.18 s.
 
+### An empty caller list names the lines that dispatch by name
+
+`callgraph`, `impact` and `refs`, and MCP `get_call_graph`, `find_references`
+and `get_ast_node include_impact`, answering with no caller could not tell
+"nobody calls it" from "called through a string key". When the caller list
+shown is empty and the symbol is a function or method, the answer now lists the
+production lines where its name appears in a dynamic-dispatch shape: a
+reflection lookup (`getattr(o, "save")`, `send(:save)`, `getMethod("save")`,
+`dlsym(h, "save")`), an event or channel name (`on("save", …)`, `emit`,
+`invoke`), a string table key (`handlers["save"]`, `{"save": f}`,
+`'save' => …`), a Ruby symbol (`before_action :save`), or the function passed
+or stored as a value (`register(save)`, `.map(Self::save)`, `{ save, load }`,
+`run = save`, `save.bind(this)`). Text output adds a block after the result: up to 5
+`file:line  shape` lines, a count of the rest, and
+`code-graph-mcp grep -w -F <name>` to see every occurrence. `--json` and the
+MCP tools add a `boundaries` object (`total`, `sites`, `note`, `next`). When
+nothing matches, the block is one line (`(no dynamic-dispatch site names 'x')`)
+and the field is `{"sites":[],"total":0}`. No edge is added, and a non-empty
+answer is unchanged byte for byte.
+
+The scan reads comments and string contents as blank (a string counts only
+where it is the key), skips test files, and in a file that declares a local,
+parameter or pattern of the name reads that file's bare uses as the local's.
+The shape table is in `src/graph/boundaries/mod.rs`; 182 corpus rows over 14
+languages pin what counts and what does not. There is no block on a
+`--direction callees` query, on `refs --relation` other than `calls` or
+`references`, or for a symbol that is not a function.
+
+Measured on this repo, 20 interleaved runs each: an empty `callgraph` p50
+3.3 → 7.2 ms (`--direction callers` 17.9 → 21.8 ms), `refs` 2.3 → 6.2 ms,
+`impact` 2.6 → 6.5 ms; a non-empty `callgraph` 7.2 → 7.2 ms (40 runs). Of the
+functions with no caller, 68 of 120 on this repo now show at least one site,
+17 of 55 on express and 23 of 107 on hono.
+
 ### Not covered
 
 - A renamed import of a re-export (`import { a as b } from './index'` where
@@ -276,6 +310,14 @@ alternating runs: this repo 1.88 s → 1.89 s, hono 0.54 s → 0.55 s, express
   function really calls and cannot pick among the project's `path` methods.
 - A typed call that no method answers waits in the pending-call buffer and
   ages out after 50 runs, like any buffered call.
+- The dispatch-site scan is lexical. A local named like the function still
+  reads as a function reference where the scan sees no declaration of it (a
+  Java or C typed local `String url = …`, a TypeScript method parameter
+  followed by a return type), and so does a qualified property read
+  (`options.executionCtx`, `req.method` for a getter). A key computed at run
+  time (`obj[name]()`, `getattr(o, f"on_{x}")`) names nothing and is not
+  found; neither is a registration by decorator or annotation (`@app.route`),
+  an HTML inline handler, or a shell `trap`. Files over 2 MB are skipped.
 - Only `use` paths read a file's crate. `crate::run()` or `super::run()`
   written in the call itself resolves by name, as the glob item above says,
   and binds both roots' `run`. A `#[path]` or macro-made `mod` below the top

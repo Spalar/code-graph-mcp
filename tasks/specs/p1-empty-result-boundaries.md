@@ -1,6 +1,6 @@
 ---
-status: approved
-revision: 1
+status: implemented
+revision: 2
 ---
 
 # P1 #4 — an empty call result says where the static graph stops
@@ -47,6 +47,25 @@ through a shape we don't see".
 ## Open questions
 - Whether `refs` (floor-less by design) needs it too — decide by whether refs
   can return empty for a dynamically-dispatched symbol; default: yes, same helper.
+  Resolved r2: yes. `refs` returns empty for a symbol reached only through
+  `getattr(ctrl, "on_save")` (fixture in `tests/dispatch_boundaries.rs`), so
+  both `refs` surfaces use the same helper, gated to `--relation` all /
+  `calls` / `references`.
+
+## Decisions taken in implementation (r2)
+- Trigger: the caller list SHOWN is empty (after the test filter), the query
+  asks for callers (not `--direction callees`), and some definition of the
+  name is a function or method. Types and constants get no field.
+- Scan source: the indexed file list, read from disk (not FTS: `module` nodes
+  carry no `code_content`, so top-level registration tables are invisible to
+  FTS; not `rg`: the MCP surface has no ripgrep dependency). Test files and
+  languages without a shape table are skipped; files over 2 MB too.
+- A file that declares a local / parameter / pattern of the name has its bare
+  uses read as the local's (qualified uses still count).
+- Wording: `N dynamic-dispatch site(s) name 'x' (not graph edges):` / `(no
+  dynamic-dispatch site names 'x')`; JSON `boundaries {total, sites[≤5],
+  note, next}` or `{sites: [], total: 0}`.
 
 # Change log
 - r1 2026-09-28: created from the analysis doc; approved under the user's batch AUTH.
+- r2 2026-09-28: implemented (`src/graph/boundaries/`, `tests/dispatch_boundaries.rs`); open question resolved; implementation decisions recorded.

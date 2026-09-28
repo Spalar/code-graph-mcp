@@ -492,6 +492,20 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         outcome.disclose();
     }
 
+    // Empty answer to "who uses it": disclose the dynamic-dispatch sites that
+    // name it (P1 #4). Only for the relation filters a dispatch site could
+    // have satisfied; `--relation imports` coming back empty says nothing about
+    // dispatch.
+    let boundaries = if all_refs.is_empty()
+        && matches!(
+            relation_filter,
+            None | Some(crate::domain::REL_CALLS) | Some(crate::domain::REL_REFERENCES)
+        ) {
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+    } else {
+        None
+    };
+
     if json_mode {
         let items: Vec<serde_json::Value> = all_refs
             .iter()
@@ -537,6 +551,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         // 2026-08-02 MED-1.
         if conf_filtered > 0 {
             envelope["confidence_filtered"] = serde_json::json!(conf_filtered);
+        }
+        if let Some(b) = &boundaries {
+            envelope["boundaries"] = b.to_json();
         }
         outcome.attach_partial(&mut envelope);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -584,6 +601,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 "({} lower-confidence ref(s) hidden by --min-confidence)",
                 conf_filtered
             )?;
+        }
+        if let Some(b) = &boundaries {
+            b.render_text(&mut stdout, "  ")?;
         }
     }
 

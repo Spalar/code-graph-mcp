@@ -269,6 +269,20 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         (display, tests, test_callees)
     };
 
+    // An empty caller side cannot tell "nobody calls it" from "called through a
+    // string key / reflection / function value". Disclose the dynamic-dispatch
+    // sites that name it — never as edges, and only when the caller list shown
+    // is empty, so a non-empty answer is byte-identical (P1 #4).
+    let boundaries = if direction != "callees"
+        && !display_nodes
+            .iter()
+            .any(|n| n.depth > 0 && matches!(n.direction, crate::graph::query::Direction::Callers))
+    {
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+    } else {
+        None
+    };
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
@@ -315,6 +329,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         // The stderr note above is invisible under `--json 2>/dev/null`, and
         // this envelope is object-shaped, so it can carry the marker (parity
         // with ast-search/refs/trace/impact/report).
+        if let Some(b) = &boundaries {
+            output["boundaries"] = b.to_json();
+        }
         outcome.attach_partial(&mut output);
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
@@ -427,6 +444,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             "  ({} direct ambiguous by-name edge(s) hidden — use --min-confidence ambiguous to show)",
             result.suppressed_ambiguous,
         )?;
+    }
+    if let Some(b) = &boundaries {
+        b.render_text(&mut stdout, "  ")?;
     }
 
     Ok(())

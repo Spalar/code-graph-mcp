@@ -652,6 +652,13 @@ impl McpServer {
                 ambiguous_callers_excluded
             ));
         }
+        // No production caller: disclose where the name is dispatched
+        // dynamically (P1 #4), inside `impact` like the CLI's top-level field.
+        if cls.prod_callers.is_empty() {
+            if let Some(b) = self.empty_result_boundaries(symbol_name)? {
+                impact["boundaries"] = b;
+            }
+        }
         result["impact"] = impact;
         Ok(())
     }
