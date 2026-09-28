@@ -1722,6 +1722,23 @@ fn resolve_batch_relations(
             // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
             if rel.relation == REL_CALLS {
                 use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
+                // A receiver type narrows the pool by the owners of every
+                // candidate, which later batches may hold (D#112): decided in
+                // the deferred pass, against the whole pool.
+                if pf.language == "rust"
+                    && rel
+                        .metadata
+                        .as_deref()
+                        .is_some_and(|m| m.contains(r#""rt":"#))
+                {
+                    deferred.push(DeferredRelation::of(
+                        &source_ids,
+                        rel,
+                        &pf.rel_path,
+                        &pf.language,
+                    ));
+                    continue;
+                }
                 match parse_callee_metadata(rel.metadata.as_deref()) {
                     // `click.echo()` through an import of a library module: no
                     // project code can run. A project module resolves as bare.
@@ -3575,6 +3592,16 @@ fn resolve_deferred_relations(
                 all,
             )?;
             let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
+            let all = classes.rust_receiver_candidates(
+                db,
+                &d.language,
+                d.metadata.as_deref(),
+                crate_roots,
+                &d.rel_path,
+                &node_id_to_path,
+                all_file_paths,
+                all,
+            )?;
 
             // 6a. JS namespace-receiver constraint captured at batch time
             //     (`m.foo()` where `m` is a require/import-namespace binding).
@@ -3644,6 +3671,22 @@ fn resolve_deferred_relations(
                         } else if methods.is_empty() {
                             // No such method anywhere yet: buffer the call, so the
                             // run that adds one binds it as a rebuild would (D#117).
+                            for &src_id in &source_ids {
+                                crate::storage::queries::insert_pending_unresolved_call(
+                                    db.conn(),
+                                    src_id,
+                                    &d.target_name,
+                                    &d.language,
+                                    call_meta,
+                                )?;
+                            }
+                            None
+                        } else if d.language == "rust"
+                            && super::resolve::rust_receiver(call_meta, crate_roots).is_some()
+                        {
+                            // A typed receiver's call is decided by its type's own
+                            // method, which a later run may add: buffer it, as a
+                            // rebuild would then bind it (D#112).
                             for &src_id in &source_ids {
                                 crate::storage::queries::insert_pending_unresolved_call(
                                     db.conn(),

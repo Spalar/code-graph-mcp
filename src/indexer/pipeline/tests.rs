@@ -8525,3 +8525,412 @@ fn test_rust_reexport_fanout_only_for_an_admissible_definition() {
     assert_eq!(rival, vec!["other/src/lib.rs".to_string()]);
     assert_all_edges_match_rebuild(&base, &[("mycrate/src/sync/rival.rs", Some(second))]);
 }
+
+/// (caller file.fn, callee file.qualified name) of every `calls` edge.
+fn calls_by_qualified_name(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT fs.path || '.' || ns.name || ' -> ' || ft.path || '.' \
+                 || COALESCE(nt.qualified_name, nt.name) \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             WHERE e.relation = 'calls' ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// The project types D#112's corpus calls into: same-named methods on several
+/// types, so a call resolved by its name alone binds the wrong one.
+const D112_TYPES: &str = "use std::sync::atomic::AtomicU16;\nuse std::sync::Arc;\n\
+pub struct Loader;\n\
+impl Loader {\n    pub fn load(&self, o: u8) -> u8 { o }\n}\n\
+pub struct Direction;\n\
+impl Direction {\n    pub fn as_str(&self) -> &str { \"\" }\n}\n\
+pub struct Savepoint;\n\
+impl Savepoint {\n    pub fn commit(self) {}\n}\n\
+pub struct Buf;\n\
+impl Buf {\n    pub fn put_slice(&mut self, s: &[u8]) {}\n    pub fn path(&self) {}\n}\n\
+pub struct Widget;\n\
+impl Widget {\n    pub fn new() -> Widget { Widget }\n    pub fn spin(&self) {}\n}\n\
+pub struct Gadget;\n\
+impl Gadget {\n    pub fn spin(&self) {}\n}\n\
+pub trait Ext {\n    fn helper(&self) {}\n}\n\
+impl Ext for String {}\n\
+pub struct Scale;\n\
+impl Scale {\n    pub fn weigh(&self) -> u8 { 0 }\n}\n\
+pub trait Weigh {\n    fn weigh(&self) -> u8;\n}\n\
+impl Weigh for AtomicU16 {\n    fn weigh(&self) -> u8 { 1 }\n}\n\
+pub struct File;\n\
+impl File {\n    pub fn sync_all(&self) {}\n}\n\
+cfg_net! {\n    pub struct Stream;\n}\n\
+impl Stream {\n    pub fn peek(&self) {}\n}\n\
+pub trait Spinner {\n    fn whirl(&self);\n}\n\
+impl Spinner for Arc<Widget> {\n    fn whirl(&self) {}\n}\n\
+impl Gadget {\n    pub fn whirl(&self) {}\n}\n";
+
+fn d112_tree() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "Cargo.toml",
+            "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", "mod types;\nmod foreign;\nmod own;\nmod untyped;\nmod sync;\nmod loom;\nmod anchored;\n"),
+        ("src/sync/mod.rs", "pub mod mutex;\npub use mutex::Mutex;\n"),
+        (
+            "src/sync/mutex.rs",
+            "pub struct Mutex;\nimpl Mutex {\n    pub fn lock(&self) {}\n}\n",
+        ),
+        ("src/loom/mod.rs", "mod std_mutex;\npub use std_mutex::Mutex;\n"),
+        (
+            "src/loom/std_mutex.rs",
+            "pub struct Mutex;\nimpl Mutex {\n    pub fn lock(&self) {}\n}\n",
+        ),
+        (
+            "src/anchored.rs",
+            "use crate::loom::Mutex;\nuse crate::sync::mutex::Mutex as AsyncMutex;\n\
+             fn via_reexport(m: &Mutex) {\n    m.lock();\n}\n\
+             fn named_module(m: &AsyncMutex) {\n    m.lock();\n}\n\
+             struct Holder {\n    m: Mutex,\n}\n\
+             impl Holder {\n    fn field_reexport(&self) {\n        self.m.lock();\n    }\n}\n",
+        ),
+        ("src/types.rs", D112_TYPES),
+        (
+            "src/foreign.rs",
+            "use std::sync::atomic::{AtomicU8, AtomicU16};\nuse std::sync::Arc;\n\
+             use bytes::BytesMut;\nuse tempfile::{tempdir, NamedTempFile};\n\
+             use rusqlite::Transaction;\n\
+             static COUNT: AtomicU8 = AtomicU8::new(0);\n\
+             struct Dir;\nimpl Dir {\n    fn as_str(&self) -> &str { \"\" }\n}\n\
+             struct Holder {\n    flag: AtomicU8,\n    inner: Inner,\n    name: String,\n    shared: Arc<AtomicU8>,\n}\n\
+             struct Inner {\n    flag: AtomicU8,\n}\n\
+             fn tempfile() -> NamedTempFile {\n    NamedTempFile::new().unwrap()\n}\n\
+             fn let_annotated() {\n    let a: AtomicU8 = make();\n    a.load(1);\n}\n\
+             fn let_ctor() {\n    let a = AtomicU8::new(0);\n    a.load(1);\n}\n\
+             fn param_ref(a: &AtomicU8) {\n    a.load(1);\n}\n\
+             fn param_mut(mut a: &mut AtomicU8) {\n    a.load(1);\n}\n\
+             fn arc_param(a: Arc<AtomicU8>) {\n    a.load(1);\n}\n\
+             fn arc_ctor() {\n    let a = Arc::new(AtomicU8::new(0));\n    a.load(1);\n}\n\
+             fn static_recv() {\n    COUNT.load(1);\n}\n\
+             fn prelude_string() {\n    let s = String::new();\n    s.as_str();\n}\n\
+             fn string_param(s: &String) {\n    s.as_str();\n}\n\
+             fn format_macro() {\n    let s = format!(\"x\");\n    s.as_str();\n}\n\
+             fn to_string_call(n: u8) {\n    let s = n.to_string();\n    s.as_str();\n}\n\
+             fn primitive_param(n: u8) {\n    n.as_str();\n}\n\
+             fn crate_ctor() {\n    let mut b = BytesMut::new();\n    b.put_slice(b\"x\");\n}\n\
+             fn local_fn_return() {\n    let t = tempfile();\n    t.path();\n}\n\
+             fn foreign_fn_unwrap() {\n    let d = tempdir().unwrap();\n    d.path();\n}\n\
+             fn foreign_fn_try() -> Result<(), ()> {\n    let d = tempdir()?;\n    d.path();\n    Ok(())\n}\n\
+             fn crate_param(tx: Transaction<'_>) {\n    tx.commit();\n}\n\
+             fn trait_default_kept() {\n    let s = String::new();\n    s.helper();\n}\n\
+             fn impl_for_foreign() {\n    let a = AtomicU16::new(0);\n    a.weigh();\n}\n\
+             impl Holder {\n    fn self_field(&self) {\n        self.flag.load(1);\n    }\n    \
+             fn self_chain(&self) {\n        self.inner.flag.load(1);\n    }\n    \
+             fn self_string(&self) {\n        self.name.as_str();\n    }\n    \
+             fn self_arc(&self) {\n        self.shared.load(1);\n    }\n}\n\
+             fn local_field(h: &Holder) {\n    h.flag.load(1);\n}\n\
+             fn std_file(f: &std::fs::File) {\n    f.sync_all();\n}\n\
+             fn macro_owner(a: &AtomicU8) {\n    a.peek();\n}\n",
+        ),
+        (
+            "src/own.rs",
+            "use crate::types::{Widget, Gadget};\nuse crate::types::Widget as W;\n\
+             struct Holder2 {\n    w: Widget,\n}\n\
+             fn own_ctor() {\n    let w = Widget::new();\n    w.spin();\n}\n\
+             fn own_annotated() {\n    let w: Widget = make();\n    w.spin();\n}\n\
+             fn own_param(w: &Widget) {\n    w.spin();\n}\n\
+             fn own_literal() {\n    let g = Gadget {};\n    g.spin();\n}\n\
+             fn own_renamed() {\n    let w = W::new();\n    w.spin();\n}\n\
+             fn own_shadowed() {\n    let w = Gadget {};\n    let w = Widget::new();\n    w.spin();\n}\n\
+             impl Holder2 {\n    fn own_field(&self) {\n        self.w.spin();\n    }\n}\n\
+             struct Queue {\n    head: Option<Widget>,\n}\n\
+             impl Queue {\n    fn own_peeled(&mut self) -> Option<()> {\n        let w = self.head?;\n        w.spin();\n        None\n    }\n}\n\
+             fn arc_own(w: std::sync::Arc<Widget>) {\n    w.spin();\n}\n\
+             fn arc_via(w: std::sync::Arc<Widget>) {\n    w.whirl();\n}\n",
+        ),
+        (
+            "src/untyped.rs",
+            "use std::sync::atomic::AtomicU8;\n\
+             trait Tr {}\n\
+             fn closure_param(v: Vec<u8>) {\n    let a = AtomicU8::new(0);\n    v.iter().for_each(|a| { a.load(1); });\n}\n\
+             fn generic_param<T: Tr>(a: T) {\n    a.load(1);\n}\n\
+             fn impl_trait(a: impl Tr) {\n    a.load(1);\n}\n\
+             fn dyn_trait(a: &dyn Tr) {\n    a.load(1);\n}\n\
+             fn shadowed_untyped() {\n    let a = AtomicU8::new(0);\n    let a = pick();\n    a.load(1);\n}\n\
+             fn if_let(o: Option<u8>) {\n    let a = AtomicU8::new(0);\n    if let Some(a) = o {\n        a.load(1);\n    }\n}\n\
+             fn method_return(h: &Holder) {\n    let a = h.get();\n    a.load(1);\n}\n\
+             fn destructured() {\n    let (a, b) = pair();\n    a.load(1);\n}\n\
+             fn crate_builder() {\n    let b = mycrate::types::Widget::builder();\n    b.spin();\n}\n",
+        ),
+    ]
+}
+
+/// D#112, the accepted shapes: a Rust method call whose receiver's type the
+/// source writes down binds only what that type can run. A std or foreign
+/// type (`AtomicU8`, `String`, `BytesMut`) runs no method of another project
+/// struct; a project type runs its own. Each row: the caller, the edges it
+/// must have, the edges it must not.
+///
+/// The `untyped.rs` rows are the receivers deliberately left untyped (see
+/// `rust_receiver.rs`): they resolve by name as before, so the project's one
+/// `load` taking `self` and one argument is still what they bind.
+#[test]
+fn test_rust_receiver_types_by_shape() {
+    const LOAD: &str = "src/types.rs.Loader.load";
+    // Same file: `as_str` is too common a name to bind across files.
+    const AS_STR: &str = "src/foreign.rs.Dir.as_str";
+    const PUT: &str = "src/types.rs.Buf.put_slice";
+    const PATH: &str = "src/types.rs.Buf.path";
+    const COMMIT: &str = "src/types.rs.Savepoint.commit";
+    const W_SPIN: &str = "src/types.rs.Widget.spin";
+    const G_SPIN: &str = "src/types.rs.Gadget.spin";
+    #[rustfmt::skip]
+    let rows: &[(&str, &[&str], &[&str])] = &[
+        // std / foreign receivers bind no other project type's method.
+        ("src/foreign.rs.let_annotated", &[], &[LOAD]),
+        ("src/foreign.rs.let_ctor", &[], &[LOAD]),
+        ("src/foreign.rs.param_ref", &[], &[LOAD]),
+        ("src/foreign.rs.param_mut", &[], &[LOAD]),
+        ("src/foreign.rs.arc_param", &[], &[LOAD]),
+        ("src/foreign.rs.arc_ctor", &[], &[LOAD]),
+        ("src/foreign.rs.static_recv", &[], &[LOAD]),
+        ("src/foreign.rs.prelude_string", &[], &[AS_STR]),
+        ("src/foreign.rs.string_param", &[], &[AS_STR]),
+        ("src/foreign.rs.format_macro", &[], &[AS_STR]),
+        ("src/foreign.rs.to_string_call", &[], &[AS_STR]),
+        ("src/foreign.rs.primitive_param", &[], &[AS_STR]),
+        ("src/foreign.rs.crate_ctor", &[], &[PUT]),
+        ("src/foreign.rs.local_fn_return", &[], &[PATH]),
+        ("src/foreign.rs.foreign_fn_unwrap", &[], &[PATH]),
+        ("src/foreign.rs.foreign_fn_try", &[], &[PATH]),
+        ("src/foreign.rs.crate_param", &[], &[COMMIT]),
+        ("src/foreign.rs.self_field", &[], &[LOAD]),
+        ("src/foreign.rs.self_chain", &[], &[LOAD]),
+        ("src/foreign.rs.self_string", &[], &[AS_STR]),
+        ("src/foreign.rs.self_arc", &[], &[LOAD]),
+        ("src/foreign.rs.local_field", &[], &[LOAD]),
+        // A std type named like a project struct is not that struct, and a
+        // type an item macro defines (no node) is still the project's.
+        ("src/foreign.rs.std_file", &[], &["src/types.rs.File.sync_all"]),
+        ("src/foreign.rs.macro_owner", &[], &["src/types.rs.Stream.peek"]),
+        // A project trait's method still runs on a std type, and so does a
+        // project impl's for that very type.
+        ("src/foreign.rs.trait_default_kept", &["src/types.rs.Ext.helper"], &[]),
+        ("src/foreign.rs.impl_for_foreign", &["src/types.rs.AtomicU16.weigh"], &["src/types.rs.Scale.weigh"]),
+        // A project receiver binds its own type's method only.
+        ("src/own.rs.own_ctor", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.own_annotated", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.own_param", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.own_literal", &[G_SPIN], &[W_SPIN]),
+        ("src/own.rs.own_renamed", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.own_shadowed", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.own_field", &[W_SPIN], &[G_SPIN]),
+        // `Option<T>` peeled by `?`; behind `Arc`, the argument's methods and
+        // the pointer's own impls.
+        ("src/own.rs.own_peeled", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.arc_own", &[W_SPIN], &[G_SPIN]),
+        ("src/own.rs.arc_via", &["src/types.rs.Arc.whirl"], &["src/types.rs.Gadget.whirl"]),
+        // Same-named project types: the one the `use` path names, through a
+        // re-export (the module sharing most of the path) or directly.
+        ("src/anchored.rs.via_reexport", &["src/loom/std_mutex.rs.Mutex.lock"], &["src/sync/mutex.rs.Mutex.lock"]),
+        ("src/anchored.rs.named_module", &["src/sync/mutex.rs.Mutex.lock"], &["src/loom/std_mutex.rs.Mutex.lock"]),
+        ("src/anchored.rs.field_reexport", &["src/loom/std_mutex.rs.Mutex.lock"], &["src/sync/mutex.rs.Mutex.lock"]),
+        // Left untyped: resolved by name, as before.
+        ("src/untyped.rs.closure_param", &[LOAD], &[]),
+        ("src/untyped.rs.generic_param", &[LOAD], &[]),
+        ("src/untyped.rs.impl_trait", &[LOAD], &[]),
+        ("src/untyped.rs.dyn_trait", &[LOAD], &[]),
+        ("src/untyped.rs.shadowed_untyped", &[LOAD], &[]),
+        ("src/untyped.rs.if_let", &[LOAD], &[]),
+        ("src/untyped.rs.method_return", &[LOAD], &[]),
+        ("src/untyped.rs.destructured", &[LOAD], &[]),
+        // A workspace crate's `T::f()` may return anything (a builder): not a
+        // `T`, so not `T`'s own `spin` (two `spin`s: resolved by name, none).
+        ("src/untyped.rs.crate_builder", &[], &["src/types.rs.Widget.spin"]),
+    ];
+    let (_p, _d, db) = fresh_index_of(&d112_tree());
+    let edges = calls_by_qualified_name(&db);
+    let mut bad = Vec::new();
+    for (caller, want, wrong) in rows {
+        let calls: Vec<&str> = edges
+            .iter()
+            .filter_map(|e| e.strip_prefix(&format!("{caller} -> ")))
+            .collect();
+        for w in *want {
+            if !calls.contains(w) {
+                bad.push(format!("{caller}: missing {w} (has {calls:?})"));
+            }
+        }
+        for w in *wrong {
+            if calls.contains(w) {
+                bad.push(format!("{caller}: wrong {w}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// D#112 parity: every input a receiver type is read from gives an incremental
+/// run the edges a rebuild gives: the caller's `let` and its file's struct
+/// fields (read in the caller's own file), and the methods other files define
+/// (read at resolution: the type gaining or losing its own method, a project
+/// method appearing for a std receiver).
+#[test]
+fn test_rust_receiver_types_incremental_matches_rebuild() {
+    fn tree(
+        caller: &'static str,
+        widget: &'static str,
+        other: &'static str,
+    ) -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "mod widget;\nmod other;\nmod caller;\n"),
+            ("src/widget.rs", widget),
+            ("src/other.rs", other),
+            ("src/caller.rs", caller),
+        ]
+    }
+    const CALLER: &str = "use std::sync::atomic::AtomicU8;\nuse crate::widget::Widget;\n\
+        struct Holder {\n    flag: AtomicU8,\n}\n\
+        fn go() {\n    let w = Widget::new();\n    w.spin();\n}\n\
+        fn atomic() {\n    let a = AtomicU8::new(0);\n    a.load(1);\n}\n\
+        impl Holder {\n    fn field(&self) {\n        self.flag.load(1);\n    }\n}\n";
+    const WIDGET: &str =
+        "pub struct Widget;\nimpl Widget {\n    pub fn new() -> Widget { Widget }\n}\n";
+    const WIDGET_SPIN: &str = "pub struct Widget;\nimpl Widget {\n    pub fn new() -> Widget { Widget }\n    pub fn spin(&self) {}\n}\n";
+    const ONE_SPIN: &str = "pub struct Gadget;\nimpl Gadget {\n    pub fn spin(&self) {}\n}\n";
+    const TWO_SPINS: &str = "pub struct Gadget;\nimpl Gadget {\n    pub fn spin(&self) {}\n}\n\
+        pub struct Gizmo;\nimpl Gizmo {\n    pub fn spin(&self) {}\n}\n";
+    const LOADER: &str =
+        "pub struct Loader;\nimpl Loader {\n    pub fn load(&self, o: u8) -> u8 { o }\n}\n";
+    let has = |edges: &[String], e: &str| edges.iter().any(|x| x == e);
+    const GO_W: &str = "src/caller.rs.go --calls--> src/widget.rs.spin";
+    const GO_O: &str = "src/caller.rs.go --calls--> src/other.rs.spin";
+
+    // The type gains its own method: the call moves off the other type's.
+    let want = assert_all_edges_match_rebuild(
+        &tree(CALLER, WIDGET, ONE_SPIN),
+        &[("src/widget.rs", Some(WIDGET_SPIN))],
+    );
+    assert!(has(&want, GO_W) && !has(&want, GO_O), "{want:#?}");
+    // ...while two other types define it (the untyped call bound neither).
+    let want = assert_all_edges_match_rebuild(
+        &tree(CALLER, WIDGET, TWO_SPINS),
+        &[("src/widget.rs", Some(WIDGET_SPIN))],
+    );
+    assert!(has(&want, GO_W) && !has(&want, GO_O), "{want:#?}");
+    // An unrelated edit runs the pending sweep over the buffered call while two
+    // other types still define it: it stays unbound, as a rebuild leaves it.
+    let want = assert_all_edges_match_rebuild(
+        &tree(CALLER, WIDGET, TWO_SPINS),
+        &[(
+            "src/lib.rs",
+            Some("mod widget;\nmod other;\nmod caller;\n// touched\n"),
+        )],
+    );
+    assert!(
+        !want
+            .iter()
+            .any(|e| e.starts_with("src/caller.rs.go --calls--> src/other.rs")),
+        "{want:#?}"
+    );
+    // ...and loses it again: resolved by name as before.
+    let want = assert_all_edges_match_rebuild(
+        &tree(CALLER, WIDGET_SPIN, ONE_SPIN),
+        &[("src/widget.rs", Some(WIDGET))],
+    );
+    assert!(has(&want, GO_O), "{want:#?}");
+    // A project method a std receiver cannot run appears: still no edge.
+    let want = assert_all_edges_match_rebuild(
+        &tree(CALLER, WIDGET, ONE_SPIN),
+        &[("src/other.rs", Some(LOADER))],
+    );
+    assert!(
+        !want
+            .iter()
+            .any(|e| e.starts_with("src/caller.rs.atomic --calls-->")
+                || e.starts_with("src/caller.rs.field --calls-->")),
+        "{want:#?}"
+    );
+    // The caller's `let` and its struct's field change type: the receiver
+    // becomes the project's `Loader`.
+    let retyped = CALLER
+        .replace(
+            "let a = AtomicU8::new(0);",
+            "let a = crate::other::Loader {};",
+        )
+        .replace("flag: AtomicU8,", "flag: crate::other::Loader,");
+    let retyped: &'static str = Box::leak(retyped.into_boxed_str());
+    let want = assert_all_edges_match_rebuild(
+        &tree(CALLER, WIDGET, LOADER),
+        &[("src/caller.rs", Some(retyped))],
+    );
+    assert!(
+        has(&want, "src/caller.rs.atomic --calls--> src/other.rs.load")
+            && has(&want, "src/caller.rs.field --calls--> src/other.rs.load"),
+        "{want:#?}"
+    );
+    // ...and back to std's.
+    let want = assert_all_edges_match_rebuild(
+        &tree(retyped, WIDGET, LOADER),
+        &[("src/caller.rs", Some(CALLER))],
+    );
+    assert!(
+        !has(&want, "src/caller.rs.atomic --calls--> src/other.rs.load")
+            && !has(&want, "src/caller.rs.field --calls--> src/other.rs.load"),
+        "{want:#?}"
+    );
+
+    // Same-named types: the one the `use` names (through a re-export) gains
+    // its method while the other has one, then loses it again.
+    let anchored = |loom: &'static str| -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mycrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "mod sync;\nmod loom;\nmod caller;\n"),
+            ("src/sync/mod.rs", "pub mod mutex;\npub use mutex::Mutex;\n"),
+            (
+                "src/sync/mutex.rs",
+                "pub struct Mutex;\nimpl Mutex {\n    pub fn lock(&self) {}\n}\n",
+            ),
+            (
+                "src/loom/mod.rs",
+                "mod std_mutex;\npub use std_mutex::Mutex;\n",
+            ),
+            ("src/loom/std_mutex.rs", loom),
+            (
+                "src/caller.rs",
+                "use crate::loom::Mutex;\nfn go(m: &Mutex) {\n    m.lock();\n}\n",
+            ),
+        ]
+    };
+    const LOOM: &str = "pub struct Mutex;\n";
+    const LOOM_LOCK: &str = "pub struct Mutex;\nimpl Mutex {\n    pub fn lock(&self) {}\n}\n";
+    let want = assert_all_edges_match_rebuild(
+        &anchored(LOOM),
+        &[("src/loom/std_mutex.rs", Some(LOOM_LOCK))],
+    );
+    assert!(
+        has(
+            &want,
+            "src/caller.rs.go --calls--> src/loom/std_mutex.rs.lock"
+        ) && !has(&want, "src/caller.rs.go --calls--> src/sync/mutex.rs.lock"),
+        "{want:#?}"
+    );
+    let want = assert_all_edges_match_rebuild(
+        &anchored(LOOM_LOCK),
+        &[("src/loom/std_mutex.rs", Some(LOOM))],
+    );
+    assert!(
+        has(&want, "src/caller.rs.go --calls--> src/sync/mutex.rs.lock"),
+        "{want:#?}"
+    );
+}

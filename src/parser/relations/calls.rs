@@ -430,7 +430,22 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 // overloading, default or variadic parameters, it reaches only a
                 // function taking that many (`resolve::rust_call_shape_admits`).
                 let metadata = if ctx.language == "rust" {
-                    metadata.map(|m| with_use_root(with_rust_arity(m, node), use_root))
+                    // A method call on a receiver whose type the source writes
+                    // down carries it (D#112, `rust_receiver.rs`).
+                    let receiver = matches!(
+                        qualifier,
+                        helpers::CalleeQualifier::Receiver(_)
+                            | helpers::CalleeQualifier::Member
+                            | helpers::CalleeQualifier::Chain
+                    )
+                    .then(|| super::rust_receiver::receiver_type(node, source))
+                    .flatten();
+                    metadata.map(|m| {
+                        with_receiver_type(
+                            with_use_root(with_rust_arity(m, node), use_root),
+                            receiver,
+                        )
+                    })
                 } else {
                     metadata
                 };
@@ -504,6 +519,20 @@ pub(super) fn with_use_root(metadata: String, root: Option<super::rust_use::UseR
         super::rust_use::UseRoot::Extern => "x",
     };
     map.insert("u".into(), tag.into());
+    serde_json::Value::Object(map).to_string()
+}
+
+/// `metadata` with the receiver type keys of [`super::rust_receiver`].
+fn with_receiver_type(metadata: String, receiver: Option<super::rust_receiver::RecvTy>) -> String {
+    let Some(ty) = receiver else {
+        return metadata;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    for (k, v) in super::rust_receiver::receiver_keys(&ty) {
+        map.insert(k.into(), v.into());
+    }
     serde_json::Value::Object(map).to_string()
 }
 

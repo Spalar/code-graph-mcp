@@ -3,11 +3,11 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 92 → 93 because the Rust fix below changes which `calls`
+`INDEX_VERSION` goes 92 → 94 because the Rust fixes below change which `calls`
 and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
 @sdsrs/code-graph@0.161.0`, or `cargo install code-graph-mcp --version
 0.161.0`; plugin users can set the version in the marketplace entry. An older
-binary leaves a v93 index intact and warns instead of rebuilding it; delete
+binary leaves a v94 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
 ### A Rust call resolves through the file's `use`
@@ -74,6 +74,66 @@ re-extracted every caller of a re-exported `new` took 141 files and 1,931 ms
 for that edit. Re-indexing the edited file, then removing and restoring
 oneshot's `channel`, matched a rebuild edge for edge (32,643 edges).
 
+### A Rust method call binds what its receiver's type can run
+
+`x.f()` names only `f`, and a Rust method call resolved by that name bound a
+project method of whatever type had one: an atomic's `.load(Ordering)` bound
+this repo's `ProjectClassNames::load`, a `BytesMut`'s `.put_slice(..)` bound
+tokio's `ReadBuf::put_slice`, a `NamedTempFile`'s `.path()` bound
+`DirEntry::path`, and a `Widget`'s `.spin()` bound a `Gadget::spin` in
+another file. When the source writes the receiver's type down, the call now
+carries it:
+
+- `self` in an `impl` block; a `let` with a type, or whose value fixes one
+  (`T::new(..)`, `T::default()`, `T::from(..)`, `T::with_capacity(..)`,
+  `T { .. }`, a literal, `vec![..]`, `format!(..)`, `.to_string()`, `.clone()`
+  of a typed value, a call of a free function of the file whose return type
+  is written, a zero-argument call of a std or dependency function, and `?`,
+  `.unwrap()` or `.expect(..)` of any of them, which take a written
+  `Result<T, _>` or `Option<T>` to `T`); a parameter `x: T`, `&T` or
+  `&mut T`; a `static` or `const`; a field of a struct the same file defines
+  (`self.buf`, `self.inner.flag`). `Box<T>`, `Rc<T>` and `Arc<T>` (a
+  project's own `Arc` too) are `T`, plus impls on the pointer itself.
+- The file's `use` says whose type it is. A std type or a dependency's
+  (`AtomicU8`, `String`, `bytes::BytesMut`, a primitive) binds only a project
+  trait's method (`impl Ext for String {}` still gives `s.helper()` its
+  default method) or an impl on that very type (`impl Weigh for AtomicU16`),
+  and none of another project type: a type an item macro defines has no node,
+  so "not a known struct" proves nothing. A project type binds its own
+  methods when it has one, else resolves as before (a trait's default method
+  or a `Deref` target may run). Of several project types of that name, the
+  one the `use` path names wins, through a re-export as a path call's does
+  (tokio's `use crate::loom::sync::Mutex` is not `tokio::sync::Mutex`).
+- A typed call the unique-method rule cannot decide (none, or several) waits
+  in the pending-call buffer, so the run that gives its type the method binds
+  it as a rebuild does.
+
+Deliberately untyped, resolved by name as before: a closure parameter without
+a type, a pattern binding (`if let Some(x)`, `match`, `for`, a destructuring
+`let`), a generic parameter, `impl Trait`, `dyn Trait`, the return of any other
+method or function, a tuple field, and a field of a struct defined in another
+file.
+
+On tokio-1.41.1 (SCIP oracle, gold 7,908 call pairs, both arms indexed copies
+of one clone): `inferred` precision 2,551/2,788 (91.5%) → 2,550/2,725 (93.6%),
+recall at the default floor 4,162 → 4,191; wrong `extracted` edges 366 → 247,
+wrong `inferred` 237 → 175, wrong `ambiguous` 1,632 → 1,056 (`ambiguous`
+precision 658/2,290 → 1,056/2,112). Of the call pairs the oracle can judge,
+428 correct ones gained and one lost (listed under Not covered); 764 wrong
+ones removed and 7 added, all `ambiguous`. On this repo (a snapshot of the
+previous commit, gold 7,259): wrong `extracted` edges 17 → 16, `inferred` 7
+and `ambiguous` 1 unchanged, recall at the default floor 7,077 unchanged; the
+receivers behind the rest are listed under Not covered.
+
+Measured cost, 3 runs each (ms, previous commit → this): full index of tokio
+2,480/2,510/2,525 → 2,508/2,439/2,492, of this repo 1,828/1,899/1,906 →
+1,930/1,870/1,937; an incremental run on tokio after editing a line of
+`runtime/io/driver.rs` 185/176/168 → 172/167/181, and after adding a
+`Probe::new` to `tokio/src/sync/mod.rs` 367 → 398 mean over 10 alternating
+runs (+8%; both re-extract the same 3 files). tokio's pending-call buffer holds
+4,559 rows after a full index instead of 3,989. After those incremental runs,
+tokio's index matched a fresh one edge for edge (32,323 edges).
+
 ### Not covered
 
 - An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
@@ -94,6 +154,28 @@ oneshot's `channel`, matched a rebuild edge for edge (32,643 edges).
   resolves through its import edge as before.
 - A crate whose library is not at `<package>/src/lib.rs` (a `[lib] path`) is
   not found by its name; such a path resolves as a path written in the call.
+- A Rust receiver whose type only a closure parameter, a pattern or another
+  method's return gives stays untyped (see above). On this repo that leaves 10
+  wrong `as_str` edges (`.map(|n| n.name.as_str())`), 11 wrong `commit` edges
+  (`let tx = conn.unchecked_transaction()?`, rusqlite's) and one `is_empty`
+  (a destructured closure parameter). Typing a method's return needs the
+  callee's signature from another file, as the C++ chain typing records it.
+- A method a project impl defines counts for its type whether or not its
+  trait is imported at the call, and whatever its `self` is: tokio's
+  `read.consume(n)` on a `BufReader` binds the `AsyncBufRead` impl's
+  `consume(self: Pin<&mut Self>, ..)`, where rust-analyzer resolves
+  `AsyncBufReadExt::consume` (2 edges). Types and traits are compared by name:
+  a std receiver keeps every project trait's method of that name
+  (`rd.take(4)` on a `&[u8]` binds `StreamExt::take` beside
+  `AsyncReadExt::take`, 2 edges), mio's `Waker` keeps an impl on std's
+  `Waker` (1), and `tokio::sync::Semaphore` keeps the mpsc `Semaphore`
+  trait's `add_permits` (2).
+- One correct tokio pair was bound only through a wrong call: in
+  `read_dir_entry_info`, `temp_dir.path()` (a `tempfile::TempDir`) bound
+  `DirEntry::path`, which the untyped `first_entry.path()` of the same
+  function really calls and cannot pick among the project's `path` methods.
+- A typed call that no method answers waits in the pending-call buffer and
+  ages out after 50 runs, like any buffered call.
 
 ## 0.161.0
 

@@ -314,6 +314,33 @@ pub(super) fn resolve_pending_calls_touching(
             source_id_to_path.get(&row.source_id).map(String::as_str),
             candidates,
         )?;
+        if all_file_paths.is_none()
+            && row
+                .metadata
+                .as_deref()
+                .is_some_and(|m| m.contains(r#""rp":"#))
+        {
+            all_file_paths = Some(
+                db.conn()
+                    .prepare("SELECT path FROM files")?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<_>>()?,
+            );
+        }
+        let no_files = HashSet::new();
+        let candidates = classes.rust_receiver_candidates(
+            db,
+            &row.source_language,
+            row.metadata.as_deref(),
+            crate_roots,
+            source_id_to_path
+                .get(&row.source_id)
+                .map(String::as_str)
+                .unwrap_or_default(),
+            &node_id_to_path,
+            all_file_paths.as_ref().unwrap_or(&no_files),
+            candidates,
+        )?;
         if candidates.is_empty() {
             continue; // still unresolvable — leave buffered
         }
@@ -505,6 +532,29 @@ pub(super) fn resolve_pending_calls_touching(
             // Member call: the same free-function exclusion as Phase 2.
             Some(CalleeMeta::Member) => {
                 classes.member_call_candidates(db, row.metadata.as_deref(), candidates)?
+            }
+            // A Rust `x.f()` whose receiver type narrowed the pool (D#112): the
+            // deferred pass's unique-method rule over that pool, which a later
+            // run can widen by more than one method at once.
+            Some(CalleeMeta::Receiver(_) | CalleeMeta::Chain)
+                if row.source_language == "rust"
+                    && rust_receiver(row.metadata.as_deref(), crate_roots).is_some() =>
+            {
+                let methods = method_candidates(&candidates, db)?;
+                let local: Vec<i64> = methods
+                    .iter()
+                    .copied()
+                    .filter(|id| node_id_to_path.get(id).map(String::as_str) == Some(caller_path))
+                    .collect();
+                if local.len() == 1 {
+                    local
+                } else if local.is_empty() && methods.len() == 1 {
+                    methods
+                } else {
+                    // No such method, or several: stays buffered, as the deferred
+                    // pass buffers it, until the type's own method decides it.
+                    continue;
+                }
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches. A buffered
@@ -3130,6 +3180,50 @@ pub(super) struct ProjectClassNames {
     /// Rust function id → its parameters ([`rust_call_shape_admits`]); None
     /// until loaded.
     rust_fn_shapes: Option<HashMap<i64, RustFnShape>>,
+    /// Names of the project's Rust structs, enums and unions, and of its
+    /// traits (`interface` nodes) ([`Self::rust_receiver_candidates`]); None
+    /// until loaded.
+    rust_concrete: Option<HashSet<String>>,
+    rust_traits: HashSet<String>,
+}
+
+/// The receiver type a Rust method call carries (parser `rust_receiver.rs`,
+/// D#112), with a crate-rooted one decided against the project's packages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RustRecv {
+    /// A type of the project, by name, the smart pointer it sits behind
+    /// (`Arc<T>`), and the path a `use` names it by: only methods of either,
+    /// when there is one; of same-named types, the one the path names.
+    Project(String, Option<String>, Option<Vec<String>>),
+    /// A std or dependency type (the name may be empty): only a project
+    /// trait's method, or one of an impl on that very type (`impl Tr for u32`)
+    /// when the project defines no type of that name.
+    Foreign(String),
+}
+
+/// The receiver type keys of a Rust call's metadata, or None.
+pub(super) fn rust_receiver(metadata: Option<&str>, crate_roots: &RustCrates) -> Option<RustRecv> {
+    let m = metadata?;
+    if !m.contains(r#""rt":"#) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(m).ok()?;
+    let name = v.get("rt")?.as_str()?.to_string();
+    let via = v.get("rv").and_then(|p| p.as_str()).map(String::from);
+    let path = v
+        .get("rp")
+        .and_then(|p| p.as_str())
+        .map(|p| p.split("::").map(String::from).collect::<Vec<_>>());
+    match (
+        v.get("rk").and_then(|k| k.as_str()),
+        v.get("rc").and_then(|c| c.as_str()),
+    ) {
+        (Some("p"), _) => Some(RustRecv::Project(name, via, path)),
+        (Some("f"), _) => Some(RustRecv::Foreign(name)),
+        (_, Some(krate)) if crate_roots.contains(krate) => Some(RustRecv::Project(name, via, path)),
+        (_, Some(_)) => Some(RustRecv::Foreign(name)),
+        _ => None,
+    }
 }
 
 impl ProjectClassNames {
@@ -3192,6 +3286,119 @@ impl ProjectClassNames {
             })
         });
         Ok(candidates)
+    }
+
+    /// The candidates a Rust method call's receiver type admits (D#112; see
+    /// [`RustRecv`]). A candidate's type is the owner its qualified name
+    /// writes (`T.f`: an inherent or trait-impl method of `T`; `Tr.f`: a
+    /// trait's). A project type with no method of that name keeps every
+    /// candidate: a trait's default method or a `Deref` target runs then.
+    /// Calls without a receiver type, and other languages', pass through.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rust_receiver_candidates(
+        &mut self,
+        db: &crate::storage::db::Database,
+        language: &str,
+        metadata: Option<&str>,
+        crate_roots: &RustCrates,
+        caller_path: &str,
+        node_id_to_path: &HashMap<i64, String>,
+        all_file_paths: &HashSet<String>,
+        candidates: Vec<i64>,
+    ) -> anyhow::Result<Vec<i64>> {
+        if language != "rust" || candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let Some(recv) = rust_receiver(metadata, crate_roots) else {
+            return Ok(candidates);
+        };
+        let missing: Vec<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !self.node_info.contains_key(id))
+            .collect();
+        if !missing.is_empty() {
+            self.node_info
+                .extend(crate::storage::queries::get_node_files_and_qualified_names(
+                    db.conn(),
+                    &missing,
+                )?);
+        }
+        let owner = |id: &i64| -> Option<&str> {
+            let (_, q) = self.node_info.get(id)?;
+            let (owner, _) = q.rsplit_once('.')?;
+            Some(owner.rsplit("::").next().unwrap_or(owner))
+        };
+        match recv {
+            RustRecv::Project(ty, via, path) => {
+                let own: Vec<i64> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|id| owner(id).is_some_and(|o| o == ty || via.as_deref() == Some(o)))
+                    .collect();
+                if own.is_empty() {
+                    return Ok(candidates);
+                }
+                // Several types of that name: the one the path names, as a path
+                // call through it (`Mutex::new`) is anchored (D#132).
+                let Some(path) = path.filter(|_| own.len() > 1) else {
+                    return Ok(own);
+                };
+                let tag = if matches!(path[0].as_str(), "crate" | "self" | "super") {
+                    r#"{"u":"c"}"#
+                } else {
+                    r#"{"u":"x"}"#
+                };
+                let UseAnchor::At(anchor) =
+                    rust_use_anchor(Some(tag), &path, caller_path, crate_roots)
+                else {
+                    return Ok(own);
+                };
+                Ok(
+                    match rust_anchored_targets(&anchor, &own, node_id_to_path, db, all_file_paths)?
+                    {
+                        Anchored::Named(ids) | Anchored::Elsewhere(ids) if !ids.is_empty() => ids,
+                        _ => own,
+                    },
+                )
+            }
+            RustRecv::Foreign(ty) => {
+                if self.rust_concrete.is_none() {
+                    let mut stmt = db.conn().prepare(
+                        "SELECT DISTINCT n.name, n.type = 'interface' FROM nodes n
+                         JOIN files f ON f.id = n.file_id
+                         WHERE f.language = 'rust'
+                           AND n.type IN ('struct', 'enum', 'union', 'interface')",
+                    )?;
+                    let mut concrete = HashSet::new();
+                    for row in
+                        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
+                    {
+                        let (name, is_trait) = row?;
+                        if is_trait {
+                            self.rust_traits.insert(name);
+                        } else {
+                            concrete.insert(name);
+                        }
+                    }
+                    self.rust_concrete = Some(concrete);
+                }
+                let concrete = self.rust_concrete.as_ref().expect("loaded above");
+                let traits = &self.rust_traits;
+                // Owners are compared by name: a type defined inside an item
+                // macro (`cfg_net! { pub struct TcpStream … }`) has no node, but
+                // its impls' methods do, so "not a known struct" is no proof
+                // that an owner is not the project's.
+                Ok(candidates
+                    .iter()
+                    .copied()
+                    .filter(|id| match owner(id) {
+                        Some(o) => traits.contains(o) || (o == ty && !concrete.contains(o)),
+                        None => true,
+                    })
+                    .collect())
+            }
+        }
     }
 
     /// [`member_call_candidates`] from memory: the deferred pass and the pending

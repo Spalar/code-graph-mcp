@@ -438,6 +438,18 @@ pub(super) fn normalize_use_path(
     })
 }
 
+/// Where the lookup of a name ended (see [`lookup_origin`]).
+enum Found<'t> {
+    /// A `use` binding: the path it writes and the scope holding it.
+    Use(Vec<String>, tree_sitter::Node<'t>),
+    /// An item defined in a scope the name is visible from.
+    Local,
+    /// A glob may bind it: nothing is known.
+    Glob,
+    /// Neither: a prelude name, a crate name, or an item the tree cannot see.
+    Nothing,
+}
+
 /// Walk out from `node` (a call, or with `from_scope` the scope a `use` sits
 /// in) to the scope holding a binding of `name`: blocks, then the module; past
 /// a module only through `use super::*`.
@@ -448,6 +460,19 @@ fn lookup<'t>(
     from_scope: bool,
     value: bool,
 ) -> Option<(Vec<String>, tree_sitter::Node<'t>)> {
+    match lookup_origin(scopes, node, name, from_scope, value) {
+        Found::Use(path, scope) => Some((path, scope)),
+        _ => None,
+    }
+}
+
+fn lookup_origin<'t>(
+    scopes: &Scopes,
+    node: &tree_sitter::Node<'t>,
+    name: &str,
+    from_scope: bool,
+    value: bool,
+) -> Found<'t> {
     let mut cur = if from_scope {
         Some(*node)
     } else {
@@ -462,21 +487,132 @@ fn lookup<'t>(
                 &scope.type_items
             };
             if items.contains(name) {
-                return None;
+                return Found::Local;
             }
             if let Some(path) = scope.names.get(name) {
-                return Some((path.clone(), n));
+                return Found::Use(path.clone(), n);
             }
             if scope.other_glob {
-                return None;
+                return Found::Glob;
             }
         }
         if is_module_scope(&n) && !scope.is_some_and(|s| s.glob_super) {
-            return None;
+            return Found::Nothing;
         }
         cur = n.parent();
     }
-    None
+    Found::Nothing
+}
+
+/// What a type (or a type path's first segment) written at `node` names, as the
+/// receiver typing in `rust_receiver.rs` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TypeOrigin {
+    /// This crate's (`crate::`/`self::`/`super::`, a module or item of the file).
+    Project,
+    /// A path rooted at a crate name: std's, a dependency's or another
+    /// workspace package's (the resolver tells them apart).
+    Extern(String),
+    /// Written with no `use` and no local item: a prelude name, or an item the
+    /// tree cannot see (a macro's).
+    Unbound,
+    /// A glob import may bind it: nothing is known.
+    Unknown,
+}
+
+/// The origin of the type path `segments` written at `node`: its first segment
+/// looked up in the type namespace like a path call's.
+pub(super) fn type_origin(
+    node: &tree_sitter::Node,
+    source: &str,
+    segments: &[String],
+) -> TypeOrigin {
+    let Some(first) = segments.first() else {
+        return TypeOrigin::Unknown;
+    };
+    if matches!(first.as_str(), "crate" | "self" | "super") {
+        return TypeOrigin::Project;
+    }
+    with_scopes(node, source, |scopes| {
+        match lookup_origin(scopes, node, first, false, false) {
+            Found::Use(path, scope) => match normalize(scopes, &scope, path, 0) {
+                Some((_, UseRoot::Project)) => TypeOrigin::Project,
+                Some((path, UseRoot::Extern)) => match path.first() {
+                    Some(root) => TypeOrigin::Extern(root.clone()),
+                    None => TypeOrigin::Unknown,
+                },
+                None => TypeOrigin::Unknown,
+            },
+            Found::Local => TypeOrigin::Project,
+            Found::Glob => TypeOrigin::Unknown,
+            // `a::T` with no `use` of `a`: a crate name (`tempfile::TempDir`).
+            Found::Nothing if segments.len() > 1 => TypeOrigin::Extern(first.clone()),
+            Found::Nothing => TypeOrigin::Unbound,
+        }
+    })
+}
+
+/// The full path the type path `segments` written at `node` stands for, when
+/// its first segment is `crate` or a name a `use` binds (normalized like a
+/// binding: `use crate::loom::sync::Mutex;` → `crate::loom::sync::Mutex`), or
+/// a crate name no `use` binds (`tokio::sync::Semaphore` as written).
+pub(super) fn type_path(
+    node: &tree_sitter::Node,
+    source: &str,
+    segments: &[String],
+) -> Option<Vec<String>> {
+    let (first, rest) = segments.split_first()?;
+    match first.as_str() {
+        "crate" => return Some(segments.to_vec()),
+        "self" | "super" | "Self" => return None,
+        _ => {}
+    }
+    with_scopes(node, source, |scopes| {
+        match lookup_origin(scopes, node, first, false, false) {
+            Found::Use(path, scope) => {
+                let (mut base, _) = normalize(scopes, &scope, path, 0)?;
+                base.extend(rest.iter().cloned());
+                Some(base)
+            }
+            Found::Nothing if !rest.is_empty() => Some(segments.to_vec()),
+            _ => None,
+        }
+    })
+}
+
+/// The origin of the value `name` (a bare call's callee) at `node`, as
+/// [`type_origin`] reads a type.
+pub(super) fn value_origin(node: &tree_sitter::Node, source: &str, name: &str) -> TypeOrigin {
+    with_scopes(node, source, |scopes| {
+        match lookup_origin(scopes, node, name, false, true) {
+            Found::Use(path, scope) => match normalize(scopes, &scope, path, 0) {
+                Some((_, UseRoot::Project)) => TypeOrigin::Project,
+                Some((path, UseRoot::Extern)) => match path.first() {
+                    Some(root) => TypeOrigin::Extern(root.clone()),
+                    None => TypeOrigin::Unknown,
+                },
+                None => TypeOrigin::Unknown,
+            },
+            Found::Local => TypeOrigin::Project,
+            Found::Glob => TypeOrigin::Unknown,
+            Found::Nothing => TypeOrigin::Unbound,
+        }
+    })
+}
+
+/// The last segment of the path a `use` binds `name` to at `node`, when it
+/// renames a type (`use a::Widget as W;` → `Widget`).
+pub(super) fn type_binding_name(
+    node: &tree_sitter::Node,
+    source: &str,
+    name: &str,
+) -> Option<String> {
+    with_scopes(node, source, |scopes| {
+        match lookup_origin(scopes, node, name, false, false) {
+            Found::Use(path, _) => path.last().cloned(),
+            _ => None,
+        }
+    })
 }
 
 /// Whether the module holding `scope_node` (or a block between) declares `mod name`.

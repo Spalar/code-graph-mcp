@@ -3798,7 +3798,8 @@ fn test_rust_callee_obj_method_receiver_qualifier() {
         .expect("missing call to exists");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"n":0,"q":"recv","v":"p"}"#),
+        // `p`'s declared type rides along (D#112, `rust_receiver.rs`).
+        Some(r#"{"n":0,"q":"recv","rk":"f","rt":"Path","v":"p"}"#),
         "obj.method() where obj is a plain identifier emits Receiver qualifier"
     );
 }
@@ -3825,9 +3826,11 @@ fn test_rust_callee_builder_chain_qualifier() {
         .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "create")
         .expect("missing call to create");
+    // `T::new()` types its value (D#112); an unimported name is taken as the
+    // project's.
     assert_eq!(
         create_call.metadata.as_deref(),
-        Some(r#"{"n":1,"q":"chain"}"#),
+        Some(r#"{"n":1,"q":"chain","rk":"p","rt":"OpenOptions"}"#),
     );
 
     // .open(...) — receiver is also call_expression → Chain
@@ -3864,7 +3867,7 @@ fn test_rust_callee_member_receiver_qualifier() {
     assert_eq!(meta("len").as_deref(), Some(r#"{"n":0,"q":"member"}"#));
     assert_eq!(
         meta("to_string").as_deref(),
-        Some(r#"{"n":0,"q":"member"}"#)
+        Some(r#"{"n":0,"q":"member","rk":"f","rt":"str"}"#)
     );
     assert_eq!(meta("drop"), None);
 }
@@ -3891,11 +3894,11 @@ fn test_rust_call_records_its_argument_count() {
     };
     assert_eq!(
         meta("load").as_deref(),
-        Some(r#"{"n":1,"q":"recv","v":"flag"}"#)
+        Some(r#"{"n":1,"q":"recv","rk":"p","rt":"AtomicBool","v":"flag"}"#)
     );
     assert_eq!(
         meta("fill").as_deref(),
-        Some(r#"{"n":3,"q":"recv","v":"c"}"#)
+        Some(r#"{"n":3,"q":"recv","rk":"p","rt":"Classes","v":"c"}"#)
     );
     assert_eq!(
         meta("pick").as_deref(),
@@ -7398,7 +7401,7 @@ fn test_rust_callee_turbofish_and_qualified_self_shapes() {
         (
             "x.collect::<Vec<u8>>()",
             "collect",
-            Some(r#"{"n":0,"q":"recv","v":"x"}"#),
+            Some(r#"{"n":0,"q":"recv","rk":"p","rt":"X","v":"x"}"#),
         ),
         (
             "Vec::<u8>::with_capacity(4)",
