@@ -482,14 +482,20 @@ test('maybeAutoAdopt skips when not plugin-mode (npm install path)', () => {
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt installs when plugin-mode + not-yet-adopted', () => {
+// Decision D4 (2026-09-28 usage evaluation): SessionStart no longer writes a
+// project's CLAUDE.md. Creating CLAUDE.md and .claude/ in the user's tree made
+// Claude stop and explain those changes to the user in 12 of 15 coding runs
+// (0 of 15 without the plugin), and the MCP instructions already carry 10 of
+// the block's 11 guidance points. `code-graph-mcp adopt` still writes it.
+test('maybeAutoAdopt never adopts a project on its own', () => {
   const sb = makeSandbox();
   try {
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: PLUGIN_SCRIPTS, env: {} });
-    assert.strictEqual(res.attempted, true);
-    assert.strictEqual(res.reason, 'adopted');
-    assert.strictEqual(res.result.ok, true);
-    assert.strictEqual(isAdopted({ cwd: sb.cwd }), true);
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'not-adopted');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), false);
+    assert.strictEqual(fs.existsSync(sb.claudeMd), false, 'no CLAUDE.md created');
+    assert.strictEqual(fs.existsSync(sb.detail), false, 'no detail doc created');
   } finally { sb.cleanup(); }
 });
 
@@ -504,17 +510,17 @@ test('maybeAutoAdopt is already-adopted when in sync (no gratuitous write)', () 
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt refreshes a drifted detail doc (reason=refreshed)', () => {
+test('maybeAutoAdopt reports a drifted block as stale and rewrites nothing', () => {
   const sb = makeSandbox();
   try {
     adopt({ cwd: sb.cwd });
     fs.writeFileSync(sb.detail, `${MANAGED_BY}\n# stale\n`);
+    const claudeMdBefore = fs.readFileSync(sb.claudeMd, 'utf8');
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: PLUGIN_SCRIPTS, env: {} });
-    assert.strictEqual(res.reason, 'refreshed');
-    const shipped = fs.readFileSync(TEMPLATE_PATH);
-    const cur = fs.readFileSync(sb.detail);
-    const nl = cur.indexOf(0x0a);
-    assert.ok(shipped.equals(cur.subarray(nl + 1)), 'detail re-synced to shipped template');
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'stale');
+    assert.strictEqual(fs.readFileSync(sb.detail, 'utf8'), `${MANAGED_BY}\n# stale\n`, 'detail left as it was');
+    assert.strictEqual(fs.readFileSync(sb.claudeMd, 'utf8'), claudeMdBefore, 'CLAUDE.md left as it was');
   } finally { sb.cleanup(); }
 });
 
@@ -530,13 +536,14 @@ test('maybeAutoAdopt skips refresh when CODE_GRAPH_NO_TEMPLATE_REFRESH=1 (locks 
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt surfaces not-a-project for a bare cwd', () => {
+test('maybeAutoAdopt writes nothing for a bare cwd', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
   const cwd = mkBareCwd();
   try {
     const res = maybeAutoAdopt({ cwd, home, scriptPath: PLUGIN_SCRIPTS, env: {} });
-    assert.strictEqual(res.result.ok, false);
-    assert.strictEqual(res.result.reason, 'not-a-project');
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'not-adopted');
+    assert.strictEqual(fs.existsSync(path.join(cwd, 'CLAUDE.md')), false);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(cwd, { recursive: true, force: true });
@@ -589,7 +596,7 @@ test('migrate is a no-op when there is nothing to clean', () => {
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt runs the legacy migration then installs the new scheme', () => {
+test('maybeAutoAdopt runs the legacy migration and installs nothing', () => {
   const sb = makeSandbox();
   try {
     const L = seedLegacy(sb);
@@ -597,7 +604,7 @@ test('maybeAutoAdopt runs the legacy migration then installs the new scheme', ()
     assert.ok(res.migrated.memoryIndexPruned && res.migrated.legacyDetailRemoved, 'legacy cleaned');
     assert.ok(!fs.existsSync(L.legacyDetail), 'legacy detail gone');
     assert.ok(!fs.readFileSync(L.memIndex, 'utf8').includes(SENTINEL_BEGIN_V1), 'v1 block gone');
-    assert.strictEqual(isAdopted({ cwd: sb.cwd }), true, 'new CLAUDE.md scheme installed');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), false, 'no CLAUDE.md block written');
   } finally { sb.cleanup(); }
 });
 
@@ -1101,7 +1108,7 @@ test('isAdopted / needsRefresh return false (never throw) on an unreadable CLAUD
   }
 });
 
-test('maybeAutoAdopt surfaces the unreadable CLAUDE.md instead of throwing', () => {
+test('maybeAutoAdopt does not throw on an unreadable CLAUDE.md', () => {
   const sb = makeSandbox();
   try {
     fs.writeFileSync(sb.claudeMd, '# mine\n');
@@ -1110,9 +1117,8 @@ test('maybeAutoAdopt surfaces the unreadable CLAUDE.md instead of throwing', () 
       cwd: sb.cwd, home: sb.home, env: {},
       scriptPath: path.join(os.homedir(), '.claude', 'plugins', 'cache', 'x', 'scripts'),
     });
-    assert.strictEqual(r.attempted, true);
-    assert.strictEqual(r.result.ok, false);
-    assert.strictEqual(r.result.reason, 'claude-md-unreadable');
+    assert.strictEqual(r.attempted, false);
+    assert.strictEqual(r.reason, 'not-adopted');
   } finally {
     try { fs.chmodSync(sb.claudeMd, 0o600); } catch { /* ok */ }
     sb.cleanup();

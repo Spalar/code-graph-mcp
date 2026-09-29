@@ -10,7 +10,8 @@ const {
 } = require('./lifecycle');
 const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
-const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand } = require('./adopt');
+const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand, adoptCommand } = require('./adopt');
+const { capContext } = require('./hook-emit');
 const { isNonProjectCwd } = require('./project-detect');
 const { hidden } = require('./proc-opts');
 const { installHookFailOpen, remainingMs } = require('./hook-fail-open');
@@ -47,6 +48,30 @@ const { resolveProjectRoot } = require('./project-root');
 // a starved SessionStart is legible to `doctor` and to tests instead of just
 // being quieter than usual.
 let budgetSkips = [];
+
+// What this run has to say, delivered as ONE JSON envelope when the hook exits
+// (sessionStartOutput): `notices` become the user-facing `systemMessage`,
+// `contextParts` the model-facing `additionalContext`. Claude Code never shows
+// a SessionStart hook's stderr when it exits 0, so the fifteen notices this
+// hook used to write there — "CLAUDE.md was modified", "hooks look dark",
+// "binary missing" — reached no one (decision D5, 2026-09-28 usage
+// evaluation). Only notices a user must act on are kept. Module state, reset
+// per run like budgetSkips.
+let notices = [];
+let contextParts = [];
+
+function sessionStartOutput() {
+  if (notices.length === 0 && contextParts.length === 0) return '';
+  const out = {};
+  if (notices.length > 0) out.systemMessage = notices.join('\n');
+  if (contextParts.length > 0) {
+    out.hookSpecificOutput = {
+      hookEventName: 'SessionStart',
+      additionalContext: capContext(contextParts.join('\n')),
+    };
+  }
+  return JSON.stringify(out) + '\n';
+}
 
 function budgetFor(label, defaultMs) {
   const ms = remainingMs(defaultMs);
@@ -125,10 +150,10 @@ function isHighIntentSource(source) {
 // Claude Code surfaces (same one injectProjectMap uses).
 function reportRebuild(r) {
   if (r && r.settingsRebuiltFrom) {
-    process.stdout.write(
+    notices.push(
       `[code-graph] ${settingsPath()} could not be parsed and has been REBUILT. ` +
       `Your original is saved at ${r.settingsRebuiltFrom} — merge anything you ` +
-      `still need (model / env / permissions / your own hooks) back by hand.\n`
+      `still need (model / env / permissions / your own hooks) back by hand.`
     );
   }
   // install()/update() have reported `manifestUnwritable` since they learned not
@@ -139,11 +164,11 @@ function reportRebuild(r) {
   // re-run install() and re-report 'installed', forever, with nothing to show
   // for it (audit 2026-08-16 review Minor tail).
   if (r && r.manifestUnwritable) {
-    process.stdout.write(
+    notices.push(
       `[code-graph] The plugin manifest could not be written (${r.manifestUnwritable}). ` +
       'Hooks are registered but the install will not be remembered, so this runs again ' +
       'every session. Check permissions on ~/.claude/plugins/, then run ' +
-      '`code-graph-mcp doctor`.\n'
+      '`code-graph-mcp doctor`.'
     );
   }
   return r;
@@ -256,9 +281,10 @@ function syncLifecycleConfig() {
  * health-check carries the verdict in `index_version_stale`. Best-effort: any
  * failure → false (never force work off a bad probe).
  *
- * Returns true | false | null, where null means the SessionStart budget ran out
- * before the probe could run. `false` says "asked, not stale"; conflating the
- * two would let the caller report a freshness it never established.
+ * Returns true | false | null | 'corrupt', where null means the SessionStart
+ * budget ran out before the probe could run. `false` says "asked, not stale";
+ * conflating the two would let the caller report a freshness it never
+ * established. 'corrupt' is health-check's `reason:"corrupt"` verdict.
  */
 function indexNeedsRevalidation(bin, cwd) {
   const budget = budgetFor('health-check', 3000);
@@ -272,7 +298,13 @@ function indexNeedsRevalidation(bin, cwd) {
       // health-check exits non-zero on an unhealthy index but still writes JSON.
       out = ((e && e.stdout) || '').toString();
     }
-    return JSON.parse(out).index_version_stale === true;
+    const report = JSON.parse(out);
+    // A corrupt index answers every hook with nothing, and a reader never
+    // rebuilds it (it reports and preserves). Only an indexer does, so the
+    // caller must start one — before this it read as "not stale" and every
+    // hook stayed dark with no word to the user (hook audit 2026-09-28 P1-7).
+    if (report.reason === 'corrupt') return 'corrupt';
+    return report.index_version_stale === true;
   } catch {
     return false;
   }
@@ -308,6 +340,7 @@ function ensureIndexFresh() {
 
   let needsRefresh = false;
   let unprobed = false;
+  let corrupt = false;
   // Trigger 1: git HEAD newer than index mtime.
   const gitBudget = budgetFor('git-log', 2000);
   if (gitBudget === null) {
@@ -325,7 +358,8 @@ function ensureIndexFresh() {
   // Trigger 2: INDEX_VERSION mismatch (only probe when mtime looked fresh).
   if (!needsRefresh) {
     const stale = indexNeedsRevalidation(bin, cwd);
-    if (stale === true) needsRefresh = true;
+    if (stale === 'corrupt') corrupt = needsRefresh = true;
+    else if (stale === true) needsRefresh = true;
     else if (stale === null) unprobed = true;
   }
 
@@ -341,6 +375,14 @@ function ensureIndexFresh() {
     stdio: 'ignore',
   }));
   if (child && typeof child.unref === 'function') child.unref();
+  if (corrupt) {
+    notices.push(
+      '[code-graph] The index at .code-graph/index.db was corrupt, so every hook had nothing to say.\n' +
+      '            Rebuilding it in the background; hooks resume when it finishes.\n' +
+      '            If this repeats: code-graph-mcp rebuild-index --confirm'
+    );
+    return 'rebuilding-corrupt';
+  }
   return 'refreshing';
 }
 
@@ -377,7 +419,7 @@ function verifyBinary() {
   const { findBinary } = require('./find-binary');
   const binary = findBinary();
   if (!binary) {
-    process.stderr.write(missingBinaryMessage());
+    notices.push(missingBinaryMessage().trimEnd());
     return { available: false, binary: null };
   }
 
@@ -385,13 +427,11 @@ function verifyBinary() {
   try {
     fs.accessSync(binary, fs.constants.X_OK);
   } catch {
-    process.stderr.write(
+    notices.push(
       `[code-graph] Binary not executable: ${binary}\n` +
-      `Fix: chmod +x "${binary}"\n`
+      `Fix: chmod +x "${binary}"` +
+      (process.platform === 'darwin' ? `\nAlso try: xattr -d com.apple.quarantine "${binary}"` : '')
     );
-    if (process.platform === 'darwin') {
-      process.stderr.write(`Also try: xattr -d com.apple.quarantine "${binary}"\n`);
-    }
     return { available: false, binary, issue: 'not-executable' };
   }
 
@@ -412,17 +452,17 @@ function verifyBinary() {
       const msg = (err.message || '') + (err.stderr ? err.stderr.toString() : '');
       if (msg.includes('quarantine') || msg.includes('not permitted') ||
           msg.includes('killed') || err.status === 137 || err.signal === 'SIGKILL') {
-        process.stderr.write(
+        notices.push(
           `[code-graph] macOS Gatekeeper is blocking the binary: ${binary}\n` +
           `Fix: xattr -d com.apple.quarantine "${binary}"\n` +
-          `Then restart Claude Code to reconnect the MCP server.\n`
+          'Then restart Claude Code to reconnect the MCP server.'
         );
         return { available: false, binary, issue: 'quarantine' };
       }
       // Other errors (e.g., missing libs) — still report
-      process.stderr.write(
+      notices.push(
         `[code-graph] Binary found but failed to run: ${binary}\n` +
-        `Error: ${msg.slice(0, 200)}\n`
+        `Error: ${msg.slice(0, 200)}`
       );
       return { available: false, binary, issue: 'runtime-error' };
     }
@@ -497,16 +537,8 @@ function consistencyCheck(binary) {
     }
   } catch { /* skip check on error */ }
 
-  // Output warnings to stderr
-  if (issues.length > 0) {
-    const lines = [`[code-graph] ${issues.length} consistency issue(s):`];
-    issues.forEach((issue, i) => {
-      lines.push(`  ${i + 1}. ${issue.msg}`);
-      lines.push(`     → ${issue.fix}`);
-    });
-    process.stderr.write(lines.join('\n') + '\n');
-  }
-
+  // Returned, not printed: stderr never reaches the user, and a version skew
+  // self-heals through the background auto-update (decision D5).
   return issues;
 }
 
@@ -527,6 +559,8 @@ function runSessionInit({ source } = {}) {
   // many times in one process. A carried-over array would report last run's
   // skips as this one's.
   budgetSkips = [];
+  notices = [];
+  contextParts = [];
   // GC the shared tmp dir before anything else, so it happens even on the
   // inactive / non-project early returns below — those sessions still wrote
   // cooldown flags on the way in. Cheap (one readdir + a stat per entry) and
@@ -616,13 +650,9 @@ function runSessionInit({ source } = {}) {
     return { inactive: false, nonProject: true, lifecycle, autoUpdateLaunched: false };
   }
 
-  const conflict = checkScopeConflict();
-  if (conflict) {
-    process.stderr.write(
-      `[code-graph] Warning: conflicting install detected — ${conflict.existingId} (${conflict.scope || 'unknown'} scope). ` +
-      `Use /plugin to remove one to avoid config conflicts.\n`
-    );
-  }
+  // `doctor` reports a conflicting install; a SessionStart line about it went
+  // to stderr, which no one sees (decision D5).
+  checkScopeConflict();
 
   // Verify binary availability — catch issues early with actionable diagnostics
   const binaryCheck = verifyBinary();
@@ -630,80 +660,26 @@ function runSessionInit({ source } = {}) {
   const autoUpdateLaunched = launchBackgroundAutoUpdate(spawn, process.env, { force: isHighIntentSource(source) });
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
 
-  // 上下文感知默认：插件模式下首次 SessionStart 自动安装（创建/注入 CLAUDE.md 块 +
-  // .claude/ detail 文件），并清理旧 memory-dir 制品（升级自动迁移）。shipped 漂移
-  // 时刷新。三种情况发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
-  // Adoption is OPTIONAL; the rest of this hook is not. It touches files the
-  // user owns (CLAUDE.md, .claude/) which can be unreadable, a directory, or on
-  // a read-only mount — and a throw here used to abort every remaining step
-  // (map injection, recent impact, consistency check, both hook canaries) with a
-  // raw stack trace (audit 2026-08-16 P1-16). adopt() now returns reasons rather
-  // than throwing; this is the belt to that suspenders, so a future unguarded
-  // read inside it cannot take the session down again.
-  let autoAdopt = { attempted: false, result: null };
+  // SessionStart no longer writes CLAUDE.md (decision D4); maybeAutoAdopt only
+  // cleans this plugin's legacy memory-dir artifacts and reports the project's
+  // adoption state. A block that has drifted from the shipped template is the
+  // one case worth a notice: its guidance is out of date and only the user can
+  // decide to refresh or remove it. Never throws out of this hook (P1-16).
+  let autoAdopt = { attempted: false, reason: null };
   if (!isRelic) {
     try {
       autoAdopt = maybeAutoAdopt({ scriptPath: __dirname });
     } catch (e) {
-      autoAdopt = { attempted: true, reason: 'threw', result: null, error: (e && e.message) || String(e) };
-      process.stderr.write(
-        `[code-graph] Skipped CLAUDE.md adoption for this project (${(e && e.code) || (e && e.message) || 'unknown error'}).\n` +
-        '            Everything else in this session start continues normally.\n'
-      );
+      autoAdopt = { attempted: false, reason: 'threw', error: (e && e.message) || String(e) };
     }
   }
-  if (autoAdopt.result && autoAdopt.result.ok === false &&
-      (autoAdopt.result.reason === 'claude-md-unreadable' || autoAdopt.result.reason === 'claude-md-unwritable' ||
-       autoAdopt.result.reason === 'detail-unwritable')) {
-    // A refusal is not a silent no-op: the user's steering block is NOT
-    // installed/refreshed, and only this line says so.
-    process.stderr.write(
-      `[code-graph] Could not install the CLAUDE.md steering block (${autoAdopt.result.reason}: ` +
-      `${autoAdopt.result.error || 'unknown'}). Nothing was changed.\n` +
-      '            Opt out permanently: CODE_GRAPH_NO_AUTO_ADOPT=1\n'
+  if (autoAdopt.reason === 'stale') {
+    notices.push(
+      "[code-graph] This project's CLAUDE.md carries an out-of-date code-graph block.\n" +
+      `            Refresh it: ${adoptCommand()}\n` +
+      `            Remove it:  ${unadoptCommand()}\n` +
+      '            (SessionStart no longer edits CLAUDE.md itself; CODE_GRAPH_NO_TEMPLATE_REFRESH=1 silences this.)'
     );
-  }
-  const migrated = autoAdopt.migrated || {};
-  if (migrated.memoryIndexPruned || migrated.legacyDetailRemoved) {
-    process.stderr.write(
-      '[code-graph] Migrated to CLAUDE.md steering — cleaned legacy memory-dir artifacts\n' +
-      '            (MEMORY.md sentinel + detail file). Your other memories are untouched.\n'
-    );
-  }
-  if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
-    if (autoAdopt.reason === 'refreshed') {
-      // Name BOTH refreshed surfaces: the drift-refresh fully overwrites the
-      // generated detail doc, so a user who hand-edited it must learn why
-      // their edits vanished and how to lock the file.
-      const detailNote = autoAdopt.result.detailWritten
-        ? ' + .claude/plugin_code_graph_mcp.md (manual edits to that generated file are overwritten)'
-        : '';
-      process.stderr.write(
-        `[code-graph] Refreshed CLAUDE.md decision block to latest shipped version${detailNote}.\n` +
-        '            Lock files: CODE_GRAPH_NO_TEMPLATE_REFRESH=1 in ~/.claude/settings.json env\n'
-      );
-    } else {
-      process.stderr.write(
-        '[code-graph] Installed code-graph block into project CLAUDE.md (plugin install → knowing consent).\n' +
-        '            Detail table: .claude/plugin_code_graph_mcp.md (generated; safe to gitignore)\n' +
-        '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
-        `            Reverse:    ${unadoptCommand()}\n`
-      );
-    }
-    // `adopt()` has returned `registryRecorded` since it stopped throwing on a
-    // broken registry, and nothing read it. The consequence is not cosmetic:
-    // `uninstall()` walks that registry to strip our managed block from every
-    // adopted project's CLAUDE.md, so an unrecorded project keeps the block
-    // FOREVER after uninstall, with no plugin code left to remove it — the
-    // teardown-asymmetry class this repo has already been bitten by (audit
-    // 2026-08-16 review Minor tail).
-    if (autoAdopt.result.registryRecorded === false) {
-      process.stderr.write(
-        '[code-graph] Note: this project could not be recorded in the adopted-projects registry,\n' +
-        '            so `/plugin uninstall` will NOT strip the block from this CLAUDE.md.\n' +
-        `            Remove it by hand with \`${unadoptCommand()}\` before uninstalling.\n`
-      );
-    }
   }
 
   // quietHooks: default quiet (project_map injection duplicates MEMORY.md +
@@ -723,9 +699,9 @@ function runSessionInit({ source } = {}) {
   // FAILED firing self-test result (and refreshes it in the background, off the
   // 5s budget); Layer B is the runtime dispatch-dark canary. Both best-effort.
   const hookFireWarn = checkHookFiring();
-  if (hookFireWarn) process.stderr.write(hookFireWarn);
+  if (hookFireWarn) notices.push(hookFireWarn.trimEnd());
   const hookDarkWarn = detectHookDark();
-  if (hookDarkWarn) process.stderr.write(hookDarkWarn);
+  if (hookDarkWarn) notices.push(hookDarkWarn.trimEnd());
   return {
     inactive: false, lifecycle,
     autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues,
@@ -735,6 +711,7 @@ function runSessionInit({ source } = {}) {
     // on every healthy run; non-empty is the only signal that this SessionStart
     // did less than it looks like it did.
     budgetSkipped: budgetSkips.slice(),
+    notices: notices.slice(),
   };
 }
 
@@ -773,9 +750,7 @@ function injectProjectMap() {
     }));
 
     if (output && output.trim()) {
-      process.stdout.write(
-        '[code-graph] Project map (indexed):\n' + output.trim() + '\n'
-      );
+      contextParts.push('[code-graph] Project map (indexed):\n' + output.trim());
       return true;
     }
   } catch {
@@ -897,6 +872,8 @@ if (require.main === module) {
   // housekeeping (audit 2026-08-16 P1-16). One `[code-graph]` line, exit 0.
   try {
     runSessionInit({ source });
+    const out = sessionStartOutput();
+    if (out) process.stdout.write(out);
   } catch (e) {
     process.stderr.write(
       `[code-graph] SessionStart hook error (${(e && e.code) || (e && e.name) || 'Error'}): ` +

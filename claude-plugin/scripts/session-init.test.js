@@ -265,7 +265,7 @@ function runSessionInitHook(t, {
     JSON.stringify({ ts: new Date().toISOString(), failures: [] }));
   fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
   // Seeds detectHookDark (runs LATE, after adoption): 3 edit events, no
-  // grep/read events → it must emit its "may be dark" warning on stderr.
+  // grep/read events → it must emit its "may be dark" warning as a notice.
   fs.writeFileSync(path.join(proj, '.code-graph', 'recommendations.jsonl'),
     ['{"hook":"edit"}', '{"hook":"edit"}', '{"hook":"edit"}', ''].join('\n'));
 
@@ -301,6 +301,15 @@ function runSessionInitHook(t, {
   return { res, proj, home };
 }
 
+// SessionStart writes ONE JSON value on stdout (decision D5): the user-facing
+// notices as `systemMessage`, model context as `additionalContext`. Its stderr
+// is never shown when it exits 0, so that is not where a notice may go.
+function noticeOf(res) {
+  const out = (res.stdout || '').trim();
+  if (!out) return '';
+  return JSON.parse(out).systemMessage || '';
+}
+
 // install()/update() have reported `manifestUnwritable` since they stopped
 // throwing on it, and nothing read the field. It is not cosmetic:
 // syncLifecycleConfig keys entirely off `manifest.version`, so a manifest that
@@ -317,63 +326,44 @@ test('an unwritable plugin manifest is reported, not swallowed', (t) => {
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stdout, /manifest could not be written \(EACCES\)/,
+  assert.match(noticeOf(res), /manifest could not be written \(EACCES\)/,
     `the unwritable manifest must be surfaced; stdout was:\n${res.stdout}`);
-  assert.match(res.stdout, /every session/,
+  assert.match(noticeOf(res), /every session/,
     'the message must name the consequence, not just the error code');
 });
 
-// adopt() has reported `registryRecorded` since it stopped throwing on a broken
-// registry, and nothing read it. uninstall() walks that registry to strip our
-// managed block from each adopted project's CLAUDE.md, so an unrecorded project
-// keeps the block forever after uninstall — with no plugin code left to remove it.
-test('an unrecorded adoption warns that uninstall will not clean this project', (t) => {
-  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
-  const { res } = runSessionInitHook(t, {
-    prefix: 'cg-si-registry-',
-    preloadSrc: `
-      const ad = require(${adopt});
-      ad.maybeAutoAdopt = () => ({
-        attempted: true,
-        reason: 'installed',
-        result: { ok: true, detailWritten: true, registryRecorded: false },
-      });
-    `,
-  });
+// Decision D4: SessionStart no longer writes CLAUDE.md, so the adoption notices
+// ("Installed …", "Refreshed …", the unrecorded-registry note) are gone. What is
+// left is a block that has drifted from the shipped template: its guidance is
+// out of date, and only the user can refresh or remove it.
+const STALE_STUB = `
+  const ad = require(${JSON.stringify(path.join(__dirname, 'adopt.js'))});
+  ad.maybeAutoAdopt = () => ({ attempted: false, reason: 'stale' });
+`;
+
+test('a stale adoption block is reported with a refresh and a remove command', (t) => {
+  const { res } = runSessionInitHook(t, { prefix: 'cg-si-stale-', preloadSrc: STALE_STUB });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /adopted-projects registry/,
-    `an unrecorded adoption must be surfaced; stderr was:\n${res.stderr}`);
-  assert.match(res.stderr, /unadopt/,
-    'the message must name the manual remedy');
+  const n = noticeOf(res);
+  assert.match(n, /out-of-date code-graph block/, `stdout was:\n${res.stdout}`);
+  assert.match(n, /Refresh it: node '[^']+adopt\.js' adopt/);
+  assert.match(n, /Remove it: {2}node '[^']+adopt\.js' unadopt/);
 });
 
 // issue #41: the reporter uses the plugin only and has no `code-graph-mcp` on
-// PATH. Both remedies this hook prints — the Reverse line on a fresh adoption
-// and the unrecorded-registry note — spend the bare name, so the escape hatch
-// was exactly as unrunnable as the feature the user wanted out of. stderr is
+// PATH, so a remedy that spends the bare name is unrunnable. The notice is
 // per-machine and ephemeral, so unlike the CLAUDE.md block it may (and must)
 // name the path this install actually resolved.
-test('the adoption remedies name a command this install can actually run', (t) => {
-  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
-  const { res } = runSessionInitHook(t, {
-    prefix: 'cg-si-reverse-',
-    preloadSrc: `
-      const ad = require(${adopt});
-      ad.maybeAutoAdopt = () => ({
-        attempted: true,
-        reason: 'adopted',
-        result: { ok: true, detailWritten: true, registryRecorded: false },
-      });
-    `,
-  });
+test('the stale-block remedy names a command this install can actually run', (t) => {
+  const { res } = runSessionInitHook(t, { prefix: 'cg-si-reverse-', preloadSrc: STALE_STUB });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
 
   // Pull the command out of the message and run it, rather than matching a
-  // shape. The first version of this test stubbed findBinary to `/bin/true` and
-  // asserted the string — it stayed green while the real command exited 1 with
-  // "adopt.js not found" on every install layout except a dev checkout.
-  const m = res.stderr.match(/Reverse:\s+(node '[^']+' unadopt)/);
-  assert.ok(m, `the Reverse hint must be present and quoted; stderr was:\n${res.stderr}`);
+  // shape. An earlier version of this test stubbed findBinary to `/bin/true`
+  // and asserted the string — it stayed green while the real command exited 1
+  // with "adopt.js not found" on every install layout except a dev checkout.
+  const m = noticeOf(res).match(/Remove it:\s+(node '[^']+' unadopt)/);
+  assert.ok(m, `the remove hint must be present and quoted; stdout was:\n${res.stdout}`);
   const script = m[1].match(/'([^']+)'/)[1];
   assert.ok(fs.existsSync(script), `the hint points at a file that does not exist: ${script}`);
   assert.equal(path.basename(script), 'adopt.js',
@@ -398,33 +388,55 @@ test('the adoption remedies name a command this install can actually run', (t) =
   });
   assert.equal(ran.status, 0,
     `the printed command must RUN, not just read well. stdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`);
-
-  assert.match(res.stderr, /`node '[^']+adopt\.js' unadopt`/,
-    `the unrecorded-registry remedy must be the same runnable command; stderr was:\n${res.stderr}`);
 });
 
-// The hint must not depend on binary resolution at all — `unadopt` is dispatched
-// through adopt.js, which sits next to this hook in every install layout, so a
-// missing or unresolvable binary changes nothing about how you undo an adoption.
-test('the remedy does not change when no binary resolved', (t) => {
-  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
+// The hint must not depend on binary resolution at all — `adopt`/`unadopt` are
+// dispatched through adopt.js, which sits next to this hook in every install
+// layout, so a missing binary changes nothing about how you undo an adoption.
+test('the stale-block remedy does not change when no binary resolved', (t) => {
   const findBinary = JSON.stringify(path.join(__dirname, 'find-binary.js'));
   const { res } = runSessionInitHook(t, {
     prefix: 'cg-si-reverse-none-',
-    preloadSrc: `
-      const ad = require(${adopt});
-      ad.maybeAutoAdopt = () => ({
-        attempted: true,
-        reason: 'adopted',
-        result: { ok: true, detailWritten: true, registryRecorded: true },
-      });
+    preloadSrc: STALE_STUB + `
       const fb = require(${findBinary});
       fb.findBinary = () => null;
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /Reverse:\s+node '[^']+adopt\.js' unadopt/,
-    `no binary must not degrade the hint; stderr was:\n${res.stderr}`);
+  assert.match(noticeOf(res), /Remove it:\s+node '[^']+adopt\.js' unadopt/,
+    `no binary must not degrade the hint; stdout was:\n${res.stdout}`);
+});
+
+// A corrupt index answers every hook with nothing. A reader never rebuilds it
+// (it reports and preserves), and health-check's `reason:"corrupt"` used to read
+// as "not stale", so the hooks stayed dark and nobody was told (hook audit
+// 2026-09-28 P1-7). SessionStart now starts the indexer and says so.
+test('a corrupt index is rebuilt in the background and the user is told', (t) => {
+  const os = require('os');
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-corrupt-bin-'));
+  t.after(() => fs.rmSync(stubDir, { recursive: true, force: true }));
+  const marker = path.join(stubDir, 'rebuilt');
+  const stub = path.join(stubDir, 'code-graph-mcp');
+  fs.writeFileSync(stub, `#!/bin/sh
+case "$1" in
+  health-check) echo '{"healthy":false,"reason":"corrupt","issue":"index database is corrupt"}'; exit 1 ;;
+  incremental-index) touch ${JSON.stringify(marker)} ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-corrupt-',
+    indexDb: true,
+    preloadSrc: `
+      const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
+      fb.findBinary = () => ${JSON.stringify(stub)};
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  assert.match(noticeOf(res), /index at \.code-graph\/index\.db was corrupt/, `stdout was:\n${res.stdout}`);
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(marker) && Date.now() < deadline) { /* the rebuild is detached */ }
+  assert.ok(fs.existsSync(marker), 'the indexer must have been started to rebuild it');
 });
 
 // Control for the two tests above: the same harness with NO stubbed failure
@@ -441,9 +453,9 @@ test('the hook-dark detector reads the resolved project root, not the shell cwd'
     indexDb: true,
   });
   assert.equal(res.status, 0, `hook must exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /may be dark/,
+  assert.match(noticeOf(res), /may be dark/,
     'the seeded recommendations.jsonl sits at the project root; a subdir session ' +
-    `must still find it. stderr was:\n${res.stderr}`);
+    `must still find it. stdout was:\n${res.stdout}`);
 });
 
 // Control for the test above: with no index.db to walk up to, resolveProjectRoot
@@ -456,15 +468,15 @@ test('a subdir session with no indexed ancestor falls back to cwd and stays quie
     indexDb: false,
   });
   assert.equal(res.status, 0, `hook must exit 0; stderr:\n${res.stderr}`);
-  assert.doesNotMatch(res.stderr, /may be dark/,
+  assert.doesNotMatch(noticeOf(res), /may be dark/,
     'without an indexed ancestor there is no file to read and nothing to conclude');
 });
 
 test('a clean session start emits neither disclosure', (t) => {
   const { res } = runSessionInitHook(t, { prefix: 'cg-si-clean-' });
   assert.equal(res.status, 0, `stderr:\n${res.stderr}`);
-  assert.doesNotMatch(res.stdout, /manifest could not be written/);
-  assert.doesNotMatch(res.stderr, /adopted-projects registry/);
+  assert.doesNotMatch(noticeOf(res), /manifest could not be written/);
+  assert.doesNotMatch(noticeOf(res), /out-of-date code-graph block/);
 });
 
 test('SessionStart fails OPEN when adoption throws: exit 0, later steps still run', (t) => {
@@ -472,10 +484,8 @@ test('SessionStart fails OPEN when adoption throws: exit 0, later steps still ru
 
   assert.equal(res.status, 0,
     `a SessionStart hook must never exit non-zero on a bad CLAUDE.md; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /may be dark/,
+  assert.match(noticeOf(res), /may be dark/,
     'detectHookDark runs AFTER adoption — its warning proves the rest of the sequence still executed');
-  assert.match(res.stderr, /\[code-graph\]/,
-    'the failure itself must be reported, not swallowed');
   assert.doesNotMatch(res.stderr, /^\s*at .*session-init\.js/m,
     'a raw node stack trace in the user\'s session is not a report');
 });
@@ -485,7 +495,7 @@ test('the fail-open wrapper is scoped: a normal run still reaches the same late 
   // produced the "may be dark" line, this run would prove nothing.
   const { res } = runSessionInitHook(t, { adoptThrows: false, prefix: 'cg-si-normal-' });
   assert.equal(res.status, 0);
-  assert.match(res.stderr, /may be dark/);
+  assert.match(noticeOf(res), /may be dark/);
 });
 
 test('runSessionInit tears down cache + adoption on a genuine uninstall (order regression)', (t) => {

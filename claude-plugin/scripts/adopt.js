@@ -736,19 +736,27 @@ function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
   if (!isPluginModeInstall(scriptPath || __dirname)) {
     return { attempted: false, reason: 'not-plugin-mode', migrated: noMigration };
   }
-  // Clean legacy memory-dir artifacts before installing the new CLAUDE.md scheme.
+  // Clean up this plugin's own legacy memory-dir artifacts.
   const migrated = migrateLegacyMemoryDir({ cwd, home });
+  // Never writes CLAUDE.md or .claude/ (decision D4, 2026-09-28 usage
+  // evaluation). Creating them on the first session made Claude stop to
+  // explain the unexpected changes in 12 of 15 coding runs (0 of 15 without
+  // the plugin), and the MCP instructions already carry 10 of the block's 11
+  // guidance points. An adopted project keeps its block as it is; one that has
+  // drifted from the shipped template is reported as `stale`, so SessionStart
+  // can tell the user how to refresh (`adopt`) or remove (`unadopt`) it. The
+  // name is kept: SessionStart, tests and the uninstall paths all call it.
   if (isAdopted({ cwd })) {
-    // shipped template / 管理块 漂移时重跑 adopt 对齐。
-    // opt-out: CODE_GRAPH_NO_TEMPLATE_REFRESH=1（锁定手动编辑）。
     if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd })) {
-      const result = adopt({ cwd, home });
-      return { attempted: true, reason: 'refreshed', result, migrated };
+      return { attempted: false, reason: 'stale', migrated };
     }
     return { attempted: false, reason: 'already-adopted', migrated };
   }
-  const result = adopt({ cwd, home });
-  return { attempted: true, reason: 'adopted', result, migrated };
+  return { attempted: false, reason: 'not-adopted', migrated };
+}
+
+function adoptCommand() {
+  return `node ${shellQuote(__filename)} adopt`;
 }
 
 function unadopt({ cwd, home } = {}) {
@@ -978,7 +986,7 @@ if (require.main === module) {
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, unadoptCommand, shellQuote, stripSentinelBlock,
   readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot, adoptCommand,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
   claudeMdPath, detailDir, detailPath,
   extractCargoRuntimeDeps, extractPyRuntimeDeps, extractGoDirectRequires,
