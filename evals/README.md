@@ -117,6 +117,68 @@ How to read it:
   walk of a closure runs out of turns or budget. That is the next step if Δ is
   to become a gate.
 
+## Coding cases (tag `coding`)
+
+The cases above ask questions. These five ask for a code change, the way a
+user of Claude Code does. Each is networkx at upstream commit `c1ebe04` with
+one real upstream change reverted, source and tests together, so the agent
+has to make that change again (`_coding/build.sh`). The workspace is a
+one-commit repo, so the fix is not one `git log` away.
+
+| Case | Upstream commit | Shape |
+|---|---|---|
+| `code-flow-capacity` | 0080011 | feature across 8 files: a callable `capacity` for every max-flow/min-cut entry point |
+| `code-betweenness-k` | a802a27 | bug from a symptom report; the fix is in rescale helpers two modules share |
+| `code-subclass-args` | 75bdd73 | bug with parallel implementations: the same `__new__` in several graph classes |
+| `code-dead-helpers` | b1b678f | delete unreferenced private functions; needs a whole-repo reference check |
+| `code-ismags-empty` | c94928e | control: a local bug whose file and traceback are given |
+
+`claude plugin eval` has no grader that runs a command after the agent is
+done, so these are scored outside it. Run with `--keep-temp --json OUT.json`,
+then `python3 evals/_coding/grade.py OUT.json --suite`: it copies each kept
+workspace out, runs the case's hidden tests (`_coding/hidden/<case>/`, public
+API only, never staged into the plugin directory the agent can read) and,
+with `--suite`, the whole networkx suite. `build.sh` checks every case both
+ways before it can be used: the hidden tests fail on the workspace and pass
+on the upstream commit (for `code-dead-helpers`, the gold set is the three
+functions upstream removed). The only in-eval grader is `used-code-graph`.
+
+```bash
+evals/run.sh --tag coding --runs 3 -j 4 --keep-temp --model claude-opus-5-5 --json /var/tmp/coding.json
+python3 evals/_coding/grade.py /var/tmp/coding.json --suite -j 6 --out /var/tmp/coding-graded.json
+```
+
+### Baseline (v0.163.0, 2026-09-28, `--model claude-opus-5-5`)
+
+$14.46, 750 s. Hidden tests and the full suite, per run:
+
+| Case | Pass W / W/O | Cost/run W / W/O | Turns/run W / W/O | code-graph calls (W) |
+|---|---|---|---|---|
+| code-flow-capacity | 3/3 / 3/3 | $1.24 / $1.11 | 41.0 / 38.7 | 0 |
+| code-betweenness-k | 3/3 / 3/3 | $0.41 / $0.42 | 16.0 / 15.0 | 0 |
+| code-subclass-args | 3/3 / 3/3 | $0.26 / $0.23 | 11.3 / 11.3 | 0 |
+| code-dead-helpers | 3/3 / 3/3 | $0.20 / $0.18 | 5.7 / 5.3 | 0 |
+| code-ismags-empty | 3/3 / 3/3 | $0.42 / $0.35 | 16.3 / 14.7 | 0 |
+| **all 15 runs per arm** | 15/15 / 15/15 | $7.60 / $6.88 | 271 / 255 | 0 |
+
+How to read it:
+
+- **The plugin was never used for a code change.** No CLI call, no MCP call,
+  in 15 runs. The grep hook recorded nothing: the agent searched
+  `networkx/…`, and the hook only acts on paths under its fixed list of
+  source-dir names (`SRC_PREFIXES` in `pre-grep-guide.js`), which has no
+  package-named dir. Three runs edited with `sed -i`, which the Edit hook
+  never sees.
+- **Its cost came from its side effects, not its context.** The first
+  request carried 16,986 tokens against 15,670 (median), about 1.3K of fixed
+  overhead. But SessionStart appends `.code-graph/` to the tracked
+  `.gitignore` and creates `CLAUDE.md` and `.claude/`, and in 12 of 15 runs
+  the final reply told the user about those changes (10 runs spent a tool
+  call on `.gitignore`); 0 of 15 without the plugin.
+- **Correctness is at the ceiling here too**, all full suites green. A
+  clearly specified change in a 583-file repo is within reach of grep and
+  reading.
+
 ## What `run.sh` sets up, and why
 
 Each eval run gets a temporary HOME, an empty workspace and a fresh Claude Code

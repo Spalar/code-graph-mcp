@@ -35,6 +35,10 @@ find "$plugin" -name '*.test.js' -delete
 mkdir -p "$plugin/evals"
 cp -a "$repo/evals/." "$plugin/evals/"
 rm -rf "${plugin:?}/evals/results"
+# The coding cases' grader tests stay out of the plugin directory the agent's
+# sandbox can read; evals/_coding/grade.py runs them after the eval.
+rm -rf "${plugin:?}/evals/_coding/hidden"
+[ "${CG_EVAL_SKIP_CODING_BUILD:-}" = 1 ] || "$repo/evals/_coding/build.sh"
 
 # The agent's Bash runs in an OS sandbox that can read only the workspace, the
 # plugin directory and the PATH directories under $HOME. node on this machine
@@ -71,7 +75,7 @@ env PATH="$tools:/usr/local/bin:/usr/bin:/bin" \
   claude plugin eval "$plugin" \
   --scaffold --trust-plugin --no-publish --allow-real-servers \
   --output-dir "$results" \
-  --allow-tools Bash "mcp__plugin_code-graph-mcp_code-graph__*" \
+  --allow-tools Bash Edit Write "mcp__plugin_code-graph-mcp_code-graph__*" \
   "$@" || status=$?
 
 "$repo/evals/_fixture/reap.sh" "$tmp_base" "$before" "$plugin" || true
