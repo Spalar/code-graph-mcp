@@ -133,15 +133,41 @@ const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 // The EARLIEST definition in the hunk names the symbol. Taking the first
 // pattern in array order let the JS `function\s+(\w+)` arm read a Python
 // docstring's "function used" as the symbol `used`.
+//
+// Earliest DEFINITION, not earliest match (pre-tag review 2026-09-29): a doc
+// comment's "the function that" and a control statement ending in `{`
+// (`if v.is_empty() {`, `if (x > 0) {`) match before the real header, and
+// taking them blinded this hook and the Stop check to a signature change
+// 0.163.0 caught (replayed on 7,106 recorded edits: 12 picked such a word). So
+// every match is a candidate, in order, and three kinds are not definitions:
+// one on a comment line, a control keyword, and a `name(...) {` (the JS
+// method / Go arm) preceded by anything but modifiers or a Go receiver.
+const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*|#(?![[!])|--|"""|''')/;
+const METHOD_ARM = 3; // `(\w+)\s*\([^)]*\)\s*\{` — also matches calls
+const METHOD_PREFIX = /^\s*(?:(?:export|default|public|private|protected|static|async|override|readonly|abstract|get|set)\s+)*$|\)\s*$/;
+function definitionAt(m, arm) {
+  const name = m[1] || m[2];
+  if (!name || isCommonKeyword(name)) return false;
+  const lineStart = scanned.lastIndexOf('\n', m.index) + 1;
+  if (COMMENT_LINE.test(scanned.slice(lineStart, m.index + 1))) return false;
+  if (arm === METHOD_ARM) {
+    const nameAt = m.index + m[0].indexOf(name);
+    if (!METHOD_PREFIX.test(scanned.slice(lineStart, nameAt))) return false;
+  }
+  return true;
+}
 let symbol = null;
 let symbolAt = -1;
-for (const pat of fnPatterns) {
-  const m = scanned.match(pat);
-  if (m && (symbolAt === -1 || m.index < symbolAt)) {
-    symbol = m[1] || m[2];
-    symbolAt = m.index;
+fnPatterns.forEach((pat, arm) => {
+  for (const m of scanned.matchAll(new RegExp(pat.source, 'g'))) {
+    if (symbolAt !== -1 && m.index >= symbolAt) break;
+    if (definitionAt(m, arm)) {
+      symbol = m[1] || m[2];
+      symbolAt = m.index;
+      break;
+    }
   }
-}
+});
 
 if (!symbol || symbol.length < 3) process.exit(0);
 

@@ -287,7 +287,7 @@ test('SEC-04: the scan window is bounded in the hook itself', () => {
   // Belt to the quantifier caps' braces, and the part that bounds a pattern a
   // future author adds without reading the note.
   assert.match(SOURCE, /oldStr\.length > 8192 \? oldStr\.slice\(0, 8192\)/);
-  assert.match(SOURCE, /for \(const pat of fnPatterns\) \{\n\s*const m = scanned\.match\(pat\)/);
+  assert.match(SOURCE, /fnPatterns\.forEach\(\(pat, arm\) => \{\n\s*for \(const m of scanned\.matchAll\(new RegExp\(pat\.source, 'g'\)\)\)/);
 });
 
 // ── Covering-test targeting (edit-time PUSH) ────────────
@@ -493,6 +493,36 @@ test('scope: the earliest definition in old_string names the symbol, not the fir
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stdout, /code-graph:impact\] send_static_file\(\)/);
 });
+
+// Earliest is earliest DEFINITION, not earliest match: a doc comment's prose
+// ("the function that") and a control statement ending in `{` (`if v.is_empty()
+// {`, `if (x > 0) {`) match the patterns before the real header does, and taking
+// them left both this hook and the Stop check blind to a signature change that
+// 0.163.0 reported (pre-tag review 2026-09-29).
+for (const [label, relPath, oldString, newString, name] of [
+  ['a Rust doc comment\'s prose', 'src/a.rs',
+    '/// Adds one; the function that every caller in b.rs uses.\npub fn target(a: i32) -> i32 {',
+    '/// Adds one; the function that every caller in b.rs uses.\npub fn target(a: i32, b: i32) -> i32 {',
+    'target'],
+  ['a JS line comment\'s prose', 'src/payments.js',
+    '// the function that charges\nfunction processPayment(order) {',
+    '// the function that charges\nfunction processPayment(order, currency) {',
+    'processPayment'],
+  ['a Rust `if` on a member call', 'src/a.rs',
+    '    if v.is_empty() {\n        return 0;\n    }\n    v.len()\n}\n\npub fn target(a: i32) -> i32 {',
+    '    if v.is_empty() {\n        return 0;\n    }\n    v.len()\n}\n\npub fn target(a: i32, b: i32) -> i32 {',
+    'target'],
+  ['a JS `if` statement', 'src/payments.js',
+    '  if (x > 0) {\n    return 1;\n  }\n}\n\nfunction processPayment(order) {',
+    '  if (x > 0) {\n    return 1;\n  }\n}\n\nfunction processPayment(order, currency) {',
+    'processPayment'],
+]) {
+  test(`scope: ${label} ahead of a changed header does not name the symbol`, (t) => {
+    const { res } = runPreEditHook(t, { relPath, oldString, newString });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, new RegExp(`code-graph:impact\\] ${name}\\(\\)`));
+  });
+}
 
 test('scope: an edit to a file outside the project injects nothing', (t) => {
   const { res } = runPreEditHook(t, { relPath: '../elsewhere/payments.js' });
