@@ -52,9 +52,10 @@ plugin as duplicates (each hook would fire twice) and removes them.
 - The `.code-graph/` ignore rule goes to the repository's local
   `.git/info/exclude`, never the tracked `.gitignore`, and only when neither
   file names it already. A worktree's rule goes to the common git dir. A
-  `.git` that is a `gitdir:` file or a symlink, and a worktree's `commondir`,
-  are followed only to a git dir (one with a `HEAD`): a directory that is no
-  git dir gets nothing written into it. A `gitdir:` file can still name
+  `.git` that is a `gitdir:` file or a symlink is followed only to what git
+  itself accepts as a repository — a `HEAD` there, and `objects/` and `refs/`
+  in its common dir — so a directory that merely holds a `HEAD` file (a
+  clone's `refs/remotes/origin/`, its `logs/`) gets nothing written into it. A `gitdir:` file can still name
   another repository's git dir, as every linked worktree does.
 
 ### SessionStart says what matters, where you can see it
@@ -259,15 +260,17 @@ not have.
   32-node batches, runs, and restarts it. It used to wait 2 s, skip, and stay
   owed for the minutes a first backfill takes.
 - `callgraph X --file F`, `impact X --file F` and MCP `get_call_graph` with a
-  `file_path` refuse a name whose definitions in that file have different
-  qualified names, as `refs` already did, instead of merging them
-  (`callgraph pop --file src/flask/ctx.py` answered for `_AppCtxGlobals.pop`
-  and `AppContext.pop` at once). Definitions that share a qualified name —
-  `#[cfg]` twins, C++ overloads, a property's getter and setter, and also
-  same-named helpers nested in different functions — and a class beside its
-  own constructor (`Widget`, `Widget.Widget`) are answered merged, as 0.163.0
-  answered them: the `--json` graph holds every definition's edges, the text
-  tree only the first one's. A qualified name
+  `file_path` refuse a name whose callable definitions (functions and
+  methods) in that file have different qualified names, instead of merging
+  them (`callgraph pop --file src/flask/ctx.py` answered for
+  `_AppCtxGlobals.pop` and `AppContext.pop` at once). Every other group is
+  answered merged, as 0.163.0 answered all of them: `#[cfg]` twins, C++
+  overloads, a property's getter and setter, same-named helpers nested in
+  different functions, a class beside its own constructor (`Widget`,
+  `Widget.Widget`), and also a type beside another owner's same-named method
+  (gin's struct `Negotiate` and `Context.Negotiate`). The `--json` graph holds
+  every definition's edges, the text tree only the first one's; `refs` keeps
+  its own, stricter rule. A qualified name
   (`AppContext.pop`) answers, and so does `--node-id`: `impact` and
   `callgraph` take `--node-id N` like `show` and `refs` (the symbol is then
   optional and `--file` is ignored with a note), answering for exactly that
@@ -347,7 +350,8 @@ Found by the pre-release review and left for a later release:
   as empty; `impact X --node-id N` ignores `X`; a lookup of an absent name
   prints the symlinked-files warning.
 - **Same-file and node ids.** A `--node-id` whose same-identity twins swap
-  places answers for the other one; checking a stale `--file` and a stale
+  places, or whose twin is replaced in the same edit, answers for the other
+  one, and one whose other twin was deleted refuses though its own is intact; checking a stale `--file` and a stale
   caller file refreshes twice (about 30% slower on that call). A `var`
   declared inside a top-level block and a TypeScript namespace's exported
   object are read as locals, so members assigned onto them are no nodes.

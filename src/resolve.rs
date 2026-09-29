@@ -203,11 +203,13 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
 /// `get_ast_node` refused the identical input (SURF-17; C4, 2026-09-28 usage
 /// evaluation). Test definitions count: the selector named their file.
 ///
-/// Only definitions with DIFFERENT qualified names need splitting. `#[cfg]`
-/// twins, C++ overloads and a property's getter and setter share one, are one
-/// symbol to every caller, and were answered merged by 0.163.0; refusing them
-/// left MCP `get_call_graph`, which takes no node_id, with no way to answer
-/// (pre-tag review 2026-09-29: tokio `num_cpus`, flask `App.debug`).
+/// It refuses only where the callable definitions (functions and methods) in
+/// the file have different qualified names — two classes' `run` — and answers
+/// every other group merged, as 0.163.0 answered all of them: `#[cfg]` twins,
+/// C++ overloads, a getter and setter, a class beside its constructor, and
+/// also a type beside another owner's same-named method (gin's `Negotiate`).
+/// Refusing those left MCP `get_call_graph`, which takes no node_id, with no
+/// way to answer (pre-tag review 2026-09-29). `refs` stays stricter.
 pub fn detect_same_file_ambiguity(
     conn: &Connection,
     name: &str,

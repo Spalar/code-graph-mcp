@@ -54,17 +54,18 @@ fn names_code_graph_dir(content: &str) -> bool {
 /// has no `.git`.
 ///
 /// A `.git` that is not a plain directory — a `gitdir:` file or a symlink —
-/// can point anywhere, so it is followed only to a git dir (one with a
-/// `HEAD`): an unpacked project must not aim the write outside itself (pre-tag
-/// review 2026-09-29).
+/// can point anywhere, so it is followed only to what git itself accepts as a
+/// repository ([`common_git_dir`]). A `HEAD` file alone is not that: every
+/// clone has `.git/refs/remotes/origin/HEAD` and `.git/logs/HEAD`, and a
+/// `.git` aimed there made the write break that repository's `git fetch`
+/// (pre-tag review 2026-09-29, third round).
 fn exclude_path(project_root: &Path) -> Option<PathBuf> {
     let dot_git = project_root.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
-    let is_git_dir = |d: &Path| d.join("HEAD").is_file();
-    let git_dir = if meta.is_dir() {
+    let common = if meta.is_dir() {
         dot_git
     } else if meta.file_type().is_symlink() {
-        Some(dot_git).filter(|d| d.is_dir() && is_git_dir(d))?
+        common_git_dir(&dot_git)?
     } else {
         let raw = std::fs::read_to_string(&dot_git).ok()?;
         let target = raw
@@ -72,13 +73,24 @@ fn exclude_path(project_root: &Path) -> Option<PathBuf> {
             .find_map(|l| l.strip_prefix("gitdir:"))?
             .trim()
             .to_string();
-        let git_dir = Some(project_root.join(target)).filter(|d| is_git_dir(d))?;
-        match std::fs::read_to_string(git_dir.join("commondir")) {
-            Ok(common) => Some(git_dir.join(common.trim())).filter(|d| is_git_dir(d))?,
-            Err(_) => git_dir,
-        }
+        common_git_dir(&project_root.join(target))?
     };
-    Some(git_dir.join("info").join("exclude"))
+    Some(common.join("info").join("exclude"))
+}
+
+/// The common dir of `suspect` when git would accept it as a git dir — git's
+/// own `is_git_directory` (setup.c): a `HEAD` file in `suspect`, and
+/// `objects/` and `refs/` in its common dir, which a linked worktree's
+/// `commondir` file names and which is `suspect` itself otherwise.
+fn common_git_dir(suspect: &Path) -> Option<PathBuf> {
+    if !suspect.join("HEAD").is_file() {
+        return None;
+    }
+    let common = match std::fs::read_to_string(suspect.join("commondir")) {
+        Ok(rel) => suspect.join(rel.trim()),
+        Err(_) => suspect.to_path_buf(),
+    };
+    (common.join("objects").is_dir() && common.join("refs").is_dir()).then_some(common)
 }
 
 /// [`ensure_code_graph_dir_ignored`] with the switch already read.
@@ -218,6 +230,8 @@ mod tests {
         let wt_git = main_git.join("worktrees/feat");
         std::fs::create_dir_all(&wt_git).unwrap();
         std::fs::write(main_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(main_git.join("objects")).unwrap();
+        std::fs::create_dir_all(main_git.join("refs")).unwrap();
         std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
         std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
         let wt = dir.path().join("feat");
@@ -263,6 +277,8 @@ mod tests {
         let real = dir.path().join("real.git");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(real.join("objects")).unwrap();
+        std::fs::create_dir_all(real.join("refs")).unwrap();
         let proj = dir.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         std::os::unix::fs::symlink(&real, proj.join(".git")).unwrap();
@@ -291,6 +307,76 @@ mod tests {
         ensure_code_graph_dir_ignored_unless(&proj, false);
 
         assert!(!dir.path().join("victim").exists(), "created a dir outside");
+    }
+
+    /// A directory with a `HEAD` FILE is not yet a git dir: every clone has
+    /// `.git/refs/remotes/origin/HEAD` and `.git/logs/HEAD`. Pointed there, the
+    /// write created `refs/remotes/origin/info/exclude` and broke that repo's
+    /// `git fetch` (third review round). git's own test — `HEAD` here, and
+    /// `objects/` and `refs/` in the common dir — refuses both.
+    fn victim_repo(dir: &Path) -> PathBuf {
+        let git = dir.join("victim/.git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::create_dir_all(git.join("refs/remotes/origin")).unwrap();
+        std::fs::create_dir_all(git.join("logs")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            git.join("refs/remotes/origin/HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .unwrap();
+        std::fs::write(git.join("logs/HEAD"), "0 1 x <x> 0 +0000\tclone\n").unwrap();
+        git
+    }
+
+    #[test]
+    fn a_gitdir_pointer_into_another_repos_refs_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = victim_repo(dir.path());
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join(".git"),
+            format!("gitdir: {}\n", victim.join("refs/remotes/origin").display()),
+        )
+        .unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert!(
+            !victim.join("refs/remotes/origin/info").exists(),
+            "wrote into refs"
+        );
+    }
+
+    /// The `HEAD` half of git's test: `objects/` and `refs/` alone are no git dir.
+    #[test]
+    fn a_gitdir_pointer_to_a_dir_without_head_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("headless");
+        std::fs::create_dir_all(bare.join("objects")).unwrap();
+        std::fs::create_dir_all(bare.join("refs")).unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".git"), "gitdir: ../headless\n").unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert!(!bare.join("info").exists(), "wrote into a dir with no HEAD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_symlink_into_another_repos_logs_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = victim_repo(dir.path());
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(victim.join("logs"), proj.join(".git")).unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert!(!victim.join("logs/info").exists(), "wrote into logs");
     }
 
     /// The symlink arm of the same rule: a `.git` symlinked to a directory
