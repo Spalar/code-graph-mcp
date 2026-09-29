@@ -302,6 +302,43 @@ not have.
   machine named deleted temp dirs). An entry that cannot be checked
   (permission denied) stays.
 
+### Not covered
+
+Found by the pre-release review and left for a later release:
+
+- **Incremental index vs a fresh one.** When a Python file loses `def helper`
+  but keeps a method `Box.helper`, an incremental run moves another file's
+  `from pkg import helper` (and its call) onto the method; a fresh index does
+  not. A relative import written before its module exists
+  (`from . import newmod`, then `newmod.py` is created) stays on the
+  package's `__init__.py` in an incremental index, so `affected newmod.py`
+  can come back empty there.
+- **Python decorators** named bare also reference a project method of the
+  same name (`@cache` → `Store.cache`), at `inferred`. flask's 50 new
+  decorator references are all right; networkx has 1 wrong of 15.
+- **JavaScript/TypeScript indexing cost.** The built-in and package checks
+  walk the enclosing scopes once per call: a full index of hono takes 42.6%
+  more CPU (8% more wall time), this repository 21% more.
+- **CLI and MCP at once.** A CLI lookup that indexes a new file can make an
+  MCP server running on the same project read the index as interrupted and
+  re-index every file (tokio: 2 of 12 rounds, 3.9–5.1 s tool calls).
+- **Same-file definitions.** A test function sharing the name in the same
+  file (tokio's `ctrl_c`, 29 such groups) still makes `--file` refuse, and
+  MCP `get_call_graph` takes no `node_id`. `show`, `refs` and MCP
+  `get_ast_node` still re-find a node by identity alone after a refresh, so
+  on `#[cfg]` twins they can answer for the other one.
+- **Smaller gaps.** An older global npm install's `doctor` re-adds the
+  settings.json hooks next to this plugin until the next session removes
+  them; a TypeScript string-literal type containing `=`, `?:` or `...` reads
+  as an optional parameter in the Stop check; `sed -i~`, `env … sed -i`,
+  loops, `find -exec` and `xargs` edits are not recorded; the adopted-projects
+  registry drops a project on an unmounted drive or behind a dangling
+  symlink; a project adopted by 0.163 shows the out-of-date notice at every
+  session start; a grep rewrite with an unignored `__pycache__/` under
+  `grep -rln` lists one file fewer, and prints a line that is not valid UTF-8
+  as empty; `impact X --node-id N` ignores `X`; a lookup of an absent name
+  prints the symlinked-files warning.
+
 ### Index versions
 
 `INDEX_VERSION` goes 103 → 113. Each step, as recorded on the constant:
