@@ -7825,3 +7825,38 @@ fn a_member_call_on_a_builtin_global_is_no_call_edge() {
         "a parameter named Object shadows the global: {calls:?}"
     );
 }
+
+// C4 (2026-09-28 usage evaluation): `@setupmethod` applies a project function
+// to the method below it, and flask has 44 such uses; `refs setupmethod` found
+// none. A decorator spelled as a bare name is a reference to it (one spelled as
+// a call, `@app.route("/")`, is already a call edge).
+#[test]
+fn a_python_decorator_named_bare_is_a_reference() {
+    let py = "def setupmethod(f):\n    return f\n\n\
+              class Scaffold:\n    @setupmethod\n    def add_url_rule(self, rule):\n        pass\n\n\
+              @setupmethod\ndef top():\n    pass\n\n\
+              @staticmethod\ndef not_project():\n    pass\n";
+    let rels = extract_relations(py, "python").unwrap();
+    let refs: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == crate::domain::REL_REFERENCES && r.target_name == "setupmethod")
+        .map(|r| r.source_name.as_str())
+        .collect();
+    let all: Vec<(&str, &str, &str)> = rels
+        .iter()
+        .map(|r| {
+            (
+                r.source_name.as_str(),
+                r.relation.as_str(),
+                r.target_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(refs.len(), 2, "both uses: {refs:?} in {all:?}");
+    // From the function the decorator applies to, as the relations walk names
+    // it (`Class.method`), so `refs` lists each decorated function, not one
+    // `<module>` per file (flask: 44 uses read as 3 edges).
+    let mut sources = refs.clone();
+    sources.sort_unstable();
+    assert_eq!(sources, ["Scaffold.add_url_rule", "top"], "{all:?}");
+}

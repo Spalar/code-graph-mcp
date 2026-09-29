@@ -137,6 +137,7 @@ pub(super) fn extract_python_type_reference(
 ///   - keyword-argument value (`sorted(xs, key=my_key)`);
 ///   - assignment RHS (`cb = handler`) — the `right` field;
 ///   - `return handler`;
+///   - a decorator named bare (`@setupmethod`);
 ///   - dict value (`{ "k": handler }`).
 ///
 /// Self-exclusion is structural: a call's callee is the `function` field of `call`
@@ -161,6 +162,10 @@ pub(super) fn extract_python_value_reference(
         }
         "assignment" => parent.child_by_field_name("right").map(|v| v.id()) == Some(node.id()),
         "return_statement" => true,
+        // `@setupmethod` names the function it applies (C4, 2026-09-28 usage
+        // evaluation: flask's 44 uses made `refs setupmethod` report none). A
+        // decorator spelled as a call (`@app.route("/")`) is a call edge already.
+        "decorator" => true,
         "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
         // Phase 3b: tuple return (`return f, g`) / tuple RHS (`a, b = f, g`) wrap the
         // values in an `expression_list` under the return / assignment-right.
@@ -186,13 +191,41 @@ pub(super) fn extract_python_value_reference(
     if py_enclosing_fn_local_names(node, source).contains(name) {
         return None;
     }
+    // A decorator sits before its `def`, where the walk's scope is still the
+    // class body or module: attribute it to the decorated function instead,
+    // named as the walk names a method (`Class.method`).
+    let decorated = (parent.kind() == "decorator")
+        .then(|| decorated_function_scope(&parent, source))
+        .flatten();
     Some(ParsedRelation {
-        source_name: scope.unwrap_or("<module>").to_string(),
+        source_name: decorated.unwrap_or_else(|| scope.unwrap_or("<module>").to_string()),
         target_name: name.to_string(),
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
         source_line: None,
+    })
+}
+
+/// `Class.method` or `function` for the definition a `decorator` applies to:
+/// the scope name the relations walk gives that definition, so the edge's
+/// source is its node.
+fn decorated_function_scope(decorator: &tree_sitter::Node, source: &str) -> Option<String> {
+    let decorated = decorator
+        .parent()
+        .filter(|p| p.kind() == "decorated_definition")?;
+    let definition = decorated.child_by_field_name("definition")?;
+    let name = node_text(&definition.child_by_field_name("name")?, source).to_string();
+    let class = decorated
+        .parent()
+        .filter(|b| b.kind() == "block")
+        .and_then(|b| b.parent())
+        .filter(|c| c.kind() == "class_definition")
+        .and_then(|c| c.child_by_field_name("name"))
+        .map(|n| node_text(&n, source).to_string());
+    Some(match class {
+        Some(class) if definition.kind() == "function_definition" => format!("{class}.{name}"),
+        _ => name,
     })
 }
 
