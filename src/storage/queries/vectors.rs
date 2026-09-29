@@ -469,8 +469,6 @@ pub fn get_unembedded_nodes_excluding(
         .collect())
 }
 
-/// Count nodes with embeddings vs total embeddable nodes.
-/// Returns (with_vectors, total_embeddable).
 /// Whether the vector table holds any row (B7, 2026-09-29 usage evaluation):
 /// with none, a semantic search's KNN half returns nothing and the answer is
 /// FTS5's alone, whatever model is loaded. One row read, so it is cheap enough
@@ -484,6 +482,8 @@ pub fn any_node_vector(conn: &Connection) -> Result<bool> {
         .is_some())
 }
 
+/// Count nodes with embeddings vs total embeddable nodes.
+/// Returns (with_vectors, total_embeddable).
 pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL",

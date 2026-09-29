@@ -960,8 +960,9 @@ fn explain_empty_results(
             // The envelope contract ("ONE envelope on every path", see
             // `finalize_search_results`) — this was the only branch that omitted
             // both fields, so a caller reading `search_mode` had to special-case
-            // the filter-emptied answer. No `note` here: the cause is known and
-            // named, and it is the filter, not the missing vector channel.
+            // the filter-emptied answer. No `note` is built here; the caller
+            // adds the vector-channel note (`note_vector_channel`) to this
+            // answer as to every other.
             "search_mode": if vector_available { "hybrid" } else { "fts_only" },
             "vector_available": vector_available
         });
@@ -1053,16 +1054,6 @@ fn explain_empty_results(
 /// mechanic and explicitly does not claim the results are wrong.
 const VECTOR_ONLY_WARNING: &str = "No exact text matches — results are ranked by vector similarity alone (no keyword anchor). Vague or natural-language queries often land here yet still return relevant symbols, so judge by the results; if they miss, add a concrete identifier or use ast_search with type/returns/params filters.";
 
-/// The one wording for "this answer had no vector channel", shared by every
-/// branch that owes it.
-///
-/// Two histories meet here. "retry shortly" was printed unconditionally, so a
-/// machine whose download can never succeed got a wait-and-see message forever
-/// (issue #35) — hence the recorded last outcome. And `default = []`, so every
-/// `cargo install code-graph-mcp` runs a binary with no downloader AT ALL and was
-/// told, on every query, to wait for a background download that cannot start —
-/// hence the compile-time arm, which names the same cause `health-check` ("binary
-/// built without embed-model feature") and `similar` already name on that build.
 /// What the vector half of a semantic search has to work with (B7,
 /// 2026-09-29 usage evaluation). `search_mode` said `hybrid` whenever the model
 /// was loaded — also before the backfill had embedded anything, when the KNN
@@ -1101,6 +1092,16 @@ fn note_vector_channel(out: &mut serde_json::Value, channel: VectorChannel) {
     }
 }
 
+/// The one wording for "this answer had no vector channel", shared by every
+/// branch that owes it.
+///
+/// Two histories meet here. "retry shortly" was printed unconditionally, so a
+/// machine whose download can never succeed got a wait-and-see message forever
+/// (issue #35) — hence the recorded last outcome. And `default = []`, so every
+/// `cargo install code-graph-mcp` runs a binary with no downloader AT ALL and was
+/// told, on every query, to wait for a background download that cannot start —
+/// hence the compile-time arm, which names the same cause `health-check` ("binary
+/// built without embed-model feature") and `similar` already name on that build.
 fn fts_only_note() -> String {
     #[cfg(feature = "embed-model")]
     let last = crate::embedding::model::EmbeddingModel::download_state_summary();

@@ -2032,7 +2032,7 @@ impl McpServer {
     fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         // CODE_GRAPH_QUIET_HOOKS=1 → ship a one-liner pointer; full decision
         // rules live in the project's .claude/plugin_code_graph_mcp.md (the
-        // CLAUDE.md managed block points to it; auto-installed on plugin SessionStart).
+        // CLAUDE.md managed block points to it; written by `code-graph-mcp adopt`).
         let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
         let instructions = if quiet {
             INSTRUCTIONS_QUIET
