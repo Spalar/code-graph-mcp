@@ -246,13 +246,15 @@ impl TimingConfig {
     }
 }
 
-/// How long an incremental waits for an in-flight embedding backfill to release the write
-/// path before skipping (and leaving the incremental owed via `pending_incremental`).
-/// In tests, 0s so the skip-path test doesn't burn the full wait.
+/// How long an incremental waits for a backfill it asked to yield (D1): one batch
+/// of 32 nodes, plus a model load when the backfill is just starting. Past it the
+/// incremental skips and stays owed via `pending_incremental`. (It waited 2 s and
+/// asked nothing before.) Short in tests, where no backfill answers the skip-path
+/// test's request.
 #[cfg(not(test))]
-const EMBEDDING_WAIT_SECS: u64 = 2;
+const EMBEDDING_YIELD_WAIT_SECS: u64 = 20;
 #[cfg(test)]
-const EMBEDDING_WAIT_SECS: u64 = 0;
+const EMBEDDING_YIELD_WAIT_SECS: u64 = 2;
 
 /// Poll interval for the no-traffic embedding backfill driver.
 /// Nodes can be added to the index by a SHORT-LIVED CLI process — the PreToolUse
@@ -383,6 +385,12 @@ pub(super) struct IndexingState {
     /// next `ensure_indexed` honors this flag and runs the owed incremental even with
     /// no fresh watcher event; cleared once an incremental actually completes.
     pub(super) pending_incremental: Arc<AtomicBool>,
+    /// Set by an incremental that finds a backfill holding the write path: the
+    /// backfill stops at its next batch boundary and releases it (D1, 2026-09-28
+    /// usage evaluation — a first backfill runs for minutes, and a skip-only wait
+    /// left that whole window's edits out of every answer). Cleared when the
+    /// incremental is done; the backfill is then respawned.
+    pub(super) embedding_yield: Arc<AtomicBool>,
 }
 
 impl IndexingState {
@@ -397,6 +405,7 @@ impl IndexingState {
             startup_repair_done: Arc::new(AtomicBool::new(false)),
             periodic_backfill_started: Arc::new(AtomicBool::new(false)),
             pending_incremental: Arc::new(AtomicBool::new(false)),
+            embedding_yield: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -937,6 +946,7 @@ impl McpServer {
         // own progress writes recreate it.
         let _ = std::fs::remove_file(&progress_file);
         let embedding_flag = Arc::clone(&self.indexing.embedding_in_progress);
+        let embedding_yield = Arc::clone(&self.indexing.embedding_yield);
         // Kept out of the closure so the spawn-failure path below can still clear
         // the flags the closure's IndexGuard would have cleared.
         let spawn_fail_flag = Arc::clone(&self.indexing.startup_indexing);
@@ -1070,7 +1080,7 @@ impl McpServer {
                 // with, spawning the backfill + its model-load attempt is pure per-session
                 // waste (the message-driven spawn_background_embedding is already guarded).
                 if cfg!(feature = "embed-model") {
-                    let _ = Self::run_guarded_backfill(&db_path, &embedding_flag);
+                    let _ = Self::run_guarded_backfill(&db_path, &embedding_flag, &embedding_yield);
                 }
             });
 
@@ -1303,8 +1313,9 @@ impl McpServer {
             return; // already running
         }
         let flag = Arc::clone(&self.indexing.embedding_in_progress);
+        let yield_flag = Arc::clone(&self.indexing.embedding_yield);
         std::thread::spawn(move || {
-            let _ = Self::run_guarded_backfill(&db_path, &flag);
+            let _ = Self::run_guarded_backfill(&db_path, &flag, &yield_flag);
         });
     }
 
@@ -1731,9 +1742,20 @@ impl McpServer {
         self.indexing
             .pending_incremental
             .store(true, Ordering::Release);
-        if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(EMBEDDING_WAIT_SECS);
+        let yielded = self.indexing.embedding_in_progress.load(Ordering::Acquire);
+        if yielded {
+            // Ask the backfill to stop at its next batch boundary (D1); withdrawn on
+            // every way out of this function, or each later backfill would stop at once.
+            struct Withdraw<'a>(&'a AtomicBool);
+            impl Drop for Withdraw<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            self.indexing.embedding_yield.store(true, Ordering::Release);
+            let _withdraw = Withdraw(&self.indexing.embedding_yield);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(EMBEDDING_YIELD_WAIT_SECS);
             while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
                 if std::time::Instant::now() > deadline {
                     // Embedding still holds the write path — skip; the incremental stays owed
@@ -1780,6 +1802,14 @@ impl McpServer {
                     // self-guards on model-present + vec_enabled + embedding_in_progress,
                     // so it's a cheap no-op when there's nothing to embed. This single
                     // call covers both incremental callers (watcher-changes + debounce).
+                    self.spawn_background_embedding();
+                }
+                if yielded && result.files_indexed == 0 {
+                    // The backfill stopped for us; resume it (with files indexed the
+                    // branch above already did).
+                    self.indexing
+                        .embedding_yield
+                        .store(false, Ordering::Release);
                     self.spawn_background_embedding();
                 }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
@@ -5296,6 +5326,105 @@ app.post('/api/login', handleLogin);
                 .unwrap()
                 .is_empty(),
             "the previously-stranded beta.rs must be indexed once the owed incremental runs"
+        );
+    }
+
+    /// D1 (2026-09-28 usage evaluation): a first backfill can run for minutes, and an
+    /// incremental that only waited then skipped left every edit of that window out of
+    /// the answers. The incremental now asks the backfill to yield at its next batch
+    /// boundary and runs; the backfill restarts afterwards.
+    #[test]
+    fn test_incremental_asks_a_running_backfill_to_yield_and_runs() {
+        use std::fs;
+        let project = TempDir::new().unwrap();
+        fs::write(project.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+
+        // A backfill that honours the yield request at its next batch boundary.
+        server
+            .indexing
+            .embedding_in_progress
+            .store(true, Ordering::SeqCst);
+        let in_progress = Arc::clone(&server.indexing.embedding_in_progress);
+        let yield_flag = Arc::clone(&server.indexing.embedding_yield);
+        let backfill = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_secs(10) {
+                if yield_flag.load(Ordering::Acquire) {
+                    in_progress.store(false, Ordering::Release);
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        });
+        server
+            .run_incremental_with_cache_restore(project.path(), None)
+            .unwrap();
+        assert!(
+            backfill.join().unwrap(),
+            "the incremental must ask the backfill to yield"
+        );
+        assert!(
+            !crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "the incremental ran instead of skipping"
+        );
+        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst));
+        assert!(
+            !server.indexing.embedding_yield.load(Ordering::SeqCst),
+            "the request is withdrawn once the incremental is done, or every later backfill would stop at once"
+        );
+    }
+
+    /// The backfill side of D1: asked to yield, it stops before its next batch
+    /// (here the first) and reports it; not asked, it drains. Needs the embedding
+    /// model on disk; without it the backfill reports NoModel and there is nothing
+    /// to check.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn a_backfill_asked_to_yield_stops_between_batches() {
+        use std::fs;
+        let project = TempDir::new().unwrap();
+        fs::write(
+            project.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() { alpha(); }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let db_path = project.path().join(CODE_GRAPH_DIR).join("index.db");
+        let in_progress = AtomicBool::new(false);
+        let asked = AtomicBool::new(true);
+        match McpServer::run_guarded_backfill(&db_path, &in_progress, &asked) {
+            Some(super::backfill::BackfillOutcome::NoModel) => return,
+            Some(super::backfill::BackfillOutcome::Yielded) => {}
+            other => panic!("asked to yield, got {other:?}"),
+        }
+        assert!(
+            !in_progress.load(Ordering::SeqCst),
+            "the write path is released"
+        );
+        let not_asked = AtomicBool::new(false);
+        assert!(matches!(
+            McpServer::run_guarded_backfill(&db_path, &in_progress, &not_asked),
+            Some(super::backfill::BackfillOutcome::Drained)
+        ));
+    }
+
+    #[test]
+    fn a_yielded_backfill_leaves_the_floor_where_it_was() {
+        assert_eq!(
+            super::backfill::apply_backfill_outcome(
+                7,
+                1,
+                super::backfill::BackfillOutcome::Yielded,
+                40
+            ),
+            (7, 1)
         );
     }
 
