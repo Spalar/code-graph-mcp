@@ -38,6 +38,12 @@ else if (pattern === 'NothingHere') {
     'HasCallers (src/a.rs)\\n' +
     '  \\u2190 called by: alpha (src/b.rs)\\n' +
     '  \\u2192 calls: beta (src/c.rs)\\n');
+} else if (pattern === 'task') {
+  // callgraph fuzzy-resolved a name with no exact match: the tree is rooted at
+  // a DIFFERENT symbol, and the "Resolved 'task' → …" notice went to stderr.
+  process.stdout.write(
+    'run_startup_tasks (src/mcp/server/mod.rs)\\n' +
+    '  \\u2190 called by: run_serve (src/main.rs) [function]\\n');
 } else if (pattern === 'LeafSymbol') {
   // callgraph with a bare header, no edge lines → 'no-hits' (no marginal value)
   process.stdout.write('LeafSymbol (src/a.rs)\\n');
@@ -353,6 +359,14 @@ test('runCallgraphAnswer: passes callgraph subcommand + symbol as argv', () => {
 
 test('runCallgraphAnswer: bare header with no edges → no-hits (no marginal value)', () => {
   const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'LeafSymbol', binary: stubBinary() });
+  assert.equal(r.status, 'no-hits');
+});
+
+test('runCallgraphAnswer: a tree rooted at another symbol (fuzzy-resolved) → no-hits', () => {
+  // Grepping `task-notification` must not inject run_startup_tasks' call tree
+  // as "the symbol you grepped": the CLI resolved the name to a different
+  // function and said so only on stderr, which the hook never reads.
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'task', binary: stubBinary() });
   assert.equal(r.status, 'no-hits');
 });
 

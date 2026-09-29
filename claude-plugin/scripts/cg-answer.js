@@ -545,6 +545,13 @@ function runCallgraphAnswer(opts = {}) {
         !(out.includes('← called by') || out.includes('→ calls'))) {
       return { status: 'no-hits' };
     }
+    // `callgraph` promotes a unique fuzzy match when the name has no edges of
+    // its own (`task` → `run_startup_tasks`) and says so only on stderr, which
+    // this run discards. A tree rooted at another symbol is not an answer about
+    // the grepped one: real sessions got up to 27 of 98 injections this way.
+    if (out.split('\n', 1)[0].split(' ', 1)[0] !== symbol) {
+      return { status: 'no-hits' };
+    }
     const { text, truncated } = truncateAtLine(out, maxBytes);
     return { status: 'hits', text, truncated };
   } catch {
