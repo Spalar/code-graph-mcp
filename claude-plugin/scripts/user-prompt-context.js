@@ -42,6 +42,7 @@ const { hidden } = require('./proc-opts');
 // must not load (startup budget); it used to be a third hand-spelled copy of the
 // same three path segments (JS-05).
 const { MANIFEST_FILE: MANIFEST_PATH } = require('./cache-paths');
+const { capContext } = require('./hook-emit');
 
 // --- Per-type rate limiting (replaces single global cooldown) ---
 const COOLDOWNS = {
@@ -56,20 +57,26 @@ const COOLDOWNS = {
 // here, so an un-scoped flag was effectively a machine-wide mute: one `impact`
 // push in any repo silenced the next 30s of impact pushes in every other repo,
 // and `overview` did it for five minutes.
-function ctxFlagPath(type, cwd) {
-  return path.join(cgTmpDir(), `.code-graph-ctx-${cwdHash(cwd)}-${type}`);
+//
+// Keyed on (type, subject) when there is a subject — the symbol or path the
+// query is about. A type-only key let an impact push for one symbol swallow
+// the impact query for a DIFFERENT symbol asked a second later (hook audit
+// 2026-09-28). The subject is hashed: symbols and paths are not file-name safe.
+function ctxFlagPath(type, cwd, key) {
+  const suffix = key ? `-${cwdHash(String(key)).slice(0, 8)}` : '';
+  return path.join(cgTmpDir(), `.code-graph-ctx-${cwdHash(cwd)}-${type}${suffix}`);
 }
 
-function isCoolingDown(type, cwd = process.cwd()) {
+function isCoolingDown(type, cwd = process.cwd(), key) {
   try {
-    const stat = fs.statSync(ctxFlagPath(type, cwd));
+    const stat = fs.statSync(ctxFlagPath(type, cwd, key));
     return Date.now() - stat.mtimeMs < (COOLDOWNS[type] || 60000);
   } catch { return false; }
 }
 
-function markCooldown(type, cwd = process.cwd()) {
+function markCooldown(type, cwd = process.cwd(), key) {
   try {
-    fs.writeFileSync(ctxFlagPath(type, cwd), '');
+    fs.writeFileSync(ctxFlagPath(type, cwd, key), '');
   } catch { /* ok */ }
 }
 
@@ -111,8 +118,14 @@ const STOP_WORDS = new Set([
 
 const PLAIN_WORD_EXCLUDE = /^(possible|together|actually|something|different|important|following|available|necessary|currently|implement|operation|otherwise|beginning|knowledge|attention|according|certainly|sometimes|direction|recommend|structure|describe|question|complete|generate|anything|continue|consider|response|approach|happened|recently|probably|expected|previous|original|specific|directly|received|required|supposed|separate|designed|finished|provided|included|prepared|combined|properly|remember|whatever|although|document|handling|existing|everyone|standard|research|personal|relative|absolute|practice|language|thousand|national|evidence|refactor|understand|validate|analysis|debugging|configure|improving|resolving|creating|building|checking|updating|removing|changing|searching|cleaning|optimize|migration|overview|introduce|reviewing|thinking|managing|starting|yourself|features|problems|breaking|requires|argument|settings|includes|examples|comments|patterns|tutorial|concepts|supports|priority|organize|scenario|tracking|internal|external|abstract|concrete|strategy|evaluate|diagnose|platform|variable|optional|multiple)$/;
 
+// Text the harness submits on the user's behalf: background-task
+// notifications, teammate messages, reminders. 42 of 175 real injections (24%)
+// fired on these, answering a question nobody asked.
+const HARNESS_PROMPT = /^(?:<(?:task-notification|teammate-message|system-reminder|local-command-(?:stdout|stderr|caveat)|command-(?:name|message|args)|bash-(?:input|stdout|stderr))\b|Another Claude session sent a message:)/;
+
 function shouldSkip(msg) {
   const trimmed = msg.trim();
+  if (HARNESS_PROMPT.test(trimmed)) return 'harness';
   if (/^(yes|no|ok|commit|push|y|n|done|thanks|thank you|继续|确认|好的|好|是的|不|可以|行|对|提交|推送|没问题|谢谢|发布|更新|编译|安装|卸载|重启|重连|清理)\s*[.!?。！？]?\s*$/i.test(trimmed)) return 'simple';
   if (/^(修复|实施|执行|开始|按|实测|进入|用|重新)/.test(trimmed) && !/[a-zA-Z_]{3,}/.test(trimmed)) return 'action-only';
   return false;
@@ -397,11 +410,18 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, messag
 
   const cd = isCoolingDownFn || (() => false);
 
-  if ((intents.impact || intents.modify) && hasStrict && !cd('impact')) return { type: 'impact', symbol: symbols.symbols[0] };
-  if (intents.callgraph && hasStrict && !cd('callgraph')) return { type: 'callgraph', symbol: symbols.symbols[0] };
-  if (filePaths.length > 0 && !cd('overview')) return { type: 'overview', path: filePaths[0].replace(/\/[^/]+$/, '/') };
-  if ((intents.search || intents.implement || hasQualified) && symbols.symbols.length > 0 && !cd('search')) return { type: 'search', symbol: symbols.symbols[0] };
-  if ((intents.understand || !hasAny) && symbols.symbols.length > 0 && !cd('search')) return { type: 'search', symbol: symbols.symbols[0] };
+  const sym = symbols.symbols[0];
+  // The file the prompt names disambiguates a same-named symbol (`impact
+  // url_for` is ambiguous in flask; `--file src/flask/helpers.py` answers).
+  const file = filePaths[0];
+
+  if ((intents.impact || intents.modify) && hasStrict && !cd('impact', sym)) return { type: 'impact', symbol: sym, ...(file ? { file } : {}) };
+  if (intents.callgraph && hasStrict && !cd('callgraph', sym)) return { type: 'callgraph', symbol: sym };
+  // The named file itself, not its parent dir: `src/context.ts` used to yield
+  // an overview of all of src/ — 18,497 chars, none of it about that file.
+  if (file && !cd('overview', file)) return { type: 'overview', path: file };
+  if ((intents.search || intents.implement || hasQualified) && symbols.symbols.length > 0 && !cd('search', sym)) return { type: 'search', symbol: sym };
+  if ((intents.understand || !hasAny) && symbols.symbols.length > 0 && !cd('search', sym)) return { type: 'search', symbol: sym };
 
   // Phase E fallback: nothing actionable above, but message has symptom phrasing.
   // Emit ONE-LINE prose hint (no CLI execution). Default-empty `message` keeps
@@ -501,7 +521,7 @@ function runMain() {
   const intents = detectIntents(message);
   // Key the cooldowns on the resolved project root, not the raw shell cwd, so a
   // `cd` into a subdir does not read as a different project and re-fire.
-  const query = determineQueryType(intents, symbols, filePaths, (type) => isCoolingDown(type, cwd), message);
+  const query = determineQueryType(intents, symbols, filePaths, (type, key) => isCoolingDown(type, cwd, key), message);
 
   if (!query) return;
 
@@ -556,17 +576,20 @@ function runMain() {
   // the same shape re-ran it — a 3s execFileSync timeout on EVERY turn, which is
   // the worst case wearing the cheapest disguise. The cooldown's job is rate
   // limiting; whether the run had something to say is a separate question.
-  markCooldown(query.type, cwd);
+  markCooldown(query.type, cwd, query.symbol || query.path);
 
   try {
     let result = '';
-    if (query.type === 'impact') result = run(['impact', query.symbol]);
+    if (query.type === 'impact') result = run(['impact', query.symbol, ...(query.file ? ['--file', query.file] : [])]);
     else if (query.type === 'callgraph') result = run(['callgraph', query.symbol, '--depth', '2']);
     else if (query.type === 'overview') result = run(['overview', query.path]);
     else if (query.type === 'search') result = run(['search', query.symbol, '--limit', '8']);
 
     if (result && result.trim()) {
-      process.stdout.write(`${PREFIXES[query.type]}\n${result.trim()}\n`);
+      // The shared 4,000-byte context budget. Written raw, a dir overview came
+      // back at 18,497 chars; past 10,000 Claude Code swaps the whole output
+      // for a file path and a preview.
+      process.stdout.write(capContext(`${PREFIXES[query.type]}\n${result.trim()}\n`));
     }
   } catch {
     /* return silently */

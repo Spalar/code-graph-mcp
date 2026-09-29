@@ -356,7 +356,7 @@ test('priority: file paths → overview (regardless of intent)', () => {
   const symbols = { symbols: [], lowConfidence: false };
   const result = determineQueryType(intents, symbols, ['src/storage/queries.rs']);
   assert.equal(result.type, 'overview');
-  assert.equal(result.path, 'src/storage/');
+  assert.equal(result.path, 'src/storage/queries.rs', 'the named file, not its parent dir');
 });
 
 test('priority: search intent + symbol → search', () => {
@@ -900,8 +900,8 @@ test('the per-type cooldown is stamped on ATTEMPT, not only on a non-empty resul
   const flags = fs.readdirSync(sb.cgTmp).filter((f) => f.startsWith('.code-graph-ctx-'));
   assert.equal(flags.length, 1,
     `a failing binary must still start the cooldown, else it re-runs every prompt (found: ${flags.join(', ')})`);
-  assert.match(flags[0], /^\.code-graph-ctx-[0-9a-f]{12}-search$/,
-    'and the flag must carry the project hash (see cwdHash in tmp-dir.js)');
+  assert.match(flags[0], /^\.code-graph-ctx-[0-9a-f]{12}-search-[0-9a-f]{8}$/,
+    'and the flag must carry the project hash (see cwdHash in tmp-dir.js) and the subject hash');
 });
 
 test('cooldown flags are project-scoped: a push in one repo must not silence another', { skip: posixOnly }, (t) => {
@@ -1049,4 +1049,64 @@ test('no child of this hook carries a hard-coded timeout (JS-18)', () => {
     `every child must take its timeout from childBudgetMs(); found ${literals.join(', ')}`);
   assert.match(src, /timeout: budget/,
     'the exec options must read the budget variable');
+});
+
+// ── 2026-09-28 usage evaluation: fire on the user's prompt, about what it names ──
+
+test('shouldSkip: harness-injected prompts are not the user asking', () => {
+  // 42 of 175 real UserPromptSubmit injections (24%) fired on a task
+  // notification or a teammate message, not on anything the user typed.
+  assert.equal(shouldSkip('<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>'), 'harness');
+  assert.equal(shouldSkip('<teammate-message teammate_id="query-quality">{"type":"idle"}</teammate-message>'), 'harness');
+  assert.equal(shouldSkip('Another Claude session sent a message:\n<teammate-message>x</teammate-message>'), 'harness');
+  assert.equal(shouldSkip('<system-reminder>ctx</system-reminder>'), 'harness');
+  assert.equal(shouldSkip('fix the <div> nesting in render_page'), false, 'a user prompt that merely contains a tag');
+});
+
+test('priority: the impact cooldown is per symbol — a second symbol is not swallowed', () => {
+  const intents = { impact: true, modify: false, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: ['full_dispatch_request'], lowConfidence: false };
+  const cd = (type, key) => type === 'impact' && key === 'get_load_dotenv';
+  const result = determineQueryType(intents, symbols, [], cd);
+  assert.equal(result && result.type, 'impact');
+  assert.equal(result.symbol, 'full_dispatch_request');
+  const same = determineQueryType(intents, { symbols: ['get_load_dotenv'], lowConfidence: false }, [], cd);
+  assert.notEqual(same && same.type, 'impact', 'the same symbol is still cooling down');
+});
+
+test('priority: impact carries the file the prompt names', () => {
+  // `impact url_for` is ambiguous in flask (two defs) and the hook went silent;
+  // `impact url_for --file src/flask/helpers.py` answers (7 direct callers).
+  const intents = { impact: false, modify: true, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: ['url_for'], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, ['src/flask/helpers.py']);
+  assert.equal(result.type, 'impact');
+  assert.equal(result.file, 'src/flask/helpers.py');
+});
+
+test('e2e: the injected text is capped at the shared context budget', { skip: posixOnly }, (t) => {
+  // An overview of a whole source dir came back at 18,497 chars and was
+  // written raw; Claude Code swaps anything over 10,000 for a file path.
+  const sb = upcSandbox(t, '#!/bin/sh\ni=0\nwhile [ $i -lt 2000 ]; do echo "src/adapter/file_$i.ts  function: handler_$i (3x)"; i=$((i+1)); done\n');
+  const proc = runUpc(sb, 'Refactor the Context class in src/context.ts to drop the deprecated helpers');
+  assert.equal(proc.status, 0, proc.stderr);
+  assert.ok(proc.stdout.length > 0, 'the fixture must reach the injection path');
+  assert.ok(Buffer.byteLength(proc.stdout, 'utf8') <= 4200,
+    `injected ${Buffer.byteLength(proc.stdout, 'utf8')} bytes; the cap is 4,000 plus the prefix line`);
+});
+
+test('e2e: a named file is overviewed itself, not its whole parent dir', { skip: posixOnly }, (t) => {
+  const sb = upcSandbox(t, '#!/bin/sh\necho "$@" > "$CG_MARKER_DIR/argv"\necho "src/context.ts  function: json (4x)"\n');
+  const proc = runUpc(sb, 'Refactor the Context class in src/context.ts to drop the deprecated helpers');
+  assert.equal(proc.status, 0, proc.stderr);
+  const argv = fs.readFileSync(path.join(sb.markers, 'argv'), 'utf8').trim();
+  assert.equal(argv, 'overview src/context.ts');
+});
+
+test('e2e: impact passes --file when the prompt names one', { skip: posixOnly }, (t) => {
+  const sb = upcSandbox(t, '#!/bin/sh\necho "$@" > "$CG_MARKER_DIR/argv"\necho "Risk: HIGH"\n');
+  const proc = runUpc(sb, 'Change the signature of url_for in src/flask/helpers.py to take a scheme');
+  assert.equal(proc.status, 0, proc.stderr);
+  const argv = fs.readFileSync(path.join(sb.markers, 'argv'), 'utf8').trim();
+  assert.equal(argv, 'impact url_for --file src/flask/helpers.py');
 });
