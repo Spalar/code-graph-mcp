@@ -1659,6 +1659,49 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CROSS JOIN files f ON f.id = src.file_id AND f.language IS u.lang
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
     );
+    // D9 (2026-09-29 usage evaluation): a Python or JS/TS import whose module
+    // did not define the name — `from flask import url_for` through the
+    // re-export in `flask/__init__.py`, `export { x } from './helpers'` — is
+    // decided by the project-wide name pool: it took the `<external>` sentinel
+    // named after the symbol, or bound another file's definition. A rebuild
+    // binds the definition this run added, and the stale import went on to
+    // prune the call a rebuild has (`prune_import_contradicted_call_edges`).
+    // Rows whose import found its name in the module it names are dropped
+    // below, in Rust, where the module paths can be resolved. Rust `use` paths
+    // follow the stricter rules of the arms above.
+    let module_import_sql = format!(
+        "SELECT DISTINCT f.path, f.language, e.metadata, tf.path, u.lang
+         FROM cg_fanout_up u
+         CROSS JOIN nodes tgt ON tgt.name = u.nm AND tgt.type <> 'external_module'
+         CROSS JOIN files tf ON tf.id = tgt.file_id
+         CROSS JOIN edges e ON e.target_id = tgt.id AND e.relation = '{REL_IMPORTS}'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id
+                           AND f.language IN ('python', 'javascript', 'typescript', 'tsx')
+         WHERE u.nm <> '<module>'
+           AND f.path NOT IN (SELECT path FROM cg_fanout_paths)"
+    );
+    // D10A's fallback: `from .helpers import url_for` binds `helpers.py`'s
+    // `<module>` while that file defines no `url_for`, and the edge keeps no
+    // name to look for. Re-extract such importers of a file of this run that
+    // gained a definition; a rebuild binds the name if it is the one added.
+    let module_fallback_sql = format!(
+        "SELECT DISTINCT f.path
+         FROM cg_fanout_paths p
+         CROSS JOIN files tf ON tf.path = p.path AND tf.language = 'python'
+         CROSS JOIN nodes tgt ON tgt.file_id = tf.id AND tgt.name = '<module>'
+         CROSS JOIN edges e ON e.target_id = tgt.id AND e.relation = '{REL_IMPORTS}'
+                           AND e.metadata LIKE '%\"python_module\":\".%'
+                           AND e.metadata NOT LIKE '%\"is_module_import\":true%'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)
+           AND EXISTS (
+               SELECT 1 FROM nodes n
+               CROSS JOIN cg_fanout_up u ON u.nm = n.name AND u.lang IS tf.language
+               WHERE n.file_id = tf.id AND n.name <> '<module>'
+           )"
+    );
     // A Rust call a `use` anchored in a crate and bound outside the module its
     // path names (`Anchored::Elsewhere`, marked `"rx"` with the crate's
     // directory, D#132): a new definition of that name in the same crate may be
@@ -1750,10 +1793,104 @@ pub(super) fn bare_name_callers_of_new_duplicates(
             paths.sort_unstable();
             paths.dedup();
         }
+        let imports: Vec<ModuleImportRow> = conn
+            .prepare(&module_import_sql)?
+            .query_map([], |row| {
+                Ok(ModuleImportRow {
+                    importer: row.get(0)?,
+                    language: row.get(1)?,
+                    metadata: row.get(2)?,
+                    target_path: row.get(3)?,
+                    added_language: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let fallbacks: Vec<String> = conn
+            .prepare(&module_fallback_sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !imports.is_empty() || !fallbacks.is_empty() {
+            paths.extend(module_importers_to_refresh(conn, &imports)?);
+            paths.extend(fallbacks);
+            paths.sort_unstable();
+            paths.dedup();
+        }
         Ok(paths)
     })();
     drop_fanout_temps(conn)?;
     collected
+}
+
+/// One Python or JS/TS `imports` edge into a name that gained a definition
+/// this run (D9).
+struct ModuleImportRow {
+    importer: String,
+    language: Option<String>,
+    metadata: Option<String>,
+    target_path: String,
+    added_language: Option<String>,
+}
+
+/// The importers of `rows` that a rebuild would bind differently: the import
+/// took the name pool — the `<external>` sentinel, or a definition outside the
+/// file its module names — in a language the added definition can bind. An
+/// import that found its name in its own module keeps it, whatever else defines
+/// that name.
+fn module_importers_to_refresh(
+    conn: &rusqlite::Connection,
+    rows: &[ModuleImportRow],
+) -> Result<Vec<String>> {
+    let all_file_paths: HashSet<String> = conn
+        .prepare("SELECT path FROM files")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let python_paths: HashSet<String> = all_file_paths
+        .iter()
+        .filter(|p| p.ends_with(".py"))
+        .cloned()
+        .collect();
+    let python_module_map = super::python_modules::build_python_module_map(&python_paths);
+    let mut out = Vec::new();
+    for row in rows {
+        let (Some(lang), Some(added)) = (row.language.as_deref(), row.added_language.as_deref())
+        else {
+            continue;
+        };
+        if !crate::utils::config::languages_compatible(lang, added) {
+            continue;
+        }
+        if row.target_path == crate::domain::EXTERNAL_FILE_PATH {
+            out.push(row.importer.clone());
+            continue;
+        }
+        let Some(meta) = row
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        else {
+            continue;
+        };
+        let named: Option<Vec<String>> =
+            if let Some(module) = meta.get("python_module").and_then(|v| v.as_str()) {
+                if meta.get("is_module_import").and_then(|v| v.as_bool()) == Some(true) {
+                    continue;
+                }
+                super::python_modules::project_module_files_from(
+                    module,
+                    &row.importer,
+                    &python_module_map,
+                )
+            } else if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                super::js_modules::resolve_js_specifier_path(spec, &row.importer, &all_file_paths)
+                    .map(|f| vec![f])
+            } else {
+                continue;
+            };
+        if !named.is_some_and(|files| files.contains(&row.target_path)) {
+            out.push(row.importer.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// One `calls` edge an [`Anchored::Elsewhere`] resolution produced, into a name

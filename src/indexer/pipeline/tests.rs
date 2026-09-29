@@ -11218,3 +11218,304 @@ fn a_python_relative_import_is_rebound_incrementally() {
         assert!(edges.iter().any(|x| x == e), "missing {e}: {edges:#?}");
     }
 }
+
+/// Index `before`, write `after` over it (None deletes), index incrementally,
+/// and require the WHOLE edge set of a fresh index of the result — imports and
+/// every other relation, not only calls.
+fn assert_incremental_edges_match_rebuild(
+    before: &[(&str, &str)],
+    after: &[(&str, Option<&str>)],
+) -> Vec<String> {
+    let (project, _d, db) = fresh_index_of(before);
+    let mut tree: Vec<(String, String)> = before
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    for (path, body) in after {
+        tree.retain(|(p, _)| p != path);
+        let abs = project.path().join(path);
+        match body {
+            Some(b) => {
+                fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                fs::write(&abs, b).unwrap();
+                tree.push((path.to_string(), b.to_string()));
+            }
+            None => fs::remove_file(&abs).unwrap(),
+        }
+    }
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    let edges = edge_set(&db);
+    assert_eq!(
+        edges,
+        edge_set(&control),
+        "incremental after {after:?} must equal a rebuild"
+    );
+    edges
+}
+
+// D9 (2026-09-29 usage evaluation): `from flask import url_for` names a
+// re-export (`flask/__init__.py` does `from .helpers import url_for`). When the
+// module the re-export points at appears in a LATER run, the importer kept the
+// import it resolved while `url_for` did not exist yet, and that stale import
+// then pruned the call a rebuild binds to the new definition.
+#[test]
+fn a_python_reexport_importer_is_rebound_when_the_definition_appears() {
+    let before: &[(&str, &str)] = &[
+        (
+            "flask/__init__.py",
+            "from .helpers import url_for as url_for\n",
+        ),
+        (
+            "flask/app.py",
+            "class Flask:\n    def url_for(self, endpoint):\n        return endpoint\n",
+        ),
+        (
+            "examples/auth.py",
+            "from flask import url_for\n\ndef login():\n    return url_for('x')\n",
+        ),
+    ];
+    let edges = assert_incremental_edges_match_rebuild(
+        before,
+        &[(
+            "flask/helpers.py",
+            Some("def url_for(endpoint):\n    return endpoint\n"),
+        )],
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e == "examples/auth.py.login --calls--> flask/helpers.py.url_for"),
+        "{edges:#?}"
+    );
+}
+
+// The same importer when the re-exported module already exists and only gains
+// the definition in a later edit.
+#[test]
+fn a_python_reexport_importer_is_rebound_when_the_definition_is_added() {
+    let before: &[(&str, &str)] = &[
+        (
+            "flask/__init__.py",
+            "from .helpers import url_for as url_for\n",
+        ),
+        ("flask/helpers.py", "def other():\n    return 1\n"),
+        (
+            "flask/app.py",
+            "class Flask:\n    def url_for(self, endpoint):\n        return endpoint\n",
+        ),
+        (
+            "examples/auth.py",
+            "from flask import url_for\n\ndef login():\n    return url_for('x')\n",
+        ),
+    ];
+    let edges = assert_incremental_edges_match_rebuild(
+        before,
+        &[(
+            "flask/helpers.py",
+            Some("def other():\n    return 1\n\ndef url_for(endpoint):\n    return endpoint\n"),
+        )],
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e == "examples/auth.py.login --calls--> flask/helpers.py.url_for"),
+        "{edges:#?}"
+    );
+}
+
+// D9 on the JS/TS re-export paths: a CommonJS package entry that re-exports a
+// module (`module.exports = require('./lib/helpers')`, C3) and an ESM
+// `export { x } from './helpers'`, each when the re-exported definition
+// appears in a later run as a new file or as an edit.
+const CJS_ENTRY: (&str, &str) = ("index.js", "module.exports = require('./lib/helpers')\n");
+const CJS_IMPORTER: (&str, &str) = (
+    "test/a.js",
+    "const { urlFor } = require('..')\nfunction t() {\n  return urlFor('x')\n}\nmodule.exports = t\n",
+);
+const CJS_OTHER: &str = "exports.other = function () {\n  return 1\n}\n";
+const CJS_DEF: &str =
+    "exports.other = function () {\n  return 1\n}\nexports.urlFor = function (e) {\n  return e\n}\n";
+const TS_ENTRY: (&str, &str) = ("src/index.ts", "export { urlFor } from './helpers'\n");
+const TS_IMPORTER: (&str, &str) = (
+    "src/app.ts",
+    "import { urlFor } from './index'\nexport function t() {\n  return urlFor('x')\n}\n",
+);
+const TS_OTHER: &str = "export function other() {\n  return 1\n}\n";
+const TS_DEF: &str =
+    "export function other() {\n  return 1\n}\nexport function urlFor(e: string) {\n  return e\n}\n";
+
+#[test]
+fn a_cjs_reexport_importer_is_rebound_when_the_module_appears() {
+    assert_incremental_edges_match_rebuild(
+        &[CJS_ENTRY, CJS_IMPORTER],
+        &[("lib/helpers.js", Some(CJS_DEF))],
+    );
+}
+
+#[test]
+fn a_cjs_reexport_importer_is_rebound_when_the_definition_is_added() {
+    assert_incremental_edges_match_rebuild(
+        &[CJS_ENTRY, CJS_IMPORTER, ("lib/helpers.js", CJS_OTHER)],
+        &[("lib/helpers.js", Some(CJS_DEF))],
+    );
+}
+
+#[test]
+fn an_esm_reexport_importer_is_rebound_when_the_module_appears() {
+    assert_incremental_edges_match_rebuild(
+        &[TS_ENTRY, TS_IMPORTER],
+        &[("src/helpers.ts", Some(TS_DEF))],
+    );
+}
+
+#[test]
+fn an_esm_reexport_importer_is_rebound_when_the_definition_is_added() {
+    assert_incremental_edges_match_rebuild(
+        &[TS_ENTRY, TS_IMPORTER, ("src/helpers.ts", TS_OTHER)],
+        &[("src/helpers.ts", Some(TS_DEF))],
+    );
+}
+
+// The reverse direction of every shape above: the definition goes away again,
+// by an edit or with its file.
+#[test]
+fn a_reexport_importer_is_rebound_when_the_definition_goes_away() {
+    let py = [
+        (
+            "flask/__init__.py",
+            "from .helpers import url_for as url_for\n",
+        ),
+        (
+            "flask/app.py",
+            "class Flask:\n    def url_for(self, endpoint):\n        return endpoint\n",
+        ),
+        (
+            "examples/auth.py",
+            "from flask import url_for\n\ndef login():\n    return url_for('x')\n",
+        ),
+        (
+            "flask/helpers.py",
+            "def other():\n    return 1\n\ndef url_for(endpoint):\n    return endpoint\n",
+        ),
+    ];
+    assert_incremental_edges_match_rebuild(
+        &py,
+        &[("flask/helpers.py", Some("def other():\n    return 1\n"))],
+    );
+    assert_incremental_edges_match_rebuild(&py, &[("flask/helpers.py", None)]);
+    let cjs = [CJS_ENTRY, CJS_IMPORTER, ("lib/helpers.js", CJS_DEF)];
+    assert_incremental_edges_match_rebuild(&cjs, &[("lib/helpers.js", Some(CJS_OTHER))]);
+    assert_incremental_edges_match_rebuild(&cjs, &[("lib/helpers.js", None)]);
+    let ts = [TS_ENTRY, TS_IMPORTER, ("src/helpers.ts", TS_DEF)];
+    assert_incremental_edges_match_rebuild(&ts, &[("src/helpers.ts", Some(TS_OTHER))]);
+    assert_incremental_edges_match_rebuild(&ts, &[("src/helpers.ts", None)]);
+}
+
+// The Python shapes a `from m import x` binding can take besides the re-export:
+// bound by name to another module's `x` (the named module had none), and the
+// same import when the module defines `x` in a later run.
+#[test]
+fn a_python_from_import_bound_elsewhere_is_rebound_when_its_module_defines_it() {
+    let before: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        ("pkg/helpers.py", "def other():\n    return 1\n"),
+        ("pkg/tools.py", "def url_for(endpoint):\n    return 2\n"),
+        (
+            "app.py",
+            "from pkg.helpers import url_for\n\ndef login():\n    return url_for('x')\n",
+        ),
+    ];
+    let edges = assert_incremental_edges_match_rebuild(
+        before,
+        &[(
+            "pkg/helpers.py",
+            Some("def other():\n    return 1\n\ndef url_for(endpoint):\n    return endpoint\n"),
+        )],
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e == "app.py.login --calls--> pkg/helpers.py.url_for"),
+        "{edges:#?}"
+    );
+}
+
+// D9's fan-out arm re-extracts only the importers a rebuild binds differently:
+// not one that found its name in the module it names, not one in a language
+// the new definition cannot bind, and a D10A `<module>` fallback only when its
+// file gained a name.
+#[test]
+fn the_module_import_fanout_pulls_only_importers_a_rebuild_rebinds() {
+    let base: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        ("pkg/helpers.py", "def url_for(e):\n    return e\n"),
+        (
+            "app.py",
+            "from pkg.helpers import url_for\n\ndef a():\n    return url_for(1)\n",
+        ),
+        (
+            "other.py",
+            "from pkg import url_for\n\ndef b():\n    return url_for(2)\n",
+        ),
+        ("lib/helpers.js", "exports.urlFor = function (e) {\n  return e\n}\n"),
+        (
+            "main.js",
+            "const { urlFor } = require('./lib/helpers')\nfunction m() {\n  return urlFor(1)\n}\nmodule.exports = m\n",
+        ),
+        (
+            "web.js",
+            "const { url_for } = require('./lib/nothing')\nfunction w() {\n  return url_for(1)\n}\nmodule.exports = w\n",
+        ),
+        ("rel/__init__.py", ""),
+        ("rel/helpers.py", "X = 1\n\ndef f():\n    return 1\n"),
+        ("rel/user.py", "from .helpers import X\n"),
+        ("rel/sub.py", "from . import helpers\n"),
+        ("uses_json.py", "import json\n"),
+    ];
+    let refresh = |path: &str, body: &str| -> Vec<String> {
+        let (project, _d, db) = fresh_index_of(base);
+        let paths = vec![path.to_string()];
+        super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+        let full = project.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, body).unwrap();
+        index_files(
+            &db,
+            project.path(),
+            &paths,
+            &std::collections::HashMap::new(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default()).unwrap()
+    };
+    // `app.py` found `url_for` in `pkg.helpers`; `web.js` is JavaScript.
+    assert_eq!(
+        refresh("pkg/tools.py", "def url_for(e):\n    return 2\n"),
+        vec!["other.py".to_string()]
+    );
+    // A module import names a module: `json` is no project definition, and a
+    // new file's `<module>` rebinds no import of another module.
+    let json = refresh("pkg/j.py", "def json():\n    return 1\n");
+    assert!(json.is_empty(), "{json:?}");
+    // `main.js` found `urlFor` in the file its specifier names.
+    let js = refresh(
+        "lib/more.js",
+        "exports.urlFor = function (e) {\n  return 2\n}\n",
+    );
+    assert!(js.is_empty(), "{js:?}");
+    // An edit that adds no name leaves the fallback alone; one that does not.
+    let body_only = refresh("rel/helpers.py", "X = 1\n\ndef f():\n    return 2\n");
+    assert!(body_only.is_empty(), "{body_only:?}");
+    assert_eq!(
+        refresh(
+            "rel/helpers.py",
+            "X = 1\n\ndef f():\n    return 1\n\ndef g():\n    return 3\n"
+        ),
+        vec!["rel/sub.py".to_string(), "rel/user.py".to_string()]
+    );
+}
