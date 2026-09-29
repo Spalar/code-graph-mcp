@@ -880,7 +880,8 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 super::member::is_member_call(node, source, "python")
                     .then(|| super::member::MEMBER_META.to_string())
             })
-            .or_else(|| super::member::python_module_call_meta(node, source));
+            .or_else(|| super::member::python_module_call_meta(node, source))
+            .or_else(|| super::member::python_untyped_receiver_meta(node, source));
         results.push(ParsedRelation {
             source_name: scope.to_string(),
             target_name: callee,

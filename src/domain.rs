@@ -140,6 +140,14 @@ pub const CALL_Q_IMPORT: &str = "imp";
 /// package) stays reachable by name.
 pub const CALL_Q_PACKAGE: &str = "pkg";
 
+/// Key of a Python call's metadata whose receiver the source leaves untyped
+/// (D10B): `{"ur":"attr"}` for an attribute of the instance (`self.x.f()`,
+/// `cls.x.f()`), `{"ur":"rel"}` for a name a relative import binds
+/// (`_cv_app.get()`). It carries no `q`, so every resolver path treats the call
+/// as bare; only the confidence pass reads it, labelling a same-file bind by its
+/// name count as it does a cross-file one.
+pub const CALL_KEY_UNTYPED_RECEIVER: &str = "ur";
+
 // -- Import `q` markers --
 //
 // Stamped onto an import relation's metadata by the parser and read back in
@@ -178,7 +186,8 @@ pub const IMPORT_Q_DEFAULT: &str = "default_import";
 //   / implements / routes_to / exports) resolved by explicit path/parent. Precise.
 //   Except a same-file Rust method call on a receiver the source leaves untyped
 //   (`self.0.m()`, `f().m()`): bound by name alone, it is labelled like a
-//   cross-file call (D#162).
+//   cross-file call (D#162). So is a same-file Python call on an attribute of
+//   `self` or on a name a relative import binds (D10B, `CALL_KEY_UNTYPED_RECEIVER`).
 // - inferred:  a cross-file `calls`/`references` edge resolved by bare name where
 //   the target name is UNIQUE among same-language nodes. Likely correct.
 // - ambiguous: a cross-file `calls`/`references` edge whose target name has >1
@@ -388,7 +397,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 110; // v110 (2026-09-29, D6): a `routes_to` edge whose handler the name pool found outside the route's file records that route file as `"rf"` in its metadata: the edge is the handler's self-edge, so it sat entirely in the handler's file and re-indexing that file dropped it (hono's `app.use(mw1, mw2)` in `types.test.ts` → `hono.test.ts`'s `mw2`), while a route file that stopped routing to it left it behind; an incremental run now requeues or deletes these by their route file. // v109 (2026-09-29, C4): a Python `@overload` stub followed in its block by the implementation is no node: the stubs type that one function, and as three same-file definitions they made callgraph/impact/refs refuse flask's 9 overloaded names (`stream_with_context`, `locate_app`, `template_filter`, …); a stub with no implementation after it (`.pyi`, Protocol) stays. // Older entries (v108 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 111; // v111 (2026-09-29, D10B): a Python call on an attribute of `self` (`self.serializer.tag()`) or on a name a relative import binds (`_cv_app.get()`) carries `{"ur":…}`, and a same-file bind of one is labelled by its name count like a cross-file guess instead of `extracted`: on flask those were 12 of the 22 wrong `extracted` edges, and 4 right ones. Resolution is unchanged. // v110 (2026-09-29, D6): a `routes_to` edge whose handler the name pool found outside the route's file records that route file as `"rf"` in its metadata: the edge is the handler's self-edge, so it sat entirely in the handler's file and re-indexing that file dropped it (hono's `app.use(mw1, mw2)` in `types.test.ts` → `hono.test.ts`'s `mw2`), while a route file that stopped routing to it left it behind; an incremental run now requeues or deletes these by their route file. // Older entries (v109 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before

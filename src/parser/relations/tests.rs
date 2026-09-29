@@ -772,6 +772,38 @@ fn test_member_call_on_an_object_is_marked_member() {
 }
 
 #[test]
+fn test_python_call_on_an_untyped_receiver_is_marked() {
+    // D10B: `self.serializer.tag()` is not a call on the instance, and
+    // `_cv_app.get()` goes through another module's object, so neither names a
+    // class — yet both reached the resolver bare and bound the caller's own
+    // file's `tag` / `get` at `extracted`. They are marked for the confidence
+    // pass, which labels such a bind by its name count; nothing else reads the
+    // mark, so they resolve as before.
+    let py = call_meta(
+        "from .globals import _cv_app\nfrom . import helpers\nimport os\n\
+         class C:\n    def f(self):\n        self.serializer.tag(1)\n        cls.x.y.make()\n        \
+         _cv_app.get()\n        helpers.load()\n        helpers.sub.deep()\n        self.own()\n        \
+         os.getcwd()\n        ctx.push()\n        local()\n",
+        "python",
+    );
+    for t in ["tag", "make"] {
+        assert_eq!(meta_of(&py, t), Some(r#"{"ur":"attr"}"#), "{t}: {py:?}");
+    }
+    for t in ["get", "load", "deep"] {
+        assert_eq!(meta_of(&py, t), Some(r#"{"ur":"rel"}"#), "{t}: {py:?}");
+    }
+    // Receivers that already say what they are keep their qualifier.
+    assert_eq!(meta_of(&py, "own"), Some(r#"{"q":"rtype","v":"C"}"#));
+    assert_eq!(meta_of(&py, "getcwd"), Some(r#"{"q":"module","v":"os"}"#));
+    assert_eq!(meta_of(&py, "push"), Some(MEMBER));
+    assert_eq!(meta_of(&py, "local"), None);
+
+    // Python only: JS measured 3 such edges over three corpora, too few to act on.
+    let js = call_meta("function f() { this.a.b(); }", "javascript");
+    assert_eq!(meta_of(&js, "b"), None);
+}
+
+#[test]
 fn test_cpp_nested_qualified_base_names_its_last_segment() {
     // `log::Reader::Reporter`: the scope's tail is itself qualified. A local
     // struct in a function body inherits like any other.

@@ -832,6 +832,40 @@ pub(super) fn is_member_call(call: tree_sitter::Node, source: &str, family: &str
     true
 }
 
+/// `{"ur":…}` metadata (`crate::domain::CALL_KEY_UNTYPED_RECEIVER`) of a Python
+/// member call no other qualifier covers: `"attr"` when the receiver is an
+/// attribute of `self` / `cls` (`self.serializer.tag()` — the instance's field,
+/// not the instance), `"rel"` when its root is a name a relative import binds
+/// (`_cv_app.get()`, `helpers.load()`). A call on `self` itself, a local, or an
+/// absolute import already carries `rtype` / `member` / `module`.
+pub(super) fn python_untyped_receiver_meta(
+    call: tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    let mut root = object;
+    while root.kind() == "attribute" {
+        root = root.child_by_field_name("object")?;
+    }
+    if root.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&root, source);
+    let kind = if matches!(name, "self" | "cls") {
+        // `self.f()` is the instance's own method; `self.x.f()` is not.
+        (object.kind() == "attribute").then_some("attr")?
+    } else if IMPORT_BOUND.with(|b| matches!(b.borrow().get(name), Some(None))) {
+        "rel"
+    } else {
+        return None;
+    };
+    Some(serde_json::json!({ crate::domain::CALL_KEY_UNTYPED_RECEIVER: kind }).to_string())
+}
+
 /// Metadata of a Python call through a name an absolute import binds
 /// (`click.echo()` → `{"q":"module","v":"click"}`): the resolver drops it when
 /// that module is not the project's, since no project code can run then.

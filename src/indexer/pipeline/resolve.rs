@@ -2048,7 +2048,9 @@ pub(super) fn bind_calls_to_imported_targets(
     // paying for. Only the FROM clause ahead of it changes.
     const BIND_PREDICATE: &str = "
              WHERE e.relation = ?1
-               AND (e.metadata IS NULL OR e.metadata = '')
+               -- bare, or bare as far as resolution goes (a D10B `ur` mark)
+               AND (e.metadata IS NULL OR e.metadata = ''
+                    OR json_extract(e.metadata, '$.ur') IS NOT NULL)
                AND e.source_id <> it.import_target_id
                AND NOT EXISTS (
                    SELECT 1 FROM nodes ln
@@ -2138,7 +2140,9 @@ pub(super) fn prune_import_contradicted_call_edges(
     build_imports_temp(conn, true)?;
     const PRUNE_PREDICATE: &str = "
             WHERE e.relation = ?1
-              AND (e.metadata IS NULL OR e.metadata = '')
+              -- bare, or bare as far as resolution goes (a D10B `ur` mark)
+              AND (e.metadata IS NULL OR e.metadata = ''
+                   OR json_extract(e.metadata, '$.ur') IS NOT NULL)
               AND tn.file_id <> sn.file_id
               -- Don't false-prune a real qualified call. A `module.func()` /
               -- `obj.method()` call can be extracted WITHOUT receiver metadata
@@ -2210,8 +2214,8 @@ pub(super) fn prune_import_contradicted_call_edges(
 /// resolution + the structural relations imports/inherits/implements/routes_to/
 /// exports) is correct without touching its insert site. This pass only
 /// DOWNGRADES cross-file `calls`/`references` edges, and the same-file Rust
-/// method calls on an untyped receiver (D#162, see `CONF_WHERE`) — the
-/// by-name-resolved class:
+/// method calls on an untyped receiver (D#162) and Python calls on an untyped
+/// receiver (D10B, see `CONF_WHERE`) — the by-name-resolved class:
 ///   - `inferred`  when the target name is unique among same-language nodes;
 ///   - `ambiguous` when >1 same-language node shares the target name (the
 ///     by-name resolution could not pick uniquely — the known false-positive
@@ -2290,13 +2294,23 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     // the same class was 75% right on hono, 91% on flask and 48% on leveldb,
     // where relabelling it hid as many correct edges as wrong ones or more. A
     // local-variable receiver (`recv`) stays out for the same reason (53 of 76).
+    //
+    // Python has its own untyped class (D10B, `ur`, parser `member.rs`): a
+    // call on an attribute of `self` or on a name a relative import binds. It
+    // carries no `q` at all, so it resolved as a bare call and bound the file's
+    // own method by name. Measured by the oracle on flask + networkx: of 33
+    // `self.x.f()` binds 14 right (6 of 24 where the name has another
+    // definition), of 28 relative-import binds 4 credited and none right on
+    // reading the code. A local receiver (`q` member) stays out: 63 of 80 right.
     const CONF_WHERE: &str = "
              WHERE e.relation IN (?1, ?2)
                AND (src.file_id <> tgt.file_id
                     OR (tf.language = 'rust'
                         AND json_extract(e.metadata, '$.q') IN ('member', 'chain')
                         AND (json_extract(e.metadata, '$.rt') IS NULL
-                             OR json_extract(e.metadata, '$.amb') IS NOT NULL)))";
+                             OR json_extract(e.metadata, '$.amb') IS NOT NULL))
+                    OR (tf.language = 'python'
+                        AND json_extract(e.metadata, '$.ur') IS NOT NULL))";
     // Which edges to reconsider. The scoped form is three arms — the caller
     // moved, the callee moved, or the callee's NAME changed how many nodes
     // share it. Only the third needs `cg_scope_names`, and only this pass has

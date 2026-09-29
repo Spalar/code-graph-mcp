@@ -11656,3 +11656,85 @@ fn an_imported_handler_context_string_follows_its_route_file() {
         context_string_of(&control, "ctrl.ts", "getUser")
     );
 }
+
+// D10B (2026-09-29 usage evaluation): a Python call on a receiver the source
+// leaves untyped — an attribute of `self` (`self.serializer.tag()`), or a name
+// a relative import binds (`_cv_app.get()`) — has no qualifier, so the same-file
+// tier bound the caller's own file's `tag` / `get` as if it were a bare call, at
+// `extracted`. On flask that was 12 of the 22 wrong `extracted` edges. Such a
+// bind is a by-name guess and is labelled like one; a local receiver (`ctx.f()`,
+// `q` member) and a call on the instance keep `extracted`.
+#[test]
+fn a_python_untyped_receiver_same_file_bind_is_labelled_by_its_name_count() {
+    let files: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/globals.py",
+            "class _Var:\n    def get(self):\n        return 1\n\n_cv_app = _Var()\n",
+        ),
+        (
+            "pkg/tag.py",
+            "from .globals import _cv_app\n\n\nclass JSONTag:\n    def tag(self, value):\n        \
+             return value\n\n    def to_json(self, value):\n        return self.serializer.tag(value)\n\n    \
+             def spin(self):\n        return self.engine.whirl()\n\n    def both(self, value):\n        \
+             self.serializer.tag(value)\n        return self.tag(value)\n\n    def current(self):\n        \
+             return _cv_app.get()\n\n\nclass TaggedJSONSerializer:\n    def tag(self, value):\n        \
+             return value\n\n    def whirl(self):\n        return 1\n\n\nclass Store:\n    \
+             def get(self):\n        return 2\n\n\ndef use(ctx):\n    return ctx.whirl()\n",
+        ),
+    ];
+    let (project, _d, db) = fresh_index_of(files);
+    let confs = |rows: &[(String, String, String, String)], s: &str, t: &str| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter(|(a, r, b, _)| a == s && r == REL_CALLS && b == t)
+            .map(|(_, _, _, c)| c.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    let rows = graph_projection_with_confidence(&db);
+    assert_eq!(
+        confs(&rows, "pkg/tag.py:to_json", "pkg/tag.py:tag"),
+        ["ambiguous", "ambiguous"],
+        "both same-file `tag`s are a guess among two definitions: {rows:#?}"
+    );
+    assert_eq!(
+        confs(&rows, "pkg/tag.py:current", "pkg/tag.py:get"),
+        ["ambiguous"],
+        "`get` has two definitions: {rows:#?}"
+    );
+    assert_eq!(
+        confs(&rows, "pkg/tag.py:spin", "pkg/tag.py:whirl"),
+        ["inferred"],
+        "`whirl` has one definition: {rows:#?}"
+    );
+    assert!(
+        confs(&rows, "pkg/tag.py:both", "pkg/tag.py:tag").contains(&"extracted".to_string()),
+        "`self.tag()` names the class, whatever else the caller does: {rows:#?}"
+    );
+    assert_eq!(
+        confs(&rows, "pkg/tag.py:use", "pkg/tag.py:whirl"),
+        ["extracted"],
+        "a local receiver keeps its label (measured right 63 of 80 times): {rows:#?}"
+    );
+
+    // A second `whirl`, in a file this run is the only one to see, relabels the
+    // untouched same-file edge; the result equals a rebuild.
+    let engine = "class Engine:\n    def whirl(self):\n        return 3\n";
+    fs::write(project.path().join("pkg/engine.py"), engine).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, control) =
+        fresh_index_of(&[files[0], files[1], files[2], ("pkg/engine.py", engine)]);
+    let inc = graph_projection_with_confidence(&db);
+    assert_eq!(
+        confs(&inc, "pkg/tag.py:spin", "pkg/tag.py:whirl"),
+        ["ambiguous"],
+        "{inc:#?}"
+    );
+    assert_eq!(
+        inc,
+        graph_projection_with_confidence(&control),
+        "incremental must equal a rebuild"
+    );
+}
