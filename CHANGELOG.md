@@ -1,5 +1,104 @@
 # Changelog
 
+## Unreleased
+
+Most of this release comes from a 2026-09-28 evaluation of the plugin inside
+real Claude Code work: 240 recorded sessions, five coding tasks run with and
+without the plugin, and every hook and steering text driven against real
+repositories. Two findings drive it. On a coding task the plugin was not used
+at all (0 calls in 15 runs) while its first-session side effects made Claude
+stop and explain unexpected `.gitignore` / `CLAUDE.md` changes in 12 of 15
+runs; and most of what the hooks injected had no measurable effect.
+
+**Upgrading.** Nothing to run. Your first session removes the seven hook
+entries earlier versions wrote into `~/.claude/settings.json`: the plugin's
+`hooks/hooks.json` now carries them. SessionStart no longer writes `CLAUDE.md`
+or `.claude/`, and a project it adopted before keeps its block (you get a
+notice with a refresh and a remove command when that block is out of date).
+
+### Hooks live in the plugin's hooks.json
+
+Since v0.32.0 the non-SessionStart hooks were written into the user-global
+`settings.json`, because Claude Code once loaded only SessionStart from a
+plugin's `hooks.json`. Claude Code 2.1.284 loads it for every event (verified:
+a plugin's PreToolUse, PostToolUse, UserPromptSubmit and Stop entries all
+fire). The plugin declares all of them there now; `settings.json` keeps them
+only for an npm-global or dev CLI with no plugin installed, and never both at
+once. `doctor` reports entries left in `settings.json` next to an installed
+plugin as duplicates (each hook would fire twice) and removes them.
+
+### Your repository is left alone
+
+- SessionStart no longer creates `CLAUDE.md` and `.claude/plugin_code_graph_mcp.md`.
+  The MCP `instructions` already carry the same routing. `code-graph-mcp adopt`
+  still writes the block; `CODE_GRAPH_NO_AUTO_ADOPT` / `CODE_GRAPH_NO_TEMPLATE_REFRESH`
+  now only silence the out-of-date-block notice (see README).
+- The `.code-graph/` ignore rule goes to the repository's local
+  `.git/info/exclude`, never the tracked `.gitignore`, and only when neither
+  file names it already. A worktree's rule goes to the common git dir.
+
+### SessionStart says what matters, where you can see it
+
+A SessionStart hook's stderr is never shown when it exits 0, so all fifteen of
+its notices reached no one. It now prints one JSON value: a `systemMessage`
+for a missing or unrunnable binary, dark or failing hooks, a rebuilt
+`settings.json`, an out-of-date `CLAUDE.md` block and a corrupt index; the
+opt-in project map goes to the model as `additionalContext`. A corrupt index
+is now rebuilt in the background (it used to read as fresh, leaving every
+hook dark). The "Recent changes — blast radius" section is gone: it was
+followed up 0 of 35 times, and a comment-only edit reported 291 of 366 files
+impacted.
+
+### Quieter, correct injections
+
+- **After a grep**, the call graph is injected only when it is rooted at the
+  grepped symbol. `callgraph` promotes a unique fuzzy match (`task` →
+  `run_startup_tasks`) and said so only on stderr; up to 27 of 98 injections
+  were about another symbol.
+- **Before an edit**, the impact summary appears only when the edit changes a
+  definition's header, names the earliest definition in the hunk, skips files
+  outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Replayed over 802
+  real injections, 67 remain; the rest were body-only edits, unchanged
+  headers or outside files, and the removed body-edit guess picked a wrong
+  TypeScript symbol for 108 of 608 definitions.
+- **Reading files**: the directory overview fires on the fifth distinct file,
+  once per directory, and only when an overview came back — no more advice to
+  run `overview tests/`, which answers "No symbols found".
+- **Prompts**: task notifications and teammate messages no longer trigger the
+  prompt hook (24% of its injections); a named file is overviewed itself, not
+  its whole parent directory (one was 18,497 chars); `impact` gets `--file`
+  when the prompt names one; cooldowns are per symbol; output is capped at
+  4,000 bytes.
+- **Edit-time reindex** (`CODE_GRAPH_HOOK_INDEX=on`) indexes structure only;
+  it made each edit wait 8 s for embeddings.
+
+### `impact`: no caller in the graph is `UNKNOWN`, not `LOW`
+
+A function the call graph shows no production or test caller for now reports
+`Risk: UNKNOWN` with a warning that the empty result can also mean unresolved
+callers (dynamic dispatch, reflection, an unresolved import). `LOW` read as an
+endorsement for express's main export, which every test calls through
+`require('..')`. CLI `impact`, `show --impact` and MCP
+`get_ast_node include_impact` all change.
+
+### Steering text
+
+The MCP instructions, tool descriptions, the `adopt` block, the detail doc,
+the `explore` skill and the `code-explorer` agent no longer claim the index
+"sees everything" (unresolved calls leave no edge; JS `obj.m = function`
+members are not indexed yet), add `refs X` then `grep -w X` for rename and
+remove audits, and drop the `~/.cache/code-graph/bin` fallback (the plugin's
+`bin/` is on the Bash PATH). The detail doc no longer recommends
+`refs --min-confidence extracted`, which drops every cross-file caller. It is
+now English and 3.3 KB instead of 12.6 KB. `code-explorer` lists only the
+plugin-hosted MCP tool names a live install exposes.
+
+### Evals
+
+`evals/` gains five coding cases (networkx, each a reverted upstream change),
+scored by hidden tests on the workspaces `--keep-temp` leaves
+(`evals/_coding/grade.py`). See `evals/README.md` for the baseline.
+
 ## 0.163.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
