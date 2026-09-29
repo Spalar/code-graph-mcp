@@ -88,6 +88,7 @@ change breaks, every use of a symbol — one call replaces rounds of Grep + Read
 |--------|---------|
 | Who calls X / what X calls | `code-graph-mcp callgraph X` |
 | Impact before changing a signature | `code-graph-mcp impact X` |
+| Tests to re-run after changing files | `code-graph-mcp affected <files>` |
 | Rename / remove audit | `code-graph-mcp refs X`, then `grep -w X` |
 | Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
 | Symbol source / signature | `code-graph-mcp show X` |

@@ -31,7 +31,7 @@ mod backfill;
 mod freshness;
 use freshness::RESULT_REFRESH_TOOLS;
 
-pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready: `code-graph-mcp callgraph X` / `impact X` / `refs X` / `show X` / `overview <dir>`; all commands: `code-graph-mcp --help`.";
+pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready: `code-graph-mcp callgraph X` / `impact X` / `affected <files>` / `refs X` / `show X` / `overview <dir>`; all commands: `code-graph-mcp --help`.";
 
 /// MCP `instructions` field (default/noisy variant). v0.49: CLI form leads. In
 /// Claude Code the MCP tools are deferred (a ToolSearch load must precede the
@@ -41,7 +41,7 @@ pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready: `code-graph-mcp call
 /// the live clap CLI by `tests/doc_cli_alignment.rs`.
 pub const INSTRUCTIONS_NOISY: &str = concat!(
     "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
-    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; before changing a fn's signature \u{2192} `code-graph-mcp impact X`; rename/remove audit \u{2192} `code-graph-mcp refs X`, then `grep -w X`; ",
+    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; before changing a fn's signature \u{2192} `code-graph-mcp impact X`; tests to re-run after changing files \u{2192} `code-graph-mcp affected <files>`; rename/remove audit \u{2192} `code-graph-mcp refs X`, then `grep -w X`; ",
     "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-i/-w/-F/-l, -c count, -t <lang>/-g <glob> scope, -A/-B/-C ctx, -M col-cap; grep exits).\n",
     "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, find_references, semantic_code_search for concept search without an exact symbol.\n",
     "The graph holds the calls it could resolve: dynamic dispatch, reflection and unresolved imports leave no edge, so an empty caller list is not proof that nothing calls X.\n",

@@ -919,3 +919,17 @@ fn doctor_help_is_byte_identical_from_both_sources() {
          install path reaches."
     );
 }
+
+/// Q3 (2026-09-29): `affected` answers "which tests does this change touch",
+/// asked after every edit, and neither resident text named it (eval F2).
+#[test]
+fn resident_instructions_name_affected() {
+    assert!(
+        INSTRUCTIONS_NOISY.contains("`code-graph-mcp affected <files>`"),
+        "noisy instructions must name `affected`"
+    );
+    assert!(
+        INSTRUCTIONS_QUIET.contains("`affected <files>`"),
+        "quiet instructions must name `affected`"
+    );
+}

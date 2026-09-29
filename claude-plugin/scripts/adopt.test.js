@@ -117,7 +117,7 @@ test('memoryDir honors CLAUDE_CONFIG_DIR override (multi-account isolation)', ()
 
 // ── buildBlock — the managed CLAUDE.md block ────────────────────────────────
 
-test('buildBlock generic: v2 sentinel + 7 base rows + pointer', () => {
+test('buildBlock generic: v2 sentinel + 8 base rows + pointer', () => {
   const block = buildBlock('generic');
   assert.ok(block.startsWith(SENTINEL_BEGIN), 'opens with v2 BEGIN');
   assert.ok(block.endsWith(SENTINEL_END), 'closes with END');
@@ -139,6 +139,15 @@ test('every project type carries the rename / remove audit row', () => {
   for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
     const block = buildBlock(type);
     assert.ok(block.includes('| Rename / remove audit | `code-graph-mcp refs X`, then `grep -w X` |'), type);
+  }
+});
+
+// Q3 (2026-09-29): "which tests does this change touch" is asked after every
+// edit, and `affected` answers it; the resident guidance never named it.
+test('every project type carries the tests-to-re-run row', () => {
+  for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
+    const block = buildBlock(type);
+    assert.ok(block.includes('| Tests to re-run after changing files | `code-graph-mcp affected <files>` |'), type);
   }
 });
 
