@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.164.0
 
 Most of this release comes from a 2026-09-28 evaluation of the plugin inside
 real Claude Code work: 240 recorded sessions, five coding tasks run with and
