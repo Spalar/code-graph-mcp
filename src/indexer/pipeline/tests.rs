@@ -11113,3 +11113,108 @@ fn a_python_from_import_binds_no_method() {
         "{edges:#?}"
     );
 }
+
+// D10 (2026-09-29 usage evaluation): a relative import — `from .globals
+// import _cv_app`, the only form inside flask's own package — bound the
+// `<external>` sentinel `.globals` (103 of flask's 402 external imports), so
+// `affected src/flask/signals.py` named no test to re-run and no call inside
+// the package was ever import-scoped. A relative module resolves against the
+// importer's package; a name that is no node of it is a submodule or a
+// variable, and binds that file, never a same-named node elsewhere.
+#[test]
+fn a_python_relative_import_binds_its_package_file() {
+    let files: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        ("pkg/signals.py", "request_started = object()\n"),
+        ("pkg/typing.py", "X = 1\n"),
+        ("pkg/helpers.py", "def get_flag():\n    return 1\n"),
+        (
+            "pkg/sub/tools.py",
+            "def get_flag():\n    return 2\n\ndef request_started():\n    return 3\n",
+        ),
+        (
+            "pkg/app.py",
+            "from .signals import request_started\nfrom . import typing as ft\n\
+             from .helpers import get_flag\nfrom .helpers import *\n\n\
+             def run():\n    return get_flag()\n",
+        ),
+        ("pkg/sub/__init__.py", ""),
+        (
+            "pkg/sub/mod.py",
+            "from ..helpers import get_flag\nfrom .. import signals\n",
+        ),
+        ("top.py", "from . import nothing\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    for e in [
+        "pkg/app.py.<module> --imports--> pkg/signals.py.<module>",
+        "pkg/app.py.<module> --imports--> pkg/typing.py.<module>",
+        "pkg/app.py.<module> --imports--> pkg/helpers.py.get_flag",
+        "pkg/app.py.<module> --imports--> pkg/helpers.py.<module>",
+        "pkg/app.py.run --calls--> pkg/helpers.py.get_flag",
+        "pkg/sub/mod.py.<module> --imports--> pkg/helpers.py.get_flag",
+        "pkg/sub/mod.py.<module> --imports--> pkg/signals.py.<module>",
+    ] {
+        assert!(has(e), "missing {e}: {edges:#?}");
+    }
+    for e in [
+        "pkg/app.py.<module> --imports--> pkg/sub/tools.py.request_started",
+        "pkg/app.py.run --calls--> pkg/sub/tools.py.get_flag",
+    ] {
+        assert!(!has(e), "unexpected {e}: {edges:#?}");
+    }
+    // Above the project root a relative import names nothing of the project.
+    assert!(
+        has("top.py.<module> --imports--> <external>.."),
+        "{edges:#?}"
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.starts_with("pkg/") && e.contains("<external>..")),
+        "{edges:#?}"
+    );
+}
+
+// The same binding survives an incremental run: a relative module that appears
+// later rebinds its importer (its sentinel `.late` names the new stem), and an
+// edited module keeps the import edge into its re-created `<module>` node.
+#[test]
+fn a_python_relative_import_is_rebound_incrementally() {
+    let before: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/app.py",
+            "from .late import thing\nfrom .signals import started\n\n\
+             def run():\n    return thing()\n",
+        ),
+        ("pkg/signals.py", "started = 1\n"),
+    ];
+    let (project, _d, db) = fresh_index_of(before);
+    let late = "def thing():\n    return 1\n";
+    let signals = "started = 2\nstopped = 3\n";
+    fs::write(project.path().join("pkg/late.py"), late).unwrap();
+    fs::write(project.path().join("pkg/signals.py"), signals).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, control) = fresh_index_of(&[
+        before[0],
+        before[1],
+        ("pkg/signals.py", signals),
+        ("pkg/late.py", late),
+    ]);
+    let edges = edge_set(&db);
+    assert_eq!(
+        edges,
+        edge_set(&control),
+        "incremental must equal a rebuild"
+    );
+    for e in [
+        "pkg/app.py.<module> --imports--> pkg/late.py.thing",
+        "pkg/app.py.run --calls--> pkg/late.py.thing",
+        "pkg/app.py.<module> --imports--> pkg/signals.py.<module>",
+    ] {
+        assert!(edges.iter().any(|x| x == e), "missing {e}: {edges:#?}");
+    }
+}

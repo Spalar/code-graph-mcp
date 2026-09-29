@@ -125,6 +125,47 @@ pub(super) fn project_module_files(
     python_module_map.get(python_module).cloned()
 }
 
+/// [`project_module_files`] for a module path as `importer` writes it. A
+/// relative path (`.globals`, `..helpers`, `.`) names a file of the importer's
+/// own package: one dot is its directory, each further dot one level up
+/// (PEP 328). It went to the `<external>` sentinel before, which cut every
+/// module of a package off from its siblings — flask's `src/flask/` imports
+/// nothing else (D10, 2026-09-29 usage evaluation). The map holds every file
+/// under its dotted path from the project root, so the key is looked up there
+/// and kept only for the exact file it spells, since another import root could
+/// register the same key for a different file. `None` above the project root.
+pub(super) fn project_module_files_from(
+    python_module: &str,
+    importer: &str,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    let Some(mut rest) = python_module.strip_prefix('.') else {
+        return project_module_files(python_module, python_module_map);
+    };
+    let mut dir = importer.rsplit_once('/').map_or("", |(d, _)| d);
+    while let Some(r) = rest.strip_prefix('.') {
+        if dir.is_empty() {
+            return None;
+        }
+        dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+        rest = r;
+    }
+    let path = match (dir, rest) {
+        ("", "") => return None,
+        ("", r) => r.replace('.', "/"),
+        (d, "") => d.to_string(),
+        (d, r) => format!("{d}/{}", r.replace('.', "/")),
+    };
+    let wanted = [format!("{path}.py"), format!("{path}/__init__.py")];
+    let files: Vec<String> = python_module_map
+        .get(&path.replace('/', "."))?
+        .iter()
+        .filter(|f| wanted.contains(f))
+        .cloned()
+        .collect();
+    (!files.is_empty()).then_some(files)
+}
+
 /// Resolve Python import targets within the files [`project_module_files`]
 /// resolved the module to.
 /// For `import X` (is_module_import): finds `<module>` nodes in those files.

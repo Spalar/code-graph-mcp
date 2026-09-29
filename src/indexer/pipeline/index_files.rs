@@ -52,7 +52,7 @@ use super::js_modules::{
     resolve_php_include_path,
 };
 use super::python_modules::{
-    build_python_module_map, project_module_files, resolve_python_module_targets,
+    build_python_module_map, project_module_files_from, resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
@@ -1575,7 +1575,7 @@ fn resolve_batch_relations(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if let Some(module_files) =
-                        project_module_files(python_module, python_module_map)
+                        project_module_files_from(python_module, &pf.rel_path, python_module_map)
                     {
                         // Internal module — try constrained resolution
                         if let Some(module_targets) = resolve_python_module_targets(
@@ -3617,7 +3617,9 @@ fn resolve_deferred_relations(
                     .get("is_module_import")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if let Some(module_files) = project_module_files(python_module, python_module_map) {
+                if let Some(module_files) =
+                    project_module_files_from(python_module, &d.rel_path, python_module_map)
+                {
                     if let Some(module_targets) = resolve_python_module_targets(
                         &module_files,
                         is_module_import,
@@ -3634,6 +3636,38 @@ fn resolve_deferred_relations(
                             false,
                         )?;
                         continue;
+                    }
+                    // A relative import stays inside its package (D10): a name
+                    // that is no node of the module is a submodule (`from .
+                    // import typing`), a variable (`from .signals import
+                    // request_started`) or `*`, and binds the file it names —
+                    // never a same-named node elsewhere via the name chain.
+                    if python_module.starts_with('.') && !is_module_import {
+                        let submodule = if python_module.ends_with('.') {
+                            format!("{python_module}{}", d.target_name)
+                        } else {
+                            format!("{python_module}.{}", d.target_name)
+                        };
+                        let files =
+                            project_module_files_from(&submodule, &d.rel_path, python_module_map)
+                                .unwrap_or(module_files);
+                        if let Some(module_nodes) = resolve_python_module_targets(
+                            &files,
+                            true,
+                            &d.target_name,
+                            &node_id_to_path,
+                            &name_to_ids,
+                        ) {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &module_nodes,
+                                &d.relation,
+                                d.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
                     }
                 }
             }
