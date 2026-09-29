@@ -108,7 +108,8 @@ impacted.
   `__init__`, two `impl`s' `new`) injects that method's impact again. Since a
   file selector stopped merging such definitions (see Queries), the edit hook
   had gone silent on them; it now asks `impact --node-id` for the definition
-  starting at or before the edited line.
+  starting at or before the edited line, and stays silent when that line lies
+  past the last definition the refusal listed.
 - **After a grep**, a symbol defined outside the path the grep searched gets
   one line saying where it is defined and the `callgraph` command for it,
   instead of its call graph: a grep for four helpers in `tests/cli_e2e.rs`
@@ -141,7 +142,8 @@ A function the call graph shows no production or test caller for now reports
 `Risk: UNKNOWN` with a warning that the empty result can also mean unresolved
 callers (dynamic dispatch, reflection, an unresolved import). `LOW` read as an
 endorsement for express's main export, which every test calls through
-`require('..')`. CLI `impact`, `show --impact` and MCP
+`require('..')`. With `--change-type remove` or `signature` such a function
+used to rate `HIGH`; it is `UNKNOWN` too. CLI `impact`, `show --impact` and MCP
 `get_ast_node include_impact` all change.
 
 ### Steering text
@@ -243,15 +245,21 @@ not have.
   32-node batches, runs, and restarts it. It used to wait 2 s, skip, and stay
   owed for the minutes a first backfill takes.
 - `callgraph X --file F`, `impact X --file F` and MCP `get_call_graph` with a
-  `file_path` refuse a name with several definitions in that file, as `refs`
-  already did, instead of merging them (`callgraph pop --file
-  src/flask/ctx.py` answered for `_AppCtxGlobals.pop` and `AppContext.pop` at
-  once). A qualified name (`AppContext.pop`) answers, and so does
-  `--node-id`: `impact` and `callgraph` take `--node-id N` like `show` and
-  `refs` (the symbol is then optional and `--file` is ignored with a note),
-  answering for exactly that definition. When the command's own query-time
-  refresh re-indexes the file, the node is found again by identity before
-  answering (a re-index reuses node ids). The refusal now names
+  `file_path` refuse a name whose definitions in that file have different
+  qualified names, as `refs` already did, instead of merging them
+  (`callgraph pop --file src/flask/ctx.py` answered for `_AppCtxGlobals.pop`
+  and `AppContext.pop` at once). Definitions that share a qualified name —
+  `#[cfg]` twins, C++ overloads, a property's getter and setter — are one
+  symbol to every caller and are still answered merged. A qualified name
+  (`AppContext.pop`) answers, and so does `--node-id`: `impact` and
+  `callgraph` take `--node-id N` like `show` and `refs` (the symbol is then
+  optional and `--file` is ignored with a note), answering for exactly that
+  definition. The command refreshes the named file before it lists
+  candidates, so their lines are the lines on disk, and the `--json` refusal
+  carries `total` next to the at most five it lists. When the query-time
+  refresh re-indexes the node's file, the node is found again by identity and
+  by its position among definitions sharing that identity; if their number
+  changed, the command refuses rather than guess. The refusal now names
   `--node-id <N>` for callgraph, impact, refs and show.
 - MCP answers that name more than 32 files check only the first 32 against the
   disk. The rest were counted in `freshness.stale_kept` under "changed on

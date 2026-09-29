@@ -145,6 +145,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
     let symbol = selection.lookup_name.as_str();
     let file_filter = selection.file_filter.as_deref();
+    // Refresh the selector's own file before the gate reads it: its node_ids
+    // and start lines are what a caller picks a definition by (see `impact`).
+    if let Some(fp) = file_filter {
+        refresh_files_if_stale(&ctx.db, &ctx.project_root, &[fp.to_string()]).disclose();
+    }
 
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge call graphs.

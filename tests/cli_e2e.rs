@@ -12426,3 +12426,199 @@ fn callgraph_by_node_id_never_fuzzy_resolves_an_edgeless_direction() {
     assert_eq!(v["symbol"].as_str(), Some("new"), "{out}");
     assert_eq!(callgraph_names(&out), Vec::<String>::new(), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// Pre-tag review of 0.164.0 (2026-09-29): the same-file gate and `--node-id`.
+// ---------------------------------------------------------------------------
+
+fn index_project(files: &[(&str, &str)]) -> TempDir {
+    let project = TempDir::new().unwrap();
+    for (rel, body) in files {
+        let p = project.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// Node ids of `name` in `file`, in source order, read from the index.
+fn node_ids_in_file(project: &TempDir, file: &str, name: &str) -> Vec<i64> {
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE f.path = ?1 AND n.name = ?2 ORDER BY n.start_line",
+        )
+        .unwrap();
+    stmt.query_map([file, name], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn append(project: &TempDir, rel: &str, text: &str) {
+    let p = project.path().join(rel);
+    let mut s = std::fs::read_to_string(&p).unwrap();
+    s.push_str(text);
+    std::fs::write(p, s).unwrap();
+}
+
+const CFG_TWINS: &str = "#[cfg(unix)]\npub fn connect() { unix_helper() }\n\n\
+    #[cfg(windows)]\npub fn connect() { win_helper() }\n\n\
+    pub fn unix_helper() {}\n\npub fn win_helper() {}\n";
+const CFG_CALLER: &str = "pub fn run() { crate::a::connect() }\n";
+
+// Definitions that share one qualified name in one file — `#[cfg]` twins, a
+// property's getter and setter — are one symbol to every caller. 0.163.0
+// answered for them under `--file`; 174f9b6's gate refused them, and MCP
+// `get_call_graph` has no node_id to get past that. Only definitions with
+// DIFFERENT qualified names (two classes' `run`) need splitting.
+#[test]
+fn same_file_definitions_sharing_a_qualified_name_answer_under_a_file_selector() {
+    let rs = index_project(&[("src/a.rs", CFG_TWINS), ("src/b.rs", CFG_CALLER)]);
+    for cmd in ["callgraph", "impact"] {
+        let (out, stderr, code) = run_cli(&rs, &[cmd, "connect", "--file", "src/a.rs", "--json"]);
+        assert_eq!(
+            code, 0,
+            "{cmd}: cfg twins must answer; stderr={stderr:?} stdout={out}"
+        );
+        assert!(
+            out.contains("run"),
+            "{cmd}: the caller must be listed: {out}"
+        );
+    }
+    let py = index_project(&[(
+        "app.py",
+        "class App:\n    @property\n    def debug(self):\n        return self._d\n\n    \
+         @debug.setter\n    def debug(self, v):\n        self._d = v\n\n\
+         def show(a):\n    return a.debug()\n",
+    )]);
+    let (out, stderr, code) = run_cli(&py, &["callgraph", "debug", "--file", "app.py", "--json"]);
+    assert_eq!(
+        code, 0,
+        "getter+setter must answer; stderr={stderr:?} stdout={out}"
+    );
+    // Control: different qualified names in one file still refuse.
+    let two = index_project(&[(
+        "app.py",
+        "class A:\n    def run(self):\n        return 1\n\n\
+         class B:\n    def run(self):\n        return 2\n",
+    )]);
+    let (out, _e, code) = run_cli(&two, &["callgraph", "run", "--file", "app.py", "--json"]);
+    assert_eq!(code, 1, "A.run and B.run must still refuse: {out}");
+}
+
+// H1: `--node-id` re-found its target after ANY refresh by (file, name,
+// qualified name, type) and took the first match — the other twin — even when
+// the target's own file was never re-indexed and its id was still valid.
+#[test]
+fn node_id_keeps_its_definition_across_a_refresh() {
+    let project = index_project(&[("src/a.rs", CFG_TWINS), ("src/b.rs", CFG_CALLER)]);
+    let ids = node_ids_in_file(&project, "src/a.rs", "connect");
+    assert_eq!(ids.len(), 2, "fixture: two connect twins: {ids:?}");
+    let second = ids[1].to_string();
+    let callees = |project: &TempDir| {
+        let (out, stderr, code) = run_cli(
+            project,
+            &[
+                "callgraph",
+                "--node-id",
+                &second,
+                "--direction",
+                "callees",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "stderr={stderr:?} stdout={out}");
+        callgraph_names(&out)
+    };
+    assert!(
+        callees(&project).contains(&"win_helper".to_string()),
+        "precondition"
+    );
+    // A caller file changes: the target's own file is untouched.
+    append(&project, "src/b.rs", "// edited\n");
+    let after = callees(&project);
+    assert!(after.contains(&"win_helper".to_string()), "{after:?}");
+    assert!(
+        !after.contains(&"unix_helper".to_string()),
+        "swapped twin: {after:?}"
+    );
+    // The target's own file changes below both twins: re-indexed, same order.
+    append(&project, "src/a.rs", "// edited\n");
+    let after = callees(&project);
+    assert!(after.contains(&"win_helper".to_string()), "{after:?}");
+    assert!(
+        !after.contains(&"unix_helper".to_string()),
+        "swapped twin: {after:?}"
+    );
+}
+
+const TWO_RUNS_WITH_FILLER: &str = "class A:\n    def run(self):\n        return 1\n\
+    # filler\n# filler\n# filler\n# filler\n# filler\n# filler\n# filler\n# filler\n\n\
+    class B:\n    def run(self):\n        return 2\n\n\
+    def go_a():\n    return A().run()\n\ndef go_b():\n    return B().run()\n";
+
+// H3: the same-file refusal listed node_ids and start lines from the index as
+// it was before this command refreshed anything, and the edit hook picks a
+// definition by the line on disk — after an unindexed edit had shifted lines,
+// it picked the neighbour.
+#[test]
+fn same_file_refusal_lists_the_lines_on_disk() {
+    // One project per command: the first command's refresh would otherwise
+    // hand the second a fresh index and leave its own refresh untested.
+    for cmd in ["callgraph", "impact"] {
+        let project = index_project(&[("app.py", TWO_RUNS_WITH_FILLER)]);
+        std::fs::write(
+            project.path().join("app.py"),
+            TWO_RUNS_WITH_FILLER.replace("# filler\n", ""),
+        )
+        .unwrap();
+        let on_disk: Vec<i64> = std::fs::read_to_string(project.path().join("app.py"))
+            .unwrap()
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("def run"))
+            .map(|(i, _)| i as i64 + 1)
+            .collect();
+        let (out, _e, code) = run_cli(&project, &[cmd, "run", "--file", "app.py", "--json"]);
+        assert_eq!(code, 1, "{cmd}: refuses: {out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let mut lines: Vec<i64> = v["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["start_line"].as_i64().unwrap())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, on_disk, "{cmd}: stale start lines: {out}");
+    }
+}
+
+// H2: the refusal lists at most `SUGGESTION_CAP` definitions; `total` says how
+// many there are, so a consumer picking one by line knows when the one it
+// needs may be past the list.
+#[test]
+fn same_file_refusal_json_carries_the_total() {
+    let mut src = String::new();
+    for i in 1..=7 {
+        src.push_str(&format!(
+            "class C{i}:\n    def run(self):\n        return {i}\n\n"
+        ));
+    }
+    let project = index_project(&[("views.py", &src)]);
+    let (out, _e, code) = run_cli(&project, &["impact", "run", "--file", "views.py", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["suggestions"].as_array().map(Vec::len), Some(5), "{out}");
+    assert_eq!(v["total"].as_u64(), Some(7), "{out}");
+}

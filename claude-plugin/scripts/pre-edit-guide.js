@@ -249,7 +249,10 @@ function runImpact(args) {
 // Q4 — the definition this edit changes, among same-file same-name ones: the
 // last candidate starting at or before the edited header's line. null when
 // the old_string is not in the file (the Edit will fail) or no candidate fits.
-function editedNodeId(suggestions, fileKey) {
+// The CLI lists at most five, in source order, and says how many exist in
+// `total`: past the last listed one an unlisted definition may start, so an
+// edit there is not guessed at (pre-tag review 2026-09-29).
+function editedNodeId(suggestions, fileKey, total) {
   let text;
   try { text = fs.readFileSync(path.join(cwd, fileKey), 'utf8'); } catch { return null; }
   const at = text.indexOf(oldStr);
@@ -260,6 +263,8 @@ function editedNodeId(suggestions, fileKey) {
     if (!c || c.file_path !== fileKey || !Number.isInteger(c.node_id) || !Number.isInteger(c.start_line)) continue;
     if (c.start_line <= line && (best === null || c.start_line > best.start_line)) best = c;
   }
+  const lastListed = Math.max(...suggestions.map((c) => (c && Number.isInteger(c.start_line) ? c.start_line : -Infinity)));
+  if (Number.isInteger(total) && total > suggestions.length && line > lastListed) return null;
   return best ? best.node_id : null;
 }
 
@@ -270,7 +275,7 @@ let jsonResult = runImpact(impactArgs);
 // `--file` refuse and list each definition's node_id (174f9b6). Ask again for
 // the one being edited.
 if (jsonResult && jsonResult.error && Array.isArray(jsonResult.suggestions)) {
-  const nodeId = editedNodeId(jsonResult.suggestions, editedKey);
+  const nodeId = editedNodeId(jsonResult.suggestions, editedKey, jsonResult.total);
   jsonResult = nodeId === null ? null : runImpact(['impact', '--node-id', String(nodeId), '--json']);
 }
 

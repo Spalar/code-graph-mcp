@@ -585,6 +585,42 @@ test('Q4: a same-file same-name edit injects the impact of the edited definition
   assert.match(first.res.stdout, /caller_of_11/, 'A.fetch starts at line 2');
 });
 
+// The refusal lists at most five definitions (`total` says how many exist, in
+// source order). An edit past the last listed one may be an unlisted
+// definition: picking the last listed named `go_5`'s caller for C7.run
+// (pre-tag review 2026-09-29). Only there the hook stays silent.
+const SEVEN_RUNS = Array.from({ length: 7 }, (_, i) =>
+  `class C${i + 1}:\n    def run(self):\n        return ${i + 1}\n\n`).join('');
+const STUB_CUT_LIST = `(bin, args) => {
+  if (args.includes('--node-id')) {
+    const id = args[args.indexOf('--node-id') + 1];
+    return JSON.stringify({ direct_callers: 1, total_callers: 1, affected_files: 1, risk: 'low',
+      callers: [{ name: 'caller_of_' + id, file: 'src/views.py', depth: 1 }], test_callers: [] });
+  }
+  const e = new Error('exit 1');
+  e.status = 1;
+  e.stdout = JSON.stringify({ error: "Ambiguous symbol 'run': 7 definitions in the same file (src/views.py). Showing the first 5 of 7.",
+    suggestions: [2, 6, 10, 14, 18].map((line, i) =>
+      ({ name: 'run', file_path: 'src/views.py', type: 'method', node_id: 101 + i, start_line: line })),
+    total: 7 });
+  throw e;
+}`;
+for (const [k, expect] of [[7, null], [2, 'caller_of_102'], [5, 'caller_of_105']]) {
+  test(`Q4: C${k}.run with the refusal list cut at five → ${expect || 'silent'}`, (t) => {
+    const { res } = runPreEditHook(t, {
+      relPath: 'src/views.py', stubExec: STUB_CUT_LIST,
+      setup: (proj) => {
+        require('node:fs').mkdirSync(require('node:path').join(proj, 'src'), { recursive: true });
+        require('node:fs').writeFileSync(require('node:path').join(proj, 'src', 'views.py'), SEVEN_RUNS);
+      },
+      oldString: `class C${k}:\n    def run(self):`, newString: `class C${k}:\n    def run(self, fast=False, *, x):`,
+    });
+    assert.equal(res.status, 0, res.stderr);
+    if (expect) assert.match(res.stdout, new RegExp(expect));
+    else assert.equal(res.stdout.trim(), '', `must stay silent, got: ${res.stdout}`);
+  });
+}
+
 test('Q4: no candidate at or before the edited line → silent, never a guess', (t) => {
   const stub = STUB_SAME_FILE.replace(/start_line: \d+ }/g, 'start_line: 50 }');
   const { res } = runPreEditHook(t, {

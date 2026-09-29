@@ -175,6 +175,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let symbol = selection.lookup_name.as_str();
     let output_symbol = selection.bare_name.as_str();
     let file_filter = selection.file_filter.as_deref();
+    // Refresh the selector's own file before anything reads it. The same-file
+    // gate below lists node_ids and start lines, and the edit hook picks one by
+    // the line on disk: from an index an unindexed edit had shifted, it picked
+    // the neighbour (pre-tag review 2026-09-29).
+    if let Some(fp) = file_filter {
+        refresh_files_if_stale(&ctx.db, &ctx.project_root, &[fp.to_string()]).disclose();
+    }
 
     let fetch_nodes =
         |sym: &str, target: &Option<CliNodeTarget>| -> Result<Vec<queries::NodeResult>> {

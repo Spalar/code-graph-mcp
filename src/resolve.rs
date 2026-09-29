@@ -130,6 +130,33 @@ pub fn reresolve_node_by_identity(
         }))
 }
 
+/// Every node carrying one identity (see [`reresolve_node_by_identity`]), as
+/// ids in source order. Identity is not unique for `#[cfg]` twins, C++
+/// overloads or a property's getter and setter, so a caller that must survive
+/// a refresh with the RIGHT one of them records its position in this group
+/// before the refresh and takes the same position after (pre-tag review
+/// 2026-09-29: `--node-id` took the first twin).
+pub fn identity_group_ids(
+    conn: &Connection,
+    file_path: &str,
+    name: &str,
+    qualified_name: Option<&str>,
+    node_type: &str,
+) -> Result<Vec<i64>> {
+    let wanted = qualified_name.unwrap_or(name);
+    let mut group: Vec<(i64, i64)> = queries::get_nodes_with_files_by_name(conn, name)?
+        .into_iter()
+        .filter(|c| {
+            c.file_path == file_path
+                && c.node.node_type == node_type
+                && c.node.qualified_name.as_deref().unwrap_or(&c.node.name) == wanted
+        })
+        .map(|c| (c.node.start_line, c.node.id))
+        .collect();
+    group.sort_unstable();
+    Ok(group.into_iter().map(|(_, id)| id).collect())
+}
+
 /// Detect whether a bare symbol `name` resolves to ≥2 non-test definitions.
 /// Returns the candidate definitions when ambiguous (same-file OR cross-file),
 /// `None` when unique or not found.
@@ -175,14 +202,30 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
 /// and `AppContext.pop` at once), while refs, `find_references` and
 /// `get_ast_node` refused the identical input (SURF-17; C4, 2026-09-28 usage
 /// evaluation). Test definitions count: the selector named their file.
+///
+/// Only definitions with DIFFERENT qualified names need splitting. `#[cfg]`
+/// twins, C++ overloads and a property's getter and setter share one, are one
+/// symbol to every caller, and were answered merged by 0.163.0; refusing them
+/// left MCP `get_call_graph`, which takes no node_id, with no way to answer
+/// (pre-tag review 2026-09-29: tokio `num_cpus`, flask `App.debug`).
 pub fn detect_same_file_ambiguity(
     conn: &Connection,
     name: &str,
     file_path: &str,
 ) -> Result<Option<Vec<NameCandidate>>> {
-    let cands: Vec<NameCandidate> = queries::get_nodes_by_file_path(conn, file_path)?
+    let nodes: Vec<_> = queries::get_nodes_by_file_path(conn, file_path)?
         .into_iter()
         .filter(|n| n.name == name)
+        .collect();
+    let identities: std::collections::HashSet<&str> = nodes
+        .iter()
+        .map(|n| n.qualified_name.as_deref().unwrap_or(&n.name))
+        .collect();
+    if identities.len() < 2 {
+        return Ok(None);
+    }
+    let cands: Vec<NameCandidate> = nodes
+        .into_iter()
         .map(|n| NameCandidate {
             name: n.name,
             file_path: file_path.to_string(),
