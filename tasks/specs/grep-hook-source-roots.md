@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented (F1 roots; __pycache__ gate see revision 2 note)
 revision: 1
 ---
 

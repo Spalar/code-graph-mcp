@@ -696,6 +696,24 @@ test('e2e: alternation grep `Alpha|Beta` → callgraph mode when a symbol has ed
   }
 });
 
+test('F1: a grep into an indexed package dir is injected once the index lists it as a source root', () => {
+  const uniq = `PkgRoot${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + '\\n  \\u2190 called by: someCaller (networkx/x.py:3)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('networkx/foo.py:7  def ' + arg + '()\\n');`);
+  const cmd = `echo "x" && grep "${uniq}" networkx/`;
+  try {
+    assert.equal(runHook(cmd, fixture).stdout, '', 'no source-roots.json: not a source path, as before');
+    fs.writeFileSync(path.join(fixture.dir, '.code-graph', 'source-roots.json'),
+      JSON.stringify({ version: 1, roots: ['networkx'] }));
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /called by: someCaller/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('D5: while the startup index is being written, no call graph — the grep echo still answers', () => {
   // Call edges from a partial index are a subset presented as the whole graph;
   // the grep echo comes from the files themselves and stays correct.

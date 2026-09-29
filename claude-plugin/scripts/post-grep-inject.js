@@ -58,6 +58,8 @@ const {
   extractPatterns,
   rebaseRelativePaths,
   resolveProjectRoot,
+  readSourceRoots,
+  useSourceRoots,
   rewritePlan,
   showAnswersPattern,
   searchesSameFiles,
@@ -252,6 +254,8 @@ function runMain() {
   const shellCwd = process.cwd();
   const root = resolveProjectRoot(shellCwd);
   if (root === null) return;  // no index anywhere up to $HOME
+  // The same source dirs the PreToolUse half recognized (F1).
+  useSourceRoots(readSourceRoots(root));
 
   let input;
   try {

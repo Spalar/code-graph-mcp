@@ -88,13 +88,48 @@ const VERB_STRIP = new RegExp(`^\\s*(?:env\\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\
 // invisible to the hook so it could never scope the answer to the real target.
 const SRC_PREFIXES =
   'src|tests|lib|libs|scripts|skills|claude-plugin|tools|pkg|cmd|internal|app|apps|components?|server|client|crates|packages|backend|frontend|services|models|domain|controllers|views|handlers|middleware|routes|repositories|entities|migrations|tasks|jobs|workers|features|modules|api|web';
-const SRC_PATH = new RegExp(`(?:^|\\s|["'])(${SRC_PREFIXES})/`);
+// The three source-path tests below are built from SRC_PREFIXES plus the
+// project's own source roots (useSourceRoots), so they are `let`.
+let SRC_PATH;
 // Anchored variant for whole-token matching in extractSearchPath.
-const SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${SRC_PREFIXES})/`);
+let SRC_PATH_TOKEN;
 // A path operand the rewrite grammar proved: a bare prefix word (`src`), or a
 // `./`-rooted one with any subpath (`./src`, `./src/x/`), which SRC_PATH's
 // lookbehind never matched.
-const SRC_BARE_TOKEN = new RegExp(`^(?:(?:${SRC_PREFIXES})|\\./(?:${SRC_PREFIXES})(?:/.*)?)$`);
+let SRC_BARE_TOKEN;
+
+// F1 (tasks/specs/grep-hook-source-roots.md) — the prefix list names
+// conventional source dirs, but a Python package lives in a dir named after it
+// (`networkx/`, `django/`): in the 2026-09-28 coding eval not one grep of 15
+// runs reached this hook. The indexer writes the top-level dirs that hold
+// indexed code to `.code-graph/source-roots.json`, and those names join the
+// list. A name must be one plain shell word (no quote, space, slash, leading
+// dot); past MAX_SOURCE_ROOTS the list alone applies, as it does when the file
+// is missing or unreadable.
+const SOURCE_ROOTS_FILE = 'source-roots.json';
+const MAX_SOURCE_ROOTS = 64;
+const SOURCE_ROOT_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.+@-]{0,63}$/;
+const PREFIX_WORDS = new Set(SRC_PREFIXES.replace('components?', 'components|component').split('|'));
+
+function readSourceRoots(root) {
+  if (!root) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(root, '.code-graph', SOURCE_ROOTS_FILE), 'utf8'));
+  } catch { return []; }
+  const roots = parsed && Array.isArray(parsed.roots) ? parsed.roots : null;
+  if (!roots || roots.length > MAX_SOURCE_ROOTS) return [];
+  return roots.filter((r) => typeof r === 'string' && SOURCE_ROOT_NAME.test(r) && !PREFIX_WORDS.has(r));
+}
+
+function useSourceRoots(roots) {
+  const escaped = (roots || []).map((r) => r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const alt = [SRC_PREFIXES, ...escaped].join('|');
+  SRC_PATH = new RegExp(`(?:^|\\s|["'])(${alt})/`);
+  SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${alt})/`);
+  SRC_BARE_TOKEN = new RegExp(`^(?:(?:${alt})|\\./(?:${alt})(?:/.*)?)$`);
+}
+useSourceRoots([]);
 
 // D#73 — a source dir written as a bare word (`grep -rn X src`, `rg X tests`,
 // `./src`): the shape models write when a prompt says "under src/", and it
@@ -2041,6 +2076,7 @@ function runMain() {
   const shellCwd = process.cwd();
   const root = resolveProjectRoot(shellCwd);
   if (root === null) return;  // no index anywhere up to $HOME — no hint
+  useSourceRoots(readSourceRoots(root));
 
   let input;
   try {
@@ -2320,6 +2356,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  useSourceRoots, readSourceRoots, MAX_SOURCE_ROOTS,
   shouldHint,
   shouldBlock,
   classifyBlock,         // v0.49 — intent-aware block tiers

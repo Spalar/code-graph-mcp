@@ -10781,3 +10781,101 @@ fn test_js_renamed_import_sweep_binds_no_self_call() {
         edge_set(&db)
     );
 }
+
+// ── F1: `.code-graph/source-roots.json` (tasks/specs/grep-hook-source-roots.md) ──
+
+fn read_source_roots(project: &std::path::Path) -> Option<Vec<String>> {
+    let raw = fs::read_to_string(project.join(".code-graph").join(SOURCE_ROOTS_FILE)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["version"], 1);
+    Some(
+        v["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect(),
+    )
+}
+
+/// A project laid out the way the coding eval's networkx checkout is: the
+/// package dir named after the package, docs that hold only markdown, a root
+/// script with no dir, and a name the grep hook must escape.
+fn source_roots_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let p = project.path();
+    for (path, body) in [
+        (
+            "networkx/classes/graph.py",
+            "def add_node(n):\n    return n\n",
+        ),
+        ("tests/test_graph.py", "def test_x():\n    pass\n"),
+        ("c++/lib.cpp", "int f() { return 1; }\n"),
+        ("doc/index.md", "# Title\n\ntext\n"),
+        ("config/settings.json", "{\"a\": 1}\n"),
+        ("setup.py", "def main():\n    pass\n"),
+    ] {
+        fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
+        fs::write(p.join(path), body).unwrap();
+    }
+    fs::create_dir_all(p.join(".code-graph")).unwrap();
+    project
+}
+
+#[test]
+fn full_index_lists_top_level_dirs_that_hold_indexed_code() {
+    let project = source_roots_project();
+    let db = Database::open(&project.path().join(".code-graph/index.db")).unwrap();
+    run_full_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(
+        read_source_roots(project.path()).expect("source-roots.json written"),
+        vec!["c++", "networkx", "tests"],
+        "markdown-only and json-only dirs are not source roots; a root file has no dir"
+    );
+}
+
+#[test]
+fn incremental_index_keeps_source_roots_current_with_the_files_table() {
+    let project = source_roots_project();
+    let p = project.path();
+    let db = Database::open(&p.join(".code-graph/index.db")).unwrap();
+    run_full_index(&db, p, None, None).unwrap();
+
+    fs::create_dir_all(p.join("benchmarks")).unwrap();
+    fs::write(p.join("benchmarks/bench.py"), "def run():\n    pass\n").unwrap();
+    fs::remove_file(p.join("c++/lib.cpp")).unwrap();
+    run_incremental_index(&db, p, None, None).unwrap();
+    assert_eq!(
+        read_source_roots(p).unwrap(),
+        vec!["benchmarks", "networkx", "tests"],
+        "a new code dir joins, a dir whose last code file is gone leaves"
+    );
+
+    // Parity: a from-scratch full index of the same tree lists the same roots.
+    let fresh = TempDir::new().unwrap();
+    fs::create_dir_all(fresh.path().join(".code-graph")).unwrap();
+    let fresh_db = Database::open(&fresh.path().join(".code-graph/index.db")).unwrap();
+    // Same files, different root.
+    for rel in [
+        "benchmarks/bench.py",
+        "networkx/classes/graph.py",
+        "tests/test_graph.py",
+    ] {
+        fs::create_dir_all(fresh.path().join(rel).parent().unwrap()).unwrap();
+        fs::copy(p.join(rel), fresh.path().join(rel)).unwrap();
+    }
+    run_full_index(&fresh_db, fresh.path(), None, None).unwrap();
+    assert_eq!(read_source_roots(fresh.path()), read_source_roots(p));
+}
+
+#[test]
+fn source_roots_are_written_only_beside_an_index_in_a_code_graph_dir() {
+    // A snapshot or a test builds into a DB elsewhere; the manifest must not
+    // appear next to it, nor in the project it indexed.
+    let project = source_roots_project();
+    let elsewhere = TempDir::new().unwrap();
+    let db = Database::open(&elsewhere.path().join("staging.db")).unwrap();
+    run_full_index(&db, project.path(), None, None).unwrap();
+    assert!(!elsewhere.path().join(SOURCE_ROOTS_FILE).exists());
+    assert!(read_source_roots(project.path()).is_none());
+}

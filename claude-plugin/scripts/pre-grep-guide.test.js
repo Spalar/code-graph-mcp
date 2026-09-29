@@ -48,6 +48,9 @@ const {
   firstShellClause,
   countNamedPaths,
   bareSourceTarget,
+  useSourceRoots,
+  readSourceRoots,
+  MAX_SOURCE_ROOTS,
   extractDeclSymbols,
   translateBreToRg,
   buildRewriteCommand,
@@ -3123,6 +3126,106 @@ test('e2e D#73: a bare dir from the project root is rewritten to the same dir', 
     const rw = rewriteOf(runHook(cmd, fixture));
     const ran = runRewrite(rw, fixture.dir);
     if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 -M 0 ${uniq} src`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── F1: source roots from the index (tasks/specs/grep-hook-source-roots.md) ──
+//
+// The prefix list names conventional source dirs (`src`, `lib`, …). A Python
+// package lives in a dir named after it (`networkx/`), so in the 2026-09-28
+// coding eval not one of 15 runs' greps reached this hook. The indexer now
+// lists the top-level dirs that hold indexed code in
+// `.code-graph/source-roots.json`; those names join the prefix list.
+
+// With `networkx` a configured root, every bare-dir shape decides exactly as
+// its `src` spelling does. Substituting the whole word `src` keeps each shape's
+// trap intact (`src_dir`, `srcs` stay; `x/src` → `x/networkx` stays outside).
+test('F1: a configured source root decides like `src`, shape for shape', (t) => {
+  t.after(() => useSourceRoots([]));
+  const sub = (x) => (x == null ? x : x.replace(/\bsrc\b/g, 'networkx'));
+  const shapes = BARE_DIR_SHAPES.filter(({ cmd }) => /\bsrc\b/.test(cmd));
+  assert.ok(shapes.length >= 20, `only ${shapes.length} shapes name src`);
+  useSourceRoots(['networkx']);
+  for (const { cmd, hint, rewrite } of shapes) {
+    const n = sub(cmd);
+    assert.equal(shouldHint(n), hint, `shouldHint: ${n}`);
+    assert.equal(rewriteTarget(n), sub(rewrite), `rewrite target: ${n}`);
+  }
+});
+
+const SOURCE_ROOT_SHAPES = [
+  // accepted once `networkx` is a root
+  { cmd: 'grep -rn "Foo_bar" networkx/', hint: true, rewrite: 'networkx/' },
+  { cmd: 'grep -rn "Foo_bar" networkx/algorithms/flow/', hint: true, rewrite: 'networkx/algorithms/flow/' },
+  { cmd: 'rg "Foo_bar" networkx', hint: true, rewrite: 'networkx' },
+  { cmd: 'grep -rn "Foo_bar" networkx/classes/graph.py', hint: true, rewrite: 'networkx/classes/graph.py' },
+  // a regex metacharacter in the name matches literally
+  { cmd: 'grep -rn "Foo_bar" c++/', hint: true, rewrite: 'c++/' },
+  { cmd: 'grep -rn "Foo_bar" cxx/', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" c/', hint: false, rewrite: null },
+  // not a root: a dir the index holds no code in, a longer name, a nested dir
+  { cmd: 'grep -rn "Foo_bar" doc/', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" networkxfoo/', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" x/networkx/', hint: false, rewrite: null },
+  // the root's name as the PATTERN is not a path
+  { cmd: 'grep -n networkx "setup_cfg.py"', hint: false, rewrite: null },
+];
+
+for (const { cmd, hint, rewrite } of SOURCE_ROOT_SHAPES) {
+  test(`F1 shape: ${cmd}`, (t) => {
+    t.after(() => useSourceRoots([]));
+    useSourceRoots(['networkx', 'c++']);
+    assert.equal(shouldHint(cmd), hint, 'shouldHint');
+    assert.equal(rewriteTarget(cmd), rewrite, 'rewrite target');
+  });
+}
+
+test('F1: without source roots every root shape runs as today (not taken)', () => {
+  useSourceRoots([]);
+  for (const cmd of ['grep -rn "Foo_bar" networkx/', 'rg "Foo_bar" networkx', 'grep -rn "Foo_bar" c++/']) {
+    assert.equal(shouldHint(cmd), false, cmd);
+    assert.equal(rewriteTarget(cmd), null, cmd);
+  }
+  assert.equal(shouldHint('grep -rn "Foo_bar" src/'), true, 'the prefix list itself stays');
+});
+
+test('F1: readSourceRoots keeps valid names and falls back to none on anything else', (t) => {
+  const dir = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-source-roots-'));
+  t.after(() => fsE2e.rmSync(dir, { recursive: true, force: true }));
+  fsE2e.mkdirSync(pathE2e.join(dir, '.code-graph'));
+  const write = (body) => fsE2e.writeFileSync(pathE2e.join(dir, '.code-graph', 'source-roots.json'),
+    typeof body === 'string' ? body : JSON.stringify(body));
+
+  assert.deepEqual(readSourceRoots(dir), [], 'no file');
+  write({ version: 1, roots: ['networkx', 'benchmarks', 'c++'] });
+  assert.deepEqual(readSourceRoots(dir), ['networkx', 'benchmarks', 'c++']);
+  // names a shell word or a path cannot be, and ones the prefix list has, drop out
+  write({ version: 1, roots: ['networkx', 'my dir', '.hidden', 'a/b', "it's", '', 'src', 7] });
+  assert.deepEqual(readSourceRoots(dir), ['networkx']);
+  write('not json');
+  assert.deepEqual(readSourceRoots(dir), []);
+  write({ version: 1, roots: 'networkx' });
+  assert.deepEqual(readSourceRoots(dir), []);
+  write({ version: 1, roots: Array.from({ length: MAX_SOURCE_ROOTS + 1 }, (_, i) => `pkg${i}`) });
+  assert.deepEqual(readSourceRoots(dir), [], 'past the cap: the prefix list alone');
+  assert.deepEqual(readSourceRoots(null), []);
+});
+
+test('e2e F1: a grep into an indexed package dir is rewritten; without the manifest it runs as typed', () => {
+  const uniq = `root_pkg_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('args=' + process.argv.slice(2).join(' ') + '\\n');`);
+  const cmd = `grep -rn "${uniq}" networkx/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'networkx'), { recursive: true });
+    assert.equal(runHook(cmd, fixture).stdout, '', 'no manifest: today\'s behavior');
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, '.code-graph', 'source-roots.json'),
+      JSON.stringify({ version: 1, roots: ['networkx'] }));
+    const rw = rewriteOf(runHook(cmd, fixture));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 -M 0 ${uniq} networkx/`);
   } finally {
     cleanupFixture(fixture, cmd);
   }

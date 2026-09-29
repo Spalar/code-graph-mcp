@@ -74,6 +74,66 @@ pub type ProgressFn<'a> = &'a dyn Fn(IndexPhase, usize, usize);
 /// server's startup indexing thread and read by the plugin statusline.
 pub const INDEXING_STATUS_FILE: &str = "indexing-status.json";
 
+/// Top-level project dirs that hold indexed code, written beside `index.db` at the
+/// end of every full and incremental index for the plugin's grep hook, which
+/// reads it instead of spawning a query per Bash call. The hook's fixed list of
+/// source-dir names (`src`, `lib`, …) misses the dir a Python package lives in
+/// (`networkx/`): in the 2026-09-28 coding eval not one grep in 15 runs reached
+/// the hook (tasks/specs/grep-hook-source-roots.md).
+pub const SOURCE_ROOTS_FILE: &str = "source-roots.json";
+
+/// Languages whose files do not make their dir a source root: prose and data. A
+/// `doc/` of markdown is not where a code grep goes.
+const NON_CODE_LANGUAGES: &[&str] = &["markdown", "json", "html", "css"];
+
+/// Write [`SOURCE_ROOTS_FILE`] from the files table. Only beside an index that
+/// lives in a `.code-graph` dir — a snapshot's staging DB or a test DB elsewhere
+/// gets none. Best-effort: indexing never fails over it, and an unchanged list is
+/// not rewritten. Atomic (temp file + rename) because hooks read it at any time.
+fn write_source_roots(db: &Database) {
+    if let Err(e) = try_write_source_roots(db) {
+        tracing::warn!("could not write {}: {}", SOURCE_ROOTS_FILE, e);
+    }
+}
+
+fn try_write_source_roots(db: &Database) -> Result<()> {
+    let conn = db.conn();
+    let db_file: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |r| r.get(0),
+    )?;
+    let Some(dir) = Path::new(&db_file).parent() else {
+        return Ok(());
+    };
+    if db_file.is_empty()
+        || dir.file_name() != Some(std::ffi::OsStr::new(crate::domain::CODE_GRAPH_DIR))
+    {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; NON_CODE_LANGUAGES.len()].join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT substr(path, 1, instr(path, '/') - 1) AS root FROM files \
+         WHERE instr(path, '/') > 1 AND language IS NOT NULL \
+         AND language NOT IN ({placeholders}) ORDER BY root"
+    ))?;
+    let roots: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(NON_CODE_LANGUAGES), |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let body = serde_json::json!({ "version": 1, "roots": roots }).to_string() + "\n";
+    let target = dir.join(SOURCE_ROOTS_FILE);
+    if std::fs::read_to_string(&target).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    let tmp = dir.join(format!("{SOURCE_ROOTS_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Age past which `indexing-status.json` is a leftover from a killed process, not
 /// a live indexer: live runs heartbeat at least once per batch / finalize phase,
 /// orders of magnitude more often than this. The statusline applies the same
@@ -144,6 +204,7 @@ pub fn run_full_index(
         crate::storage::schema::META_KEY_RUST_ROOT_MODS,
         &root_mods,
     )?;
+    write_source_roots(db);
     Ok(result)
 }
 
@@ -601,6 +662,7 @@ pub fn run_incremental_index_cached(
         );
     }
 
+    write_source_roots(db);
     Ok((result, new_cache))
 }
 
