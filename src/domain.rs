@@ -663,16 +663,16 @@ pub fn is_function_node_type(node_type: &str) -> bool {
     matches!(node_type, "function" | "method")
 }
 
-/// Warning surfaced by impact analysis when the target is non-function-like
-/// and has zero call-graph callers. Prevents the risk level from reading as
-/// a misleading `LOW` for constants / types / traits whose real users are
-/// imports or type references, not calls.
 /// Warning surfaced by impact analysis when a function has no caller at all in
 /// the call graph — neither production nor test. The graph cannot tell "nothing
 /// calls it" from "its callers were not resolved", so the risk reads `UNKNOWN`
 /// rather than a `LOW` that would endorse the change.
 pub const NO_CALLERS_IMPACT_WARNING: &str = "No caller of this function is in the call graph. Either nothing calls it, or its callers were not resolved (dynamic dispatch, an unresolved import, use from outside the indexed code). Check `code-graph-mcp refs <symbol>` and `code-graph-mcp grep -w <symbol>` before treating the change as safe.";
 
+/// Warning surfaced by impact analysis when the target is non-function-like
+/// and its calls cannot rate it: none, or few enough for `LOW`. Prevents the
+/// risk level from reading as a misleading `LOW` for constants / types /
+/// traits whose real users are imports or type references, not calls.
 pub const NON_FUNCTION_IMPACT_WARNING: &str = "Impact analysis tracks function call chains. This symbol is not a function — actual usage (imports, field access, type annotations, instantiation) may be broader than shown. Use `find_references` (MCP) or `code-graph-mcp refs <symbol>` (CLI) to find all references.";
 
 // -- Test symbol detection --
