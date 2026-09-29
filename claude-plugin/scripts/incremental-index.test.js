@@ -154,3 +154,37 @@ test('incremental-index runs inside a minimal git repo without creating stray st
   assert.equal(result.status, 0, `expected exit 0, got ${result.status}; stderr: ${result.stderr}`);
   // Index may or may not materialize for an empty repo; the contract is that the guard does NOT block this case.
 });
+
+// ── Opted in, the edit must not wait for embeddings ─────────────────────────
+// `incremental-index --quiet` also backfills vectors, so with the hook on each
+// Write/Edit blocked 8,048 ms until the budget killed it (hook audit
+// 2026-09-28); `incremental-index --no-embed` indexed all of hono in 0.8 s.
+// The structure is what a query after the edit needs; vectors backfill in the
+// MCP server.
+test('opted in, the hook indexes structure only (--no-embed)', { skip: process.platform === 'win32' && 'POSIX shell fixture' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-incr-argv-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const cache = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cache, 'bin'), { recursive: true });
+  const marker = path.join(root, 'argv');
+  const fake = path.join(cache, 'bin', 'code-graph-mcp');
+  fs.writeFileSync(fake, `#!/bin/sh\necho "$@" > "${marker}"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(cache, 'binary-path'), fake);
+  const tmp = path.join(root, 'tmp');
+  fs.mkdirSync(tmp);
+
+  const proc = spawnSync(process.execPath, [path.join(__dirname, 'incremental-index.js')], {
+    cwd: root,
+    env: {
+      ...process.env,
+      HOME: home, USERPROFILE: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp,
+      CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      CODE_GRAPH_HOOK_INDEX: 'on',
+    },
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+  assert.equal(proc.status, 0, proc.stderr);
+  assert.equal(fs.readFileSync(marker, 'utf8').trim(), 'incremental-index --quiet --no-embed');
+});
