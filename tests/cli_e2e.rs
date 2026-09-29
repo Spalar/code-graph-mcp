@@ -3058,6 +3058,41 @@ fn test_cli_search_resyncs_after_edit() {
     );
 }
 
+/// C5 (2026-09-28 usage evaluation): outside Rust, 0–25% of the dead-code
+/// candidates on the evaluation corpora were really unused (Go `init`,
+/// interface and override methods, `__init__.py` re-exports). The text report
+/// says so when a candidate is outside Rust, and only then.
+#[test]
+fn test_cli_dead_code_marks_non_rust_candidates_experimental() {
+    for (file, body, experimental) in [
+        (
+            "lib.py",
+            "def unused_helper(x):\n    y = x + 1\n    return y\n",
+            true,
+        ),
+        (
+            "lib.rs",
+            "fn unused_helper(x: u8) -> u8 {\n    let y = x + 1;\n    y\n}\n",
+            false,
+        ),
+    ] {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join(file), body).unwrap();
+        let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+        code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+        let (stdout, stderr, code) = run_cli(&project, &["dead-code", "--min-lines", "1"]);
+        assert_eq!(code, 0, "{file}: {stderr}");
+        assert!(stdout.contains("unused_helper"), "{file}: {stdout}");
+        assert_eq!(
+            stdout.contains("experimental"),
+            experimental,
+            "{file}: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn test_cli_dead_code_resyncs_after_edit() {
     let project = setup_indexed_project();

@@ -624,13 +624,17 @@ impl McpServer {
         // names it: `hidden_below_threshold` is only probed when the result set is
         // EMPTY, so a non-empty answer used to read as complete while every symbol
         // shorter than the threshold was silently absent from it.
-        let threshold_note = if min_lines > 1 {
+        let mut threshold_note = if min_lines > 1 {
             format!(
                 " Showing symbols >= {min_lines} lines; pass min_lines:1 to include shorter ones."
             )
         } else {
             String::new()
         };
+        if let Some(note) = report.non_rust_note() {
+            threshold_note.push(' ');
+            threshold_note.push_str(note);
+        }
 
         Ok(json!({
             "results": all_items,

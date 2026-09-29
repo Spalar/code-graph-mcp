@@ -3103,6 +3103,23 @@ function handleLogin(req: Request) {
         );
     }
 
+    /// C5: the dead-code summary says a non-Rust candidate list is experimental.
+    #[test]
+    fn test_find_dead_code_marks_non_rust_candidates_experimental() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("lib.py"),
+            "def unused_helper(x):\n    y = x + 1\n    return y\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+        let req = tool_call_json("find_dead_code", json!({ "min_lines": 1 }));
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        let summary = result["summary"].as_str().unwrap_or_default();
+        assert!(summary.contains("experimental"), "got: {result}");
+    }
+
     #[test]
     fn test_read_snippet_tool() {
         let project_dir = TempDir::new().unwrap();

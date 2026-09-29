@@ -261,6 +261,9 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         report.exported_count
     )?;
     writeln!(stdout, "(candidates to verify — receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked)")?;
+    if let Some(note) = report.non_rust_note() {
+        writeln!(stdout, "({note})")?;
+    }
     // The `hidden_below_threshold` probe only runs when NOTHING is visible, so a
     // non-empty report never disclosed that the default cut hides every symbol
     // shorter than `--min-lines`. A one-line `export function f() { return 42 }`
