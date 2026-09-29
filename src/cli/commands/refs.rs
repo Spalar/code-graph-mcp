@@ -267,6 +267,8 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
+        // A symbol in a file added since the last index (D2).
+        crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
         let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
             Ok(selection) => selection,
             Err(CliSymbolSelectionError::Ambiguous(candidates)) => {

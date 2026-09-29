@@ -72,6 +72,8 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
+    // A symbol in a file added since the last index (D2).
+    crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
     let conn = ctx.db.conn();
 
     let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {

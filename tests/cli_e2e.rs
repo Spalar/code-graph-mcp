@@ -5203,13 +5203,10 @@ fn test_cli_similar_no_embeddings_remedy_matches_binary_features() {
 // empty-result branch, and a reindex hint there would be chasing a non-problem.
 #[test]
 fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
+    // A name no file holds. (One in a file added since the last index is now
+    // found: test_cli_a_symbol_in_a_new_file_is_found_by_every_lookup.)
     let project = setup_indexed_project();
-    std::fs::write(
-        project.path().join("src").join("fresh2.ts"),
-        "export function brandNewCgFn() { return 1; }\n",
-    )
-    .unwrap();
-    let (_, stderr, code) = run_cli(&project, &["callgraph", "brandNewCgFn"]);
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "noSuchCgFnAnywhere"]);
     assert_ne!(code, 0);
     assert!(
         stderr.contains("incremental-index"),
@@ -5236,19 +5233,70 @@ fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
     );
 }
 
-// A symbol ADDED after the last index has no indexed file for query-time
-// freshness to refresh, so `show` misses it — the miss must at least tell the
-// user the index may be stale instead of a bare "Symbol not found" that reads
-// as "doesn't exist" (a fresh `incremental-index` then makes it visible).
+// A symbol ADDED after the last index lives in a file the index does not hold,
+// which no result-set refresh reaches: every lookup missed it until a manual
+// `incremental-index` (2026-09-28 usage evaluation D2; the hook audit reproduced
+// it 4/4). On a name miss the lookups now index the unindexed files that mention
+// the name, within the resync budget, and look again.
 #[test]
-fn test_cli_show_miss_hints_stale_index_for_new_symbol() {
-    let project = setup_indexed_project();
-    std::fs::write(
-        project.path().join("src").join("fresh.ts"),
-        "export function brandNewFn() { return 1; }\n",
+fn test_cli_a_symbol_in_a_new_file_is_found_by_every_lookup() {
+    // A project of its own per command: the first lookup indexes the file, so a
+    // shared one would let the others pass on its work.
+    let fresh_project = || {
+        let project = setup_indexed_project();
+        std::fs::write(
+            project.path().join("src").join("fresh.ts"),
+            "import { validateToken } from './auth';\n\
+             export function brandNewFn(t: string) { return validateToken(t); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("src").join("unrelated.ts"),
+            "export function somethingElse() { return 2; }\n",
+        )
+        .unwrap();
+        project
+    };
+    for args in [
+        &["show", "brandNewFn"][..],
+        &["impact", "brandNewFn"][..],
+        &["refs", "brandNewFn"][..],
+        &["callgraph", "brandNewFn"][..],
+    ] {
+        let project = fresh_project();
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_eq!(code, 0, "{args:?}: stdout={stdout} stderr={stderr}");
+        assert!(stdout.contains("brandNewFn"), "{args:?}: {stdout}");
+        assert!(!stderr.contains("may be stale"), "{args:?}: {stderr}");
+    }
+    // Only a file that mentions the name was pulled in: a lookup does not
+    // index the rest of the working tree.
+    let project = fresh_project();
+    run_cli(&project, &["show", "brandNewFn"]);
+    let db = code_graph_mcp::storage::db::Database::open(
+        &project.path().join(".code-graph").join("index.db"),
     )
     .unwrap();
-    let (_, stderr, code) = run_cli(&project, &["show", "brandNewFn"]);
+    let indexed = |p: &str| {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", [p], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(indexed("src/fresh.ts"), 1);
+    assert_eq!(
+        indexed("src/unrelated.ts"),
+        0,
+        "a file that does not name the symbol stays out"
+    );
+}
+
+// A name nothing defines still misses, and the miss still says how to refresh.
+#[test]
+fn test_cli_show_miss_hints_stale_index_for_an_absent_symbol() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["show", "noSuchFunctionAnywhere"]);
     assert_ne!(code, 0);
     assert!(
         stderr.contains("incremental-index"),

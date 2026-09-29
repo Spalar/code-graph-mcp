@@ -422,6 +422,8 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--refs] [--impact] [--context-lines N] [--compact] [--json]"
             ))?;
+        // A symbol in a file added since the last index (D2).
+        crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, symbol);
 
         let mut nodes = resolve_show_nodes(conn, symbol, file_filter)?;
 

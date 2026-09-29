@@ -112,3 +112,57 @@ fn resync(db: &Database, root: &Path, paths: &[String], scope: RefreshScope) -> 
         failed: outcome.failed,
     }
 }
+
+/// Before a lookup: when no node carries the symbol's name at all, index the
+/// unindexed files that mention it ([`index_new_files_naming`]), so the
+/// command's own resolution — exact, qualified or fuzzy — sees them. One
+/// indexed name query when the name exists; the walk only on a true absence.
+pub(crate) fn index_new_files_if_absent(db: &Database, root: &Path, symbol: &str) {
+    let name = symbol.rsplit(['.', ':']).next().unwrap_or(symbol);
+    let present = crate::storage::queries::get_nodes_by_name(db.conn(), name)
+        .map(|nodes| !nodes.is_empty())
+        .unwrap_or(true);
+    if !present {
+        index_new_files_naming(db, root, symbol);
+    }
+}
+
+/// On a symbol-name miss, index the files the index does not hold yet that
+/// mention the name, so the lookup can try again (2026-09-28 usage evaluation
+/// D2). A symbol ADDED since the last index lives in such a file, and no
+/// result-set refresh reaches it: every lookup missed it until a manual
+/// `incremental-index` (the hook audit reproduced it 4/4). Only files whose
+/// bytes contain the name's last segment are read in, at most the resync
+/// budget of them, so a miss does not turn into an index run over the tree.
+/// Returns true when a file was indexed; the caller then resolves again.
+pub(crate) fn index_new_files_naming(db: &Database, root: &Path, symbol: &str) -> bool {
+    let name = symbol.rsplit(['.', ':']).next().unwrap_or(symbol);
+    if name.len() < 2 {
+        return false;
+    }
+    let Ok(walked) = crate::indexer::merkle::walk_indexable_files(root) else {
+        return false;
+    };
+    let known: std::collections::HashSet<String> = match db
+        .conn()
+        .prepare("SELECT path FROM files")
+        .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0))?.collect())
+    {
+        Ok(known) => known,
+        Err(_) => return false,
+    };
+    let limit = crate::domain::max_file_size();
+    let budget = crate::indexer::resync::resync_budget();
+    let naming: Vec<String> = walked
+        .into_iter()
+        .filter(|(rel, _)| !known.contains(rel))
+        .filter(|(_, abs)| {
+            std::fs::metadata(abs).is_ok_and(|m| m.len() <= limit)
+                && std::fs::read(abs)
+                    .is_ok_and(|bytes| bytes.windows(name.len()).any(|w| w == name.as_bytes()))
+        })
+        .map(|(rel, _)| rel)
+        .take(budget)
+        .collect();
+    !naming.is_empty() && refresh_input_files(db, root, &naming).any_changed
+}
