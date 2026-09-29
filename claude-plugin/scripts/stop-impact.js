@@ -25,7 +25,9 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('St
 //
 // Silent when: `stop_hook_active` (a continuation this or another Stop hook
 // caused — never loop), no session edit log, no index, not a git work tree,
-// no signature changed, the language has no exact header reading (LANGS),
+// no signature changed (optional parameters appended at the end of a list do
+// not count: every existing call stays valid), the language has no exact
+// header reading (LANGS),
 // every caller's file was touched this turn, or the symbol was already
 // reported this session. CODE_GRAPH_QUIET_HOOKS=1 silences it like the other
 // injecting hooks.
@@ -212,15 +214,120 @@ function signatureKey(header) {
  * True when a definition that existed before is gone: its header changed, or
  * it was removed while others of the same name remain. A definition ADDED
  * beside unchanged ones (a new overload, a new `impl From<B>`) changes no
- * existing caller's target, so it is not a change (review M2).
+ * existing caller's target, so it is not a change (review M2). Nor is a header
+ * whose only difference is optional parameters appended to its parameter list
+ * (Q2, see appendsOptionalParams) — every existing call stays valid. That
+ * reading needs `symbol` to find the parameter list; without it every
+ * difference counts.
  */
-function signatureChanged(oldSigs, newSigs) {
+function signatureChanged(oldSigs, newSigs, symbol = null) {
   const remaining = new Map();
   for (const s of newSigs) remaining.set(s, (remaining.get(s) || 0) + 1);
+  const unmatched = [];
   for (const s of oldSigs) {
     const n = remaining.get(s) || 0;
-    if (n === 0) return true;
-    remaining.set(s, n - 1);
+    if (n === 0) unmatched.push(s);
+    else remaining.set(s, n - 1);
+  }
+  if (unmatched.length === 0) return false;
+  if (!symbol) return true;
+  // Each old header may pair with one new header that only extends it.
+  const pool = [];
+  for (const [s, n] of remaining) for (let k = 0; k < n; k++) pool.push(s);
+  for (const s of unmatched) {
+    const at = pool.findIndex((t) => appendsOptionalParams(s, t, symbol));
+    if (at === -1) return true;
+    pool.splice(at, 1);
+  }
+  return false;
+}
+
+/**
+ * True when signature key `newKey` is `oldKey` with parameters inserted just
+ * before the `)` that closes `symbol`'s parameter list, and every inserted
+ * parameter is optional at a call site (isOptionalParam). Anything else that
+ * moved — a return type, a parameter before the end, a parameter list inside
+ * a type — makes it false. Keys are whitespace-free (signatureKey).
+ */
+function appendsOptionalParams(oldKey, newKey, symbol) {
+  if (newKey.length <= oldKey.length) return false;
+  let i = 0;
+  while (i < oldKey.length && oldKey[i] === newKey[i]) i++;
+  if (oldKey[i] !== ')') return false;
+  const tail = oldKey.slice(i);
+  if (!newKey.endsWith(tail)) return false;
+  // The `(` this `)` closes.
+  let open = -1;
+  for (let j = i - 1, depth = 0; j >= 0; j--) {
+    if (oldKey[j] === ')') depth++;
+    else if (oldKey[j] === '(') {
+      if (depth === 0) { open = j; break; }
+      depth--;
+    }
+  }
+  if (open === -1) return false;
+  // A parameter list opens right after the name, its generics, or — for a JS
+  // binding — `name = [async] [function]`. A `(` after `->`, `:` or `)` opens
+  // a return type or a Go receiver/result list, never the parameters.
+  const S = escapeRe(symbol);
+  const opener = new RegExp(`${S}(?:<.*>|\\[.*\\])?(?:=(?:async)?(?:function\\*?)?)?$`);
+  if (!opener.test(oldKey.slice(0, open))) return false;
+  let inserted = newKey.slice(i, newKey.length - tail.length);
+  if (open < i - 1) {
+    if (inserted[0] !== ',') return false;
+    inserted = inserted.slice(1);
+  }
+  const params = splitTopLevel(inserted);
+  return params.length > 0 && params.every(isOptionalParam);
+}
+
+// +1 for an opening bracket at s[i], -1 for a closing one, else 0. The `>` of
+// `=>` / `->` closes nothing.
+function bracketStep(s, i) {
+  const c = s[i];
+  if ('([{<'.includes(c)) return 1;
+  if (')]}'.includes(c) || (c === '>' && s[i - 1] !== '=' && s[i - 1] !== '-')) return -1;
+  return 0;
+}
+
+// Splits at commas outside brackets.
+function splitTopLevel(s) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const step = bracketStep(s, i);
+    if (step !== 0) depth = Math.max(0, depth + step);
+    else if (s[i] === ',' && depth === 0) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+/**
+ * A parameter a caller may leave out: a default value (`x = 1`, `int y = 0`,
+ * `strict: bool = False`), TS `x?: T`, a variadic (`*args`, `**kwargs`, a bare
+ * `*` marker, `...rest`, Go `opts ...T`, Java `T... xs`). Whitespace is
+ * already gone from the key.
+ */
+function isOptionalParam(p) {
+  if (!p) return false;
+  if (p[0] === '*') return true;
+  let depth = 0;
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    const step = bracketStep(p, i);
+    if (step !== 0) { depth = Math.max(0, depth + step); continue; }
+    if (depth !== 0) continue;
+    if (c === '.' && p.startsWith('...', i)) return true;
+    if (c === '?' && (p[i + 1] === ':' || i === p.length - 1)) return true;
+    // The first depth-0 `=` is the default, unless it starts `=>` (an arrow
+    // type). No `==`/`>=` can come earlier; `number>=new Map()` is a generic's
+    // `>` then a default.
+    if (c === '=' && p[i + 1] !== '>') return true;
   }
   return false;
 }
@@ -286,7 +393,8 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
     if (!Array.isArray(e.sigs)) continue;
     const after = extractSignatures(workText(e.file), e.symbol, path.extname(e.file).toLowerCase());
     if (!after || after.length === 0) continue;     // removed, or no reading now
-    if (!signatureChanged(e.sigs, after)) continue; // body-only this turn
+    // Body-only this turn, or only optional parameters appended (Q2).
+    if (!signatureChanged(e.sigs, after, e.symbol)) continue;
     changed.push({ key, file: e.file, symbol: e.symbol });
   }
 

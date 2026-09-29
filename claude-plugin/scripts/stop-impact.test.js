@@ -32,8 +32,22 @@ test('extractSignatures: Rust header up to the brace, whitespace-insensitive', (
 test('extractSignatures: Python stops at the depth-0 colon, annotations kept', () => {
   const a = extractSignatures('def load(path: str) -> dict:\n    return {}\n', 'load', '.py');
   assert.deepEqual(a, ['defload(path:str)->dict']);
+  const b = extractSignatures('def load(path: str, strict: bool) -> dict:\n    pass\n', 'load', '.py');
+  assert.ok(signatureChanged(a, b, 'load'));
+});
+
+test('signatureChanged: optional parameters appended at the end break no caller (Q2)', () => {
+  const a = extractSignatures('def load(path: str) -> dict:\n    return {}\n', 'load', '.py');
   const b = extractSignatures('def load(path: str, strict: bool = False) -> dict:\n    pass\n', 'load', '.py');
-  assert.ok(signatureChanged(a, b));
+  assert.equal(signatureChanged(a, b, 'load'), false);
+  // Without the symbol there is no parameter list to locate: every difference counts.
+  assert.equal(signatureChanged(a, b), true);
+  // Matched per definition: one compatible extension per old header.
+  const two = ['defload(a)', 'defload(b)'];
+  assert.equal(signatureChanged(two, ['defload(a,x=1)', 'defload(b)'], 'load'), false);
+  assert.equal(signatureChanged(two, ['defload(a,x=1)'], 'load'), true, 'the other definition is gone');
+  assert.equal(signatureChanged(['defload(a)', 'defload(a)'], ['defload(a,x=1)'], 'load'), true,
+    'one new header extends one old header, not two');
 });
 
 test('extractSignatures: JS function, arrow binding and class method; calls are not definitions', () => {
@@ -170,6 +184,15 @@ test('stop: body-only change → silent; new, vanished, or unreadable definition
     'added this turn');
   assert.deepEqual(computeStopReport({ edits: withSigs(null), state: EMPTY, now: 9000, ...world() }).lines, [],
     'no baseline (unsupported language, pre-repair log line)');
+});
+
+test('stop Q2: a defaulted parameter appended → silent; a required one → reported', () => {
+  const before = 'def load(p):\n    pass\n';
+  const edits = [{ ts: 5001, file: 'src/a.py', symbol: 'load', sigs: extractSignatures(before, 'load', '.py') }];
+  const run = (work) => computeStopReport({ edits, state: EMPTY, now: 9000, ...world(),
+    workText: (f) => (f === 'src/a.py' ? work : null) }).lines;
+  assert.deepEqual(run('def load(p, strict=False):\n    pass\n'), []);
+  assert.deepEqual(run('def load(p, strict):\n    pass\n'), ['  load() in src/a.py: src/b.rs:5 (caller_b)']);
 });
 
 test('stop: edits before the previous Stop belong to an earlier turn', () => {
@@ -469,7 +492,7 @@ function verdict(oldText, newText, symbol, ext) {
   const a = extractSignatures(oldText, symbol, ext);
   const b = extractSignatures(newText, symbol, ext);
   if (!a || !b || a.length === 0 || b.length === 0) return 'silent';
-  return signatureChanged(a, b) ? 'changed' : 'same';
+  return signatureChanged(a, b, symbol) ? 'changed' : 'same';
 }
 
 const SHAPES = [
@@ -532,6 +555,48 @@ const SHAPES = [
     'func (s *S) Compute(x int) (int, error) {\n}\n', 'func (s *S) Compute(x int, y int) (int, error) {\n}\n', 'changed'],
   ['js: arrow binding parameter added', '.js', 'build',
     'const build = (x) => x;\n', 'const build = (x, y) => x + y;\n', 'changed'],
+  // Q2: optional parameters appended at the end of the list leave every
+  // existing call valid. Anything else that moves stays a change.
+  ['py: defaulted parameter appended', '.py', 'load',
+    'def load(p):\n    pass\n', 'def load(p, strict=False):\n    pass\n', 'same'],
+  ['py: *args and **kwargs appended', '.py', 'load',
+    'def load(self, p):\n    pass\n', 'def load(self, p, *args, **kwargs):\n    pass\n', 'same'],
+  ['py: keyword-only parameters with defaults appended', '.py', 'load',
+    'def load(p):\n    pass\n', 'def load(p, *, strict=False):\n    pass\n', 'same'],
+  ['py: re-wrapped with a trailing comma', '.py', 'load',
+    'def load(p):\n    pass\n', 'def load(\n    p,\n    strict: bool = False,\n) -> None:\n    pass\n', 'changed'],
+  ['py: re-wrapped with a trailing comma, no return type added', '.py', 'load',
+    'def load(p):\n    pass\n', 'def load(\n    p,\n    strict: bool = False,\n):\n    pass\n', 'same'],
+  ['py: first parameter of an empty list, defaulted', '.py', 'load',
+    'def load():\n    pass\n', 'def load(p=None):\n    pass\n', 'same'],
+  ['py: keyword-only parameter WITHOUT a default', '.py', 'load',
+    'def load(p):\n    pass\n', 'def load(p, *, strict):\n    pass\n', 'changed'],
+  ['py: defaulted parameter inserted before an existing one', '.py', 'load',
+    'def load(a, b=1):\n    pass\n', 'def load(a, c=2, b=1):\n    pass\n', 'changed'],
+  ['py: defaulted parameter renamed', '.py', 'load',
+    'def load(a, b=1):\n    pass\n', 'def load(a, c=1):\n    pass\n', 'changed'],
+  ['ts: optional parameter appended', '.ts', 'pick',
+    'function pick(a: T) {\n}\n', 'function pick(a: T, b?: number) {\n}\n', 'same'],
+  ['ts: rest parameter appended to a generic function', '.ts', 'pick',
+    'function pick<T>(a: T): T {\n}\n', 'function pick<T>(a: T, ...rest: T[]): T {\n}\n', 'same'],
+  ['ts: defaulted parameter appended to an arrow binding', '.ts', 'build',
+    'const build = (x) => x;\n', 'const build = (x, y = () => 1) => x;\n', 'same'],
+  ['ts: appended parameter of function type, no default', '.ts', 'build',
+    'const build = (x) => x;\n', 'const build = (x, cb: (a: number) => void) => x;\n', 'changed'],
+  ['ts: defaulted parameter whose generic type holds an arrow type', '.ts', 'pick',
+    'function pick(a: T) {\n}\n', 'function pick(a: T, m: Map<(k: K) => V, number> = new Map()) {\n}\n', 'same'],
+  ['ts: last parameter type changed, then optionals appended', '.ts', 'pick',
+    'function pick(a: T) {\n}\n', 'function pick(a: T[] = [], b?: number) {\n}\n', 'changed'],
+  ['ts: optional parameter appended to the RETURN type, not the parameters', '.ts', 'pick',
+    'function pick(a: T): (x: number) => void {\n}\n', 'function pick(a: T): (x: number, y?: number) => void {\n}\n', 'changed'],
+  ['go: variadic parameter appended', '.go', 'Compute',
+    'func (s *S) Compute(x int) (int, error) {\n}\n', 'func (s *S) Compute(x int, opts ...Option) (int, error) {\n}\n', 'same'],
+  ['c++: defaulted parameter appended', '.cpp', 'compute',
+    'int compute(int x) {\n}\n', 'int compute(int x, int y = 0) {\n}\n', 'same'],
+  ['kotlin: defaulted parameter appended', '.kt', 'area',
+    'fun area(r: Double): Double {\n}\n', 'fun area(r: Double, k: Double = 1.0): Double {\n}\n', 'same'],
+  ['rust: no optional parameters exist; a tuple return grows', '.rs', 'split',
+    'fn split(s: &str) -> (A, B) {\n}\n', 'fn split(s: &str) -> (A, B, C) {\n}\n', 'changed'],
   // No exact reading for these: say nothing rather than guess.
   ['elixir: unsupported → silent', '.ex', 'run',
     'def run(a), do: a + 1\n', 'def run(a), do: a + 2\n', 'silent'],
