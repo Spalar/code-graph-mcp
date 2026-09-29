@@ -26,8 +26,9 @@ Python call on `self.x.f()` or on a relatively imported object that bound its
 own file's method is labelled by its name's count, so `callgraph` and `impact`
 hide some of those edges by default, say how many, and show them with
 `--min-confidence ambiguous`. To pin back: `npm i -g @sdsrs/code-graph@0.163.0`,
-or `cargo install code-graph-mcp --version 0.163.0`; plugin users can set the
-version in the marketplace entry. An older binary leaves a v113 index intact
+or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.163.0`,
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1` so the plugin's auto-update does not move
+you forward again. An older binary leaves a v113 index intact
 and warns instead of rebuilding it; delete `.code-graph/index.db*` after
 pinning back to get its graph back.
 
@@ -73,9 +74,10 @@ impacted.
   `run_startup_tasks`) and said so only on stderr; up to 27 of 98 injections
   were about another symbol.
 - **Before an edit**, the impact summary appears only when the edit changes a
-  definition's header, names the earliest definition in the hunk (a word in a
-  comment or a control statement is none), skips files
-  outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Replayed over 802
+  definition's header and names that definition — a keyword-anchored one
+  (`fn`, `def`, `function`, a modifier) before a bare `name(…) {`, and never a
+  name on a comment line, a control keyword or a call on a receiver
+  (`if v.is_empty() {`) — skips files outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Replayed over 802
   real injections, 67 remain; the rest were body-only edits, unchanged
   headers or outside files, and the removed body-edit guess picked a wrong
   TypeScript symbol for 108 of 608 definitions.
@@ -338,6 +340,11 @@ Found by the pre-release review and left for a later release:
   `grep -rln` lists one file fewer, and prints a line that is not valid UTF-8
   as empty; `impact X --node-id N` ignores `X`; a lookup of an absent name
   prints the symlinked-files warning.
+- **The edit hook's definition pick**, as in 0.163.0: prose after code on the
+  same line (`x = 1; // the function that …`), prose inside a multi-line
+  docstring, and a gtest `TEST(…) {` ahead of the C function it tests can
+  still name the wrong word; when the fifth definition a same-file refusal
+  lists is decorated, an edit of its header stays silent.
 
 ### Index versions
 

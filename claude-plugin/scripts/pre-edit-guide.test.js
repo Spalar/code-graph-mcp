@@ -287,7 +287,7 @@ test('SEC-04: the scan window is bounded in the hook itself', () => {
   // Belt to the quantifier caps' braces, and the part that bounds a pattern a
   // future author adds without reading the note.
   assert.match(SOURCE, /oldStr\.length > 8192 \? oldStr\.slice\(0, 8192\)/);
-  assert.match(SOURCE, /fnPatterns\.forEach\(\(pat, arm\) => \{\n\s*for \(const m of scanned\.matchAll\(new RegExp\(pat\.source, 'g'\)\)\)/);
+  assert.match(SOURCE, /for \(const m of scanned\.matchAll\(new RegExp\(fnPatterns\[arm\]\.source, 'gd'\)\)\)/);
 });
 
 // ── Covering-test targeting (edit-time PUSH) ────────────
@@ -524,6 +524,33 @@ for (const [label, relPath, oldString, newString, name] of [
   });
 }
 
+// The hook's own loop, per language (second review round, 2026-09-29): the
+// fn-extract tests above run the patterns first-match in array order, so they
+// never saw that the first repair's allow-list of JS modifiers rejected every
+// definition whose return type or keyword comes first. Each case changes the
+// header and must inject its own name.
+for (const [label, relPath, header, changed, name] of [
+  ['C', 'src/parse.c', 'int parse_header(const char *buf, int n) {', 'int parse_header(const char *buf, int n, int flags) {', 'parse_header'],
+  ['C++ out-of-line', 'src/db.cc', 'Status DBImpl::Write(const WriteOptions& o) {', 'Status DBImpl::Write(const WriteOptions& o, int x) {', 'Write'],
+  ['Java package-private', 'src/A.java', 'void recalculate(int depth) {', 'void recalculate(int depth, int max) {', 'recalculate'],
+  ['Kotlin', 'src/App.kt', 'fun processOrder(order: Int) {', 'fun processOrder(order: Int, rush: Boolean) {', 'processOrder'],
+  ['Kotlin extension', 'src/Ext.kt', 'fun String.toSlug(sep: Char) {', 'fun String.toSlug(sep: Char, max: Int) {', 'toSlug'],
+  ['C#', 'src/Repo.cs', 'public async Task SaveAsync(int order)\n{', 'public async Task SaveAsync(int order, bool flush)\n{', 'SaveAsync'],
+  ['Dart', 'lib/w.dart', 'Widget build(BuildContext context) {', 'Widget build(BuildContext context, int n) {', 'build'],
+  ['JS generator', 'src/store.js', '  *entries(prefix) {', '  *entries(prefix, limit) {', 'entries'],
+  ['Rust after a comment ending in async', 'src/a.rs', '// TODO: make this async\nfn load_all(p: &Path) -> Vec<u8> {', '// TODO: make this async\nfn load_all(p: &Path, n: usize) -> Vec<u8> {', 'load_all'],
+  ['PHP after a foreach', 'src/a.php', '    foreach ($items as $item) {\n        $x++;\n    }\n}\n\npublic function store($request) {', '    foreach ($items as $item) {\n        $x++;\n    }\n}\n\npublic function store($request, $opts) {', 'store'],
+  ['Go method after an `if` on a member call', 'src/s.go', '\tif s.ready() {\n\t\treturn\n\t}\n}\n\nfunc (s *Server) Close() {', '\tif s.ready() {\n\t\treturn\n\t}\n}\n\nfunc (s *Server) Close(force bool) {', 'Close'],
+  ['C function after an `if`', 'src/parse.c', '    if (n > 0) {\n        n--;\n    }\n}\n\nint parse_header(const char *b) {', '    if (n > 0) {\n        n--;\n    }\n}\n\nint parse_header(const char *b, int n) {', 'parse_header'],
+  ['JS after a describe callback', 'src/a.js', "describe('x', function () {\n  it('y');\n});\n\nfunction save(a) {", "describe('x', function () {\n  it('y');\n});\n\nfunction save(a, b) {", 'save'],
+]) {
+  test(`scope: a ${label} definition whose header changed names itself`, (t) => {
+    const { res } = runPreEditHook(t, { relPath, oldString: header, newString: changed });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, new RegExp(`code-graph:impact\\] ${name}\\(\\)`), `got: ${res.stdout}`);
+  });
+}
+
 test('scope: an edit to a file outside the project injects nothing', (t) => {
   const { res } = runPreEditHook(t, { relPath: '../elsewhere/payments.js' });
   assert.equal(res.status, 0, res.stderr);
@@ -620,6 +647,28 @@ for (const [k, expect] of [[7, null], [2, 'caller_of_102'], [5, 'caller_of_105']
     else assert.equal(res.stdout.trim(), '', `must stay silent, got: ${res.stdout}`);
   });
 }
+
+// Where a definition starts is its name's line: `// TODO: make this async\n
+// fn load(` matches from the comment line, and counting from there picked
+// the previous `load` of the file.
+const TWO_LOADS = 'impl A {\n    // TODO: make this async\n    fn load(&self) {}\n}\n\nimpl B {\n    // TODO: make this async\n    fn load(&self) {}\n}\n';
+const STUB_TWO_LOADS = STUB_SAME_FILE
+  .replace("'Ambiguous symbol \\'fetch\\'", "'Ambiguous symbol \\'load\\'")
+  .replace(/file_path: 'src\/app.py', type: 'method', node_id: 11, start_line: 2/, "file_path: 'src/lib.rs', type: 'method', node_id: 11, start_line: 3")
+  .replace(/file_path: 'src\/app.py', type: 'method', node_id: 22, start_line: 7/, "file_path: 'src/lib.rs', type: 'method', node_id: 22, start_line: 8");
+test('Q4: a match that starts on a comment line counts from its name\'s line', (t) => {
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/lib.rs', stubExec: STUB_TWO_LOADS,
+    setup: (proj) => {
+      require('node:fs').mkdirSync(require('node:path').join(proj, 'src'), { recursive: true });
+      require('node:fs').writeFileSync(require('node:path').join(proj, 'src', 'lib.rs'), TWO_LOADS);
+    },
+    oldString: 'impl B {\n    // TODO: make this async\n    fn load(&self) {}',
+    newString: 'impl B {\n    // TODO: make this async\n    fn load(&self, n: usize) {}',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_22/, `B.load starts at line 8; got: ${res.stdout}`);
+});
 
 test('Q4: no candidate at or before the edited line → silent, never a guess', (t) => {
   const stub = STUB_SAME_FILE.replace(/start_line: \d+ }/g, 'start_line: 50 }');

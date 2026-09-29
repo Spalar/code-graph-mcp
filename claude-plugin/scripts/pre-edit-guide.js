@@ -138,37 +138,56 @@ const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 // comment's "the function that" and a control statement ending in `{`
 // (`if v.is_empty() {`, `if (x > 0) {`) match before the real header, and
 // taking them blinded this hook and the Stop check to a signature change
-// 0.163.0 caught (replayed on 7,106 recorded edits: 12 picked such a word). So
-// every match is a candidate, in order, and three kinds are not definitions:
-// one on a comment line, a control keyword, and a `name(...) {` (the JS
-// method / Go arm) preceded by anything but modifiers or a Go receiver.
-const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*|#(?![[!])|--|"""|''')/;
+// 0.163.0 caught. So every match is a candidate, in order, and only three
+// kinds are skipped — each a thing no definition is: a name on a comment line,
+// a control keyword, and a `name(...) {` from the JS method / Go arm called on
+// a receiver (`v.is_empty() {`, `p->ok() {`). An allow-list of what may
+// precede a method name (the first cut) rejected every C, Java, Kotlin, C# and
+// Dart definition, whose return type comes first (second review round).
+// The name's own line is what is checked: `// TODO: make this async\nfn f(`
+// starts its match on the comment line and names `f` on the next.
+//
+// Measured on the second round's 70 shapes (a definition after a comment,
+// a control statement or a callback, per language): 62 named right, against
+// 57 for 0.163.0 and 51 for c7ac62a, and none that either named right named
+// wrong; over 7,124 recorded edits no definition either named is lost.
+const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*(?:\s|\/|$)|#(?![[!])|--|"""|''')/;
 const METHOD_ARM = 3; // `(\w+)\s*\([^)]*\)\s*\{` — also matches calls
-const METHOD_PREFIX = /^\s*(?:(?:export|default|public|private|protected|static|async|override|readonly|abstract|get|set)\s+)*$|\)\s*$/;
-function definitionAt(m, arm) {
+// Where the definition starts, or -1 when the match is none. A match that
+// began on an earlier line than its name starts at the name's line.
+function definitionStart(m, arm) {
   const name = m[1] || m[2];
-  if (!name || isCommonKeyword(name)) return false;
-  const lineStart = scanned.lastIndexOf('\n', m.index) + 1;
-  if (COMMENT_LINE.test(scanned.slice(lineStart, m.index + 1))) return false;
-  if (arm === METHOD_ARM) {
-    const nameAt = m.index + m[0].indexOf(name);
-    if (!METHOD_PREFIX.test(scanned.slice(lineStart, nameAt))) return false;
-  }
-  return true;
+  if (!name || isCommonKeyword(name)) return -1;
+  const nameAt = (m.indices[1] || m.indices[2])[0];
+  const lineStart = scanned.lastIndexOf('\n', nameAt - 1) + 1;
+  if (COMMENT_LINE.test(scanned.slice(lineStart, nameAt + 1))) return -1;
+  const prefix = scanned.slice(lineStart, nameAt);
+  // Kotlin's extension `fun String.toSlug(` is a definition, not a call.
+  if (arm === METHOD_ARM && /(?:\.|->)\s*$/.test(prefix) && !/^\s*(?:\w+\s+)*fun\s/.test(prefix)) return -1;
+  return Math.max(m.index, lineStart);
 }
 let symbol = null;
 let symbolAt = -1;
-fnPatterns.forEach((pat, arm) => {
-  for (const m of scanned.matchAll(new RegExp(pat.source, 'g'))) {
-    if (symbolAt !== -1 && m.index >= symbolAt) break;
-    if (definitionAt(m, arm)) {
-      symbol = m[1] || m[2];
-      symbolAt = m.index;
-      break;
+// The keyword-anchored arms first; the JS method / Go arm, which a call with
+// a block or a callback (`foreach (…) {`, `describe('x', function () {`)
+// matches too, only when none of them names a definition — the precedence
+// 0.163.0's array order gave it.
+for (const arms of [fnPatterns.map((_, i) => i).filter((i) => i !== METHOD_ARM), [METHOD_ARM]]) {
+  for (const arm of arms) {
+    for (const m of scanned.matchAll(new RegExp(fnPatterns[arm].source, 'gd'))) {
+      if (symbolAt !== -1 && m.index >= symbolAt) break;
+      const at = definitionStart(m, arm);
+      if (at !== -1) {
+        if (symbolAt === -1 || at < symbolAt) {
+          symbol = m[1] || m[2];
+          symbolAt = at;
+        }
+        break;
+      }
     }
   }
-});
-
+  if (symbol) break;
+}
 if (!symbol || symbol.length < 3) process.exit(0);
 
 // Skip common patterns that aren't real function names
