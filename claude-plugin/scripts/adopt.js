@@ -482,6 +482,17 @@ function readAdoptedProjects(home) {
   return readAdoptedResult(home).list;
 }
 
+// A8 (2026-09-29 usage evaluation): the registry only ever grew — 7 of 16
+// entries on the evaluation machine named deleted temp dirs. A directory that
+// no longer exists holds no managed block, so each write drops those; an entry
+// whose check fails any other way (EACCES, a stale mount) stays, since its
+// block may still be there.
+function withoutGoneDirs(list) {
+  return list.filter((p) => {
+    try { fs.statSync(p); return true; } catch (err) { return !(err && err.code === 'ENOENT'); }
+  });
+}
+
 /** @returns {boolean} true when the project is recorded (or already was). */
 function recordAdopted(projectDir, home) {
   const res = readAdoptedResult(home);
@@ -489,9 +500,11 @@ function recordAdopted(projectDir, home) {
   try {
     const file = adoptedRegistryFile(home);
     const abs = path.resolve(projectDir);
-    if (res.list.includes(abs)) return true;
+    const kept = withoutGoneDirs(res.list);
+    const next = kept.includes(abs) ? kept : [...kept, abs];
+    if (next.length === res.list.length && next.every((p, i) => p === res.list[i])) return true;
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeFileAtomic(file, JSON.stringify([...res.list, abs], null, 2) + '\n');
+    writeFileAtomic(file, JSON.stringify(next, null, 2) + '\n');
     return true;
   } catch { return false; }        // best-effort: registry loss only degrades guidance
 }
@@ -502,7 +515,7 @@ function removeAdopted(projectDir, home) {
   if (res.unusable) return false;
   try {
     const abs = path.resolve(projectDir);
-    const next = res.list.filter((p) => p !== abs);
+    const next = withoutGoneDirs(res.list).filter((p) => p !== abs);
     if (next.length === res.list.length) return true;
     writeFileAtomic(adoptedRegistryFile(home), JSON.stringify(next, null, 2) + '\n');
     return true;

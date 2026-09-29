@@ -885,6 +885,54 @@ test('adopt records the project in the registry; unadopt removes it', () => {
   } finally { sb.cleanup(); }
 });
 
+// A8 (2026-09-29 usage evaluation): the registry only grew — 7 of 16 entries
+// on the evaluation machine named deleted temp dirs. A directory that no
+// longer exists holds no managed block, so every write drops such entries;
+// one that exists (or cannot be checked) stays.
+test('registry writes drop projects whose directory is gone (A8)', () => {
+  const sb = makeSandbox();
+  try {
+    const { readAdoptedProjects, adoptedRegistryFile } = require('./adopt');
+    const file = adoptedRegistryFile(sb.home);
+    const kept = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-kept-'));
+    const gone = path.join(os.tmpdir(), `cg-adopt-gone-${process.pid}-${Date.now()}`);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify([gone, kept]));
+      assert.strictEqual(adopt({ cwd: sb.cwd, home: sb.home }).ok, true);
+      assert.deepStrictEqual(readAdoptedProjects(sb.home), [kept, path.resolve(sb.cwd)],
+        'adopt drops the gone entry and appends this project');
+
+      fs.writeFileSync(file, JSON.stringify([gone, kept, path.resolve(sb.cwd)]));
+      unadopt({ cwd: sb.cwd, home: sb.home });
+      assert.deepStrictEqual(readAdoptedProjects(sb.home), [kept],
+        'unadopt drops the gone entry along with this project');
+
+      // Already registered: the write that re-adopting skips still prunes.
+      fs.writeFileSync(file, JSON.stringify([gone, path.resolve(sb.cwd)]));
+      adopt({ cwd: sb.cwd, home: sb.home });
+      assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)]);
+
+      // Unverifiable is not gone: behind a directory we may not search, the
+      // project (and its block) may well still exist.
+      if (process.platform !== 'win32' && process.getuid && process.getuid() !== 0) {
+        const hidden = path.join(kept, 'proj');
+        fs.mkdirSync(hidden);
+        fs.chmodSync(kept, 0o000);
+        try {
+          fs.writeFileSync(file, JSON.stringify([hidden, gone]));
+          adopt({ cwd: sb.cwd, home: sb.home });
+          assert.deepStrictEqual(readAdoptedProjects(sb.home), [hidden, path.resolve(sb.cwd)]);
+        } finally {
+          fs.chmodSync(kept, 0o700);
+        }
+      }
+    } finally {
+      fs.rmSync(kept, { recursive: true, force: true });
+    }
+  } finally { sb.cleanup(); }
+});
+
 test('unadopt KEEPS the registry entry when it could not strip the block', () => {
   // The registry is the only record of which repos carry a managed block, and
   // `uninstall --unadopt-all` is driven entirely by it. Deregistering a project
