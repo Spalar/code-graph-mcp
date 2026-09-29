@@ -11738,3 +11738,53 @@ fn a_python_untyped_receiver_same_file_bind_is_labelled_by_its_name_count() {
         "incremental must equal a rebuild"
     );
 }
+
+// B9 (2026-09-29 usage evaluation): a member call on a Node built-in module
+// (`path.resolve(p)`, `fs.renameSync(a, b)`) runs Node's code, yet it bound a
+// project function or method of that name elsewhere (express: a test's
+// `path.resolve` → `View.prototype.resolve`; this repo: `fs.renameSync` → a
+// test's `renameSync` mock) — 8 of 8 such edges over three corpora wrong on
+// reading the code. A bare call through the same binding was already dropped
+// (D7); a member call on it now is too. A parameter of that name is not the
+// module, and another package (a workspace package in a monorepo) is untouched.
+#[test]
+fn a_member_call_on_a_node_builtin_module_binds_no_project_function() {
+    let files: &[(&str, &str)] = &[
+        (
+            "lib/view.js",
+            "function View() {}\nView.prototype.resolve = function resolve(dir, file) { return dir + file; };\n\
+             View.prototype.readFile = function readFile(p) { return p; };\nmodule.exports = View;\n",
+        ),
+        (
+            "lib/static.js",
+            "var path = require('path');\nvar fs = require('node:fs');\nconst { promises: fsp } = require('fs');\n\
+             function serve(p) {\n  path.resolve(p);\n  require('path').resolve(p);\n  fs.promises.readFile(p);\n  \
+             return fsp.readFile(p);\n}\nfunction local(path) { return path.resolve(1); }\nmodule.exports = serve;\n",
+        ),
+        (
+            "packages/app/main.js",
+            "import * as lib from '@org/lib';\nexport function main() { return lib.helper(1); }\n",
+        ),
+        ("packages/lib/index.js", "export function helper(x) { return x; }\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    for e in [
+        "lib/static.js.serve --calls--> lib/view.js.resolve",
+        "lib/static.js.serve --calls--> lib/view.js.readFile",
+    ] {
+        assert!(
+            !has(e),
+            "a call into Node's own module reached {e}: {edges:#?}"
+        );
+    }
+    assert!(
+        has("lib/static.js.local --calls--> lib/view.js.resolve"),
+        "a parameter named `path` is not the module: {edges:#?}"
+    );
+    assert!(
+        has("packages/app/main.js.main --calls--> packages/lib/index.js.helper"),
+        "a package the project holds stays reachable: {edges:#?}"
+    );
+}

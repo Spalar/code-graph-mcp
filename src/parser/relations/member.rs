@@ -442,10 +442,46 @@ pub(super) fn js_node_builtin_call(call: tree_sitter::Node, source: &str, family
     if js_renamed_import_call(call, source, family).is_some() {
         return false;
     }
-    js_package_bound_call(call, source, family).is_some_and(|spec| {
-        spec.starts_with("node:")
-            || NODE_BUILTIN_MODULES.contains(&spec.split('/').next().unwrap_or(&spec))
-    })
+    js_package_bound_call(call, source, family).is_some_and(|spec| is_node_builtin(&spec))
+}
+
+/// `node:path`, `path`, `fs/promises`: one of Node's own modules.
+fn is_node_builtin(spec: &str) -> bool {
+    spec.starts_with("node:")
+        || NODE_BUILTIN_MODULES.contains(&spec.split('/').next().unwrap_or(spec))
+}
+
+/// Whether a JS/TS member call's receiver is one of Node's own modules (B9):
+/// `path.resolve(p)`, `fs.promises.readFile(p)` or `require('path').join(p)`,
+/// the root name's nearest binding a built-in module or a member of one. No
+/// project code runs, however many project functions share the method's name.
+pub(super) fn js_node_builtin_member_call(
+    call: tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> bool {
+    if !matches!(family, "javascript" | "typescript" | "tsx") {
+        return false;
+    }
+    let Some(mut root) = call
+        .child_by_field_name("function")
+        .filter(|f| f.kind() == "member_expression")
+        .and_then(|f| f.child_by_field_name("object"))
+    else {
+        return false;
+    };
+    while root.kind() == "member_expression" {
+        match root.child_by_field_name("object") {
+            Some(inner) => root = inner,
+            None => return false,
+        }
+    }
+    let spec = match root.kind() {
+        "identifier" => js_package_binding(call, node_text(&root, source), source),
+        "call_expression" => require_call(root, source),
+        _ => None,
+    };
+    spec.is_some_and(|s| is_node_builtin(&s))
 }
 
 /// The package a bare JS/TS call goes through (`crate::domain::CALL_Q_PACKAGE`):
@@ -465,8 +501,15 @@ pub(super) fn js_package_bound_call(
     if function.kind() != "identifier" {
         return None;
     }
-    let name = node_text(&function, source);
-    let mut child = call;
+    js_package_binding(call, node_text(&function, source), source)
+}
+
+/// The package `name` stands for at `from`: its nearest binding is the file's
+/// own `var send = require('send')` / `import send from 'send'`, or a member of
+/// one (`var resolve = path.resolve`). None when a parameter or local shadows
+/// it, or when the specifier is relative (a project file, not a package).
+fn js_package_binding(from: tree_sitter::Node, name: &str, source: &str) -> Option<String> {
+    let mut child = from;
     let program = loop {
         let scope = child.parent()?;
         if binding_in(scope, child, name, source).is_some() {

@@ -391,7 +391,8 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             // `exports.create = function () {}` a node, express's seven bound it.
             let shadowed = shadowed
                 || super::member::js_builtin_global_call(node, source, ctx.language)
-                || super::member::js_node_builtin_call(node, source, ctx.language);
+                || super::member::js_node_builtin_call(node, source, ctx.language)
+                || super::member::js_node_builtin_member_call(node, source, ctx.language);
             // The file's `use` names what the call's leading name stands for
             // (D#132): `use std::sync::Mutex; Mutex::new()` is std's.
             let use_root = if ctx.language == "rust" && !shadowed {
