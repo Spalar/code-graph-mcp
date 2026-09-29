@@ -236,6 +236,32 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         });
                     }
 
+                    // `module.exports = require('./lib/express')` (express's index.js;
+                    // `exports = module.exports = require(…)` too) re-exports that
+                    // file: bind this module to it, as a namespace require does, so
+                    // deps/affected follow the package through its index (D7 / C3).
+                    let reexport = node
+                        .parent()
+                        .filter(|p| p.kind() == "assignment_expression")
+                        .filter(|p| {
+                            p.child_by_field_name("right")
+                                .is_some_and(|r| r.id() == node.id())
+                        })
+                        .and_then(|p| p.child_by_field_name("left"))
+                        .is_some_and(|l| {
+                            matches!(node_text(&l, source), "module.exports" | "exports")
+                        });
+                    if reexport {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: "module.exports".into(),
+                            relation: REL_IMPORTS.into(),
+                            metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
+                            source_language: String::new(),
+                            source_line: None,
+                        });
+                    }
+
                     // Destructured require: `const { foo, bar } = require('./x')`.
                     // Emit a per-name import stamped with the full specifier so
                     // js_modules resolution binds each name to the required file's

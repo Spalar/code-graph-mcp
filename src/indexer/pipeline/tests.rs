@@ -11005,3 +11005,44 @@ fn a_bare_call_through_a_package_import_never_binds_a_same_file_function() {
     run_incremental_index(&db, project.path(), None, None).unwrap();
     check(&db, "after an incremental run");
 }
+
+// D7 / C3: express's tests load the package as `require('..')` / `require('../')`,
+// and its index.js is `module.exports = require('./lib/express')`. Neither was an
+// import edge, so `affected lib/view.js` reached 1 of the 74 test files that load
+// it and `deps index.js` said "<external>".
+#[test]
+fn a_directory_require_and_a_re_exporting_index_are_file_imports() {
+    let files: &[(&str, &str)] = &[
+        (
+            "index.js",
+            "'use strict';\nmodule.exports = require('./lib/express');\n",
+        ),
+        (
+            "lib/express.js",
+            "var proto = require('./application');\n\
+             exports = module.exports = function createApplication() { return proto; };\n",
+        ),
+        (
+            "lib/application.js",
+            "var app = exports = module.exports = {};\napp.init = function init() {};\n",
+        ),
+        ("test/a.js", "var express = require('..');\nexpress();\n"),
+        ("test/b.js", "var express = require('../');\nexpress();\n"),
+        (
+            "test/sub/c.js",
+            "var express = require('../..');\nexpress();\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    for e in [
+        "index.js.<module> --imports--> lib/express.js.<module>",
+        "lib/express.js.<module> --imports--> lib/application.js.<module>",
+        "test/a.js.<module> --imports--> index.js.<module>",
+        "test/b.js.<module> --imports--> index.js.<module>",
+        "test/sub/c.js.<module> --imports--> index.js.<module>",
+    ] {
+        assert!(has(e), "missing {e}: {edges:#?}");
+    }
+}

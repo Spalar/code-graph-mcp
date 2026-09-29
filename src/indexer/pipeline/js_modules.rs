@@ -29,6 +29,15 @@ pub(super) fn resolve_js_specifier_path(
     file_set: &HashSet<String>,
 ) -> Option<String> {
     // Only relative specifiers are file-resolvable without node_modules/tsconfig.
+    // A bare `.` / `..` names a directory as `./` / `../` does (express's tests
+    // load the package as `require('..')`).
+    let dir_spec;
+    let specifier = if specifier == "." || specifier == ".." {
+        dir_spec = format!("{specifier}/");
+        dir_spec.as_str()
+    } else {
+        specifier
+    };
     if !(specifier.starts_with("./") || specifier.starts_with("../")) {
         return None;
     }
@@ -57,9 +66,13 @@ pub(super) fn resolve_js_specifier_path(
             return Some(cand);
         }
     }
-    // `<base>/index.<ext>`
+    // `<base>/index.<ext>` (`index.<ext>` when the base is the repo root)
     for ext in JS_EXTENSIONS {
-        let cand = format!("{}/index.{}", base, ext);
+        let cand = if base.is_empty() {
+            format!("index.{ext}")
+        } else {
+            format!("{}/index.{}", base, ext)
+        };
         if file_set.contains(&cand) {
             return Some(cand);
         }
