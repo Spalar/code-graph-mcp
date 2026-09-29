@@ -412,18 +412,42 @@ impl McpServer {
             }
         }
 
-        let stale_kept = outcome.failed + outcome.skipped_over_budget + unchecked;
-        if stale_kept > 0 {
+        // Changed-and-kept and never-checked are different facts. Files past the
+        // scan cap were not compared with the disk at all, so counting them as
+        // "changed on disk" reported 8 changed files for 40 untouched ones (B7,
+        // 2026-09-29 usage evaluation).
+        let stale_kept = outcome.failed + outcome.skipped_over_budget;
+        if stale_kept > 0 || unchecked > 0 {
+            let note = match (stale_kept > 0, unchecked > 0) {
+                (true, false) => {
+                    "Some files in this result changed on disk and were not re-indexed \
+                                  (per-call budget or a busy database). Their line numbers and \
+                                  snippets may predate your last edit — re-run the query, or pass \
+                                  an explicit file_path tool for those files."
+                        .to_string()
+                }
+                (false, _) => format!(
+                    "{unchecked} file(s) in this result were not checked against the disk (only \
+                     the first {RESULT_REFRESH_SCAN_CAP} are, per call). If you edited any of \
+                     them, their line numbers and snippets may predate the edit — narrow the \
+                     query to re-check them."
+                ),
+                (true, true) => format!(
+                    "Some files in this result changed on disk and were not re-indexed \
+                     (per-call budget or a busy database), and {unchecked} more were not \
+                     checked (only the first {RESULT_REFRESH_SCAN_CAP} are, per call). Line \
+                     numbers and snippets from those files may predate your last edit — re-run \
+                     or narrow the query."
+                ),
+            };
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "freshness".to_string(),
                     json!({
                         "refreshed": outcome.refreshed,
                         "stale_kept": stale_kept,
-                        "note": "Some files in this result changed on disk and were not re-indexed \
-                                 (per-call budget or a busy database). Their line numbers and \
-                                 snippets may predate your last edit — re-run the query, or pass \
-                                 an explicit file_path tool for those files.",
+                        "unchecked": unchecked,
+                        "note": note,
                     }),
                 );
             }

@@ -7153,6 +7153,72 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// B7 (2026-09-29 usage evaluation): files past the 32-file scan cap were
+    /// never compared with the disk, yet they were counted into `stale_kept`
+    /// under a note saying they "changed on disk" — 40 untouched files read as
+    /// 8 changed ones. Unchecked is its own count, with its own wording.
+    #[test]
+    fn test_result_set_refresh_reports_files_past_the_scan_cap_as_unchecked() {
+        let project = TempDir::new().unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                project.path().join(format!("m{i:02}.rs")),
+                format!("fn b7cap_target_{i:02}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        close_other_freshness_paths(&mut server);
+
+        let req = tool_call_json(
+            "ast_search",
+            json!({ "query": "b7cap_target", "limit": 100 }),
+        );
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            payload["count"].as_u64(),
+            Some(40),
+            "precondition: the result names 40 files (display keeps fewer): {payload}"
+        );
+        let freshness = &payload["freshness"];
+        assert_eq!(freshness["unchecked"].as_u64(), Some(8), "{payload}");
+        assert_eq!(
+            freshness["stale_kept"].as_u64(),
+            Some(0),
+            "nothing changed on disk: {payload}"
+        );
+        let note = freshness["note"].as_str().unwrap_or_default();
+        assert!(
+            !note.contains("changed on disk") && note.contains("not checked"),
+            "{note}"
+        );
+
+        // Both at once: one checked file changed and kept (no budget), and the
+        // same eight past the cap.
+        server.result_refresh_budget = 0;
+        std::fs::write(
+            project.path().join("m00.rs"),
+            "\n\nfn b7cap_target_00() {}\n",
+        )
+        .unwrap();
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        let freshness = &payload["freshness"];
+        assert_eq!(freshness["stale_kept"].as_u64(), Some(1), "{payload}");
+        assert_eq!(freshness["unchecked"].as_u64(), Some(8), "{payload}");
+        let note = freshness["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("changed on disk") && note.contains("8 more were not checked"),
+            "{note}"
+        );
+    }
+
     #[test]
     fn test_db_busy_is_classified_as_transient_not_failure() {
         // The distinction decides whether a tool call returns an error or keeps
