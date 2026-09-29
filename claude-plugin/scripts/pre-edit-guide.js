@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
 const { cgTmpDir, cwdHash } = require('./tmp-dir');
-const { resolveProjectRoot } = require('./project-root');
+const { resolveProjectRoot, indexBuildInProgress } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
@@ -168,6 +168,10 @@ const cooldownFile = path.join(cgTmpDir(), `.cg-impact-${cwdHash(cwd)}-${symbol}
 try {
   if (Date.now() - fs.statSync(cooldownFile).mtimeMs < 120000) process.exit(0);
 } catch { /* first time for this symbol */ }
+
+// A half-built index gives a wrong caller count and risk, not a short one (D5).
+// The edit itself is already logged above for the Stop hook.
+if (indexBuildInProgress(cwd)) process.exit(0);
 
 // --- Run impact analysis (JSON mode for programmatic parsing) ---
 // Disambiguate via --file: file_path from tool_input is absolute, but the

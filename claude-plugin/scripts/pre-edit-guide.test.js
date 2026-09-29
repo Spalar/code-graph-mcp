@@ -358,6 +358,7 @@ function runPreEditHook(t, {
   newString = 'x',
   relPath = 'src/payments.js',
   extraEnv = {},
+  setup = () => {},
 } = {}) {
   const fs = require('node:fs');
   const os = require('node:os');
@@ -375,6 +376,7 @@ function runPreEditHook(t, {
   fs.mkdirSync(path.join(proj, '.code-graph'), { recursive: true });
   fs.writeFileSync(path.join(proj, '.code-graph', 'index.db'), '');
   fs.mkdirSync(path.join(home, 'tmp'), { recursive: true });
+  setup(proj);
 
   const preload = path.join(home, 'stub-preload.js');
   fs.writeFileSync(preload, `
@@ -433,6 +435,17 @@ test('emit(subprocess): the real hook emits additionalContext and NEVER auto-all
   assert.ok(!('permissionDecision' in out),
     `PreToolUse(Edit) must carry no permissionDecision; got ${JSON.stringify(out.permissionDecision)}`);
   assert.doesNotMatch(res.stdout, /"allow"/);
+});
+
+test('D5: no impact while the startup index is being written', (t) => {
+  // "2 callers, LOW" from a half-built index is a wrong risk, not a short one.
+  const building = (proj) => require('node:fs').writeFileSync(
+    require('node:path').join(proj, '.code-graph', 'indexing-status.json'),
+    JSON.stringify({ s: 'indexing', d: 3, t: 50 }));
+  const { res } = runPreEditHook(t, { setup: building });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '');
+  // Control: the same edit with no build in progress injects (the first test above).
 });
 
 // ── Fires only when the edit changes a definition's header ──────────────────

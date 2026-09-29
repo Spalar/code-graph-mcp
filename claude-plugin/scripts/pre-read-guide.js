@@ -36,7 +36,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { resolveProjectRoot } = require('./project-root');
+const { resolveProjectRoot, indexBuildInProgress } = require('./project-root');
 const { runOverviewAnswer } = require('./cg-answer');
 const { emitPreToolAllowContext } = require('./hook-emit');
 
@@ -175,7 +175,9 @@ function trackRead(root, rel, now = Date.now()) {
   const state = loadState(root, now);
   recordRead(state, dir, now, rel);
   let fired = false;
-  if (shouldHint(state, dir, now)) {
+  // During the startup build the overview would list part of the dir as the
+  // whole module (D5); leave the hint unspent for the first read after it.
+  if (!indexBuildInProgress(root, now) && shouldHint(state, dir, now)) {
     markHint(state, dir, now);
     fired = true;
   }

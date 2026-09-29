@@ -541,6 +541,10 @@ function runMain() {
     return;
   }
 
+  // A partial index answers wrongly, not just briefly (D5). Return before the
+  // cooldown so the same question is answered once the build is done.
+  if (require('./project-root').indexBuildInProgress(cwd)) return;
+
   const PREFIXES = {
     impact:    '[code-graph:impact] Blast radius — review before editing:',
     overview:  '[code-graph:structure] Module structure:',

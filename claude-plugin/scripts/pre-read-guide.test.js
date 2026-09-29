@@ -314,6 +314,33 @@ test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', ()
   }
 });
 
+test('D5: no fan-out hint while the startup index is being written, and the dir stays eligible', () => {
+  // A partial index's overview lists some of the dir's files as if it were the
+  // module. Marking the hint delivered anyway would spend the dir's one hint.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-building-'));
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: 3 symbols\\n");');
+  fs.chmodSync(stub, 0o755);
+  const oldEnv = process.env._CG_ANSWER_BINARY;
+  process.env._CG_ANSWER_BINARY = stub;
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  const status = path.join(root, '.code-graph', 'indexing-status.json');
+  fs.writeFileSync(status, JSON.stringify({ s: 'indexing', d: 3, t: 50 }));
+  try {
+    for (let i = 0; i < 6; i++) {
+      assert.equal(trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs'), null, `read ${i + 1}`);
+    }
+    fs.rmSync(status);
+    const hint = trackReadAndMaybeHint(root, 'src/storage/file6.rs');
+    assert.match(String(hint), /Module overview stub/, 'the first read after the build gets the hint');
+  } finally {
+    if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
+    else process.env._CG_ANSWER_BINARY = oldEnv;
+    fs.rmSync(statePath(root), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('hook entry: the 5th Read emits one allow+additionalContext envelope', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-main-'));
   fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });

@@ -62,6 +62,7 @@ const {
   showAnswersPattern,
   searchesSameFiles,
 } = require('./pre-grep-guide');
+const { indexBuildInProgress } = require('./project-root');
 
 // The command HEAD is grep/rg/ag (or git grep, or a KEY=VALUE/env prefix). Kept
 // loosely aligned with pre-grep-guide's GREP_VERB; this only gates "is this
@@ -391,7 +392,10 @@ function runMain() {
   // stopping at the first symbol with real edges. runCallgraphAnswer returns `hits`
   // ONLY when the symbol has edges → a leaf/absent symbol self-filters to the
   // show/grep echo below.
-  for (const symbol of extractCallgraphSymbols(rawPattern)) {
+  // Not while the startup index is being written: its call edges are a subset
+  // shown as the whole graph (D5). The grep echo below reads the files.
+  const callgraphSymbols = indexBuildInProgress(root) ? [] : extractCallgraphSymbols(rawPattern);
+  for (const symbol of callgraphSymbols) {
     const cg = runCallgraphAnswer({ cwd: root, symbol });
     if (cg.status === 'hits') {
       answer = cg;

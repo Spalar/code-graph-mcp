@@ -940,6 +940,29 @@ test('the per-type cooldown is stamped on ATTEMPT, not only on a non-empty resul
     'and the flag must carry the project hash (see cwdHash in tmp-dir.js) and the subject hash');
 });
 
+test('D5: while the startup index is being written, the prompt hook runs nothing and starts no cooldown', { skip: posixOnly }, (t) => {
+  // 0.3 s into a cold networkx build, `impact` answered "0 callers, Risk
+  // UNKNOWN" for a function the finished index gives 4 callers. The first
+  // prompt in a new repo lands in exactly that window (coding eval: 12 of 12).
+  const sb = upcSandbox(t, '#!/bin/sh\ntouch "$CG_MARKER_DIR/ran"\necho "fn parseConfig  src/config.js:3"\n');
+  const status = path.join(sb.project, '.code-graph', 'indexing-status.json');
+  fs.writeFileSync(status, JSON.stringify({ s: 'indexing', d: 3, t: 50 }));
+  const ctxFlags = () => (fs.existsSync(sb.cgTmp) ? fs.readdirSync(sb.cgTmp) : [])
+    .filter((f) => f.startsWith('.code-graph-ctx-'));
+
+  const during = runUpc(sb, 'where is parseConfig defined');
+  assert.equal(during.status, 0, during.stderr);
+  assert.equal(during.stdout, '', 'nothing from a partial index');
+  assert.equal(fs.existsSync(path.join(sb.markers, 'ran')), false, 'the CLI must not even run');
+  assert.deepEqual(ctxFlags(), [], 'no cooldown: the same question must be answered once the index is done');
+
+  // Control: the build finishes (the server removes the file) → same prompt answers.
+  fs.rmSync(status);
+  const after = runUpc(sb, 'where is parseConfig defined');
+  assert.match(after.stdout, /\[code-graph:search\][\s\S]*parseConfig/);
+  assert.equal(ctxFlags().length, 1);
+});
+
 test('cooldown flags are project-scoped: a push in one repo must not silence another', { skip: posixOnly }, (t) => {
   // There are only five ctx flag names, and one shared tmp dir for the whole
   // machine, so an un-scoped flag was a machine-wide mute: an `impact` push in

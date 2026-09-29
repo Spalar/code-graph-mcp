@@ -696,6 +696,26 @@ test('e2e: alternation grep `Alpha|Beta` → callgraph mode when a symbol has ed
   }
 });
 
+test('D5: while the startup index is being written, no call graph — the grep echo still answers', () => {
+  // Call edges from a partial index are a subset presented as the whole graph;
+  // the grep echo comes from the files themselves and stays correct.
+  const uniq = `AltBuild${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + '\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/foo.rs:7  fn ' + arg + '()\\n');`);
+  fs.writeFileSync(path.join(fixture.dir, '.code-graph', 'indexing-status.json'),
+    JSON.stringify({ s: 'finalizing', d: 50, t: 50 }));
+  const cmd = `echo "x" && grep "${uniq}|OtherSym" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.doesNotMatch(out.hookSpecificOutput.additionalContext, /Cross-file call graph|called by/);
+    assert.match(out.hookSpecificOutput.additionalContext, /AST-aware view of your grep/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('e2e: alternation grep, no symbol has edges → falls back to grep echo (grep mode)', () => {
   // callgraph returns exit 1 (no node) for every alternand → the grep-echo path
   // still delivers, mode:grep. Guards that widening never LOSES the echo fallback.
