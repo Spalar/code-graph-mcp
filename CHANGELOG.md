@@ -75,14 +75,12 @@ impacted.
   grepped symbol. `callgraph` promotes a unique fuzzy match (`task` →
   `run_startup_tasks`) and said so only on stderr; up to 27 of 98 injections
   were about another symbol.
-- **Before an edit**, the impact summary appears only when the edit changes a
-  definition's header and names that definition — a keyword-anchored one
-  (`fn`, `def`, `function`, a modifier) before a bare `name(…) {`, and never a
-  name on a comment line, a control keyword or a call on a receiver
-  (`if v.is_empty() {`) — skips files outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Replayed over 802
-  real injections, 67 remain; the rest were body-only edits, unchanged
-  headers or outside files, and the removed body-edit guess picked a wrong
-  TypeScript symbol for 108 of 608 definitions.
+- **Before an edit**, the impact summary appears only when the edit changes
+  the header of the definition the hunk names (named as 0.163.0 named it),
+  skips files outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Most
+  of 802 recorded injections were body-only edits, unchanged headers or
+  outside files, and the removed body-edit guess picked a wrong TypeScript
+  symbol for 108 of 608 definitions.
 - **Reading files**: the directory overview fires on the fifth distinct file,
   once per directory, and only when an overview came back — no more advice to
   run `overview tests/`, which answers "No symbols found".
@@ -353,11 +351,17 @@ Found by the pre-release review and left for a later release:
   caller file refreshes twice (about 30% slower on that call). A `var`
   declared inside a top-level block and a TypeScript namespace's exported
   object are read as locals, so members assigned onto them are no nodes.
-- **The edit hook's definition pick**, as in 0.163.0: prose after code on the
-  same line (`x = 1; // the function that …`), prose inside a multi-line
-  docstring, and a gtest `TEST(…) {` ahead of the C function it tests can
-  still name the wrong word; when the fifth definition a same-file refusal
-  lists is decorated, an edit of its header stays silent.
+- **The edit hook's definition pick** is 0.163.0's: the first pattern that
+  matches the hunk names it. So a JavaScript `function` word in prose (a
+  comment, a Python docstring's "The function used …") can win over the
+  definition, and so can a call ending in `{` ahead of a Go or C definition
+  (`if s.ready() {`). Three replacement rules each fixed some shapes and broke
+  others in review, so none ships; when the fifth definition a same-file
+  refusal lists is decorated, an edit of its header stays silent.
+- **An unwritable `settings.json`** keeps the hook entries an earlier version
+  wrote there, and each of those hooks then runs twice beside the plugin's
+  own; SessionStart says so only on stderr, and `code-graph-mcp doctor`
+  reports it.
 
 ### Index versions
 

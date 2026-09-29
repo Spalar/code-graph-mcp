@@ -6,7 +6,7 @@ const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, isPluginUninstalled, removeCacheResidue,
-  readJson, CACHE_DIR, settingsPath, isStaleRelicContext, hookCmdScript, surveyHookCoverage,
+  readJson, CACHE_DIR, settingsPath, isStaleRelicContext, hookCmdScript,
 } = require('./lifecycle');
 const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
@@ -170,22 +170,6 @@ function reportRebuild(r) {
       'every session. Check permissions on ~/.claude/plugins/, then run ' +
       '`code-graph-mcp doctor`.'
     );
-  }
-  // The hooks live in the plugin's hooks.json now (D2): when settings.json
-  // cannot be written and still lists the copies an earlier version put there,
-  // each of them fires beside the plugin's own. Only then — the same write
-  // also claims the statusLine, and a read-only file with none of our hooks
-  // costs nothing worth a notice at every session (second review round).
-  if (r && r.settingsUnwritable) {
-    const listed = surveyHookCoverage(readJson(settingsPath()) || {}).present.length;
-    if (listed > 0) {
-      notices.push(
-        `[code-graph] could not update ${settingsPath()} (${r.error || 'unwritable'}). ` +
-        `It still lists ${listed} code-graph hook(s) from an earlier version, and each ` +
-        'runs twice (there and in the plugin). Make the file writable, then run ' +
-        '`code-graph-mcp doctor`.'
-      );
-    }
   }
   return r;
 }

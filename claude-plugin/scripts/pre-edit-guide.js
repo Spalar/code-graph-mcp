@@ -66,8 +66,9 @@ const insideProject = editedRel && !editedRel.startsWith('..') && !path.isAbsolu
 const editedKey = insideProject ? editedRel.split(path.sep).join('/') : '';
 
 // Q1 — a Write (matcher `Edit|Write`) is logged for the Stop check and never
-// answered: it carries the whole file, and "the earliest definition in it"
-// would name the file's first function, not the one that changed. A Write over
+// answered: it carries the whole file, and the pick below would name
+// whichever definition its first matching pattern finds, not the one that
+// changed. A Write over
 // an existing file records a baseline for each definition whose header its
 // content changes.
 if (input.tool_name === 'Write') {
@@ -130,63 +131,26 @@ const fnPatterns = [
 // future author adds to the array without reading the note above.
 const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 
-// The EARLIEST definition in the hunk names the symbol. Taking the first
-// pattern in array order let the JS `function\s+(\w+)` arm read a Python
-// docstring's "function used" as the symbol `used`.
+// Which definition the hunk names: the first pattern, in array order, that
+// matches — 0.163.0's rule. Three replacements (the earliest match, then an
+// allow-list of what may precede a method name, then keyword-anchored arms
+// first) each fixed shapes and broke others, and three review rounds found a
+// regression in each (pre-tag review 2026-09-29), so the released rule stays
+// until a per-language design with a corpus for each language replaces it.
 //
-// Earliest DEFINITION, not earliest match (pre-tag review 2026-09-29): a doc
-// comment's "the function that" and a control statement ending in `{`
-// (`if v.is_empty() {`, `if (x > 0) {`) match before the real header, and
-// taking them blinded this hook and the Stop check to a signature change
-// 0.163.0 caught. So every match is a candidate, in order, and only three
-// kinds are skipped — each a thing no definition is: a name on a comment line,
-// a control keyword, and a `name(...) {` from the JS method / Go arm called on
-// a receiver (`v.is_empty() {`, `p->ok() {`). An allow-list of what may
-// precede a method name (the first cut) rejected every C, Java, Kotlin, C# and
-// Dart definition, whose return type comes first (second review round).
-// The name's own line is what is checked: `// TODO: make this async\nfn f(`
-// starts its match on the comment line and names `f` on the next.
-//
-// Measured on the second round's 70 shapes (a definition after a comment,
-// a control statement or a callback, per language): 62 named right, against
-// 57 for 0.163.0 and 51 for c7ac62a, and none that either named right named
-// wrong; over 7,124 recorded edits no definition either named is lost.
-const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*(?:\s|\/|$)|#(?![[!])|--|"""|''')/;
-const METHOD_ARM = 3; // `(\w+)\s*\([^)]*\)\s*\{` — also matches calls
-// Where the definition starts, or -1 when the match is none. A match that
-// began on an earlier line than its name starts at the name's line.
-function definitionStart(m, arm) {
-  const name = m[1] || m[2];
-  if (!name || isCommonKeyword(name)) return -1;
-  const nameAt = (m.indices[1] || m.indices[2])[0];
-  const lineStart = scanned.lastIndexOf('\n', nameAt - 1) + 1;
-  if (COMMENT_LINE.test(scanned.slice(lineStart, nameAt + 1))) return -1;
-  const prefix = scanned.slice(lineStart, nameAt);
-  // Kotlin's extension `fun String.toSlug(` is a definition, not a call.
-  if (arm === METHOD_ARM && /(?:\.|->)\s*$/.test(prefix) && !/^\s*(?:\w+\s+)*fun\s/.test(prefix)) return -1;
-  return Math.max(m.index, lineStart);
-}
+// Where the definition starts is its name's line: `// TODO: make this
+// async\nfn f(` matches from the comment line, and the same-file pick below
+// counts lines from here. That moves no name, only the line.
 let symbol = null;
 let symbolAt = -1;
-// The keyword-anchored arms first; the JS method / Go arm, which a call with
-// a block or a callback (`foreach (…) {`, `describe('x', function () {`)
-// matches too, only when none of them names a definition — the precedence
-// 0.163.0's array order gave it.
-for (const arms of [fnPatterns.map((_, i) => i).filter((i) => i !== METHOD_ARM), [METHOD_ARM]]) {
-  for (const arm of arms) {
-    for (const m of scanned.matchAll(new RegExp(fnPatterns[arm].source, 'gd'))) {
-      if (symbolAt !== -1 && m.index >= symbolAt) break;
-      const at = definitionStart(m, arm);
-      if (at !== -1) {
-        if (symbolAt === -1 || at < symbolAt) {
-          symbol = m[1] || m[2];
-          symbolAt = at;
-        }
-        break;
-      }
-    }
+for (const pat of fnPatterns) {
+  const m = scanned.match(new RegExp(pat.source, `${pat.flags}d`));
+  if (m) {
+    symbol = m[1] || m[2];
+    const nameAt = (m.indices[1] || m.indices[2])[0];
+    symbolAt = Math.max(m.index, scanned.lastIndexOf('\n', nameAt - 1) + 1);
+    break;
   }
-  if (symbol) break;
 }
 if (!symbol || symbol.length < 3) process.exit(0);
 

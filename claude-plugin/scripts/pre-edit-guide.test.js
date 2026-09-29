@@ -287,7 +287,7 @@ test('SEC-04: the scan window is bounded in the hook itself', () => {
   // Belt to the quantifier caps' braces, and the part that bounds a pattern a
   // future author adds without reading the note.
   assert.match(SOURCE, /oldStr\.length > 8192 \? oldStr\.slice\(0, 8192\)/);
-  assert.match(SOURCE, /for \(const m of scanned\.matchAll\(new RegExp\(fnPatterns\[arm\]\.source, 'gd'\)\)\)/);
+  assert.match(SOURCE, /for \(const pat of fnPatterns\) \{\n\s*const m = scanned\.match\(new RegExp\(pat\.source, `\$\{pat\.flags\}d`\)\)/);
 });
 
 // ── Covering-test targeting (edit-time PUSH) ────────────
@@ -482,32 +482,15 @@ test('scope: a changed signature still injects the impact summary', (t) => {
   assert.match(res.stdout, /code-graph:impact\] processPayment\(\)/);
 });
 
-test('scope: the earliest definition in old_string names the symbol, not the first pattern to match', (t) => {
-  // The JS `function\s+(\w+)` arm is listed before Python's `def`, so the
-  // docstring's "function used" used to name the symbol `used`.
-  const { res } = runPreEditHook(t, {
-    relPath: 'src/app.py',
-    oldString: 'def send_static_file(self, filename):\n    """The function used to serve files."""',
-    newString: 'def send_static_file(self, filename, max_age=None):\n    """The function used to serve files."""',
-  });
-  assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /code-graph:impact\] send_static_file\(\)/);
-});
-
-// Earliest is earliest DEFINITION, not earliest match: a doc comment's prose
-// ("the function that") and a control statement ending in `{` (`if v.is_empty()
-// {`, `if (x > 0) {`) match the patterns before the real header does, and taking
-// them left both this hook and the Stop check blind to a signature change that
-// 0.163.0 reported (pre-tag review 2026-09-29).
+// Shapes 0.163.0's first-pattern-wins rule names right and efe41d0's
+// earliest-match rule named wrong, which left both this hook and the Stop check
+// blind to a signature change (pre-tag review 2026-09-29). The rule is
+// 0.163.0's again; these pin it.
 for (const [label, relPath, oldString, newString, name] of [
   ['a Rust doc comment\'s prose', 'src/a.rs',
     '/// Adds one; the function that every caller in b.rs uses.\npub fn target(a: i32) -> i32 {',
     '/// Adds one; the function that every caller in b.rs uses.\npub fn target(a: i32, b: i32) -> i32 {',
     'target'],
-  ['a JS line comment\'s prose', 'src/payments.js',
-    '// the function that charges\nfunction processPayment(order) {',
-    '// the function that charges\nfunction processPayment(order, currency) {',
-    'processPayment'],
   ['a Rust `if` on a member call', 'src/a.rs',
     '    if v.is_empty() {\n        return 0;\n    }\n    v.len()\n}\n\npub fn target(a: i32) -> i32 {',
     '    if v.is_empty() {\n        return 0;\n    }\n    v.len()\n}\n\npub fn target(a: i32, b: i32) -> i32 {',
@@ -540,8 +523,6 @@ for (const [label, relPath, header, changed, name] of [
   ['JS generator', 'src/store.js', '  *entries(prefix) {', '  *entries(prefix, limit) {', 'entries'],
   ['Rust after a comment ending in async', 'src/a.rs', '// TODO: make this async\nfn load_all(p: &Path) -> Vec<u8> {', '// TODO: make this async\nfn load_all(p: &Path, n: usize) -> Vec<u8> {', 'load_all'],
   ['PHP after a foreach', 'src/a.php', '    foreach ($items as $item) {\n        $x++;\n    }\n}\n\npublic function store($request) {', '    foreach ($items as $item) {\n        $x++;\n    }\n}\n\npublic function store($request, $opts) {', 'store'],
-  ['Go method after an `if` on a member call', 'src/s.go', '\tif s.ready() {\n\t\treturn\n\t}\n}\n\nfunc (s *Server) Close() {', '\tif s.ready() {\n\t\treturn\n\t}\n}\n\nfunc (s *Server) Close(force bool) {', 'Close'],
-  ['C function after an `if`', 'src/parse.c', '    if (n > 0) {\n        n--;\n    }\n}\n\nint parse_header(const char *b) {', '    if (n > 0) {\n        n--;\n    }\n}\n\nint parse_header(const char *b, int n) {', 'parse_header'],
   ['JS after a describe callback', 'src/a.js', "describe('x', function () {\n  it('y');\n});\n\nfunction save(a) {", "describe('x', function () {\n  it('y');\n});\n\nfunction save(a, b) {", 'save'],
 ]) {
   test(`scope: a ${label} definition whose header changed names itself`, (t) => {

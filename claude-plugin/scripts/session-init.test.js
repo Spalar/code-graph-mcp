@@ -332,48 +332,6 @@ test('an unwritable plugin manifest is reported, not swallowed', (t) => {
     'the message must name the consequence, not just the error code');
 });
 
-// Hooks moved from settings.json into the plugin's hooks.json (D2). When
-// settings.json cannot be written, the entries an earlier version put there
-// stay, and each hook fires twice beside the plugin's own copy; the only
-// message was lifecycle's stderr, which nobody sees (pre-tag review 2026-09-29).
-// The write that fails leaves settings.json as it was: `seed` is what it
-// holds — an earlier version's hook entries, or none of ours.
-function unwritableSettingsPreload(seed) {
-  const lifecycle = JSON.stringify(path.join(__dirname, 'lifecycle.js'));
-  return `
-    const lc = require(${lifecycle});
-    for (const fn of ['install', 'update']) {
-      const real = lc[fn];
-      lc[fn] = (...a) => {
-        const r = real(...a) || {};
-        const hooks = ${seed === 'ours'} ? lc.buildSettingsHookEntries() : {};
-        require('fs').writeFileSync(lc.settingsPath(), JSON.stringify({ model: 'opus', hooks }));
-        return { ...r, settingsUnwritable: true, error: 'EACCES' };
-      };
-    }
-  `;
-}
-
-test('an unwritable settings.json is reported with its double-firing consequence', (t) => {
-  const { res } = runSessionInitHook(t, {
-    prefix: 'cg-si-settings-ro-', preloadSrc: unwritableSettingsPreload('ours'),
-  });
-  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  const n = noticeOf(res);
-  assert.match(n, /could not update \S*settings\.json \(EACCES\)/, `stdout was:\n${res.stdout}`);
-  assert.match(n, /still lists 8 code-graph hook\(s\)/, 'the message must count what stays');
-  assert.match(n, /runs twice/, 'the message must name the consequence');
-  assert.match(n, /code-graph-mcp doctor/);
-});
-
-test('an unwritable settings.json with none of our hooks is no notice', (t) => {
-  const { res } = runSessionInitHook(t, {
-    prefix: 'cg-si-settings-ro-none-', preloadSrc: unwritableSettingsPreload('none'),
-  });
-  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.doesNotMatch(noticeOf(res), /could not update|runs twice/, `stdout was:\n${res.stdout}`);
-});
-
 // Decision D4: SessionStart no longer writes CLAUDE.md, so the adoption notices
 // ("Installed …", "Refreshed …", the unrecorded-registry note) are gone. What is
 // left is a block that has drifted from the shipped template: its guidance is
