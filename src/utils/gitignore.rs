@@ -74,7 +74,7 @@ fn exclude_path(project_root: &Path) -> Option<PathBuf> {
             .to_string();
         let git_dir = Some(project_root.join(target)).filter(|d| is_git_dir(d))?;
         match std::fs::read_to_string(git_dir.join("commondir")) {
-            Ok(common) => git_dir.join(common.trim()),
+            Ok(common) => Some(git_dir.join(common.trim())).filter(|d| is_git_dir(d))?,
             Err(_) => git_dir,
         }
     };
@@ -217,6 +217,7 @@ mod tests {
         let main_git = dir.path().join("main/.git");
         let wt_git = main_git.join("worktrees/feat");
         std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(main_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
         std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
         let wt = dir.path().join("feat");
@@ -272,6 +273,24 @@ mod tests {
             std::fs::read_to_string(real.join("info/exclude")).unwrap_or_default(),
             ".code-graph/\n"
         );
+    }
+
+    /// A worktree's `commondir` is followed only to a git dir as well: a
+    /// crafted `.git` dir with a `HEAD` could otherwise aim it anywhere
+    /// (second review round: `commondir` = `../../victim-rel`).
+    #[test]
+    fn a_commondir_to_a_non_git_dir_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        let fake = proj.join(".fakegit");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(fake.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(fake.join("commondir"), "../../victim\n").unwrap();
+        std::fs::write(proj.join(".git"), "gitdir: .fakegit\n").unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert!(!dir.path().join("victim").exists(), "created a dir outside");
     }
 
     /// The symlink arm of the same rule: a `.git` symlinked to a directory

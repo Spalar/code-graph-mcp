@@ -52,8 +52,10 @@ plugin as duplicates (each hook would fire twice) and removes them.
 - The `.code-graph/` ignore rule goes to the repository's local
   `.git/info/exclude`, never the tracked `.gitignore`, and only when neither
   file names it already. A worktree's rule goes to the common git dir. A
-  `.git` that is a `gitdir:` file or a symlink is followed only to a git dir
-  (one with a `HEAD`), so a project cannot aim the write outside itself.
+  `.git` that is a `gitdir:` file or a symlink, and a worktree's `commondir`,
+  are followed only to a git dir (one with a `HEAD`): a directory that is no
+  git dir gets nothing written into it. A `gitdir:` file can still name
+  another repository's git dir, as every linked worktree does.
 
 ### SessionStart says what matters, where you can see it
 
@@ -180,9 +182,12 @@ holding a function is method `Class.field`, and the calls inside either are
 scoped to it. `this.x = …`, `obj[k] = …` and `f().x = …` stay none, and so
 does a member of a parameter, of a function's local or of a host global
 (`global.fetch = …`, a test mock's `fake.end = () => {}`); a prototype chain
-names a node on any root. Before the pre-release review, test mocks were nodes
+names a node on any root. Before the pre-release review, such mocks were nodes
 and drew production calls by name (20 wrong `inferred` edges on this repo, all
-into test stubs).
+into test stubs). A library's API assigned onto a local of its IIFE, UMD or
+factory wrapper (`lunr.tokenizer`, `jQuery.extend` inside jQuery's factory) is
+no node either, as in 0.163.0; a mock bound at a test file's top level still
+is one.
 
 The new names would draw by-name edges the language rules out, so those are
 narrowed: a call or `require` through a package binding
@@ -260,8 +265,11 @@ not have.
   qualified names, as `refs` already did, instead of merging them
   (`callgraph pop --file src/flask/ctx.py` answered for `_AppCtxGlobals.pop`
   and `AppContext.pop` at once). Definitions that share a qualified name —
-  `#[cfg]` twins, C++ overloads, a property's getter and setter — are one
-  symbol to every caller and are still answered merged. A qualified name
+  `#[cfg]` twins, C++ overloads, a property's getter and setter, and also
+  same-named helpers nested in different functions — and a class beside its
+  own constructor (`Widget`, `Widget.Widget`) are answered merged, as 0.163.0
+  answered them: the `--json` graph holds every definition's edges, the text
+  tree only the first one's. A qualified name
   (`AppContext.pop`) answers, and so does `--node-id`: `impact` and
   `callgraph` take `--node-id N` like `show` and `refs` (the symbol is then
   optional and `--file` is ignored with a note), answering for exactly that
@@ -340,6 +348,11 @@ Found by the pre-release review and left for a later release:
   `grep -rln` lists one file fewer, and prints a line that is not valid UTF-8
   as empty; `impact X --node-id N` ignores `X`; a lookup of an absent name
   prints the symlinked-files warning.
+- **Same-file and node ids.** A `--node-id` whose same-identity twins swap
+  places answers for the other one; checking a stale `--file` and a stale
+  caller file refreshes twice (about 30% slower on that call). A `var`
+  declared inside a top-level block and a TypeScript namespace's exported
+  object are read as locals, so members assigned onto them are no nodes.
 - **The edit hook's definition pick**, as in 0.163.0: prose after code on the
   same line (`x = 1; // the function that …`), prose inside a multi-line
   docstring, and a gtest `TEST(…) {` ahead of the C function it tests can

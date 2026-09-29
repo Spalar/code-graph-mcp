@@ -213,7 +213,6 @@ impl CliNodeTarget {
         let (at, len) = self.ordinal;
         let found = match group.len() {
             0 => None,
-            1 => Some(group[0]),
             n if n == len => Some(group[at]),
             _ => {
                 // The definitions sharing this identity were added or removed:

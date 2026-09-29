@@ -12622,3 +12622,54 @@ fn same_file_refusal_json_carries_the_total() {
     assert_eq!(v["suggestions"].as_array().map(Vec::len), Some(5), "{out}");
     assert_eq!(v["total"].as_u64(), Some(7), "{out}");
 }
+
+// Second review round: a class and its own constructor have different
+// qualified names (`Widget`, `Widget.Widget`) but are one symbol to a caller;
+// 0.163.0 answered `callgraph Widget --file …`, and the gate refused it.
+#[test]
+fn a_class_and_its_constructor_answer_under_a_file_selector() {
+    let project = index_project(&[
+        (
+            "src/Widget.java",
+            "public class Widget {\n    public Widget() { init(); }\n    void init() {}\n}\n",
+        ),
+        (
+            "src/Use.java",
+            "public class Use {\n    Widget make() { return new Widget(); }\n}\n",
+        ),
+    ]);
+    let (out, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "Widget", "--file", "src/Widget.java", "--json"],
+    );
+    assert_eq!(code, 0, "stderr={stderr:?} stdout={out}");
+}
+
+// Second review round: when the definitions sharing a node's identity change
+// in number, no position is the one the caller meant — the deleted twin must
+// not be answered for by the one that is left.
+#[test]
+fn node_id_refuses_when_its_twin_group_changes_size() {
+    let project = index_project(&[("src/a.rs", CFG_TWINS), ("src/b.rs", CFG_CALLER)]);
+    let ids = node_ids_in_file(&project, "src/a.rs", "connect");
+    assert_eq!(ids.len(), 2, "fixture: {ids:?}");
+    let second = ids[1].to_string();
+    std::fs::write(
+        project.path().join("src/a.rs"),
+        CFG_TWINS.replace("#[cfg(windows)]\npub fn connect() { win_helper() }\n\n", ""),
+    )
+    .unwrap();
+    let (out, _e, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "--node-id",
+            &second,
+            "--direction",
+            "callees",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "the deleted twin must not be answered for: {out}");
+    assert!(!out.contains("unix_helper"), "{out}");
+}

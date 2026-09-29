@@ -217,7 +217,17 @@ pub fn detect_same_file_ambiguity(
         .into_iter()
         .filter(|n| n.name == name)
         .collect();
-    let identities: std::collections::HashSet<&str> = nodes
+    // Counted over the callable definitions when there are any: a class and
+    // its own constructor (`Widget`, `Widget.Widget` in Java, C#, Dart, C++)
+    // or a function and a same-named constant are one symbol to a caller, and
+    // 0.163.0 answered them (second review round).
+    let callable = |n: &&queries::NodeResult| matches!(n.node_type.as_str(), "function" | "method");
+    let pool: Vec<&queries::NodeResult> = if nodes.iter().any(|n| callable(&n)) {
+        nodes.iter().filter(callable).collect()
+    } else {
+        nodes.iter().collect()
+    };
+    let identities: std::collections::HashSet<&str> = pool
         .iter()
         .map(|n| n.qualified_name.as_deref().unwrap_or(&n.name))
         .collect();
