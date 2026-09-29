@@ -203,6 +203,7 @@ fn js_member_path(
 ) -> Option<(String, String, &'static str)> {
     let mut member = Some(*left).filter(|l| l.kind() == "member_expression")?;
     let mut segments = Vec::new();
+    let root_node;
     loop {
         let property = member.child_by_field_name("property")?;
         if property.kind() != "property_identifier" {
@@ -214,6 +215,7 @@ fn js_member_path(
             "member_expression" => member = object,
             "identifier" => {
                 segments.push(node_text(&object, source).to_string());
+                root_node = object;
                 break;
             }
             _ => return None,
@@ -224,6 +226,19 @@ fn js_member_path(
     let is_prototype = segments[..segments.len() - 1]
         .iter()
         .any(|s| s == "prototype");
+    // Only a function a module hands out: under `exports` / `module`, on a
+    // prototype, or on an object that is no parameter or local of an enclosing
+    // function and no host global. A test's mocks (`global.fetch = …`,
+    // `req.end = () => {}`) are nobody's API, and as nodes they drew
+    // production calls by name (pre-tag review 2026-09-29: 20 wrong
+    // `inferred` edges on this repo, all into test stubs).
+    let root = segments[0].as_str();
+    if !(matches!(root, "exports" | "module")
+        || is_prototype
+        || relations::js_member_root_is_api(root_node, root, source))
+    {
+        return None;
+    }
     let mut path: Vec<&str> = segments
         .iter()
         .enumerate()

@@ -10909,6 +10909,39 @@ fn member_call_reaches_a_member_assigned_function_across_files() {
     );
 }
 
+// Pre-tag review 2026-09-29: a test's mocks (`global.fetch = …`, a stub's
+// `fake.end = …` inside a test callback) are no nodes, so production calls of
+// the same names bind no test stub.
+#[test]
+fn production_calls_bind_no_test_mock() {
+    let files: &[(&str, &str)] = &[
+        (
+            "src/api.js",
+            "async function getUser(id) { return fetch('/u/' + id); }\n\
+             function close(stream) { stream.end(); stream.destroy(); }\n\
+             module.exports = { getUser, close };\n",
+        ),
+        (
+            "test/api.test.js",
+            "const { getUser, close } = require('../src/api');\n\
+             global.fetch = async () => ({ ok: true });\n\
+             it('closes', () => {\n\
+               const fake = {};\n\
+               fake.end = function () {};\n\
+               fake.destroy = () => {};\n\
+               close(fake);\n\
+             });\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let into_test: Vec<&String> = edges
+        .iter()
+        .filter(|e| e.starts_with("src/api.js.") && e.contains("--calls--> test/"))
+        .collect();
+    assert!(into_test.is_empty(), "{into_test:#?}");
+}
+
 // D7: `send(req)` through `var send = require('send')` calls the package. With
 // `res.send = function send() {}` now a node in the same file, the same-file
 // tier bound it there at `extracted` (express: sendFile/sendfile → res.send,

@@ -577,6 +577,49 @@ fn binding_in(
     name: &str,
     source: &str,
 ) -> Option<Option<(String, String)>> {
+    binding_in_memo(scope, from, name, source, true)
+}
+
+/// Runtime globals beyond [`JS_BUILTIN_GLOBALS`] that a file assigns onto
+/// only to stub or patch the host (`global.fetch = …` in a test).
+const JS_HOST_GLOBALS: &[&str] = &[
+    "Bun",
+    "Deno",
+    "document",
+    "global",
+    "location",
+    "navigator",
+    "self",
+    "window",
+];
+
+/// Whether a function assigned onto `name.…`, seen from `from`, is API a
+/// module hands out: `name` is bound at the file's top level, or bound nowhere
+/// in the file and not a host global (a global another script defines, as in
+/// `jQuery.fn.plugin = …`). A parameter or local of an enclosing function
+/// (a test's mock) and a host global (`global`, `console`) are not (pre-tag
+/// review 2026-09-29). For the node pass, which runs outside the per-file state
+/// `reset_import_bound` keeps, so it takes no memo: node ids repeat across
+/// trees and a memo from another file could answer for this one.
+pub(crate) fn js_member_root_is_api(from: tree_sitter::Node, name: &str, source: &str) -> bool {
+    let mut child = from;
+    while let Some(scope) = child.parent() {
+        if binding_in_memo(scope, child, name, source, false).is_some() {
+            return scope.kind() == "program";
+        }
+        child = scope;
+    }
+    !JS_BUILTIN_GLOBALS.contains(&name) && !JS_HOST_GLOBALS.contains(&name)
+}
+
+#[allow(clippy::option_option)]
+fn binding_in_memo(
+    scope: tree_sitter::Node,
+    from: tree_sitter::Node,
+    name: &str,
+    source: &str,
+    memo: bool,
+) -> Option<Option<(String, String)>> {
     let kind = scope.kind();
     if is_function_like(kind) {
         let params = scope
@@ -626,6 +669,9 @@ fn binding_in(
         None
     };
     let body = body?;
+    if !memo {
+        return hoisted_var(body, name, source, 0);
+    }
     let key = (body.id(), name.to_string());
     if let Some(memo) = HOISTED.with(|h| h.borrow().get(&key).cloned()) {
         return memo;

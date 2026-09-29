@@ -30,7 +30,7 @@ curl -sLo /var/tmp/scip-tools/scip-clang \
 chmod +x /var/tmp/scip-tools/scip-clang
 COMPDB=build/compile_commands.json scripts/scip_oracle/run.sh --repo DIR --language cpp
 
-# Another repo, indexed by code-graph first (writes DIR/.code-graph, DIR/.gitignore)
+# Another repo, indexed by code-graph first (writes DIR/.code-graph and a line in DIR/.git/info/exclude)
 scripts/scip_oracle/run.sh --repo DIR --language python
 
 # The pinned external corpora below: clone, index, score (~10 min, mostly embedding)

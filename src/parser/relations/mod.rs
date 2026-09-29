@@ -55,6 +55,7 @@ mod imports;
 mod inherits;
 mod java;
 mod member;
+pub(crate) use member::js_member_root_is_api;
 mod python;
 mod receiver;
 pub use receiver::{cpp_class_fields, CppField};

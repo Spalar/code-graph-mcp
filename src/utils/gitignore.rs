@@ -52,11 +52,19 @@ fn names_code_graph_dir(content: &str) -> bool {
 /// a worktree's `commondir` taken into account — git reads `info/exclude` from
 /// the common dir, not from `.git/worktrees/<name>`. `None` when `project_root`
 /// has no `.git`.
+///
+/// A `.git` that is not a plain directory — a `gitdir:` file or a symlink —
+/// can point anywhere, so it is followed only to a git dir (one with a
+/// `HEAD`): an unpacked project must not aim the write outside itself (pre-tag
+/// review 2026-09-29).
 fn exclude_path(project_root: &Path) -> Option<PathBuf> {
     let dot_git = project_root.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    let is_git_dir = |d: &Path| d.join("HEAD").is_file();
     let git_dir = if meta.is_dir() {
         dot_git
+    } else if meta.file_type().is_symlink() {
+        Some(dot_git).filter(|d| d.is_dir() && is_git_dir(d))?
     } else {
         let raw = std::fs::read_to_string(&dot_git).ok()?;
         let target = raw
@@ -64,7 +72,7 @@ fn exclude_path(project_root: &Path) -> Option<PathBuf> {
             .find_map(|l| l.strip_prefix("gitdir:"))?
             .trim()
             .to_string();
-        let git_dir = project_root.join(target);
+        let git_dir = Some(project_root.join(target)).filter(|d| is_git_dir(d))?;
         match std::fs::read_to_string(git_dir.join("commondir")) {
             Ok(common) => git_dir.join(common.trim()),
             Err(_) => git_dir,
@@ -209,6 +217,7 @@ mod tests {
         let main_git = dir.path().join("main/.git");
         let wt_git = main_git.join("worktrees/feat");
         std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
         std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
         let wt = dir.path().join("feat");
         std::fs::create_dir_all(&wt).unwrap();
@@ -222,6 +231,64 @@ mod tests {
         );
         assert!(!wt_git.join("info").exists(), "not the per-worktree dir");
         assert!(!wt.join(".gitignore").exists());
+    }
+
+    /// A `.git` FILE can point anywhere; only a git dir (one with a `HEAD`)
+    /// gets the rule, so an unpacked project cannot aim the write outside
+    /// itself (pre-tag review 2026-09-29: `gitdir: ../victim2` created
+    /// `victim2/info/exclude`).
+    #[test]
+    fn a_gitdir_pointer_to_a_non_git_dir_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".git"), "gitdir: ../victim\n").unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert!(!victim.join("info").exists(), "wrote outside the project");
+        assert!(!proj.join(".gitignore").exists());
+    }
+
+    /// A `.git` symlinked to a git dir gets the rule in that dir, as git reads
+    /// it; 0.163.0's `.gitignore` covered this layout and the switch to
+    /// `info/exclude` had dropped it (pre-tag review 2026-09-29).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_dir_gets_the_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real.git");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&real, proj.join(".git")).unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert_eq!(
+            std::fs::read_to_string(real.join("info/exclude")).unwrap_or_default(),
+            ".code-graph/\n"
+        );
+    }
+
+    /// The symlink arm of the same rule: a `.git` symlinked to a directory
+    /// that is no git dir gets nothing written into it.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_symlink_to_a_non_git_dir_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&victim, proj.join(".git")).unwrap();
+
+        ensure_code_graph_dir_ignored_unless(&proj, false);
+
+        assert!(!victim.join("info").exists(), "wrote outside the project");
     }
 
     /// A repo can ship a symlink where the exclude file goes. The append must

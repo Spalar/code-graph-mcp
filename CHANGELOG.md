@@ -18,7 +18,7 @@ every hook but SessionStart came from those entries. SessionStart no longer writ
 or `.claude/`, and a project it adopted before keeps its block (you get a
 notice with a refresh and a remove command when that block is out of date).
 **Every index rebuilds once, automatically, on first use:** `INDEX_VERSION`
-goes 103 → 112 because JavaScript/TypeScript and Python files now produce
+goes 103 → 113 because JavaScript/TypeScript and Python files now produce
 different nodes and edges (see below). **Two answers change by default:**
 `impact` reports `Risk: UNKNOWN` instead of `LOW` for a function with no caller
 in the graph and for a type whose callers alone would rate it `LOW`; and a
@@ -27,7 +27,7 @@ own file's method is labelled by its name's count, so `callgraph` and `impact`
 hide some of those edges by default, say how many, and show them with
 `--min-confidence ambiguous`. To pin back: `npm i -g @sdsrs/code-graph@0.163.0`,
 or `cargo install code-graph-mcp --version 0.163.0`; plugin users can set the
-version in the marketplace entry. An older binary leaves a v112 index intact
+version in the marketplace entry. An older binary leaves a v113 index intact
 and warns instead of rebuilding it; delete `.code-graph/index.db*` after
 pinning back to get its graph back.
 
@@ -50,7 +50,9 @@ plugin as duplicates (each hook would fire twice) and removes them.
   now only silence the out-of-date-block notice (see README).
 - The `.code-graph/` ignore rule goes to the repository's local
   `.git/info/exclude`, never the tracked `.gitignore`, and only when neither
-  file names it already. A worktree's rule goes to the common git dir.
+  file names it already. A worktree's rule goes to the common git dir. A
+  `.git` that is a `gitdir:` file or a symlink is followed only to a git dir
+  (one with a `HEAD`), so a project cannot aim the write outside itself.
 
 ### SessionStart says what matters, where you can see it
 
@@ -173,7 +175,12 @@ credited to `<module>`. Now a function literal assigned to a plain member path
 is a node named by the property (`res.send`, `exports.f`; `View.lookup` as a
 method; one node per member of `res.set = res.header = …`), a class field
 holding a function is method `Class.field`, and the calls inside either are
-scoped to it. `this.x = …`, `obj[k] = …` and `f().x = …` stay none.
+scoped to it. `this.x = …`, `obj[k] = …` and `f().x = …` stay none, and so
+does a member of a parameter, of a function's local or of a host global
+(`global.fetch = …`, a test mock's `fake.end = () => {}`); a prototype chain
+names a node on any root. Before the pre-release review, test mocks were nodes
+and drew production calls by name (20 wrong `inferred` edges on this repo, all
+into test stubs).
 
 The new names would draw by-name edges the language rules out, so those are
 narrowed: a call or `require` through a package binding
@@ -193,8 +200,10 @@ Measured with the SCIP oracle on hono: 1,145 gold call pairs instead of 896
 (the new definitions map), 921 correct edges at the default floor instead of
 805, inferred precision 97.1% instead of 94.3%, and no correct edge lost;
 extracted-tier wrong edges go 4 → 8, four of them an existing rule meeting the
-new `Context.set`. On express every judged edge stays correct. Calls through a re-export (`express()`
-reaching `createApplication`) still resolve by name.
+new `Context.set`. On express the oracle judges 50 of 995 call edges —
+scip-typescript does not map `res.send = function send() {}` to a function, so
+388 edges fall outside it — and those 50 stay correct. Calls through a
+re-export (`express()` reaching `createApplication`) still resolve by name.
 
 A member call on one of Node's own modules (`path.resolve(p)`,
 `fs.promises.readFile(p)`, `require('path').join(p)`) binds no project
@@ -295,7 +304,7 @@ not have.
 
 ### Index versions
 
-`INDEX_VERSION` goes 103 → 112. Each step, as recorded on the constant:
+`INDEX_VERSION` goes 103 → 113. Each step, as recorded on the constant:
 
 - v104 (2026-09-29, D7): a JS/TS function literal assigned to a named member (`res.send = function send() {}`, `View.prototype.lookup = …` as method `View.lookup`, `exports.f` / `module.exports.f` as `exports.f`) and a class field holding a function (`json = () => {}` as method `Class.json`) are nodes, and the calls inside them are scoped to them instead of `<module>` or the class body; a chained `res.set = res.header = function () {}` is a node per member; a `this.x = …` assignment is none; a bare call or `require` import through a package binding (`var send = require('send')`, or a member of one: `var resolve = path.resolve`) binds no node of its own file, and such an import no project node at all (`q:"pkg"`); a member call on an unshadowed built-in global (`Object.create`, `JSON.parse`), and a bare call through one of Node's own modules (`path.resolve`), is no call edge.
 - v105 (2026-09-29, D7/C3): a bare `require('.')` / `require('..')` resolves like `./` / `../`, a directory specifier that reaches the repo root finds its `index.js`, and `module.exports = require('./x')` (`exports = module.exports = …` too) binds its module to `./x` as a namespace require does, so express's tests reach `lib/` through `index.js` in deps/affected.
@@ -306,6 +315,7 @@ not have.
 - v110 (2026-09-29, D6): a `routes_to` edge whose handler the name pool found outside the route's file records that route file as `"rf"` in its metadata: the edge is the handler's self-edge, so it sat entirely in the handler's file and re-indexing that file dropped it (hono's `app.use(mw1, mw2)` in `types.test.ts` → `hono.test.ts`'s `mw2`), while a route file that stopped routing to it left it behind; an incremental run now requeues or deletes these by their route file.
 - v111 (2026-09-29, D10B): a Python call on an attribute of `self` (`self.serializer.tag()`) or on a name a relative import binds (`_cv_app.get()`) carries `{"ur":…}`, and a same-file bind of one is labelled by its name count like a cross-file guess instead of `extracted`: on flask those were 12 of the 22 wrong `extracted` edges, and 4 right ones. Resolution is unchanged.
 - v112 (2026-09-29, B9): a JS/TS member call whose receiver is one of Node's own modules (`path.resolve(p)`, `fs.promises.readFile(p)`, `require('path').join(p)`) emits no call: it bound a project function or method of that name elsewhere (express: `path.resolve` → `View.prototype.resolve`; this repo: `fs.renameSync` → a test's mock, `assert.ok` → a local `const ok`): it removes 9 edges over three corpora, all 9 wrong (8 cross-file, 1 same-file).
+- v113 (2026-09-29, pre-tag review): a JS/TS function assigned to a member is no node when the member's root is a parameter or local of an enclosing function or a host global (`global.fetch = …`, a test mock's `fake.end = () => {}`), as `this.x = …` already was; `exports` / `module`, a prototype chain, a top-level binding and a global another script defines (`jQuery.fn.x`) still name one. As nodes they drew production calls by name: 20 wrong `inferred` edges on this repo, all into test stubs.
 
 ### Evals
 

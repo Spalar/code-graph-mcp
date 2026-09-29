@@ -4700,6 +4700,51 @@ app.get('/users', function handler(req, res) { res.send(1); });
         assert_eq!(n.doc_comment.as_deref(), Some("// Send a body."));
     }
 
+    // A member-assigned function is a node only when a module can hand it out:
+    // not on a parameter, a function's local or a host global. A test's mocks
+    // became nodes and drew production calls by name (pre-tag review
+    // 2026-09-29). A global another script defines (`jQuery`) still counts.
+    #[test]
+    fn member_assigned_function_needs_an_api_root() {
+        let js = r#"
+jQuery.fn.plugin = function () {};
+global.fetch = async () => 1;
+console.log = function () {};
+var res = {};
+res.send = function send() {};
+exports.helper = function () {};
+module.exports.other = function () {};
+Widget.prototype.draw = function () {};
+function setup(req) {
+  req.end = () => {};
+  const fake = {};
+  fake.destroy = function () {};
+  res.status = function () {};
+}
+(function () {
+  function View() {}
+  View.prototype.paint = function () {};
+})();
+it('x', () => { const s = {}; s.close = () => {}; });
+"#;
+        let names: Vec<String> = parse_code(js, "javascript")
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        for kept in [
+            "send", "helper", "other", "draw", "status", "plugin", "paint",
+        ] {
+            assert!(names.iter().any(|n| n == kept), "{kept} missing: {names:?}");
+        }
+        for gone in ["fetch", "log", "end", "destroy", "close"] {
+            assert!(
+                !names.iter().any(|n| n == gone),
+                "{gone} is a node: {names:?}"
+            );
+        }
+    }
+
     #[test]
     fn class_field_holding_a_function_is_a_method_node() {
         let ts = r#"
