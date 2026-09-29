@@ -552,7 +552,6 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |
 | `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
-| `CODE_GRAPH_NO_RECENT_IMPACT=1` | Skip the recent-impact section of the SessionStart briefing. |
 | `CODE_GRAPH_HOOK_INDEX=on\|off` | Force the incremental-index hook on or off instead of letting it decide. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |

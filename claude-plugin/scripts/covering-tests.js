@@ -56,8 +56,7 @@ function formatCoveringTests(testCallers, editedFile) {
   }
 
   // High fan-out: editing a widely-tested symbol. A long targeted command is noise
-  // — point at the suite instead (mirrors the blast-size scaling in
-  // session-init.js formatRecentImpact).
+  // — point at the suite instead.
   let out = `  Covering tests: ${n} — editing a widely-tested symbol\n`;
   const suite = suiteCommand(runner);
   if (suite) out += `  → Run the suite after editing: ${suite}\n`;
