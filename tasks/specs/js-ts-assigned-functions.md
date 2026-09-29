@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented (C1-C3: 414b0b6, 220fd8f; call-level re-export binding not done)
 revision: 1
 ---
 
