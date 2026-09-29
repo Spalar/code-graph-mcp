@@ -332,6 +332,29 @@ test('an unwritable plugin manifest is reported, not swallowed', (t) => {
     'the message must name the consequence, not just the error code');
 });
 
+// Hooks moved from settings.json into the plugin's hooks.json (D2). When
+// settings.json cannot be written, the entries an earlier version put there
+// stay, and each hook fires twice beside the plugin's own copy; the only
+// message was lifecycle's stderr, which nobody sees (pre-tag review 2026-09-29).
+test('an unwritable settings.json is reported with its double-firing consequence', (t) => {
+  const lifecycle = JSON.stringify(path.join(__dirname, 'lifecycle.js'));
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-settings-ro-',
+    preloadSrc: `
+      const lc = require(${lifecycle});
+      for (const fn of ['install', 'update']) {
+        const real = lc[fn];
+        lc[fn] = (...a) => ({ ...(real(...a) || {}), settingsUnwritable: true, error: 'EACCES' });
+      }
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  const n = noticeOf(res);
+  assert.match(n, /could not update \S*settings\.json \(EACCES\)/, `stdout was:\n${res.stdout}`);
+  assert.match(n, /runs twice/, 'the message must name the consequence');
+  assert.match(n, /code-graph-mcp doctor/);
+});
+
 // Decision D4: SessionStart no longer writes CLAUDE.md, so the adoption notices
 // ("Installed …", "Refreshed …", the unrecorded-registry note) are gone. What is
 // left is a block that has drifted from the shipped template: its guidance is

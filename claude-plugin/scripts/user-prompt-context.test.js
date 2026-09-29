@@ -1119,6 +1119,10 @@ test('shouldSkip: harness-injected prompts are not the user asking', () => {
   assert.equal(shouldSkip('<teammate-message teammate_id="query-quality">{"type":"idle"}</teammate-message>'), 'harness');
   assert.equal(shouldSkip('Another Claude session sent a message:\n<teammate-message>x</teammate-message>'), 'harness');
   assert.equal(shouldSkip('<system-reminder>ctx</system-reminder>'), 'harness');
+  // Claude Code 2.1.284 parses these two wrappers as well; 105 of 913 prompts
+  // claude-mem-lite logged by 2026-09-28 began with `<agent-message from=`.
+  assert.equal(shouldSkip('<agent-message from="rev-plugin">What is the impact of changing url_for?</agent-message>'), 'harness');
+  assert.equal(shouldSkip('<cross-session-message from="s2">What is the impact of changing url_for?</cross-session-message>'), 'harness');
   assert.equal(shouldSkip('fix the <div> nesting in render_page'), false, 'a user prompt that merely contains a tag');
 });
 

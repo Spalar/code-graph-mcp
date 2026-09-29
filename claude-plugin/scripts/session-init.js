@@ -171,6 +171,17 @@ function reportRebuild(r) {
       '`code-graph-mcp doctor`.'
     );
   }
+  // The hooks live in the plugin's hooks.json now (D2), so the write that
+  // failed here is the one that removes the copies an earlier version put in
+  // settings.json. Left there, each of them fires beside the plugin's own.
+  if (r && r.settingsUnwritable) {
+    notices.push(
+      `[code-graph] could not update ${settingsPath()} (${r.error || 'unwritable'}). ` +
+      'While it still lists code-graph hooks from an earlier version, each of them ' +
+      'runs twice (there and in the plugin). Make the file writable, then run ' +
+      '`code-graph-mcp doctor`.'
+    );
+  }
   return r;
 }
 function installReporting(...args) { return reportRebuild(install(...args)); }

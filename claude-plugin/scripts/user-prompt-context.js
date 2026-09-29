@@ -119,9 +119,9 @@ const STOP_WORDS = new Set([
 const PLAIN_WORD_EXCLUDE = /^(possible|together|actually|something|different|important|following|available|necessary|currently|implement|operation|otherwise|beginning|knowledge|attention|according|certainly|sometimes|direction|recommend|structure|describe|question|complete|generate|anything|continue|consider|response|approach|happened|recently|probably|expected|previous|original|specific|directly|received|required|supposed|separate|designed|finished|provided|included|prepared|combined|properly|remember|whatever|although|document|handling|existing|everyone|standard|research|personal|relative|absolute|practice|language|thousand|national|evidence|refactor|understand|validate|analysis|debugging|configure|improving|resolving|creating|building|checking|updating|removing|changing|searching|cleaning|optimize|migration|overview|introduce|reviewing|thinking|managing|starting|yourself|features|problems|breaking|requires|argument|settings|includes|examples|comments|patterns|tutorial|concepts|supports|priority|organize|scenario|tracking|internal|external|abstract|concrete|strategy|evaluate|diagnose|platform|variable|optional|multiple)$/;
 
 // Text the harness submits on the user's behalf: background-task
-// notifications, teammate messages, reminders. 42 of 175 real injections (24%)
-// fired on these, answering a question nobody asked.
-const HARNESS_PROMPT = /^(?:<(?:task-notification|teammate-message|system-reminder|local-command-(?:stdout|stderr|caveat)|command-(?:name|message|args)|bash-(?:input|stdout|stderr))\b|Another Claude session sent a message:)/;
+// notifications, teammate / agent / cross-session messages, reminders. 42 of
+// 175 real injections (24%) fired on these, answering a question nobody asked.
+const HARNESS_PROMPT = /^(?:<(?:task-notification|teammate-message|agent-message|cross-session-message|system-reminder|local-command-(?:stdout|stderr|caveat)|command-(?:name|message|args)|bash-(?:input|stdout|stderr))\b|Another Claude session sent a message:)/;
 
 function shouldSkip(msg) {
   const trimmed = msg.trim();

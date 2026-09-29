@@ -348,7 +348,7 @@ function tryWriteSettings(settings) {
   } catch (err) {
     console.error(
       `[code-graph] cannot write ${settingsPath()} (${err.code || err.name}: ${err.message}). ` +
-      `Nothing was changed. The plugin stays inactive until the file is writable.`
+      `Nothing was changed; run \`code-graph-mcp doctor\` once the file is writable.`
     );
     return err;
   }
