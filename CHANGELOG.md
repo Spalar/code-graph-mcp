@@ -10,15 +10,26 @@ at all (0 calls in 15 runs) while its first-session side effects made Claude
 stop and explain unexpected `.gitignore` / `CLAUDE.md` changes in 12 of 15
 runs; and most of what the hooks injected had no measurable effect.
 
-**Upgrading.** Nothing to run. Your first session removes the seven hook
-entries earlier versions wrote into `~/.claude/settings.json`: the plugin's
-`hooks/hooks.json` now carries them. SessionStart no longer writes `CLAUDE.md`
+**Upgrading.** Nothing to run. The update (or your first session on this
+version, whichever runs first) removes the eight hook entries earlier versions
+wrote into `~/.claude/settings.json`: the plugin's `hooks/hooks.json` now
+carries them. Restart Claude Code sessions still open on an older version;
+every hook but SessionStart came from those entries. SessionStart no longer writes `CLAUDE.md`
 or `.claude/`, and a project it adopted before keeps its block (you get a
 notice with a refresh and a remove command when that block is out of date).
 **Every index rebuilds once, automatically, on first use:** `INDEX_VERSION`
 goes 103 → 112 because JavaScript/TypeScript and Python files now produce
-different nodes and edges (see below). An older binary leaves a v112 index
-intact and warns instead of rebuilding it.
+different nodes and edges (see below). **Two answers change by default:**
+`impact` reports `Risk: UNKNOWN` instead of `LOW` for a function with no caller
+in the graph and for a type whose callers alone would rate it `LOW`; and a
+Python call on `self.x.f()` or on a relatively imported object that bound its
+own file's method is labelled by its name's count, so `callgraph` and `impact`
+hide some of those edges by default, say how many, and show them with
+`--min-confidence ambiguous`. To pin back: `npm i -g @sdsrs/code-graph@0.163.0`,
+or `cargo install code-graph-mcp --version 0.163.0`; plugin users can set the
+version in the marketplace entry. An older binary leaves a v112 index intact
+and warns instead of rebuilding it; delete `.code-graph/index.db*` after
+pinning back to get its graph back.
 
 ### Hooks live in the plugin's hooks.json
 
@@ -60,7 +71,8 @@ impacted.
   `run_startup_tasks`) and said so only on stderr; up to 27 of 98 injections
   were about another symbol.
 - **Before an edit**, the impact summary appears only when the edit changes a
-  definition's header, names the earliest definition in the hunk, skips files
+  definition's header, names the earliest definition in the hunk (a word in a
+  comment or a control statement is none), skips files
   outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Replayed over 802
   real injections, 67 remain; the rest were body-only edits, unchanged
   headers or outside files, and the removed body-edit guess picked a wrong
@@ -68,7 +80,8 @@ impacted.
 - **Reading files**: the directory overview fires on the fifth distinct file,
   once per directory, and only when an overview came back — no more advice to
   run `overview tests/`, which answers "No symbols found".
-- **Prompts**: task notifications and teammate messages no longer trigger the
+- **Prompts**: task notifications and teammate, agent and cross-session
+  messages no longer trigger the
   prompt hook (24% of its injections); a named file is overviewed itself, not
   its whole parent directory (one was 18,497 chars); `impact` gets `--file`
   when the prompt names one; cooldowns are per symbol; output is capped at
@@ -108,8 +121,8 @@ impacted.
 The end-of-turn signature check compared only edits made with the Edit tool.
 A Write over an existing file now records a baseline for each definition whose
 header its content changes, and an in-place `sed -i` / `perl -pi` (read from
-the Bash command: quoted options, redirects, globs and a leading `cd` are
-handled; shapes in `tasks/specs/edit-log-coverage.md`) records one for every
+the Bash command: quoted options, redirects and a leading `cd` are handled, a
+glob operand is not recorded; shapes in `tasks/specs/edit-log-coverage.md`) records one for every
 definition of each file it edits. Nothing is injected for either. In the
 coding evaluation, 3 of 3 runs of one case made their fix with `sed -i`. The
 edit hook's matcher is `Edit|Write`; NotebookEdit stays unmatched (a notebook

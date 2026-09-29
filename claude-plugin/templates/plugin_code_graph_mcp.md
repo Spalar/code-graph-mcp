@@ -42,8 +42,8 @@ Claude Code.
 - A JS function held only by a variable (`const f = function () {}`) or a computed
   member (`obj[k] = …`) is not a node. A call on a receiver with no written type
   (hono's `c.json()`) binds by name and is often `ambiguous`, hidden by default.
-- `affected` follows resolved imports; with unresolved ones (`require('..')`) its test
-  list is a lower bound.
+- `affected` follows resolved imports; with unresolved ones (a tsconfig path alias, a
+  computed `require(name)`) its test list is a lower bound.
 - `dead-code` is dependable for Rust. Elsewhere read it as candidates: interface
   methods, re-exports and framework entry points show up in it.
 
