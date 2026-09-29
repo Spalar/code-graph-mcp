@@ -36,7 +36,7 @@ const { recordRecommendation } = require('./recommendation-log');
 // `sanitizeSearchPath` is deliberately NOT imported any more: this hook passes
 // the RAW path so buildGrepArgs can split a glob into scope + `-g` instead of
 // widening it away. Leaving the require behind would read as "still used".
-const { runGrepAnswer, runShowAnswer, runCallgraphAnswer } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, shellQuoteArg, formatCgCommand } = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
 const {
   splitTopLevelSegments,
@@ -208,6 +208,38 @@ const INJECT_HEADER = '[code-graph] AST-aware view of your grep (ran alongside):
 // with the model's own hits; the caller tree is what moves behavior).
 const CALLGRAPH_HEADER =
   '[code-graph] Cross-file call graph for the symbol you grepped (grep can\'t show this):';
+
+// B11 (2026-09-29 usage evaluation) — a call graph about a symbol defined
+// outside the path the grep searched. The grep's own scope says where the model
+// is looking; a same-named symbol's 4 KB call tree from elsewhere is not about
+// that place (a grep in tests/cli_e2e.rs got `indexed_project`'s tree from
+// src/indexer/resync.rs). Its location was the useful part, so that is what it
+// gets: one pointer line.
+
+/** The file on a `callgraph` answer's root line (`name (path)`), or null. */
+function definitionFile(text) {
+  const m = /^\S+ \(([^()\n]+)\)/.exec(String(text || ''));
+  return m ? m[1] : null;
+}
+
+/**
+ * Whether a grep over root-relative `searchPath` reads `file`. No path, `.`,
+ * or an unknown file count as covered (the full answer, as before); a glob
+ * counts as its directory.
+ */
+function searchCovers(searchPath, file) {
+  if (!file) return true;
+  let p = String(searchPath || '').replace(/^\.\//, '').replace(/\/+$/, '');
+  const glob = p.search(/[*?[]/);
+  if (glob !== -1) p = p.slice(0, glob).replace(/\/?[^/]*$/, '');
+  if (p === '' || p === '.') return true;
+  return file === p || file.startsWith(p + '/');
+}
+
+function buildPointerText(symbol, file, searchPath) {
+  return `[code-graph] ${symbol} is defined in ${shellQuoteArg(file)}, outside the path your grep ` +
+    `searched (${shellQuoteArg(searchPath)}). Its callers and callees: ${formatCgCommand(['callgraph', symbol])}`;
+}
 
 function buildInjectText(answer, mode) {
   if (mode === 'callgraph') {
@@ -400,11 +432,13 @@ function runMain() {
   // Not while the startup index is being written: its call edges are a subset
   // shown as the whole graph (D5). The grep echo below reads the files.
   const callgraphSymbols = indexBuildInProgress(root) ? [] : extractCallgraphSymbols(rawPattern);
+  let answeredSymbol = null;
   for (const symbol of callgraphSymbols) {
     const cg = runCallgraphAnswer({ cwd: root, symbol });
     if (cg.status === 'hits') {
       answer = cg;
       answeredMode = 'callgraph';
+      answeredSymbol = symbol;
       break;
     }
   }
@@ -475,12 +509,20 @@ function runMain() {
     binaryCacheOk: !grepListsBinaryMatches(segment),
   })) return;
 
+  // B11: `scope:'outside'` marks a pointer in place of the tree; `mode` stays
+  // `callgraph`, the one the funnel aggregator buckets.
+  const rootFile = answeredMode === 'callgraph' ? definitionFile(answer.text) : null;
+  const outside = answeredMode === 'callgraph' && !searchCovers(searchPath, rootFile);
   recordRecommendation(root, {
     hook: 'grep', action: 'inject', answered: true,
     ...(pattern ? { pattern } : {}),
     mode: answeredMode,
+    ...(outside ? { scope: 'outside' } : {}),
   });
-  process.stdout.write(emitPostToolContext(buildInjectText(answer, answeredMode)) + '\n');
+  const text = outside
+    ? buildPointerText(answeredSymbol, rootFile, searchPath)
+    : buildInjectText(answer, answeredMode);
+  process.stdout.write(emitPostToolContext(text) + '\n');
 }
 
 if (require.main === module) {
@@ -493,6 +535,9 @@ module.exports = {
   extractGrepOutput,
   grepFoundPattern,
   buildInjectText,
+  definitionFile,
+  searchCovers,
+  buildPointerText,
   isSilenced,
   isInjectDisabled,
   commandHash,

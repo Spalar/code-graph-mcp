@@ -1435,3 +1435,81 @@ test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and 
     for (const [fixture, cmd] of cmds) cleanupFixture(fixture, cmd);
   }
 });
+
+// ── B11 (2026-09-29 usage evaluation): a symbol defined outside the grep's path ──
+// A grep scoped to one file found nothing, and the hook injected 4 KB of the
+// call tree of a same-named symbol defined elsewhere (`indexed_project` in
+// src/indexer/resync.rs for a grep in tests/cli_e2e.rs). Only its location
+// was useful: that is now all it gets, as one pointer line.
+{
+  const { definitionFile, searchCovers, buildPointerText } = require('./post-grep-inject');
+
+  test('definitionFile: the file on the callgraph root line, or null', () => {
+    assert.equal(definitionFile('indexed_project (src/indexer/resync.rs)\n  ← called by: x (a.rs)'), 'src/indexer/resync.rs');
+    assert.equal(definitionFile('indexed_project\n  ← called by: x (a.rs)'), null, 'no file on the root line');
+    assert.equal(definitionFile(''), null);
+    assert.equal(definitionFile(undefined), null);
+  });
+
+  test('searchCovers: a path covers itself and what is under it; a glob counts as its directory', () => {
+    const cases = [
+      [null, 'src/a.rs', true], ['', 'src/a.rs', true], ['.', 'src/a.rs', true], ['./', 'src/a.rs', true],
+      ['src', 'src/a.rs', true], ['src/', 'src/deep/a.rs', true], ['./src', 'src/a.rs', true],
+      ['src/a.rs', 'src/a.rs', true], ['tests/cli_e2e.rs', 'src/indexer/resync.rs', false],
+      ['tests', 'src/a.rs', false], ['src/a', 'src/ab.rs', false],
+      ['tests/*.rs', 'tests/x.rs', true], ['tests/*.rs', 'src/x.rs', false], ['*.py', 'src/x.py', true],
+      ['src/**/x.rs', 'src/deep/x.rs', true],
+      ['tests', null, true],
+    ];
+    for (const [p, f, want] of cases) assert.equal(searchCovers(p, f), want, `${p} covers ${f}`);
+  });
+
+  test('buildPointerText: location and the command, repo tokens shell-quoted', () => {
+    const t = buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs');
+    assert.match(t, /indexed_project is defined in src\/indexer\/resync\.rs, outside the path your grep searched \(tests\/cli_e2e\.rs\)/);
+    assert.match(t, /code-graph-mcp callgraph indexed_project/);
+    assert.ok(t.split('\n').length <= 2, t);
+    assert.match(buildPointerText('f', "src/a b'.rs", 'x'), /'src\/a b'\\''\.rs'/);
+  });
+
+  const STUB_ROOTED = (file) =>
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + ' (${file})\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    `process.exit(1);`;
+
+  test('e2e B11: a symbol defined outside the grep path gets a pointer, not its call graph', () => {
+    const uniq = `Outside${Date.now()}`;
+    const fixture = e2eFixture(STUB_ROOTED('src/indexer/resync.rs'));
+    const cmd = `echo "x" && grep "${uniq}" tests/cli_e2e.rs`;
+    try {
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.match(ctx, new RegExp(`${uniq} is defined in src/indexer/resync\\.rs, outside the path your grep searched`));
+      assert.doesNotMatch(ctx, /called by/);
+      const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+      const rec = JSON.parse(recs.trim().split('\n').pop());
+      assert.equal(rec.mode, 'callgraph');
+      assert.equal(rec.scope, 'outside');
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+
+  test('e2e B11: a symbol defined inside the grep path keeps its call graph', () => {
+    const uniq = `Inside${Date.now()}`;
+    const fixture = e2eFixture(STUB_ROOTED('src/lib.rs'));
+    const cmd = `echo "x" && grep "${uniq}" src/`;
+    try {
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.match(ctx, /Cross-file call graph/);
+      assert.match(ctx, /called by: someCaller/);
+      const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+      assert.equal(JSON.parse(recs.trim().split('\n').pop()).scope, undefined);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+}
