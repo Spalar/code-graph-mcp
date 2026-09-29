@@ -1494,7 +1494,48 @@ function rgIgnoreAbove(dir) {
 function isSymlink(p, { missing = true } = {}) {
   try { return fs.lstatSync(p).isSymbolicLink(); } catch { return missing; }
 }
-function searchesSameFiles({ root, target, verb, show = false } = {}) {
+// F1b — `grep -r` reads git-ignored files and the rewrite does not, so an
+// ignored entry under the path declines. The one nearly every Python tree has
+// once its tests ran is a `__pycache__/` of `.pyc` files (the coding-eval
+// fixtures carry 286), and a binary file yields no matched line: grep notes
+// "binary file matches" instead (stderr in GNU grep 3.5+, stdout in BSD grep
+// and ugrep), a notice, not a hit. So a bytecode cache may differ between the
+// two — for a grep that does not list files (see grepListsBinaryMatches).
+const BYTECODE_FILE = /\.py[co]$/;
+function isBytecodeCache(root, rel) {
+  const r = rel.replace(/\/+$/, '');
+  if (BYTECODE_FILE.test(r)) return true;
+  if (path.posix.basename(r) !== '__pycache__') return false;
+  let entries;
+  try { entries = fs.readdirSync(path.join(root, r), { withFileTypes: true }); } catch { return false; }
+  return entries.length <= WALK_LIMIT && entries.every((e) => e.isFile() && BYTECODE_FILE.test(e.name));
+}
+
+/// True when the grep would PRINT a matching binary file: it lists files
+/// (`-l`, `--files-with-matches`) and does not skip binaries (`-I`). The
+/// rewrite grammar admits no other output mode that prints one for grep
+/// (`-c`, `-L`, `-a`, `-o` are refused). Only the grep's own clause counts.
+function grepListsBinaryMatches(cmd) {
+  const words = clauseWords(firstShellClause(cmd || '').replace(VERB_STRIP, ''));
+  if (!words) return true;
+  let lists = false;
+  let skipsBinary = false;
+  // Quoted words count too: the shell strips the quotes and grep still reads
+  // `"-l"` as an option. A quoted PATTERN that merely contains ` -l ` has a
+  // space in it and never matches the one-cluster shape below.
+  for (const w of words) {
+    const t = w.text;
+    if (t === '--files-with-matches') lists = true;
+    else if (t === '--binary-files=without-match') skipsBinary = true;
+    else if (/^-[A-Za-z0-9]+$/.test(t)) {
+      if (t.includes('l')) lists = true;
+      if (t.includes('I')) skipsBinary = true;
+    }
+  }
+  return lists && !skipsBinary;
+}
+
+function searchesSameFiles({ root, target, verb, show = false, binaryCacheOk = false } = {}) {
   if (!root || !['grep', 'git', 'rg', 'ag'].includes(verb)) return false;
   const rel = target === undefined ? '' : String(target).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
   if (rel.split('/').includes('..') || path.isAbsolute(rel)) return false;
@@ -1538,7 +1579,8 @@ function searchesSameFiles({ root, target, verb, show = false } = {}) {
     const anyHidden = (l) => l.some((f) => HIDDEN_SEGMENT.test(f));
     let reads;
     if (verb === 'grep') {
-      if (anyHidden(others) || ignoredOthers.length || ignoredTracked.length) return false;
+      const ignored = binaryCacheOk ? ignoredOthers.filter((f) => !isBytecodeCache(root, f)) : ignoredOthers;
+      if (anyHidden(others) || ignored.length || ignoredTracked.length) return false;
       reads = [...tracked, ...others];
     } else if (verb === 'git') {
       if (others.length) return false;
@@ -2277,6 +2319,7 @@ function runMain() {
     // D#133, H-2).
     if (plan && !searchesSameFiles({
       root, target: extractSearchPath(cmd), verb: plan.verb, show: answeredMode === 'show',
+      binaryCacheOk: !grepListsBinaryMatches(cmd),
     })) return;
 
     const answered = answer.status === 'hits';
@@ -2356,6 +2399,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  grepListsBinaryMatches,
   useSourceRoots, readSourceRoots, MAX_SOURCE_ROOTS,
   shouldHint,
   shouldBlock,

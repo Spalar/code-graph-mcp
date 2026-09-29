@@ -60,6 +60,7 @@ const {
   resolveProjectRoot,
   readSourceRoots,
   useSourceRoots,
+  grepListsBinaryMatches,
   rewritePlan,
   showAnswersPattern,
   searchesSameFiles,
@@ -471,6 +472,7 @@ function runMain() {
   // which skips more (review of D#133, H-2).
   if (answeredMode !== 'callgraph' && !searchesSameFiles({
     root, target: searchPath, verb: plan.verb, show: answeredMode === 'show',
+    binaryCacheOk: !grepListsBinaryMatches(segment),
   })) return;
 
   recordRecommendation(root, {

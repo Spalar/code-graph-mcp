@@ -51,6 +51,7 @@ const {
   useSourceRoots,
   readSourceRoots,
   MAX_SOURCE_ROOTS,
+  grepListsBinaryMatches,
   extractDeclSymbols,
   translateBreToRg,
   buildRewriteCommand,
@@ -3228,6 +3229,120 @@ test('e2e F1: a grep into an indexed package dir is rewritten; without the manif
     if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 -M 0 ${uniq} networkx/`);
   } finally {
     cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── F1b: a Python bytecode cache does not change what `grep -r` prints ──
+//
+// `grep -r` reads git-ignored files and the rewrite does not, so an ignored
+// entry under the path declines the rewrite. Every Python tree that has run
+// its tests holds an ignored `__pycache__/` of `.pyc` files (the coding-eval
+// fixtures: 286 each), so F1's `networkx/` greps were all still declined. A
+// binary file yields no matched LINE — only a "binary file matches" notice —
+// unless the grep lists files (`-l`) and does not skip binaries (`-I`).
+const PYC_BYTES = Buffer.concat([Buffer.from([0x6f, 0x0d, 0x0d, 0x0a, 0, 0, 0, 0]),
+  Buffer.from('co_names\0widget_count\0__new__\0'), Buffer.from([0, 0xff, 0xfe])]);
+
+function pycacheFixture() {
+  const fx = gitFixture();
+  fsE2e.appendFileSync(pathE2e.join(fx.dir, '.gitignore'), '__pycache__/\n*.py[co]\n');
+  fx.git('add', '.gitignore');
+  fx.git('commit', '-qm', 'ignore bytecode');
+  fsE2e.writeFileSync(pathE2e.join(fx.dir, 'src', 'a.py'), 'def widget_count():\n    return 1\n');
+  fx.git('add', 'src/a.py');
+  fx.git('commit', '-qm', 'a.py');
+  fsE2e.mkdirSync(pathE2e.join(fx.dir, 'src', '__pycache__'));
+  fsE2e.writeFileSync(pathE2e.join(fx.dir, 'src', '__pycache__', 'a.cpython-312.pyc'), PYC_BYTES);
+  return fx;
+}
+
+test('F1b premise: real grep -r prints no line of a matching .pyc, only a binary-file notice', { skip: process.platform === 'win32' && 'POSIX grep' }, () => {
+  const fx = pycacheFixture();
+  try {
+    const r = spawnHook('grep', ['-rn', 'widget_count', 'src/'], { cwd: fx.dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    const lines = (r.stdout + r.stderr).split('\n').filter((l) => l.includes('.pyc'));
+    assert.ok(lines.length >= 1, 'the .pyc must match, or this premise test proves nothing');
+    for (const l of lines) assert.match(l, /[Bb]inary file .*matches/, l);
+    assert.match(r.stdout, /src\/a\.py:1:def widget_count/);
+  } finally {
+    fsE2e.rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('F1b: an ignored bytecode cache under the path keeps grep -r equivalent, when allowed', () => {
+  const cases = [
+    // [extra setup, binaryCacheOk, expected]
+    [() => {}, false, false],                       // today: any ignored entry declines
+    [() => {}, true, true],
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'b.pyc'), PYC_BYTES), true, true],
+    // a text file inside __pycache__ is not bytecode: grep would print its lines
+    [({ dir }) => fsE2e.writeFileSync(pathE2e.join(dir, 'src', '__pycache__', 'notes.txt'), 'widget_count\n'), true, false],
+    // any other ignored entry still declines
+    [({ dir }) => {
+      fsE2e.appendFileSync(pathE2e.join(dir, '.gitignore'), 'src/gen/\n');
+      fsE2e.mkdirSync(pathE2e.join(dir, 'src', 'gen'));
+      fsE2e.writeFileSync(pathE2e.join(dir, 'src', 'gen', 'x.py'), 'widget_count = 1\n');
+    }, true, false],
+  ];
+  for (const [setup, binaryCacheOk, want] of cases) {
+    const fx = pycacheFixture();
+    try {
+      setup(fx);
+      assert.equal(searchesSameFiles({ root: fx.dir, target: 'src/', verb: 'grep', binaryCacheOk }), want,
+        `binaryCacheOk=${binaryCacheOk} after ${setup.toString().slice(0, 90)}`);
+      // other verbs never read ignored files: unaffected either way
+      assert.equal(searchesSameFiles({ root: fx.dir, target: 'src/', verb: 'rg', binaryCacheOk }), true);
+    } finally {
+      fsE2e.rmSync(fx.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('F1b: only a file-listing grep that reads binaries would list a .pyc', () => {
+  for (const [cmd, want] of [
+    ['grep -rn "widget_count" src/', false],
+    ['grep -rn -A2 "widget_count" src/', false],
+    ['grep -rl "widget_count" src/', true],
+    ['grep -r --files-with-matches "widget_count" src/', true],
+    ['grep -rlI "widget_count" src/', false],
+    ['grep -rl -I "widget_count" src/', false],
+    ['grep -rn "-l widget" src/', false],              // `-l` inside the quoted pattern
+    ['grep -rn "widget_count" "-l" src/', true],       // a quoted option is still an option
+    ['grep -rn "widget_count" src/ | grep -l x', false], // a later command's flags are not the grep's
+  ]) {
+    assert.equal(grepListsBinaryMatches(cmd), want, cmd);
+  }
+});
+
+test('e2e F1b: grep -r into a package dir with a __pycache__ is rewritten; -l is not', () => {
+  const uniq = `pyc_pkg_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('args=' + process.argv.slice(2).join(' ') + '\\n');`);
+  const run = (...a) => spawnHook('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a],
+    { cwd: fixture.dir, encoding: 'utf8' });
+  const cmd = `grep -rn "${uniq}" networkx/`;
+  const listCmd = `grep -rln "${uniq}" networkx/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'networkx', '__pycache__'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'networkx', 'graph.py'), `${uniq} = 1\n`);
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'networkx', '__pycache__', 'graph.cpython-312.pyc'), PYC_BYTES);
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, '.gitignore'), '.code-graph/\n__pycache__/\ncg-stub.js\n');
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, '.code-graph', 'source-roots.json'),
+      JSON.stringify({ version: 1, roots: ['networkx'] }));
+    assert.equal(run('init', '-q', '.').status, 0);
+    assert.equal(run('add', '-A').status, 0);
+    assert.equal(run('commit', '-qm', 'init').status, 0);
+
+    const rw = rewriteOf(runHook(cmd, fixture));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 -M 0 ${uniq} networkx/`);
+    const listed = runHook(listCmd, fixture).stdout.trim();
+    assert.ok(!listed.startsWith('{') || !JSON.parse(listed).hookSpecificOutput.updatedInput,
+      `-l would list the .pyc; it must run as typed: ${listed}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+    cleanupFixture({ dir: fixture.dir }, listCmd);
   }
 });
 

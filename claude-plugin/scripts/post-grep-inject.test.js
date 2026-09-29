@@ -714,6 +714,31 @@ test('F1: a grep into an indexed package dir is injected once the index lists it
   }
 });
 
+test('F1b: grep -r into a package dir holding an ignored __pycache__ still gets the grep echo', () => {
+  const uniq = `PycEcho${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2];\n` +
+    `if (sub === 'callgraph') { process.exit(1); }\n` +
+    `process.stdout.write('networkx/graph.py:1  ${uniq} = 1\\n');`);
+  const git = (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a],
+    { cwd: fixture.dir, encoding: 'utf8' });
+  const cmd = `echo "x" && grep -rn "${uniq}" networkx/`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'networkx', '__pycache__'), { recursive: true });
+    fs.writeFileSync(path.join(fixture.dir, 'networkx', 'graph.py'), `${uniq} = 1\n`);
+    fs.writeFileSync(path.join(fixture.dir, 'networkx', '__pycache__', 'graph.cpython-312.pyc'),
+      Buffer.from([0x6f, 0x0d, 0x0d, 0x0a, 0, 0, 0xff]));
+    fs.writeFileSync(path.join(fixture.dir, '.gitignore'), '.code-graph/\n__pycache__/\ncg-stub.js\n');
+    fs.writeFileSync(path.join(fixture.dir, '.code-graph', 'source-roots.json'),
+      JSON.stringify({ version: 1, roots: ['networkx'] }));
+    for (const a of [['init', '-q', '.'], ['add', '-A'], ['commit', '-qm', 'init']]) assert.equal(git(...a).status, 0);
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /AST-aware view of your grep/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('D5: while the startup index is being written, no call graph — the grep echo still answers', () => {
   // Call edges from a partial index are a subset presented as the whole graph;
   // the grep echo comes from the files themselves and stays correct.
