@@ -861,6 +861,135 @@ function extractSedReadTargets(cmd) {
   return out;
 }
 
+// Q1 — `sed -i` and `perl -pi` edit files the edit hooks never see. Their
+// targets are logged for the Stop hook's signature check (never answered).
+// Shapes: tasks/specs/edit-log-coverage.md. A word only counts as a target
+// when it names an existing regular file, so a misread costs a few baseline
+// records the Stop check then finds unchanged; a command the tokenizer cannot
+// read exactly (`$x`, globs) is skipped, which is the state before Q1.
+const MAX_IN_PLACE_TARGETS = 8;
+const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Absolute paths of the files an in-place `sed`/`perl` in `cmd` edits, at
+ * most MAX_IN_PLACE_TARGETS, in command order.
+ * @param {string} cmd
+ * @param {string} shellCwd  where the command starts
+ * @param {{isFile?: (abs:string)=>boolean, isDir?: (abs:string)=>boolean}} [opts]
+ * @returns {string[]}
+ */
+function extractInPlaceEditTargets(cmd, shellCwd, { isFile = isRegularFile, isDir = isDirectory } = {}) {
+  if (!cmd || typeof cmd !== 'string' || cmd.length > 4000 || !/\b(?:sed|perl)\b/.test(cmd)) return [];
+  const segments = splitTopLevelSegments(cmd);
+  const seps = segmentSeparators(cmd);
+  const out = [];
+  for (let i = 0; i < segments.length && out.length < MAX_IN_PLACE_TARGETS; i++) {
+    const words = shellWords(segments[i]);
+    if (!words) continue;
+    let k = 0;
+    while (k < words.length && !words[k].op && !words[k].anyQuoted && ENV_ASSIGNMENT.test(words[k].text)) k++;
+    const head = words[k];
+    if (!head || head.op || head.anyQuoted || (head.text !== 'sed' && head.text !== 'perl')) continue;
+    const args = [];
+    for (let j = k + 1; j < words.length && !words[j].op; j++) args.push(words[j]);
+    const operands = head.text === 'sed' ? sedInPlaceFiles(args) : perlInPlaceFiles(args);
+    if (operands.length === 0) continue;
+    const cwd = segmentCwd(segments, i, shellCwd, { isDir, seps });
+    if (cwd === null) continue;
+    for (const w of operands) {
+      const abs = path.resolve(cwd, w);
+      if (!out.includes(abs) && out.length < MAX_IN_PLACE_TARGETS && isFile(abs)) out.push(abs);
+    }
+  }
+  return out;
+}
+
+// Quoting does not decide what is an option: the shell removes the quotes
+// before sed or perl sees `--expression='s/a/b/'` or `'-i'`.
+//
+// Plain operand words, a redirect and its target dropped. A word with a bare
+// glob or redirect character is not a file name the shell passes unchanged.
+function operandWords(words) {
+  const out = [];
+  for (let j = 0; j < words.length; j++) {
+    const w = words[j];
+    if (w.bareOp) {
+      if (/[<>]$/.test(w.text)) j++;  // `> out`: the next word is the redirect's target
+      continue;
+    }
+    if (!w.bareSpecial) out.push(w.text);
+  }
+  return out;
+}
+
+// GNU sed: `-i[SUFFIX]` / `--in-place[=SUFFIX]` (a suffix is attached, so in a
+// cluster the rest of the word is it: `-ie` = suffix `e`); `-e`/`-f`/`-l` and
+// their long forms take a value. The first operand is the script unless `-e`
+// or `-f` gave one. BSD `-i ''` reads as GNU `-i` with script `''`, and its
+// real script then fails the existing-file test.
+function sedInPlaceFiles(words) {
+  let inPlace = false;
+  let haveScript = false;
+  let endOfOpts = false;
+  const operands = [];
+  for (let j = 0; j < words.length; j++) {
+    const w = words[j];
+    const t = w.text;
+    if (endOfOpts || !t.startsWith('-') || t === '-') { operands.push(w); continue; }
+    if (t === '--') { endOfOpts = true; continue; }
+    if (t.startsWith('--')) {
+      const [name, value] = [t.slice(2).split('=')[0], t.includes('=')];
+      if (name === 'in-place') inPlace = true;
+      else if (name === 'expression' || name === 'file') { haveScript = true; if (!value) j++; }
+      else if (name === 'line-length' && !value) j++;
+      continue;
+    }
+    for (let c = 1; c < t.length; c++) {
+      const ch = t[c];
+      if (ch === 'i') { inPlace = true; break; }
+      if (ch === 'e' || ch === 'f' || ch === 'l') {
+        if (ch !== 'l') haveScript = true;
+        if (c === t.length - 1) j++;
+        break;
+      }
+    }
+  }
+  if (!inPlace) return [];
+  return operandWords(haveScript ? operands : operands.slice(1));
+}
+
+// perl: `-i[EXT]` (the rest of the word is the extension: `-pie` = `-p -i`
+// with extension `e`); `-e`/`-E` take the code (rest of the word, else the
+// next word), `-M`/`-I`/`-F` a value the same way. With no `-e`, the first
+// operand is the script file.
+function perlInPlaceFiles(words) {
+  let inPlace = false;
+  let haveCode = false;
+  let endOfOpts = false;
+  const operands = [];
+  for (let j = 0; j < words.length; j++) {
+    const w = words[j];
+    const t = w.text;
+    if (endOfOpts || !t.startsWith('-') || t === '-') { operands.push(w); continue; }
+    if (t === '--') { endOfOpts = true; continue; }
+    for (let c = 1; c < t.length; c++) {
+      const ch = t[c];
+      if (ch === 'i') { inPlace = true; break; }
+      if ('eEMIF'.includes(ch)) {
+        if (ch === 'e' || ch === 'E') haveCode = true;
+        if (c === t.length - 1) j++;
+        break;
+      }
+    }
+  }
+  if (!inPlace) return [];
+  return operandWords(haveCode ? operands : operands.slice(1));
+}
+
+function isRegularFile(p) {
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
 // v0.50 — a compound command (`grep …; sed -n 1,60p f` / `grep … && wc`) is
 // denied WHOLE, but the answer covers only the grep. The 2026-06-13 mem-project
 // deny swallowed a `; sed` read while the copy said "use these results directly
@@ -2130,6 +2259,18 @@ function runMain() {
 
   const rawCmd = (input.tool_input && input.tool_input.command) || '';
 
+  // Q1 — an in-place `sed`/`perl` is logged for the Stop check, then the
+  // command goes on as it would have (nothing here answers or rewrites it).
+  const inPlace = extractInPlaceEditTargets(rawCmd, shellCwd);
+  if (inPlace.length > 0) {
+    const sessionEdits = require('./session-edits');
+    for (const abs of inPlace) {
+      const rel = path.relative(root, abs);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      sessionEdits.recordFileEdit(root, input.session_id, rel.split(path.sep).join('/'));
+    }
+  }
+
   // v0.49 — sed-range reads count toward the read-fanout state (the Read hook
   // never sees Bash-side file reads). A fired fanout hint already delivered an
   // overview — skip grep hinting for this command to avoid double output.
@@ -2420,6 +2561,7 @@ module.exports = {
   segmentCwd,            // D#76 — the directory a compound command's segment runs in
   segmentSeparators,     // D#76 — the separator before each top-level segment
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
+  extractInPlaceEditTargets, // Q1 — `sed -i` / `perl -pi` targets feed the Stop check's edit log
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
   countNamedPaths,    // v0.70 — multi-path deny→hint downgrade

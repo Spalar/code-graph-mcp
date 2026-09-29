@@ -302,7 +302,7 @@ test('lifecycle.buildSettingsHookEntries covers PreToolUse Edit/Bash/Read', () =
   const { buildSettingsHookEntries } = require('./lifecycle');
   const desired = buildSettingsHookEntries();
   const ptu = (desired.PreToolUse || []).map(e => e.matcher);
-  for (const tool of ['Edit', 'Bash', 'Read']) {
+  for (const tool of ['Edit|Write', 'Bash', 'Read']) {
     assert.ok(ptu.includes(tool), `lifecycle.js PreToolUse missing matcher: ${tool}; got ${JSON.stringify(ptu)}`);
   }
 });
@@ -608,12 +608,16 @@ test('every registered hook script parses (node --check)', () => {
 //     support in the parser / supported-language set), so both pre-edit-guide
 //     (needs graph symbols) and incremental-index (needs to re-index the file)
 //     would no-op on a notebook. Prerequisite is .ipynb PARSING support (a parser
-//     feature); add the matcher as PART of that work, never before it.
+//     feature); add the matcher as PART of that work, never before it. Q1
+//     (2026-09-29) re-checked this for the Stop check's edit log: a notebook has
+//     no signature reading, and "touched this turn" already comes from mtime.
+// Write joined Edit in Q1: pre-edit-guide logs it (baselines of the definitions
+// whose header the new content changes) for the Stop check, and answers nothing.
 test('buildSettingsHookEntries: matcher surface is exactly the intended set', () => {
   const { buildSettingsHookEntries } = require('./lifecycle');
   const desired = buildSettingsHookEntries();
   const setOf = (event) => (desired[event] || []).map(e => e.matcher).sort();
-  assert.deepEqual(setOf('PreToolUse'), ['Bash', 'Edit', 'Read'],
+  assert.deepEqual(setOf('PreToolUse'), ['Bash', 'Edit|Write', 'Read'],
     'PreToolUse matcher set changed — update this gate intentionally (does the new tool need a guide hook?)');
   assert.deepEqual(setOf('PostToolUse'), ['Bash', 'Write|Edit'],
     'PostToolUse matcher set changed — incremental-index (Write|Edit) + compound-grep inject (Bash) trigger surface must be deliberate');
@@ -656,4 +660,13 @@ test('settings hook commands are existence-guarded on POSIX (dead path silent-0,
   const guarded = `if [ -f "${script}" ]; then node "${script}"; fi`;
   const r2 = spawnSync('sh', ['-c', guarded], { encoding: 'utf8' });
   assert.equal(r2.status, 2, 'live script exit code passes through the guard');
+});
+
+// Q1 (2026-09-29): Write reaches the edit hook, which logs it for the Stop
+// check and answers nothing; before, only Edit did, and a signature changed by
+// a Write was never checked. (NotebookEdit: see the matcher-surface gate.)
+test('hooks.json: the edit hook also fires for Write', () => {
+  const pre = loadHooks().hooks.PreToolUse.filter((e) => e.hooks.some((h) => h.command.includes('pre-edit-guide.js')));
+  assert.equal(pre.length, 1);
+  assert.deepEqual(pre[0].matcher.split('|').sort(), ['Edit', 'Write']);
 });

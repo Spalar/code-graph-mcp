@@ -818,7 +818,7 @@ test('install() registers PreToolUse/PostToolUse/UserPromptSubmit hooks in setti
 
   // Verify the matchers we promised exist
   const ptuMatchers = after.hooks.PreToolUse.map(e => e.matcher);
-  for (const m of ['Edit', 'Bash', 'Read']) {
+  for (const m of ['Edit|Write', 'Bash', 'Read']) {
     assert.ok(ptuMatchers.includes(m), `PreToolUse matcher ${m} missing; got ${JSON.stringify(ptuMatchers)}`);
   }
 
@@ -908,7 +908,7 @@ test('install() preserves foreign plugin hooks (other plugins\' entries survive)
   assert.ok(ptoFor, 'foreign PostToolUse hook was stripped');
 
   // Ours are also there
-  assert.ok(after.hooks.PreToolUse.some(e => e.matcher === 'Edit' && e.description?.includes('[code-graph-mcp')));
+  assert.ok(after.hooks.PreToolUse.some(e => e.matcher === 'Edit|Write' && e.description?.includes('[code-graph-mcp')));
 });
 
 test('registerHooksToSettings is idempotent when called directly', () => {

@@ -1019,7 +1019,7 @@ function buildSettingsHookEntries() {
 
   return {
     PreToolUse: [
-      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Edit', hooks: [scriptCmd('pre-edit-guide.js')] },
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Edit|Write', hooks: [scriptCmd('pre-edit-guide.js')] },
       { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Bash', hooks: [scriptCmd('pre-grep-guide.js')] },
       { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Read', hooks: [scriptCmd('pre-read-guide.js')] },
     ],
@@ -1287,6 +1287,7 @@ function hookFirePayload(matcher, event = '') {
     case 'Read':
       return { tool_name: 'Read', tool_input: { file_path: 'src/example.rs' } };
     case 'Edit':
+    case 'Edit|Write':
     case 'Write|Edit':
       return { tool_name: 'Edit', tool_input: { file_path: 'src/example.rs', old_string: 'a', new_string: 'b' } };
     case '': // UserPromptSubmit

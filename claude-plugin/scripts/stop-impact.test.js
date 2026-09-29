@@ -12,7 +12,7 @@ const { spawnSync, execFileSync } = require('node:child_process');
 delete process.env.CLAUDE_CONFIG_DIR;
 
 const {
-  extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext, followUpOf,
+  extractSignatures, allSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext, followUpOf,
   reportRecords, MAX_FOLLOWUP_FILES,
 } = require('./stop-impact');
 
@@ -80,6 +80,54 @@ test('extractSignatures: a match on a line over 2,000 characters gives no readin
   assert.equal(got, null);
   const ms = (d.user + d.system) / 1e3;
   assert.ok(ms < 1000, `1.5 MB one-line bundle took ${ms.toFixed(0)} ms of CPU`);
+});
+
+// Q1: an edit that names no definition (Write, `sed -i`) baselines every
+// definition in the file at once. One pass per pattern, and for every name it
+// finds the same reading as extractSignatures for that name.
+const ALL_FIXTURES = {
+  '.py': 'import os\n\ndef load(path, strict=False):\n    return read(path)\n\nclass K:\n    def load(self, p):\n        if p:\n            return 1\n\n    async def fetch(self):\n        pass\n\n# def commented(x):\nx = load(1)\n',
+  '.ts': 'export function parse(a: string): T {\n  if (a) {\n    return build(a);\n  }\n}\nconst build = (x, y) => x + y;\nclass K {\n  render(props) {\n    for (const p of props) {\n    }\n    return parse(props);\n  }\n}\nwhile (x) {\n}\n',
+  '.rs': 'pub fn compute(x: i32) -> i32 {\n    helper(x)\n}\nimpl From<A> for X {\n    fn from(a: A) -> X { X }\n}\nimpl From<B> for X {\n    fn from(b: B) -> X { X }\n}\n',
+  '.go': 'func (s *S) Compute(x int) (int, error) {\n}\n\nfunc helper() {\n}\n',
+  '.java': '  public int compute(int x) {\n    return helper(x);\n  }\n  private static String name() {\n    return "a";\n  }\n',
+};
+const ALL_WANT = {
+  '.py': ['fetch', 'load'],
+  '.ts': ['build', 'parse', 'render'],
+  '.rs': ['compute', 'from'],
+  '.go': ['Compute', 'helper'],
+  '.java': ['compute', 'name'],
+};
+
+for (const [ext, text] of Object.entries(ALL_FIXTURES)) {
+  test(`allSignatures ${ext}: every definition, and each reads as extractSignatures reads it`, () => {
+    const all = allSignatures(text, ext);
+    assert.deepEqual([...all.keys()].sort(), ALL_WANT[ext]);
+    for (const [name, sigs] of all) assert.deepEqual(sigs, extractSignatures(text, name, ext), name);
+  });
+}
+
+test('allSignatures: names come in file order, whichever pattern found them', () => {
+  const text = 'class K {\n  render(p) {\n  }\n}\nconst build = (x) => x;\nfunction parse(a) {\n}\n';
+  assert.deepEqual([...allSignatures(text, '.js').keys()], ['render', 'build', 'parse']);
+});
+
+test('allSignatures: a header with no reading leaves out that name only', () => {
+  const text = 'fn compute(' + 'a: u8, '.repeat(120) + ') {}\nfn other(x: u8) {}\n';
+  assert.equal(extractSignatures(text, 'compute', '.rs'), null);
+  assert.deepEqual([...allSignatures(text, '.rs')], [['other', ['fnother(x:u8)']]]);
+});
+
+test('allSignatures: no reading for an unsupported language or a one-line bundle', () => {
+  assert.equal(allSignatures('def run(a), do: a\n', '.ex'), null);
+  const unit = 'function abc(t){return t+1}var a=abc(1);';
+  const bundle = unit.repeat(Math.ceil((1536 * 1024) / unit.length));
+  const t0 = process.cpuUsage();
+  assert.equal(allSignatures(bundle, '.js'), null);
+  const d = process.cpuUsage(t0);
+  assert.ok((d.user + d.system) / 1e3 < 1000, 'refused at its first match, not scanned per match');
+  assert.deepEqual([...allSignatures('', '.py').keys()], []);
 });
 
 test('extractSignatures: comments and absent symbols yield nothing', () => {
@@ -329,6 +377,30 @@ function edit(sb, session, file, oldString, newString) {
   sb.index();
 }
 
+// Q1: a Write over an existing file goes through the same PreToolUse hook.
+function write(sb, session, file, content) {
+  const abs = path.join(sb.repo, file);
+  const pre = hook(sb, 'pre-edit-guide.js', {
+    session_id: session, hook_event_name: 'PreToolUse', tool_name: 'Write', cwd: sb.repo,
+    tool_input: { file_path: abs, content },
+  });
+  assert.equal(pre.status, 0, pre.stderr);
+  assert.equal(pre.stdout.trim(), '', 'a Write is logged, never answered');
+  fs.writeFileSync(abs, content);
+  sb.index();
+}
+
+// Q1: `sed -i` / `perl -pi` reach PreToolUse as a Bash call.
+function bash(sb, session, command) {
+  const pre = hook(sb, 'pre-grep-guide.js', {
+    session_id: session, hook_event_name: 'PreToolUse', tool_name: 'Bash', cwd: sb.repo,
+    tool_input: { command },
+  });
+  assert.equal(pre.status, 0, pre.stderr);
+  execFileSync('sh', ['-c', command], { cwd: sb.repo, env: sb.env, stdio: 'pipe' });
+  sb.index();
+}
+
 function stop(sb, session, extra = {}) {
   const r = hook(sb, 'stop-impact.js', {
     session_id: session, hook_event_name: 'Stop', cwd: sb.repo, stop_hook_active: false, ...extra,
@@ -374,6 +446,30 @@ function stopRecords(sb) {
   try { raw = fs.readFileSync(path.join(sb.repo, '.code-graph', 'recommendations.jsonl'), 'utf8'); } catch { /* none */ }
   return raw.split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.hook === 'stop');
 }
+
+test('e2e Q1: a signature changed by Write, sed -i or perl -pi reports the untouched caller', { skip: e2eSkip }, (t) => {
+  const changed = HEAD_A.replace('compute(x: i32)', 'compute(x: i32, y: i32)');
+  const sb = sandboxRepo(t);
+  write(sb, 'w', 'src/a.rs', changed);
+  assert.match(stop(sb, 'w').hookSpecificOutput.additionalContext, /compute\(\) in src\/a\.rs: src\/b\.rs:5 \(caller_b\)/);
+
+  const sb2 = sandboxRepo(t);
+  bash(sb2, 's', "sed -i 's/compute(x: i32)/compute(x: i32, y: i32)/' src/a.rs");
+  assert.match(stop(sb2, 's').hookSpecificOutput.additionalContext, /compute\(\) in src\/a\.rs: src\/b\.rs:5/);
+
+  const sb3 = sandboxRepo(t);
+  bash(sb3, 'p', "perl -pi -e 's/compute\\(x: i32\\)/compute(x: i32, y: i32)/' src/a.rs");
+  assert.match(stop(sb3, 'p').hookSpecificOutput.additionalContext, /compute\(\) in src\/a\.rs: src\/b\.rs:5/);
+});
+
+test('e2e Q1: a body-only Write or sed -i stays silent', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t);
+  write(sb, 'w', 'src/a.rs', BODY_A);
+  assert.equal(stop(sb, 'w'), null);
+  const sb2 = sandboxRepo(t);
+  bash(sb2, 's', "sed -i 's/x + 1/x + 2/' src/a.rs");
+  assert.equal(stop(sb2, 's'), null);
+});
 
 test('e2e: a report is recorded, and the next Stop records that a listed caller file was edited', { skip: e2eSkip }, (t) => {
   const sb = sandboxRepo(t);

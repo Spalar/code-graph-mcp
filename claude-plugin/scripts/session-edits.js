@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
-// Per-session edit log shared by the PreToolUse(Edit) hook (writer) and the
-// Stop hook (reader) — P1 #3.
+// Per-session edit log shared by the PreToolUse hooks (writers: pre-edit-guide
+// for Edit/Write, pre-grep-guide for `sed -i`/`perl -pi`) and the
+// Stop hook (reader) — P1 #3, Q1.
 //
 // Two files per (project, session), both in the shared cgTmpDir() so the
 // SessionStart prune (24 h, mtime) and `uninstall`'s wholesale removal of that
@@ -84,6 +85,59 @@ function recordEdit(root, sessionId, { file, symbol = null }, now = Date.now()) 
   } catch { return false; }
 }
 
+// Q1: an edit that names no definition (Write over an existing file, `sed -i`,
+// `perl -pi`) baselines the file's definitions at once. Bounded so the hook
+// stays inside its budget: a larger file is logged as a file only, and at
+// most this many definitions — the first in the file — get a record.
+const MAX_FILE_SCAN_BYTES = 256 * 1024;
+const MAX_FILE_DEFINITIONS = 64;
+
+/**
+ * Log an edit that names no definition: one file record, then one baselined
+ * record per definition of the file as it is now (before the edit). With
+ * `newText` (a Write's content) only definitions whose header the new text
+ * changes are recorded — the Stop hook would find the rest unchanged. Without
+ * it (`sed -i`: the result is unknown until the command runs) every
+ * definition is, and the Stop hook sorts them out. One append, best-effort.
+ * @param {string} root project root
+ * @param {string} sessionId
+ * @param {string} file root-relative
+ * @param {{newText?: string|null}} [opts]
+ * @returns {number} records written
+ */
+function recordFileEdit(root, sessionId, file, { newText = null } = {}, now = Date.now()) {
+  const p = editsPath(root, sessionId);
+  if (!p || !file) return 0;
+  const recs = [{ ts: now, file, symbol: null }];
+  for (const [symbol, sigs] of fileBaselines(root, file, newText)) recs.push({ ts: now, file, symbol, sigs });
+  try {
+    fs.appendFileSync(p, recs.map((r) => JSON.stringify(r) + '\n').join(''));
+    return recs.length;
+  } catch { return 0; }
+}
+
+function fileBaselines(root, file, newText) {
+  try {
+    const abs = path.join(root, file);
+    if (fs.statSync(abs).size > MAX_FILE_SCAN_BYTES) return [];
+    const { allSignatures, extractSignatures, signatureChanged } = require('./stop-impact');
+    const ext = path.extname(file).toLowerCase();
+    const all = allSignatures(fs.readFileSync(abs, 'utf8'), ext);
+    if (!all) return [];
+    const out = [];
+    for (const [symbol, sigs] of all) {
+      if (out.length === MAX_FILE_DEFINITIONS) break;
+      if (sigs.length > MAX_BASELINE_SIGS) continue;
+      if (typeof newText === 'string') {
+        const after = extractSignatures(newText, symbol, ext);
+        if (!after || after.length === 0 || !signatureChanged(sigs, after, symbol)) continue;
+      }
+      out.push([symbol, sigs]);
+    }
+    return out;
+  } catch { return []; }
+}
+
 /** Every well-formed record in the session log; a torn or foreign line is skipped. */
 function readEdits(root, sessionId) {
   const p = editsPath(root, sessionId);
@@ -137,5 +191,6 @@ function writeStopState(root, sessionId, state) {
 }
 
 module.exports = {
-  sessionKey, editsPath, stopStatePath, recordEdit, readEdits, readStopState, writeStopState,
+  sessionKey, editsPath, stopStatePath, recordEdit, recordFileEdit, readEdits, readStopState, writeStopState,
+  MAX_FILE_DEFINITIONS,
 };

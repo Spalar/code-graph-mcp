@@ -143,8 +143,54 @@ function extractSignatures(text, symbol, ext = '') {
   const lang = LANGS.get(String(ext).toLowerCase());
   if (!lang) return null;
   if (typeof text !== 'string' || !symbol) return [];
-  const lineStarts = new Set();
-  for (const { re, typed } of definitionPatterns(escapeRe(symbol), lang)) {
+  const starts = definitionStarts(text, lang, escapeRe(symbol), symbol);
+  if (starts === null) return null;
+  return headersAt(text, starts.get(symbol) || [], lang);
+}
+
+// The name slot of definitionPatterns when every definition is wanted.
+const ANY_NAME = '([A-Za-z_$][\\w$]*)';
+// Words the name slot must not take: the control words that open a
+// `word (…) {` line, which the JS one-line-method pattern reads as a method.
+// Not NOT_A_TYPE: `from`, `use`, `match` are ordinary method names (`fn from`).
+const NOT_A_NAME = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'with', 'function', 'foreach', 'elseif',
+  'synchronized', 'using', 'lock', 'fixed', 'until', 'unless', 'return', 'await',
+  'yield', 'typeof', 'sizeof', 'new', 'super', 'this',
+]);
+
+/**
+ * Every definition in `text` with its signatures (Q1): Map name → sorted keys,
+ * in order of first appearance in the file — for an edit that names no
+ * definition (Write, `sed -i`). One pass per pattern; each name reads exactly
+ * as extractSignatures(text, name) reads it, and a name whose header has no
+ * reading is left out. null: the language is not in LANGS, or a definition
+ * sits on a line over MAX_DEFINITION_LINE_CHARS (for every name at once: the
+ * scan stops there, as extractSignatures does).
+ * @returns {Map<string,string[]>|null}
+ */
+function allSignatures(text, ext = '') {
+  const lang = LANGS.get(String(ext).toLowerCase());
+  if (!lang || typeof text !== 'string') return null;
+  const starts = definitionStarts(text, lang, ANY_NAME, null);
+  if (starts === null) return null;
+  const byFirst = [...starts].sort((a, b) => Math.min(...a[1]) - Math.min(...b[1]));
+  const out = new Map();
+  for (const [name, lineStarts] of byFirst) {
+    const sigs = headersAt(text, lineStarts, lang);
+    if (sigs && sigs.length > 0) out.set(name, sigs);
+  }
+  return out;
+}
+
+/**
+ * Where definitions start: Map name → Set of line-start offsets. With `symbol`
+ * the patterns carry it escaped in `S`; without, `S` is ANY_NAME and the name
+ * is the pattern's last group. null when a match sits on an over-long line.
+ */
+function definitionStarts(text, lang, S, symbol) {
+  const out = new Map();
+  for (const { re, typed } of definitionPatterns(S, lang)) {
     for (const m of text.matchAll(re)) {
       const at = text.lastIndexOf('\n', m.index) + 1;
       const lineEnd = text.indexOf('\n', at);
@@ -160,9 +206,16 @@ function extractSignatures(text, symbol, ext = '') {
         // `:` is a label or access specifier, never part of a return type.
         if (m[1].split(/[ \t]+/).some((tok) => /(?:^|[^:]):$/.test(tok))) continue;
       }
-      lineStarts.add(at);
+      const name = symbol || m[m.length - 1];
+      if (!symbol && NOT_A_NAME.has(name)) continue;
+      if (!out.has(name)) out.set(name, new Set());
+      out.get(name).add(at);
     }
   }
+  return out;
+}
+
+function headersAt(text, lineStarts, lang) {
   const out = [];
   for (const at of lineStarts) {
     const header = readHeader(text, at, lang);
@@ -599,6 +652,6 @@ function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
-  extractSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
+  extractSignatures, allSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
   followUpOf, reportRecords, MAX_SYMBOLS_CHECKED, MAX_CALLERS_LISTED, MAX_FOLLOWUP_FILES,
 };

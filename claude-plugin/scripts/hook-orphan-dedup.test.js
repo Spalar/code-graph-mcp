@@ -66,10 +66,10 @@ test('P0-b surveyHookCoverage flags a dead-path entry as stale (dangling after n
   // Register the real desired set, then corrupt one entry to a dead path.
   lifecycle.registerHooksToSettings(settings);
   const deadCmd = 'if [ -f "/home/u/.nvm/versions/node/v24.11.1/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts/pre-edit-guide.js" ]; then node "/home/u/.nvm/versions/node/v24.11.1/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts/pre-edit-guide.js"; fi';
-  const preEdit = settings.hooks.PreToolUse.find(e => e.matcher === 'Edit');
+  const preEdit = settings.hooks.PreToolUse.find(e => e.matcher === 'Edit|Write');
   preEdit.hooks[0].command = deadCmd;
   const survey = lifecycle.surveyHookCoverage(settings);
-  assert.ok(survey.stale.includes('PreToolUse:Edit'),
+  assert.ok(survey.stale.includes('PreToolUse:Edit|Write'),
     `dead-path entry must be flagged stale; stale=${JSON.stringify(survey.stale)}`);
 });
 

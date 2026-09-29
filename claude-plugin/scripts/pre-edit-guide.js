@@ -9,7 +9,7 @@
 if (require.main === module) require('./hook-fail-open').installHookFailOpen('PreToolUse:Edit');
 
 // PreToolUse(Edit) hook: auto-inject impact analysis when editing function definitions.
-// Only fires when:
+// Write reaches it too (Q1): only logged for the Stop check, never answered. For Edit, it only fires when:
 //   1. The old_string contains a function/method definition AND the edit changes
 //      that definition's header (a body-only edit cannot break a caller)
 //   2. The edited file is inside the project
@@ -59,21 +59,36 @@ try {
 // edits the signature extraction below gives up on), then again with the
 // symbol once one is known. Append-only, best-effort: it cannot fail the Edit.
 const sessionEdits = require('./session-edits');
-const editedAbs = (input.tool_input && input.tool_input.file_path) || '';
+const toolInput = input.tool_input || {};
+const editedAbs = toolInput.file_path || '';
 const editedRel = editedAbs ? path.relative(cwd, path.resolve(cwd, editedAbs)) : '';
-const logEdit = (symbol) => {
-  if (editedRel && !editedRel.startsWith('..') && !path.isAbsolute(editedRel)) {
-    sessionEdits.recordEdit(cwd, input.session_id, { file: editedRel.split(path.sep).join('/'), symbol });
+const insideProject = editedRel && !editedRel.startsWith('..') && !path.isAbsolute(editedRel);
+const editedKey = insideProject ? editedRel.split(path.sep).join('/') : '';
+
+// Q1 — a Write (matcher `Edit|Write`) is logged for the Stop check and never
+// answered: it carries the whole file, and "the earliest definition in it"
+// would name the file's first function, not the one that changed. A Write over
+// an existing file records a baseline for each definition whose header its
+// content changes.
+if (input.tool_name === 'Write') {
+  if (editedKey) {
+    const newText = typeof toolInput.content === 'string' ? toolInput.content : null;
+    sessionEdits.recordFileEdit(cwd, input.session_id, editedKey, { newText });
   }
+  process.exit(0);
+}
+
+const logEdit = (symbol) => {
+  if (editedKey) sessionEdits.recordEdit(cwd, input.session_id, { file: editedKey, symbol });
 };
 logEdit(null);
 
 // An edit outside the project cannot be about this project's symbols; asking
 // the index anyway injected a same-named project function's callers.
-if (!editedRel || editedRel.startsWith('..') || path.isAbsolute(editedRel)) process.exit(0);
+if (!insideProject) process.exit(0);
 
-const oldStr = (input.tool_input && input.tool_input.old_string) || '';
-const newStr = (input.tool_input && input.tool_input.new_string) || '';
+const oldStr = toolInput.old_string || '';
+const newStr = toolInput.new_string || '';
 if (!oldStr || oldStr.length < 10) process.exit(0);
 
 // --- Extract function/method signature from the edited text ---

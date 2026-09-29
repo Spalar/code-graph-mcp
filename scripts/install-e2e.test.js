@@ -116,7 +116,7 @@ function readJson(filePath) {
 // v0.32.0 contract: install()/update() register these (event, matcher, script)
 // tuples in settings.json with current PLUGIN_ROOT paths.
 const EXPECTED_SETTINGS_HOOKS = [
-  ['PreToolUse', 'Edit', 'pre-edit-guide.js'],
+  ['PreToolUse', 'Edit|Write', 'pre-edit-guide.js'],
   ['PreToolUse', 'Bash', 'pre-grep-guide.js'],
   ['PreToolUse', 'Read', 'pre-read-guide.js'],
   ['PostToolUse', 'Write|Edit', 'incremental-index.js'],
@@ -367,7 +367,7 @@ test('§1.9 session-init self-heals a stale-but-existing settings.json hook path
   fs.mkdirSync(path.dirname(staleScript), { recursive: true });
   fs.writeFileSync(staleScript, '// stale copy\n');
   const settings = readJson(settingsPath);
-  const entry = settings.hooks.PreToolUse.find(e => e.matcher === 'Edit');
+  const entry = settings.hooks.PreToolUse.find(e => e.matcher === 'Edit|Write');
   entry.hooks[0].command = `node "${staleScript}"`;
   writeJson(settingsPath, settings);
 

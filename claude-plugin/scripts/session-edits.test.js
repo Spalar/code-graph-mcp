@@ -204,3 +204,120 @@ test('pre-edit-guide on a 1.5 MB one-line bundle records no baseline and stays i
     { file: 'dist/bundle.js', symbol: 'abc', sigs: null },
   ]);
 });
+
+// ── Q1: edits that name no definition (Write, `sed -i`, `perl -pi`) ──────────
+// One file record, then a baselined record per definition: every definition
+// when the new text is unknown (sed), only those whose header differs when it
+// is known (Write). Nothing is ever injected for these tools.
+
+const PY_BEFORE = 'def load(p):\n    return p\n\ndef keep(a):\n    return a\n\nclass K:\n    def run(self):\n        pass\n';
+
+test('recordFileEdit: every definition without the new text, only changed ones with it', (t) => {
+  const sb = sandbox(t);
+  const project = path.join(sb.root, 'project');
+  fs.mkdirSync(path.join(project, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(project, 'src', 'a.py'), PY_BEFORE);
+  const after = PY_BEFORE.replace('def load(p):', 'def load(p, q):').replace('return a', 'return a + 1');
+  const got = inChild(sb, `
+    se.recordFileEdit(${JSON.stringify(project)}, 'S1', 'src/a.py', {}, 1);
+    se.recordFileEdit(${JSON.stringify(project)}, 'S2', 'src/a.py', { newText: ${JSON.stringify(after)} }, 2);
+    se.recordFileEdit(${JSON.stringify(project)}, 'S3', 'src/new.py', { newText: 'def x():\\n  pass\\n' }, 3);
+    se.recordFileEdit(${JSON.stringify(project)}, 'S4', 'nb.ipynb', {}, 4);
+    return ['S1', 'S2', 'S3', 'S4'].map((s) => se.readEdits(${JSON.stringify(project)}, s));
+  `);
+  assert.deepEqual(got[0], [
+    { ts: 1, file: 'src/a.py', symbol: null, sigs: null },
+    { ts: 1, file: 'src/a.py', symbol: 'load', sigs: ['defload(p)'] },
+    { ts: 1, file: 'src/a.py', symbol: 'keep', sigs: ['defkeep(a)'] },
+    { ts: 1, file: 'src/a.py', symbol: 'run', sigs: ['defrun(self)'] },
+  ], 'sed: every definition, in file order');
+  assert.deepEqual(got[1], [
+    { ts: 2, file: 'src/a.py', symbol: null, sigs: null },
+    { ts: 2, file: 'src/a.py', symbol: 'load', sigs: ['defload(p)'] },
+  ], 'Write: only the definition whose header the new text changes');
+  assert.deepEqual(got[2], [{ ts: 3, file: 'src/new.py', symbol: null, sigs: null }], 'a new file has no baseline');
+  assert.deepEqual(got[3], [{ ts: 4, file: 'nb.ipynb', symbol: null, sigs: null }], 'no exact reading: file only');
+});
+
+test('recordFileEdit: at most 64 definitions, the first in the file', (t) => {
+  const sb = sandbox(t);
+  const project = path.join(sb.root, 'project');
+  fs.mkdirSync(project, { recursive: true });
+  const text = Array.from({ length: 70 }, (_, i) => `def f${String(i).padStart(2, '0')}(x):\n    pass\n`).join('\n');
+  fs.writeFileSync(path.join(project, 'big.py'), text);
+  const recs = inChild(sb, `
+    se.recordFileEdit(${JSON.stringify(project)}, 'S', 'big.py', {}, 1);
+    return se.readEdits(${JSON.stringify(project)}, 'S');
+  `);
+  assert.equal(recs.length, 1 + 64);
+  assert.equal(recs[1].symbol, 'f00');
+  assert.equal(recs[64].symbol, 'f63');
+});
+
+test('recordFileEdit: a file over 256 KB is logged as a file only', (t) => {
+  const sb = sandbox(t);
+  const project = path.join(sb.root, 'project');
+  fs.mkdirSync(project, { recursive: true });
+  const body = 'def big(x):\n' + '    x = x + 1\n'.repeat(Math.ceil((257 * 1024) / 14));
+  assert.ok(body.length > 256 * 1024);
+  fs.writeFileSync(path.join(project, 'big.py'), body);
+  fs.writeFileSync(path.join(project, 'small.py'), 'def big(x):\n    pass\n');
+  const recs = inChild(sb, `
+    se.recordFileEdit(${JSON.stringify(project)}, 'S', 'big.py', {}, 1);
+    se.recordFileEdit(${JSON.stringify(project)}, 'S', 'small.py', {}, 2);
+    return se.readEdits(${JSON.stringify(project)}, 'S').map((r) => [r.file, r.symbol]);
+  `);
+  assert.deepEqual(recs, [['big.py', null], ['small.py', null], ['small.py', 'big']]);
+});
+
+// The writer side through the real hooks: pre-edit-guide for Write,
+// pre-grep-guide for `sed -i`. The fake binary fails every call.
+function hookSandbox(t) {
+  const sb = sandbox(t);
+  const cache = path.join(sb.home, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cache, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cache, 'install-manifest.json'), '{"version":"9.9.9","config":{}}');
+  const fake = path.join(cache, 'bin', 'code-graph-mcp');
+  fs.writeFileSync(fake, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(cache, 'binary-path'), fake);
+  const project = path.join(sb.root, 'project');
+  fs.mkdirSync(path.join(project, '.code-graph'), { recursive: true });
+  fs.mkdirSync(path.join(project, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(project, '.code-graph', 'index.db'), '');
+  fs.writeFileSync(path.join(project, 'src', 'a.py'), PY_BEFORE);
+  const run = (script, payload) => spawnSync(process.execPath, [path.join(__dirname, script)], {
+    input: JSON.stringify(payload), cwd: project, env: sb.env, encoding: 'utf8', timeout: 15000,
+  });
+  const read = (s) => inChild(sb, `return se.readEdits(${JSON.stringify(project)}, '${s}');`)
+    .map(({ file, symbol }) => ({ file, symbol }));
+  return { sb, project, run, read };
+}
+
+test('pre-edit-guide logs a Write and prints nothing for it', { skip: process.platform === 'win32' && 'POSIX shell fixture' }, (t) => {
+  const { project, run, read } = hookSandbox(t);
+  const after = PY_BEFORE.replace('def load(p):', 'def load(p, q):');
+  const w = run('pre-edit-guide.js', { session_id: 'W', tool_name: 'Write',
+    tool_input: { file_path: path.join(project, 'src', 'a.py'), content: after } });
+  assert.equal(w.status, 0, w.stderr);
+  assert.equal(w.stdout, '');
+  assert.deepEqual(read('W'), [{ file: 'src/a.py', symbol: null }, { file: 'src/a.py', symbol: 'load' }]);
+});
+
+test('pre-grep-guide logs the files a sed -i edits', { skip: process.platform === 'win32' && 'POSIX shell fixture' }, (t) => {
+  const { run, read } = hookSandbox(t);
+  const r = run('pre-grep-guide.js', { session_id: 'B', tool_name: 'Bash',
+    tool_input: { command: "sed -i 's/def load(p)/def load(p, q)/' src/a.py" } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '');
+  assert.deepEqual(read('B'), [
+    { file: 'src/a.py', symbol: null },
+    { file: 'src/a.py', symbol: 'load' },
+    { file: 'src/a.py', symbol: 'keep' },
+    { file: 'src/a.py', symbol: 'run' },
+  ]);
+  // Not an in-place edit: nothing logged.
+  const g = run('pre-grep-guide.js', { session_id: 'G', tool_name: 'Bash',
+    tool_input: { command: "sed -n 's/a/b/p' src/a.py" } });
+  assert.equal(g.status, 0, g.stderr);
+  assert.deepEqual(read('G'), []);
+});

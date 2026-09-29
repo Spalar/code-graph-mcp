@@ -4659,3 +4659,79 @@ test('e2e: a grep in a linked worktree reading its main checkout index is not re
     fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
+
+// ── Q1: in-place edits (`sed -i`, `perl -pi`) are logged for the Stop check ──
+// The shape table is tasks/specs/edit-log-coverage.md. Operands are kept only
+// when they name an existing regular file, so a misread costs a few extra
+// baseline records (the Stop check then finds nothing changed), never a report.
+{
+  const { extractInPlaceEditTargets } = require('./pre-grep-guide');
+  const FILES = new Set(['/p/f.py', '/p/g.py', '/p/sub/f.py', '/p/script.sed']);
+  const opts = { isFile: (p) => FILES.has(p), isDir: (p) => p === '/p/sub' };
+  const targets = (cmd) => extractInPlaceEditTargets(cmd, '/p', opts);
+  const IN_PLACE = [
+    ["sed -i 's/a/b/' f.py", ['/p/f.py']],
+    ["sed -i.bak -e 's/a/b/' -e 's/c/d/' f.py g.py", ['/p/f.py', '/p/g.py']],
+    ["sed -Ei 's/a/b/' f.py", ['/p/f.py']],
+    ["sed --in-place 's/a/b/' f.py", ['/p/f.py']],
+    ["sed --in-place=.bak 's/a/b/' f.py", ['/p/f.py']],
+    ['sed -i -f script.sed f.py', ['/p/f.py']],
+    ["sed -i '' 's/a/b/' f.py", ['/p/f.py']],          // BSD spelling: '' is the script to GNU, 's/a/b/' no file
+    ["sed -ie 's/a/b/' f.py", ['/p/f.py']],            // GNU: suffix `e`, then the script
+    ["sed -i 's/a/b/' /p/f.py", ['/p/f.py']],
+    ["perl -pi -e 's/a/b/' f.py", ['/p/f.py']],
+    ["perl -i -pe 's/a/b/' f.py", ['/p/f.py']],
+    ["perl -i.bak -pe 's/a/b/' f.py", ['/p/f.py']],
+    ["git diff; sed -i 's/a/b/' f.py", ['/p/f.py']],
+    ["cd sub && sed -i 's/a/b/' f.py", ['/p/sub/f.py']],
+    ["LC_ALL=C sed -i 's/a/b/' f.py", ['/p/f.py']],
+    ["sed -i 's/a/b/' f.py 2>/dev/null", ['/p/f.py']],
+    ["sed -i 's/a/b/' f.py > g.py", ['/p/f.py']],       // a redirect's target is no operand
+    ["sed -i 's/a/b/' f.py f.py", ['/p/f.py']],
+  ];
+  const NOT_IN_PLACE = [
+    "sed -n 's/a/b/p' f.py",
+    "sed 's/a/b/' f.py > g.py",
+    "sed -i 's/a/b/' *.py",
+    "echo sed -i x f.py",
+    "grep 'sed -i' f.py",
+    "perl -pe 's/a/b/' f.py",
+    "perl -e 'print 1'",
+    "sed -i 's/a/b/' missing.py",
+    "sed -i 's/a/b/' sub",
+    "sed -i \"s/$x/y/\" f.py",                          // not a command the tokenizer reads exactly
+    "cat f.py | sed -i 's/a/b/'",
+    '',
+  ];
+  for (const [cmd, want] of IN_PLACE) {
+    test(`in-place targets: ${cmd}`, () => assert.deepEqual(targets(cmd), want));
+  }
+  for (const cmd of NOT_IN_PLACE) {
+    test(`not in place: ${JSON.stringify(cmd)}`, () => assert.deepEqual(targets(cmd), []));
+  }
+  // Every word "exists" here, so what is kept is decided by the grammar alone —
+  // with the existence filter on, a misread script or flag value is dropped
+  // anyway and a parser mistake would not show.
+  const EXACT = [
+    ["sed -i -e 's/a/b/' f.py", ['/p/f.py']],
+    ['sed -i -f script.sed f.py', ['/p/f.py']],
+    ["sed -i --expression='s/a/b/' f.py g.py", ['/p/f.py', '/p/g.py']],
+    ["sed '-i' 's/a/b/' f.py", ['/p/f.py']],
+    ["sed -i 's/a/b/' *.py f.py 2>/dev/null > out.txt", ['/p/f.py']],
+    ["sed -i 's/a/b/' f.py | tee log", ['/p/f.py']],
+    ["perl -i -pe 's/a/b/' f.py", ['/p/f.py']],
+    ['perl -i -p script.pl f.py', ['/p/f.py']],
+    ["perl -i -I lib -pe 's/a/b/' f.py", ['/p/f.py']],
+  ];
+  for (const [cmd, want] of EXACT) {
+    test(`in-place grammar: ${cmd}`, () => {
+      assert.deepEqual(extractInPlaceEditTargets(cmd, '/p', { isFile: () => true, isDir: () => false }), want);
+    });
+  }
+
+  test('in-place targets: at most 8 files per command', () => {
+    const many = Array.from({ length: 12 }, (_, i) => `/p/m${i}.py`);
+    const got = extractInPlaceEditTargets(`sed -i 's/a/b/' ${many.join(' ')}`, '/p', { isFile: () => true, isDir: () => false });
+    assert.deepEqual(got, many.slice(0, 8));
+  });
+}
