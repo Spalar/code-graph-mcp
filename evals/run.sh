@@ -16,8 +16,9 @@ work="${CG_EVAL_WORK_DIR:-/var/tmp/code-graph-eval}"
 # under $HOME (/var/tmp and /tmp are denied outright), so the tools live there.
 tools="${CG_EVAL_TOOLS_DIR:-$HOME/.cache/code-graph-eval/bin}"
 # A real install lives under ~/.claude/plugins/, and the plugin keys behavior
-# on that path: SessionStart adopts the project's CLAUDE.md only in plugin mode
-# (adopt.js isPluginModeInstall). Loading claude-plugin/ from this checkout
+# on that path: SessionStart's plugin-mode paths (the stale CLAUDE.md block
+# notice, legacy migration) run only there (adopt.js isPluginModeInstall).
+# Loading claude-plugin/ from this checkout
 # would also let every launcher resolve target/release as a dev build. So the
 # plugin under test is a copy staged at a plugin-mode path, with the suite
 # inside it where claude plugin eval looks for it.

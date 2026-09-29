@@ -138,7 +138,9 @@ done, so these are scored outside it. Run with `--keep-temp --json OUT.json`,
 then `python3 evals/_coding/grade.py OUT.json --suite`: it copies each kept
 workspace out, runs the case's hidden tests (`_coding/hidden/<case>/`, public
 API only, never staged into the plugin directory the agent can read) and,
-with `--suite`, the whole networkx suite. `build.sh` checks every case both
+with `--suite`, the whole networkx suite; each copy (~60 MB) is removed once
+graded unless `--keep-scratch`. The kept `/tmp/claude-eval-*` directories are
+yours to delete afterwards. `build.sh` checks every case both
 ways before it can be used: the hidden tests fail on the workspace and pass
 on the upstream commit (for `code-dead-helpers`, the gold set is the three
 functions upstream removed). The only in-eval grader is `used-code-graph`.
@@ -179,6 +181,29 @@ How to read it:
   clearly specified change in a 583-file repo is within reach of grep and
   reading.
 
+### After the 2026-09-28 changes (branch head `05499f9`, 2026-09-29, same model)
+
+$12.95, 712 s. The no-plugin arm moves between rounds too (255 → 230 turns),
+so compare the arms within a round.
+
+| Measure | Baseline W / W/O | After W / W/O |
+|---|---|---|
+| Pass (hidden tests, full suite) | 15/15 / 15/15 | 15/15 / 15/15 |
+| Cost | $7.60 / $6.88 (+10.5%) | $6.51 / $6.45 (+0.9%) |
+| Turns | 271 / 255 | 227 / 230 |
+| Cache-read tokens | 8.27M / 7.04M (+17.6%) | 6.42M / 6.33M (+1.4%) |
+| Final reply mentions `.gitignore` / `CLAUDE.md` | 12/15 / 0/15 | 0/15 / 0/15 |
+| code-graph calls (W) | 0 | 0 |
+
+A bootstrap over runs within each case puts both cost deltas inside noise
+(95% intervals −1.8%..+24.6% and −7.5%..+9.2%); the side-effect replies are
+not noise (Fisher one-sided p ≈ 5e-6). The plugin is still not used for a
+code change: the grep hook still never sees `networkx/…`, and the only
+injection was one UserPromptSubmit search for the word `networkx` whose hits
+were unrelated. Every hook now fires from `hooks.json` from the first event;
+the first prompt's hook runs before the new repo's index is built, so 12 of
+12 first-prompt impact queries returned nothing.
+
 ## What `run.sh` sets up, and why
 
 Each eval run gets a temporary HOME, an empty workspace and a fresh Claude Code
@@ -188,10 +213,10 @@ several ways. `run.sh` closes the ones that would change what is measured:
 
 1. **The plugin is loaded from a staged copy at a plugin-mode path**
    (`/var/tmp/code-graph-eval/stage/.claude/plugins/code-graph-mcp`), with the
-   suite copied inside it. From the checkout, SessionStart does not adopt the
-   project's CLAUDE.md, because `adopt.js isPluginModeInstall` keys on
-   `/.claude/plugins/`. Every launcher would also resolve `target/release` as a
-   dev build.
+   suite copied inside it. From the checkout, SessionStart's plugin-mode paths
+   (the stale CLAUDE.md block notice, legacy migration) would not run, because
+   `adopt.js isPluginModeInstall` keys on `/.claude/plugins/`. Every launcher
+   would also resolve `target/release` as a dev build.
 2. **The MCP server is started** (`--allow-real-servers`, plus a grant for its
    tools). The eval never starts a plugin's MCP server by default, and a real
    session always does. Without it, the server's `instructions` field and the
