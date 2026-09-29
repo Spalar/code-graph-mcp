@@ -11519,3 +11519,140 @@ fn the_module_import_fanout_pulls_only_importers_a_rebuild_rebinds() {
         vec!["rel/sub.py".to_string(), "rel/user.py".to_string()]
     );
 }
+
+// D6 (2026-09-29 usage evaluation): a route whose handler lives in another
+// file — the canonical `import { getUser } from './ctrl'; app.get('/users',
+// getUser)` — is stored as the handler's self-edge, inside the HANDLER's file,
+// and nothing records the route's file. hono lost one such edge
+// (`app.use(mw1, mw2)` in `types.test.ts`, bound to `hono.test.ts`'s `mw2`)
+// whenever `hono.test.ts` was re-indexed.
+const ROUTE_CTRL: (&str, &str) = (
+    "ctrl.ts",
+    "export function getUser(c: any) {\n  return c\n}\n",
+);
+const ROUTE_FILE: (&str, &str) = (
+    "routes.ts",
+    "import { getUser } from './ctrl'\nimport { Hono } from 'hono'\nconst app = new Hono()\napp.get('/users', getUser)\n",
+);
+
+#[test]
+fn an_imported_handler_route_survives_an_edit_of_the_handler_file() {
+    let edges = assert_incremental_edges_match_rebuild(
+        &[ROUTE_CTRL, ROUTE_FILE],
+        &[(
+            "ctrl.ts",
+            Some("export function getUser(c: any) {\n  return c.json(1)\n}\n"),
+        )],
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e == "ctrl.ts.getUser --routes_to--> ctrl.ts.getUser"),
+        "{edges:#?}"
+    );
+}
+
+#[test]
+fn an_imported_handler_route_goes_when_the_route_file_drops_it() {
+    assert_incremental_edges_match_rebuild(
+        &[ROUTE_CTRL, ROUTE_FILE],
+        &[(
+            "routes.ts",
+            Some("import { getUser } from './ctrl'\nimport { Hono } from 'hono'\nconst app = new Hono()\n"),
+        )],
+    );
+    assert_incremental_edges_match_rebuild(&[ROUTE_CTRL, ROUTE_FILE], &[("routes.ts", None)]);
+}
+
+#[test]
+fn an_imported_handler_route_follows_its_handler_to_another_file() {
+    let other = (
+        "legacy/ctrl.ts",
+        "export function getUser(c: any) {\n  return 2\n}\n",
+    );
+    assert_incremental_edges_match_rebuild(&[ROUTE_CTRL, ROUTE_FILE, other], &[("ctrl.ts", None)]);
+    assert_incremental_edges_match_rebuild(
+        &[ROUTE_CTRL, ROUTE_FILE, other],
+        &[(
+            "ctrl.ts",
+            Some("export function other() {\n  return 1\n}\n"),
+        )],
+    );
+}
+
+// hono's own shape, minimized: no import, the route file routes to a local
+// `const` that is no node, and the name pool binds another file's `mw2`.
+#[test]
+fn a_route_bound_by_name_to_another_file_survives_its_edit() {
+    let handler = "const mw2 =\n  () =>\n  async (c: any, next: any) => {\n    await next()\n  }\n";
+    let edges = assert_incremental_edges_match_rebuild(
+        &[
+            ("src/hono.test.ts", handler),
+            (
+                "src/types.test.ts",
+                "import { Hono } from 'hono'\nconst app = new Hono()\n\
+                 const mw1 = createMiddleware(async () => {})\n\
+                 const mw2 = createMiddleware(async () => {})\n\
+                 app.use(mw1, mw2).get('/', (c: any) => c.json(1))\n",
+            ),
+        ],
+        &[("src/hono.test.ts", Some(&format!("{handler}// touched\n")))],
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e == "src/hono.test.ts.mw2 --routes_to--> src/hono.test.ts.mw2"),
+        "{edges:#?}"
+    );
+}
+
+// A route bound by name follows the handler a rebuild would pick when a
+// closer same-name handler appears. (One appearing where none existed is not
+// covered: the route and its value reference were dropped with no record,
+// and only calls keep one, in `pending_unresolved_calls`.)
+#[test]
+fn a_route_bound_by_name_follows_a_closer_same_name_handler() {
+    let routes = (
+        "api/routes.ts",
+        "import { Hono } from 'hono'\nconst app = new Hono()\napp.get('/users', getUser)\n",
+    );
+    let far = (
+        "far/away/h.ts",
+        "export function getUser(c: any) {\n  return 1\n}\n",
+    );
+    let near = "export function getUser(c: any) {\n  return 2\n}\n";
+    let edges = assert_incremental_edges_match_rebuild(&[routes, far], &[("api/h.ts", Some(near))]);
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.starts_with("far/away/h.ts.getUser --routes_to-->")),
+        "{edges:#?}"
+    );
+}
+
+/// The context string of the node `name` in `path`.
+fn context_string_of(db: &Database, path: &str, name: &str) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT n.context_string FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE f.path = ?1 AND n.name = ?2",
+            [path, name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+// The handler's context string names its route, so it follows the route file.
+#[test]
+fn an_imported_handler_context_string_follows_its_route_file() {
+    let (project, _d, db) = fresh_index_of(&[ROUTE_CTRL, ROUTE_FILE]);
+    let dropped =
+        "import { getUser } from './ctrl'\nimport { Hono } from 'hono'\nconst app = new Hono()\n";
+    fs::write(project.path().join("routes.ts"), dropped).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, control) = fresh_index_of(&[ROUTE_CTRL, ("routes.ts", dropped)]);
+    assert_eq!(
+        context_string_of(&db, "ctrl.ts", "getUser"),
+        context_string_of(&control, "ctrl.ts", "getUser")
+    );
+}

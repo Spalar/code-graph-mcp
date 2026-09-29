@@ -1066,6 +1066,132 @@ pub(super) fn sentinel_name_matches_stem(name: &str, stem: &str) -> bool {
     seg == stem || seg_no_ext == stem || dotted_last == stem
 }
 
+/// Metadata key of a `routes_to` edge whose handler was found outside the
+/// route's own file: the ROUTE file (D6, 2026-09-29 usage evaluation). Such an
+/// edge is the handler's self-edge, so both of its ends sit in the handler's
+/// file and nothing else says which file wrote it: re-indexing the handler's
+/// file dropped it (hono's `app.use(mw1, mw2)` in `types.test.ts`, bound to
+/// `hono.test.ts`'s `mw2`), and a route file that stopped routing to it left
+/// it behind.
+pub(super) const ROUTE_FILE_KEY: &str = "rf";
+
+/// The route file [`ROUTE_FILE_KEY`] records on a `routes_to` edge.
+pub(super) fn route_file_of(metadata: Option<&str>) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(metadata?)
+        .ok()?
+        .get(ROUTE_FILE_KEY)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `metadata` with [`ROUTE_FILE_KEY`] set to `route_file`.
+fn with_route_file(metadata: Option<&str>, route_file: &str) -> Option<String> {
+    let mut map = metadata
+        .and_then(|m| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(m).ok())
+        .unwrap_or_default();
+    map.insert(ROUTE_FILE_KEY.to_string(), route_file.into());
+    serde_json::to_string(&map).ok()
+}
+
+/// Every `routes_to` edge a route file wrote into another file's handler, as
+/// (source id, target id, handler name, metadata, route file, source path,
+/// target path). Routes are few, so one read serves the whole run.
+#[allow(clippy::type_complexity)]
+fn foreign_route_edges(
+    db: &Database,
+) -> Result<Vec<(i64, i64, String, Option<String>, String, String, String)>> {
+    let mut stmt = db.conn().prepare_cached(
+        "SELECT e.source_id, e.target_id, nt.name, e.metadata, fs.path, ft.path
+         FROM edges e
+         JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id
+         JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id
+         WHERE e.relation = ?1 AND e.metadata LIKE '%\"rf\":%'",
+    )?;
+    let rows = stmt
+        .query_map([REL_ROUTES_TO], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(src, tgt, name, meta, sp, tp)| {
+            let rf = route_file_of(meta.as_deref())?;
+            Some((src, tgt, name, meta, rf, sp, tp))
+        })
+        .collect())
+}
+
+/// D6 before any file of the run is purged: the routes another file wrote
+/// into a file of this run.
+///
+/// - Written by a file this run re-extracts or deletes: stale, since that
+///   file's extraction writes the ones it still has. Deleted now. (The
+///   handler's context string follows through the route file's own import or
+///   value reference of it, which puts the handler in the caller's dirty set.)
+/// - Written by a file outside the run into a handler of the run: the purge
+///   takes the edge, and the handler's own extraction never writes it. Its
+///   route file's relation is requeued, so the deferred pass resolves the
+///   handler exactly as a rebuild does.
+fn settle_foreign_routes(
+    db: &Database,
+    files: &[String],
+    delete_paths: &[String],
+    deferred: &mut Vec<DeferredRelation>,
+) -> Result<()> {
+    let edges = foreign_route_edges(db)?;
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let run: HashSet<&str> = files
+        .iter()
+        .chain(delete_paths.iter())
+        .map(|s| s.as_str())
+        .collect();
+    let tx = db.savepoint("idx_foreign_routes")?;
+    let mut requeued: HashSet<(String, String, Option<String>)> = HashSet::new();
+    for (src, tgt, name, meta, rf, src_path, tgt_path) in edges {
+        if run.contains(rf.as_str()) {
+            db.conn().execute(
+                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2
+                 AND relation = ?3 AND metadata IS ?4",
+                rusqlite::params![src, tgt, REL_ROUTES_TO, meta],
+            )?;
+        } else if (run.contains(src_path.as_str()) || run.contains(tgt_path.as_str()))
+            && requeued.insert((rf.clone(), name.clone(), meta.clone()))
+        {
+            let language: Option<String> = db
+                .conn()
+                .query_row("SELECT language FROM files WHERE path = ?1", [&rf], |row| {
+                    row.get(0)
+                })
+                .ok()
+                .flatten();
+            let Some(language) = language else {
+                continue;
+            };
+            deferred.push(DeferredRelation {
+                source_ids: Vec::new(),
+                source_name: name.clone(),
+                target_name: name,
+                relation: REL_ROUTES_TO.to_string(),
+                metadata: meta,
+                rel_path: rf,
+                language,
+                ns_file: None,
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Files this run must re-extract because a file they depend on just appeared or
 /// vanished. See the Phase 0-pre block in [`index_files`] for why re-extraction,
 /// and not edge re-resolution, is the mechanism.
@@ -2396,6 +2522,12 @@ Restart every code-graph server on this project so they run one version.",
         )?;
     }
 
+    // Phase 0-routes (D6): routes another file wrote into this run's files, and
+    // the ones this run's files wrote elsewhere, before any purge takes them.
+    if has_work {
+        settle_foreign_routes(db, &files, delete_paths, &mut deferred)?;
+    }
+
     // Phase 0: Delete removed files in own transaction.
     if !delete_paths.is_empty() {
         buffer_then_delete_files(db, delete_paths, &run_file_paths, &mut deferred)?;
@@ -3530,6 +3662,23 @@ fn resolve_deferred_relations(
         if source_ids.is_empty() {
             continue;
         }
+
+        // D6: a handler found outside the route's own file gets the route's
+        // self-edge in ITS file, so the edge records which file wrote it.
+        let routed: DeferredRelation;
+        let d = if d.relation == REL_ROUTES_TO
+            && source_ids
+                .iter()
+                .all(|id| node_id_to_path.get(id) != Some(&d.rel_path))
+        {
+            routed = DeferredRelation {
+                metadata: with_route_file(d.metadata.as_deref(), &d.rel_path),
+                ..d.clone()
+            };
+            &routed
+        } else {
+            d
+        };
 
         // A call through a renamed import (D#120): the export in the file its
         // specifier names, else buffered while that file lacks it, else nothing.
