@@ -19,8 +19,9 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Pr
 //   2. file_path is under CWD (no escape to absolute paths outside the project)
 //   3. file_path is not at CWD root (top-level files = config / one-off scripts)
 //   4. .code-graph/index.db exists in CWD (project is indexed)
-//   5. ≥5 prior Reads to the SAME parent dir tracked in /tmp state
-//   6. Same-dir cooldown not active (5 min)
+//   5. ≥5 DISTINCT files read in the SAME parent dir, tracked in /tmp state
+//   6. The dir has not fired before while its state entry lives
+//   7. The CLI delivers an overview for the dir (no advice-only line)
 //
 // State scoping: per-cwd (NOT per-session). Cost: two concurrent sessions in
 // the same project might share counters and over-trigger by ~1 hint each.
@@ -41,15 +42,10 @@ const { emitPreToolAllowContext } = require('./hook-emit');
 
 // --- Configuration ---
 
-// Hint fires on the (FANOUT_THRESHOLD + 1)-th Read into the same dir.
+// Hint fires on the (FANOUT_THRESHOLD + 1)-th DISTINCT file read in the same dir.
 // Set so that 4 reads stay quiet (legitimate "read a couple files to
-// understand X" pattern); 5+ reads is the fanout we want to catch.
+// understand X" pattern); 5+ files is the fanout we want to catch.
 const FANOUT_THRESHOLD = 4;
-
-// Per-dir cooldown after firing a hint. Prevents spam if Claude keeps
-// reading the same dir after seeing the hint (e.g., still has 3 more
-// files queued from a prior plan).
-const COOLDOWN_MS = 5 * 60 * 1000;
 
 // Entries older than this are pruned on load. Long enough to survive
 // normal multi-step tasks (15-20 min typical), short enough that stale
@@ -104,11 +100,23 @@ function saveState(cwd, state) {
   } catch { /* ok */ }
 }
 
-function recordRead(state, dir, now = Date.now()) {
+// Distinct files remembered per dir. Past this the count is already far over
+// the threshold, so the list stops growing and so does the state file.
+const MAX_FILES_PER_DIR = 32;
+
+/// Count a read of `file` (when given) in `dir`. Re-reading one file does not
+/// count again: five chunked reads of one big file are not a fanout, and they
+/// fired an overview of its whole parent dir (hook audit 2026-09-28).
+function recordRead(state, dir, now = Date.now(), file) {
   if (!state.by_dir[dir]) state.by_dir[dir] = { reads: 0, last_read_at: 0, last_hint_at: 0 };
   const e = state.by_dir[dir];
-  e.reads += 1;
   e.last_read_at = now;
+  if (file) {
+    if (!Array.isArray(e.files)) e.files = [];
+    if (e.files.includes(file)) return;
+    if (e.files.length < MAX_FILES_PER_DIR) e.files.push(file);
+  }
+  e.reads += 1;
 }
 
 function shouldHint(state, dir, now = Date.now()) {
@@ -116,18 +124,16 @@ function shouldHint(state, dir, now = Date.now()) {
   const e = state.by_dir[dir];
   if (!e) return false;
   if (e.reads < FANOUT_THRESHOLD + 1) return false;  // need >=5
-  if (e.last_hint_at && (now - e.last_hint_at < COOLDOWN_MS)) return false;
+  // Once per dir while its entry lives (pruned STATE_TTL_MS after the last
+  // read). The old 5-minute re-fire re-sent the same overview: 31.7% of fanout
+  // hints in 2026-09 sessions repeated a text the session already had.
+  if (e.last_hint_at) return false;
   return true;
 }
 
 function markHint(state, dir, now = Date.now()) {
   if (!state.by_dir[dir]) return;
   state.by_dir[dir].last_hint_at = now;
-}
-
-function buildHint(dir) {
-  // Single-line, ~190-byte budget. Skip-clause matches pre-grep-guide voice.
-  return `[code-graph] 5+ Reads into ${dir}/ — \`code-graph-mcp overview ${dir}/\` gives symbols+callers in one call (MCP: \`module_overview path=${dir}\`). Skip if you need raw file contents.`;
 }
 
 // v0.49 — the hint DELIVERS the overview instead of advising a tool call
@@ -167,7 +173,7 @@ function trackRead(root, rel, now = Date.now()) {
   if (!dir || dir === '.' || dir === '') return null;  // top-level file: not fanout
 
   const state = loadState(root, now);
-  recordRead(state, dir, now);
+  recordRead(state, dir, now, rel);
   let fired = false;
   if (shouldHint(state, dir, now)) {
     markHint(state, dir, now);
@@ -184,9 +190,15 @@ function trackRead(root, rel, now = Date.now()) {
   return dir;
 }
 
-/// The fanout hint text for `dir`, with the overview answer embedded when the
-/// CLI delivers one. `maxBytes` bounds that answer — the pre-grep sed path
-/// splits one envelope's budget between several dirs.
+/// The fanout hint text for `dir` with the overview answer embedded, or null
+/// when the CLI delivers none. `maxBytes` bounds that answer — the pre-grep sed
+/// path splits one envelope's budget between several dirs.
+///
+/// No overview, no hint. The advice-only line measured no effect twice: 0/40
+/// transfer on 2026-06-12, and 18/672 follow-through against a 2.76% baseline in
+/// 2026-09 sessions, where 572 of the 672 advised `overview tests/` — which
+/// answers "No symbols found", since overview leaves test symbols out. The
+/// unanswered hint is still recorded, so the funnel keeps its reasons.
 function buildFanoutHint(root, dir, { maxBytes } = {}) {
   let answer = { status: 'unavailable' };
   if (maxBytes === 0) {
@@ -212,11 +224,11 @@ function buildFanoutHint(root, dir, { maxBytes } = {}) {
     ...(answered ? {} : { reason: answer.status }),
     ...(answered || !answer.reason ? {} : { fallthrough_reason: answer.reason }),
   });
-  return answered ? buildHintWithAnswer(dir, answer) : buildHint(dir);
+  return answered ? buildHintWithAnswer(dir, answer) : null;
 }
 
 /// trackRead + buildFanoutHint for one read. Returns the hint text when the
-/// hint fired, else null. The caller emits it.
+/// hint fired with an overview, else null. The caller emits it.
 function trackReadAndMaybeHint(root, rel, now = Date.now()) {
   const dir = trackRead(root, rel, now);
   return dir === null ? null : buildFanoutHint(root, dir);
@@ -263,8 +275,8 @@ if (require.main === module) {
 module.exports = {
   isSourceFile, dirOf, cwdHash, statePath,
   loadState, saveState, recordRead, shouldHint, markHint,
-  buildHint, buildHintWithAnswer, isSilenced, isAnswerDisabled,
+  buildHintWithAnswer, isSilenced, isAnswerDisabled,
   trackReadAndMaybeHint,   // v0.49 — shared with pre-grep-guide's sed-range path
   trackRead, buildFanoutHint,  // the sed path's two halves: one envelope for every dir that fired
-  FANOUT_THRESHOLD, COOLDOWN_MS, STATE_TTL_MS, SRC_EXT,
+  FANOUT_THRESHOLD, STATE_TTL_MS, SRC_EXT,
 };

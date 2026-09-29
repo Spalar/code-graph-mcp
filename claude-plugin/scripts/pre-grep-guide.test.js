@@ -2730,7 +2730,12 @@ test('sed-range fanout: long dir names still fit both hints uncut', () => {
   }
 });
 
-test('sed-range fanout: fourteen dirs at once each keep their hint', () => {
+test('sed-range fanout: dirs whose share cannot hold an overview emit nothing', () => {
+  // The advice-only line ("`code-graph-mcp overview <dir>/` gives …") measured
+  // no effect twice: 0/40 transfer on 2026-06-12, and 18/672 follow-through
+  // against a 2.76% baseline in 2026-09 sessions — 572 of those advised
+  // `overview tests/`, which answers "No symbols found". Without an overview
+  // there is nothing to deliver. The dirs are still marked, so they stay quiet.
   const readGuide = require('./pre-read-guide');
   const fixture = e2eFixture(
     'const d = process.argv[3]; for (let i = 0; i < 200; i++) process.stdout.write(d + " symbol_" + i + " (src/some/long/path.rs)\\n");');
@@ -2745,36 +2750,32 @@ test('sed-range fanout: fourteen dirs at once each keep their hint', () => {
 
     const res = runHook(dirs.map((d) => `sed -n 1,5p ${d}/f.js`).join('; '), fixture);
     assert.equal(res.status, 0, res.stderr);
-    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
-    for (const d of dirs) {
-      assert.match(ctx, new RegExp(`5\\+ Reads into ${d}/ `), `${d} keeps its hint`);
-    }
-    assert.doesNotMatch(ctx, /truncated at \d+ bytes/, 'every hint fits the envelope');
-    assert.doesNotMatch(ctx, /symbol_0/, 'no share is big enough for an answer, so none ran');
+    assert.equal(res.stdout.trim(), '', 'no share fits an answer, so nothing is injected');
+    const after = readGuide.loadState(root).by_dir;
+    for (const d of dirs) assert.ok(after[d].last_hint_at > 0, `${d} is marked and will not re-fire`);
   } finally {
     fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test('sed-range fanout: every dir marked delivered is named in the envelope', () => {
+test('sed-range fanout: one dir with a full-size overview keeps its answer', () => {
+  // A single dir used to get no budget, so its ~4.1 KB hint overflowed the
+  // 4,000-byte envelope and was swapped for a bare "5+ Reads also into …"
+  // line: the overview was computed and thrown away (hook audit P2-5).
   const readGuide = require('./pre-read-guide');
-  const fixture = e2eFixture('process.stdout.write("overview stub\\n");');
+  const fixture = e2eFixture(
+    'const d = process.argv[3]; for (let i = 0; i < 200; i++) process.stdout.write(d + " symbol_" + i + " (src/some/long/path.rs)\\n");');
   try {
     const root = resolveProjectRoot(fixture.dir);
-    for (const [n, len] of [[9, 100], [23, 5]]) {
-      const dirs = Array.from({ length: n }, (_, i) => `${'x'.repeat(len - String(i).length)}${i}`);
-      const state = readGuide.loadState(root);
-      for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) {
-        for (const d of dirs) readGuide.recordRead(state, d);
-      }
-      readGuide.saveState(root, state);
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) readGuide.recordRead(state, 'lib');
+    readGuide.saveState(root, state);
 
-      const res = runHook(dirs.map((d) => `sed -n 1,5p ${d}/f.js`).join('; '), fixture);
-      assert.equal(res.status, 0, res.stderr);
-      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
-      for (const d of dirs) assert.ok(ctx.includes(`${d}/`), `${n}x${len}: ${d} is named`);
-      assert.doesNotMatch(ctx, /truncated at \d+ bytes/, `${n}x${len}: nothing is cut`);
-    }
+    const res = runHook('sed -n 1,10p lib/core.js', fixture);
+    assert.equal(res.status, 0, res.stderr);
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /5\+ Reads into lib\/ — module overview/);
+    assert.match(ctx, /^lib symbol_0 /m, 'the overview answer rides in the envelope');
   } finally {
     fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
   }

@@ -1998,15 +1998,17 @@ function isAnswerDisabled(env = process.env) {
 // Smallest per-dir share of the context cap worth spending on an overview answer.
 const MIN_FANOUT_ANSWER_BYTES = 400;
 
-/// Byte budget for each overview answer when several dirs fire in one command
-/// (undefined for one dir: the answer keeps its own default). Every hint first
+/// Byte budget for each overview answer of the dirs that fire in one command.
+/// A single dir is budgeted too: left at the answer's own 4,000-byte default,
+/// its header pushed the hint past the envelope cap and the overview was
+/// replaced by a bare "5+ Reads also into …" line (hook audit P2-5). Every hint first
 /// pays for its own lines — an answer's header, footer and separator are about
 /// 175 bytes plus the dir name twice, the one-line advice about 165 plus the
 /// name three times — reserved as 200 plus the name three times, and the
 /// answers share what is left of the cap. A share under MIN_FANOUT_ANSWER_BYTES
 /// returns 0: every dir then gets the one-line advice instead.
 function fanoutAnswerBudget(dirs) {
-  if (dirs.length < 2) return undefined;
+  if (dirs.length < 1) return undefined;
   const reserved = dirs.reduce((sum, d) => sum + 200 + 3 * Buffer.byteLength(d, 'utf8'), 0);
   const share = Math.floor((MAX_INJECTED_BYTES - reserved) / dirs.length);
   return share >= MIN_FANOUT_ANSWER_BYTES ? share : 0;
@@ -2077,8 +2079,15 @@ function runMain() {
     }
     if (firedDirs.length > 0) {
       const maxBytes = fanoutAnswerBudget(firedDirs);
-      const hints = firedDirs.map((dir) => readGuide.buildFanoutHint(root, dir, { maxBytes }));
-      process.stdout.write(emitPreToolContext(joinFanoutHints(firedDirs, hints)) + '\n');
+      // A dir with no overview contributes nothing (buildFanoutHint → null);
+      // it stays marked, so it does not fire again.
+      const answered = firedDirs
+        .map((dir) => ({ dir, hint: readGuide.buildFanoutHint(root, dir, { maxBytes }) }))
+        .filter((h) => h.hint !== null);
+      if (answered.length > 0) {
+        process.stdout.write(emitPreToolContext(
+          joinFanoutHints(answered.map((h) => h.dir), answered.map((h) => h.hint))) + '\n');
+      }
       return;
     }
   }
