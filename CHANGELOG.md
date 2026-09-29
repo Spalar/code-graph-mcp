@@ -15,6 +15,10 @@ entries earlier versions wrote into `~/.claude/settings.json`: the plugin's
 `hooks/hooks.json` now carries them. SessionStart no longer writes `CLAUDE.md`
 or `.claude/`, and a project it adopted before keeps its block (you get a
 notice with a refresh and a remove command when that block is out of date).
+**Every index rebuilds once, automatically, on first use:** `INDEX_VERSION`
+goes 103 → 109 because JavaScript/TypeScript and Python files now produce
+different nodes and edges (see below). An older binary leaves a v109 index
+intact and warns instead of rebuilding it.
 
 ### Hooks live in the plugin's hooks.json
 
@@ -71,6 +75,21 @@ impacted.
   4,000 bytes.
 - **Edit-time reindex** (`CODE_GRAPH_HOOK_INDEX=on`) indexes structure only;
   it made each edit wait 8 s for embeddings.
+- **The prompt hook searches** only for identifier-shaped names, as its
+  `impact` and `callgraph` branches already did: a prompt naming only
+  `networkx` and `checkout` injected 7 unrelated search results.
+- **While the startup index is being written** (`.code-graph/indexing-status.json`
+  fresh), the prompt, pre-edit, post-grep and read-fanout hooks inject no
+  structural answer: a half-built index answered `0 callers, Risk UNKNOWN`
+  for a function the finished index gives 4 callers. The prompt hook does not
+  start its cooldown then, so a later prompt about the same name is answered.
+- **The grep hooks know the project's own source directories.** The indexer
+  writes `.code-graph/source-roots.json` (the top-level directories holding
+  indexed code) at the end of every run, and both grep hooks add them to
+  their fixed list, so a Python package directory (`networkx/`, `django/`)
+  is answered like `src/`. A `__pycache__` holding only `.pyc`/`.pyo` files
+  no longer declines the `grep -r` rewrite (`-l` without `-I` still does:
+  grep would list the `.pyc`).
 
 ### `impact`: no caller in the graph is `UNKNOWN`, not `LOW`
 
@@ -85,19 +104,116 @@ endorsement for express's main export, which every test calls through
 
 The MCP instructions, tool descriptions, the `adopt` block, the detail doc,
 the `explore` skill and the `code-explorer` agent no longer claim the index
-"sees everything" (unresolved calls leave no edge; JS `obj.m = function`
-members are not indexed yet), add `refs X` then `grep -w X` for rename and
+"sees everything" (unresolved calls leave no edge; the detail doc names the
+JS shapes that are still no node), add `refs X` then `grep -w X` for rename and
 remove audits, and drop the `~/.cache/code-graph/bin` fallback (the plugin's
 `bin/` is on the Bash PATH). The detail doc no longer recommends
 `refs --min-confidence extracted`, which drops every cross-file caller. It is
 now English and 3.3 KB instead of 12.6 KB. `code-explorer` lists only the
 plugin-hosted MCP tool names a live install exposes.
 
+### JavaScript and TypeScript: functions held by members and fields are nodes
+
+express 4.21.2 defines 70 of the 107 functions in `lib/` as
+`res.send = function send() {}`, `View.prototype.lookup = function () {}` or
+`exports.f = function () {}`, and hono's `Context` holds 15 of its methods as
+arrow fields. None was a node: `show send` found nothing and their calls were
+credited to `<module>`. Now a function literal assigned to a plain member path
+is a node named by the property (`res.send`, `exports.f`; `View.lookup` as a
+method; one node per member of `res.set = res.header = …`), a class field
+holding a function is method `Class.field`, and the calls inside either are
+scoped to it. `this.x = …`, `obj[k] = …` and `f().x = …` stay none.
+
+The new names would draw by-name edges the language rules out, so those are
+narrowed: a call or `require` through a package binding
+(`var send = require('send')`, `var resolve = path.resolve`) binds nothing
+in its own file and such an import no project node; a call through one of
+Node's own modules (`path.resolve`) or an unshadowed built-in global
+(`Object.create`, `JSON.parse`) is no call edge.
+
+CommonJS package entry points resolve: `require('..')` / `require('.')` are
+relative, a directory specifier reaching the repository root finds its
+`index.js`, and `module.exports = require('./lib/express')` makes `./lib/express`
+the module's import. express: `deps index.js` now names `lib/express.js`,
+and `affected lib/view.js` lists 93 test files (was 1; all 74 that load the
+package plus 19 that load it through `examples/`).
+
+Measured with the SCIP oracle on hono: 1,145 gold call pairs instead of 896
+(the new definitions map), 921 correct edges at the default floor instead of
+805, inferred precision 97.1% instead of 94.3%, and no correct edge lost;
+extracted-tier wrong edges go 4 → 8, four of them an existing rule meeting the
+new `Context.set`. On express every judged edge stays correct. Calls through a re-export (`express()`
+reaching `createApplication`) still resolve by name.
+
+### Python: decorators, imports and `@overload`
+
+- A decorator named bare (`@setupmethod`) is a reference from the function it
+  decorates: `refs setupmethod` on flask finds its 44 uses (was none, so it
+  also read as dead code).
+- A relative import (`from .globals import x`, `from .. import m`) binds the
+  file it names in the importer's package. It took an `<external>` sentinel
+  named `.globals`, so a package's modules imported nothing of each other:
+  on flask 103 phantom externals are gone, 150 in-package imports appear, and
+  `affected src/flask/signals.py` lists 45 test files instead of none. A name
+  that is no node of the module (a variable, a submodule, `*`) binds the
+  module file rather than a same-named symbol elsewhere.
+- `from flask import url_for` never binds a method. The name fallback took
+  `Flask.url_for` beside `helpers.url_for`, and every `url_for(...)` of the
+  importer bound both; 15 wrong flask call edges are gone.
+- `@overload` stubs followed by their implementation are no nodes of their
+  own. Three same-file definitions of one name made `callgraph`, `impact` and
+  `refs` refuse flask's 9 overloaded functions (`stream_with_context`,
+  `locate_app`, `template_filter`, …); the implementation answers for them. A
+  stub with nothing after it (a `.pyi` file, a Protocol) stays.
+
+### Queries
+
+- `show`, `impact`, `refs` and `callgraph` find a symbol added in a file the
+  index does not hold yet: on a true miss they index the unindexed files that
+  mention the name (at most 8) and resolve again. Measured on this
+  repository's 511 files, a miss costs 171 ms instead of 163 ms; a name that
+  exists costs nothing extra.
+- The MCP server no longer answers from the pre-edit graph while an embedding
+  backfill runs: a structural re-index asks the backfill to yield between
+  32-node batches, runs, and restarts it. It used to wait 2 s, skip, and stay
+  owed for the minutes a first backfill takes.
+- `callgraph X --file F`, `impact X --file F` and MCP `get_call_graph` with a
+  `file_path` refuse a name with several definitions in that file, as `refs`
+  already did, instead of merging them (`callgraph pop --file
+  src/flask/ctx.py` answered for `_AppCtxGlobals.pop` and `AppContext.pop` at
+  once). A qualified name (`AppContext.pop`) answers.
+- `impact` on a type, constant or trait with few callers reports
+  `Risk: UNKNOWN` and the non-function warning instead of `LOW`: its users are
+  type positions, implementers and imports, which calls do not count (hono's
+  `Router` interface read `LOW` on one caller). MEDIUM or HIGH from calls
+  stays.
+- `dead-code` (text) and MCP `find_dead_code` say a candidate list with a
+  non-Rust file in it is experimental: on the evaluation corpora 0–25% of
+  such candidates were really unused. `dead-code --json` is unchanged.
+
+### Index versions
+
+`INDEX_VERSION` goes 103 → 109. Each step, as recorded on the constant:
+
+- v104 (2026-09-29, D7): a JS/TS function literal assigned to a named member (`res.send = function send() {}`, `View.prototype.lookup = …` as method `View.lookup`, `exports.f` / `module.exports.f` as `exports.f`) and a class field holding a function (`json = () => {}` as method `Class.json`) are nodes, and the calls inside them are scoped to them instead of `<module>` or the class body; a chained `res.set = res.header = function () {}` is a node per member; a `this.x = …` assignment is none; a bare call or `require` import through a package binding (`var send = require('send')`, or a member of one: `var resolve = path.resolve`) binds no node of its own file, and such an import no project node at all (`q:"pkg"`); a member call on an unshadowed built-in global (`Object.create`, `JSON.parse`), and a bare call through one of Node's own modules (`path.resolve`), is no call edge.
+- v105 (2026-09-29, D7/C3): a bare `require('.')` / `require('..')` resolves like `./` / `../`, a directory specifier that reaches the repo root finds its `index.js`, and `module.exports = require('./x')` (`exports = module.exports = …` too) binds its module to `./x` as a namespace require does, so express's tests reach `lib/` through `index.js` in deps/affected.
+- v106 (2026-09-29, C4): a Python decorator named bare (`@setupmethod`) is a `references` edge from the function it decorates (`Class.method`), so flask's 44 uses of `setupmethod` are 44 references, not none.
+- v107 (2026-09-29, C4): a Python `from m import x` never binds a method; flask's `from flask import url_for` names a re-export of `helpers.url_for` the module lookup cannot follow, and the name fallback took `Flask.url_for` too, so every `url_for(...)` of the importer bound both (the unique import now prunes the method from the calls: 15 wrong flask call edges, 0 judged edges lost).
+- v108 (2026-09-29, D10): a Python relative import (`from .signals import x`, `from .. import m`) resolves against the importer's package instead of binding the `<external>` sentinel `.signals`; a name that is no node of the module (a variable, a submodule, `*`) binds that file's `<module>`, so flask's package modules import each other (103 phantom externals gone, 150 in-package imports) and `affected src/flask/signals.py` names 45 tests instead of none.
+- v109 (2026-09-29, C4): a Python `@overload` stub followed in its block by the implementation is no node: the stubs type that one function, and as three same-file definitions they made callgraph/impact/refs refuse flask's 9 overloaded names (`stream_with_context`, `locate_app`, `template_filter`, …); a stub with no implementation after it (`.pyi`, Protocol) stays.
+
 ### Evals
 
 `evals/` gains five coding cases (networkx, each a reverted upstream change),
 scored by hidden tests on the workspaces `--keep-temp` leaves
 (`evals/_coding/grade.py`). See `evals/README.md` for the baseline.
+
+The SCIP oracle maps an `@overload` function to its implementation.
+scip-python 0.6.6 gives such a function one definition, on its first stub,
+enclosing only that stub, so every call in the implementation's body was
+credited to `<module>`, and an index without stub nodes lost the symbol
+(flask gold 300 → 288). On flask's pre-change index the corrected oracle
+counts 9 more correct extracted edges and the same wrong ones.
 
 ## 0.163.0
 
