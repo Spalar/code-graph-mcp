@@ -256,8 +256,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge callers across
     // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
-    if file_filter.is_none() && !is_exact_qualified {
-        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+    // A file selector cannot split same-file definitions either.
+    if !is_exact_qualified {
+        let cands = match file_filter {
+            None => crate::resolve::detect_ambiguity(conn, symbol)?,
+            Some(fp) => crate::resolve::detect_same_file_ambiguity(conn, symbol, fp)?,
+        };
+        if let Some(cands) = cands {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }

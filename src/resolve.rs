@@ -167,6 +167,33 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
     }
 }
 
+/// [`detect_ambiguity`] under a file selector: the definitions of bare `name`
+/// in `file_path` when there are ≥2. A file cannot split same-file
+/// definitions, yet callgraph, impact and `get_call_graph` skipped the gate
+/// whenever one was given and merged both into one answer (flask:
+/// `callgraph pop --file src/flask/ctx.py` answered for `_AppCtxGlobals.pop`
+/// and `AppContext.pop` at once), while refs, `find_references` and
+/// `get_ast_node` refused the identical input (SURF-17; C4, 2026-09-28 usage
+/// evaluation). Test definitions count: the selector named their file.
+pub fn detect_same_file_ambiguity(
+    conn: &Connection,
+    name: &str,
+    file_path: &str,
+) -> Result<Option<Vec<NameCandidate>>> {
+    let cands: Vec<NameCandidate> = queries::get_nodes_by_file_path(conn, file_path)?
+        .into_iter()
+        .filter(|n| n.name == name)
+        .map(|n| NameCandidate {
+            name: n.name,
+            file_path: file_path.to_string(),
+            node_type: n.node_type,
+            node_id: n.id,
+            start_line: n.start_line,
+        })
+        .collect();
+    Ok((cands.len() > 1).then_some(cands))
+}
+
 /// True when `file_path` names a definition the caller can actually act on.
 ///
 /// The `<external>` pseudo-file holds sentinel nodes for imports that bind

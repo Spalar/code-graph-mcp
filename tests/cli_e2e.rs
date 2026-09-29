@@ -4252,6 +4252,37 @@ fn test_cli_impact_same_file_overload_is_ambiguous() {
     );
 }
 
+// C4 (2026-09-28 usage evaluation): the same two `new` under `--file lib.rs`.
+// A file selector cannot split same-file definitions, yet callgraph and impact
+// skipped the ambiguity gate whenever it was given and merged both graphs
+// (flask: `callgraph pop --file src/flask/ctx.py` answered for
+// `_AppCtxGlobals.pop` and `AppContext.pop` at once) while refs refused the
+// identical input (SURF-17). The selector now gets the same verdict.
+#[test]
+fn test_cli_same_file_overload_is_ambiguous_under_a_file_selector() {
+    let project = setup_same_file_overload_project();
+    for cmd in ["callgraph", "impact"] {
+        let (_, stderr, code) = run_cli(&project, &[cmd, "new", "--file", "lib.rs"]);
+        assert_eq!(code, 1, "{cmd} --file must not merge; stderr={stderr:?}");
+        assert!(
+            stderr.contains("Ambiguous symbol 'new'") && stderr.contains("same file"),
+            "{cmd}: {stderr:?}"
+        );
+        let (stdout, _, code) = run_cli(&project, &[cmd, "new", "--file", "lib.rs", "--json"]);
+        assert_eq!(code, 1, "{cmd} --json too; stdout={stdout:?}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(
+            v["suggestions"].as_array().map(Vec::len),
+            Some(2),
+            "{cmd}: {stdout}"
+        );
+    }
+    // A name defined once in the named file still answers.
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "make_them", "--file", "lib.rs"]);
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert!(stdout.contains("make_them"), "{stdout}");
+}
+
 #[test]
 fn test_cli_callgraph_import_disambiguates_same_name() {
     // Regression (Phase 2d): `run()` does `from db import save` and calls save()

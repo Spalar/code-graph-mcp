@@ -160,29 +160,34 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
-        // Disambiguate: if no file_path provided, check if symbol matches multiple
-        // distinct nodes (cross-file OR same-file overloads). Message + suggestion
-        // shape are shared with the CLI via crate::resolve (audit #6).
-        if file_path.is_none() {
-            if let Some(cands) = self.disambiguate_symbol(function_name)? {
-                return Ok(json!({
-                    "function": function_name,
-                    "direction": direction,
-                    "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
-                    // MUST stay capped in step with `ambiguity_message`, which
-                    // now says "Showing the first 5 of N" whenever it hides
-                    // something. This site renders the message but built its own
-                    // uncapped list, so SURF-34 turned a truthful envelope into
-                    // one that announced a cap it had not applied — 7 suggestions
-                    // under a note claiming 5. `ambiguity_response` (the other
-                    // four MCP sites) caps internally; this arm is hand-rolled
-                    // because it also carries `function`/`direction`.
-                    "suggestions": crate::resolve::candidates_to_json(&cands)
-                        .into_iter()
-                        .take(crate::resolve::SUGGESTION_CAP)
-                        .collect::<Vec<_>>(),
-                }));
+        // Disambiguate: the symbol may match several distinct nodes (cross-file
+        // OR same-file overloads), and a file_path cannot split same-file ones
+        // either. Message + suggestion shape are shared with the CLI via
+        // crate::resolve (audit #6).
+        let ambiguous = match file_path {
+            None => self.disambiguate_symbol(function_name)?,
+            Some(fp) => {
+                crate::resolve::detect_same_file_ambiguity(self.db.conn(), function_name, fp)?
             }
+        };
+        if let Some(cands) = ambiguous {
+            return Ok(json!({
+                "function": function_name,
+                "direction": direction,
+                "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
+                // MUST stay capped in step with `ambiguity_message`, which
+                // now says "Showing the first 5 of N" whenever it hides
+                // something. This site renders the message but built its own
+                // uncapped list, so SURF-34 turned a truthful envelope into
+                // one that announced a cap it had not applied — 7 suggestions
+                // under a note claiming 5. `ambiguity_response` (the other
+                // four MCP sites) caps internally; this arm is hand-rolled
+                // because it also carries `function`/`direction`.
+                "suggestions": crate::resolve::candidates_to_json(&cands)
+                    .into_iter()
+                    .take(crate::resolve::SUGGESTION_CAP)
+                    .collect::<Vec<_>>(),
+            }));
         }
 
         let results = crate::graph::query::get_call_graph_filtered(

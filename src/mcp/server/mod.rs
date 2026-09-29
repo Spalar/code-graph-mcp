@@ -3068,6 +3068,41 @@ function handleLogin(req: Request) {
         );
     }
 
+    /// C4 (2026-09-28 usage evaluation): `get_call_graph` with `file_path` skipped
+    /// the ambiguity gate and merged two same-file `new`s into one graph, while
+    /// `find_references` and `get_ast_node` refused the identical input.
+    #[test]
+    fn test_get_call_graph_file_path_discloses_same_file_overloads() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("overloads.rs"),
+            "struct A;\nstruct B;\nimpl A {\n    pub fn new() -> A { A }\n}\n\
+             impl B {\n    pub fn new() -> B { B }\n}\n\
+             pub fn make() { let _ = A::new(); let _ = B::new(); }\n",
+        )
+        .unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({ "file_path": "overloads.rs", "symbol_name": "new" }),
+        );
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("Ambiguous symbol 'new'") && err.contains("same file"),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["suggestions"].as_array().map(Vec::len),
+            Some(2),
+            "got: {result}"
+        );
+    }
+
     #[test]
     fn test_read_snippet_tool() {
         let project_dir = TempDir::new().unwrap();
