@@ -138,16 +138,36 @@ test('hooks.json: matchers avoid banned expression-DSL tokens', () => {
     'hooks.json matcher syntax regression — see v0.31.1 CHANGELOG:\n  ' + offenders.join('\n  '));
 });
 
-// v0.32.0 architecture: plugin-cache hooks.json ONLY carries SessionStart.
-// PreToolUse / PostToolUse / UserPromptSubmit are registered into
-// ~/.claude/settings.json by lifecycle.js (current Claude Code silently
-// ignores plugin-cache hooks.json entries for those events — confirmed
-// 2026-05-24 via session jsonl, see feedback_pretooluse_dark_under_green_health.md).
-test('hooks.json: contains SessionStart only (v0.32.0)', () => {
-  const cfg = loadHooks();
-  assert.deepEqual(Object.keys(cfg.hooks || {}), ['SessionStart'],
-    'plugin-cache hooks.json must contain only SessionStart; other events go via settings.json. ' +
-    'Adding entries here for PreToolUse/PostToolUse/UserPromptSubmit would be dead config — CC does not load them.');
+// Decision D2 (2026-09-28 usage evaluation): every hook lives in hooks.json
+// again. Current Claude Code loads a plugin's hooks.json for every event —
+// verified on 2.1.284: PreToolUse / PostToolUse / UserPromptSubmit / Stop
+// entries in a plugin's hooks.json all fired, and the marketplace-installed
+// claude-mem-lite runs every hook it has that way. The 2026-05-24 observation
+// behind the v0.32.0 settings.json re-route no longer holds.
+// buildSettingsHookEntries stays the one list (it still feeds settings.json for
+// an install that has no plugin), and this test holds hooks.json to it: same
+// events, matchers, scripts and timeouts, nothing more, nothing less.
+test('hooks.json declares every hook the plugin runs, matching the settings.json list', () => {
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const script = (cmd) => {
+    const m = (cmd || '').match(/([\w-]+\.js)"/);
+    return m ? m[1] : `unparsed(${cmd})`;
+  };
+  const want = [];
+  for (const [event, entries] of Object.entries(buildSettingsHookEntries())) {
+    for (const e of entries) {
+      for (const h of e.hooks) want.push(`${event}|${e.matcher || ''}|${script(h.command)}|${h.timeout}`);
+    }
+  }
+  const got = [];
+  for (const [event, entries] of Object.entries(loadHooks().hooks || {})) {
+    if (event === 'SessionStart') continue;
+    for (const e of entries) {
+      for (const h of e.hooks) got.push(`${event}|${e.matcher || ''}|${script(h.command)}|${h.timeout}`);
+    }
+  }
+  assert.ok(want.length >= 7, `the settings.json list must not be empty (${want.length})`);
+  assert.deepEqual(got.sort(), want.sort());
 });
 
 // v0.145.1: Claude Code validates this file against a closed key set and warns

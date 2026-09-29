@@ -259,8 +259,19 @@ function syncLifecycleConfig() {
   // exists) also heals. Previously only doctor checked staleness, so if the
   // auto-update re-register step failed silently, users kept running old hook
   // code indefinitely — the settings.json sibling of the binary-pin bug.
-  const { surveyHookCoverage } = require('./lifecycle');
+  const { surveyHookCoverage, hooksFromPluginManifest } = require('./lifecycle');
   const cov = surveyHookCoverage(settings);
+  // Decision D2: a plugin session gets every hook from the plugin's hooks.json,
+  // so "missing from settings.json" is the healthy state there, and an entry
+  // still in settings.json (written by a pre-0.164 install, or re-added by
+  // hand) fires its hook a second time. install() removes ours on this path.
+  if (hooksFromPluginManifest(settings)) {
+    if (cov.present.length > 0) {
+      installReporting();
+      return 'removed-settings-hooks';
+    }
+    return 'noop';
+  }
   if (cov.missing.length > 0) {
     installReporting();
     return 'self-healed-missing-settings-hook';

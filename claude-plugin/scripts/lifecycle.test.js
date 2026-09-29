@@ -2061,3 +2061,59 @@ test('the unadopt sweep names a remedy that survives the plugin being removed', 
   }
   assert.ok(!clean.includes(SENTINEL_BEGIN), 'a successful sweep must not print hand-removal instructions');
 });
+
+
+// ── Where the hooks live (decision D2, 2026-09-28) ──────────────────────────
+// A plugin install carries its hooks in hooks.json; settings.json entries next
+// to them would fire every hook twice. settings.json registration is only for a
+// surface hooks.json does not reach: an npm-global or dev CLI with no plugin.
+test('hooksFromPluginManifest: a Claude Code plugin session, a plugin-cache copy, or an installed plugin', (t) => {
+  const os = require('os');
+  const { hooksFromPluginManifest, PLUGIN_ROOT } = require('./lifecycle');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hooksrc-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = home;
+  t.after(() => { if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev; });
+
+  // Run by Claude Code as this plugin: SessionStart gets CLAUDE_PLUGIN_ROOT.
+  assert.equal(hooksFromPluginManifest({}, { env: { CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT } }), true);
+  // Another plugin's root in the env says nothing about this one.
+  assert.equal(hooksFromPluginManifest({}, { env: { CLAUDE_PLUGIN_ROOT: '/elsewhere/plugin' } }), false);
+  // A marketplace install's copy.
+  const cached = path.join(home, 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '9.9.9');
+  assert.equal(hooksFromPluginManifest({}, { pluginRoot: cached, env: {} }), true);
+  // A dev / npm copy with no plugin installed.
+  assert.equal(hooksFromPluginManifest({}, { pluginRoot: '/opt/npm/lib/code-graph', env: {} }), false);
+  // ...and the same copy once the plugin is installed and enabled.
+  fs.mkdirSync(path.join(home, 'plugins'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'plugins', 'installed_plugins.json'),
+    JSON.stringify({ plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: cached }] } }));
+  assert.equal(hooksFromPluginManifest({}, { pluginRoot: '/opt/npm/lib/code-graph', env: {} }), true);
+  // An explicitly disabled plugin runs no hooks: the CLI surface registers its own.
+  assert.equal(hooksFromPluginManifest({ enabledPlugins: { 'code-graph-mcp@code-graph-mcp': false } },
+    { pluginRoot: '/opt/npm/lib/code-graph', env: {} }), false);
+});
+
+test('syncSettingsHooks: removes our settings.json entries when hooks.json carries them', (t) => {
+  const os = require('os');
+  const { syncSettingsHooks, registerHooksToSettings, PLUGIN_ROOT } = require('./lifecycle');
+  // A config dir with no installed plugin: the answer must not depend on
+  // whether the machine running the suite has the plugin installed.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hooksync-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = home;
+  t.after(() => { if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev; });
+  const settings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'mine.sh' }] }] } };
+  registerHooksToSettings(settings);
+  assert.ok(settings.hooks.PreToolUse.length > 1, 'precondition: ours registered next to the user entry');
+  const changed = syncSettingsHooks(settings, { env: { CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT } });
+  assert.equal(changed, true);
+  assert.deepEqual(settings.hooks, { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'mine.sh' }] }] },
+    'only the user entry is left');
+  // And registers them where hooks.json does not reach.
+  const bare = {};
+  assert.equal(syncSettingsHooks(bare, { pluginRoot: '/opt/npm/lib/code-graph', env: {} }), true);
+  assert.ok(bare.hooks && bare.hooks.PreToolUse && bare.hooks.Stop, 'settings.json registration for an npm-only install');
+});

@@ -1449,3 +1449,42 @@ test('a throwing probe leaves a warn row, it does not delete the row', () => {
     lifecycle.verifyHooksFire = realVerify;
   }
 });
+
+// ── Decision D2: an installed plugin carries its hooks in hooks.json ─────────
+// Our entries left in settings.json (by a pre-0.164 install) then fire every
+// hook a second time. doctor must call that the problem — not report the empty
+// settings.json of a healthy plugin install as "missing" — and its repair must
+// remove ours while keeping the user's own entries.
+test('with the plugin installed, our settings.json hooks are reported as duplicates and removed', (t) => {
+  const home = freshHome(t);
+  const claudeDir = path.join(home, '.claude');
+  fs.mkdirSync(path.join(claudeDir, 'plugins'), { recursive: true });
+  fs.writeFileSync(path.join(claudeDir, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: path.join(claudeDir, 'plugins', 'cache', 'x') }] },
+  }));
+  const seeded = settingsWithCurrentHooks();
+  seeded.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] });
+  fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify(seeded, null, 2) + '\n');
+
+  const check = runDoctorCli(home, ['--check-only']);
+  assert.match(check.stdout + check.stderr, /hooks\.json/, 'the report must say where the hooks come from');
+  assert.doesNotMatch(check.stdout + check.stderr, /missing \d+\/\d+ settings\.json entries/);
+
+  runDoctorCli(home, []);
+  const after = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf8'));
+  assert.deepEqual(after.hooks, { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }] },
+    'our entries removed, the user entry kept');
+});
+
+test('with the plugin installed, a settings.json without our hooks is healthy', (t) => {
+  const home = freshHome(t);
+  const claudeDir = path.join(home, '.claude');
+  fs.mkdirSync(path.join(claudeDir, 'plugins'), { recursive: true });
+  fs.writeFileSync(path.join(claudeDir, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: path.join(claudeDir, 'plugins', 'cache', 'x') }] },
+  }));
+  fs.writeFileSync(path.join(claudeDir, 'settings.json'), '{}\n');
+  const r = runDoctorCli(home, ['--check-only']);
+  assert.doesNotMatch(r.stdout + r.stderr, /missing \d+\/\d+ settings\.json entries/,
+    'an empty settings.json is the healthy state for a plugin install');
+});

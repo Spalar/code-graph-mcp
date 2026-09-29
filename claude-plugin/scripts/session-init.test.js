@@ -777,3 +777,39 @@ test('SessionStart no longer injects a recent-change blast radius', () => {
   assert.doesNotMatch(src, /blast radius from the AST index/);
   assert.doesNotMatch(src, /CODE_GRAPH_NO_RECENT_IMPACT/);
 });
+
+// Decision D2: an install from before 0.164 left its hooks in settings.json.
+// Run as the plugin (Claude Code sets CLAUDE_PLUGIN_ROOT for a hooks.json
+// SessionStart), the hook must take them out — hooks.json already carries them,
+// and both copies would fire every hook twice — and leave the user's own alone.
+test('a plugin SessionStart removes our hooks from settings.json and keeps the user\'s', (t) => {
+  const os = require('os');
+  const { execFileSync } = require('child_process');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-d2-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const cfg = path.join(sb, '.claude');
+  const proj = path.join(sb, 'proj');
+  fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p"}');
+  const base = { ...process.env, HOME: sb, USERPROFILE: sb, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' };
+  delete base.CLAUDE_PLUGIN_ROOT;
+  // The pre-0.164 state: install from a surface hooks.json does not reach.
+  execFileSync(process.execPath, [path.join(__dirname, 'lifecycle.js'), 'install'], { env: base, cwd: proj, stdio: 'ignore' });
+  const settingsFile = path.join(cfg, 'settings.json');
+  const before = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.ok(before.hooks && before.hooks.PreToolUse, 'precondition: hooks registered in settings.json');
+  before.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] });
+  fs.writeFileSync(settingsFile, JSON.stringify(before, null, 2));
+
+  const si = path.join(__dirname, 'session-init.js');
+  const res = JSON.parse(execFileSync(process.execPath, ['-e',
+    `process.stdout.write(JSON.stringify(require(${JSON.stringify(si)}).runSessionInit({source:'startup'})))`],
+    { env: { ...base, CLAUDE_PLUGIN_ROOT: path.resolve(__dirname, '..') }, cwd: proj }).toString());
+
+  assert.equal(res.lifecycle, 'removed-settings-hooks');
+  const after = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.deepEqual(after.hooks, { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }] },
+    'only the user hook is left');
+  assert.match(after.statusLine && after.statusLine.command, /statusline-composite/, 'the statusline stays');
+});

@@ -1101,6 +1101,42 @@ function registerHooksToSettings(settings) {
   return before !== JSON.stringify(settings.hooks);
 }
 
+// --- Where the hooks live (decision D2, 2026-09-28 usage evaluation) ---
+//
+// A plugin install declares its hooks in the plugin's own hooks/hooks.json, and
+// current Claude Code loads that file for every event — verified on 2.1.284:
+// PreToolUse / PostToolUse / UserPromptSubmit / Stop entries in a plugin's
+// hooks.json all fired, and the marketplace-installed claude-mem-lite runs every
+// hook it has that way. The 2026-05-24 observation behind the v0.32.0 re-route
+// (only SessionStart loaded from there) no longer holds, and writing into the
+// user-global settings.json cost a doctor that re-added hooks after uninstall,
+// version-pinned paths and the ping-pong between delivery surfaces.
+//
+// settings.json registration stays for the one surface hooks.json does not
+// reach: an npm-global or dev CLI with no plugin installed. It never runs next
+// to an installed, enabled plugin — both copies would fire every hook twice.
+function hooksFromPluginManifest(settings = readJson(settingsPath()) || {}, { pluginRoot = PLUGIN_ROOT, env = process.env } = {}) {
+  // Claude Code is running this copy as a plugin right now: SessionStart comes
+  // from its hooks.json with CLAUDE_PLUGIN_ROOT set to its root. Compared, not
+  // merely present — the variable can carry another plugin's root.
+  if (env.CLAUDE_PLUGIN_ROOT && path.resolve(env.CLAUDE_PLUGIN_ROOT) === path.resolve(pluginRoot)) return true;
+  // A marketplace install's copy, reached outside a session (doctor, auto-update).
+  const rel = path.relative(pluginsCacheDir(), path.resolve(pluginRoot));
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return true;
+  // Another surface (npm global, dev checkout) while the plugin is installed and
+  // enabled: the plugin's hooks.json already covers every session.
+  return hasInstalledPluginRecord() && !isPluginExplicitlyDisabled(settings);
+}
+
+// Put settings.json in the state the surface needs: our entries registered when
+// nothing else carries the hooks, removed when the plugin's hooks.json does.
+// Returns whether `settings` changed.
+function syncSettingsHooks(settings, opts = {}) {
+  return hooksFromPluginManifest(settings, opts)
+    ? removeHooksFromSettings(settings)
+    : registerHooksToSettings(settings);
+}
+
 // Extract the .js script path a hook command invokes — bare (`node "…"`) or
 // existence-guarded (`if [ -f "…" ]; then node "…"; fi`).
 // Is the composite command currently in the statusLine slot one we should
@@ -1269,9 +1305,9 @@ function hookFirePayload(matcher, event = '') {
   }
 }
 
-// The hooks CC actually loads from settings.json (PreToolUse/PostToolUse/
-// UserPromptSubmit). SessionStart (hooks.json) runs every session → its own
-// liveness proof → excluded here.
+// Every hook besides SessionStart, from the one list both registration surfaces
+// use (hooks.json for a plugin, settings.json otherwise). SessionStart runs
+// every session → its own liveness proof → excluded here.
 function defaultHookFireProbes() {
   const probes = [];
   for (const [event, entries] of Object.entries(buildSettingsHookEntries())) {
@@ -1485,11 +1521,9 @@ function install({ reclaimStatusline = false, clearTombstone = false } = {}) {
   // Register code-graph provider
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 2. Hooks — v0.32.0: actively write PreToolUse/PostToolUse/UserPromptSubmit
-  //    to settings.json. Plugin-cache hooks.json is silently ignored by current
-  //    Claude Code for these events (SessionStart still loads from cache).
-  //    registerHooksToSettings is idempotent: strips priors then appends fresh.
-  const hooksRegistered = registerHooksToSettings(settings);
+  // 2. Hooks — registered in settings.json only where the plugin's hooks.json
+  //    does not reach; removed from it where it does (syncSettingsHooks).
+  const hooksRegistered = syncSettingsHooks(settings);
   if (hooksRegistered) settingsChanged = true;
 
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
@@ -1765,9 +1799,9 @@ function update() {
   // 2. Update code-graph provider in registry
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 3. Hooks — v0.32.0: register PreToolUse/PostToolUse/UserPromptSubmit in
-  //    settings.json (idempotent; absolute paths re-anchor on every update).
-  const hooksRegistered = registerHooksToSettings(settings);
+  // 3. Hooks — as in install(): settings.json carries them only where the
+  //    plugin's hooks.json does not (idempotent; paths re-anchor on update).
+  const hooksRegistered = syncSettingsHooks(settings);
   if (hooksRegistered) settingsChanged = true;
 
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
@@ -2192,6 +2226,7 @@ module.exports = {
   cacheDirVersion,                                                     // exported for the separator-agnostic test
 
   verifyHooksFire, defaultHookFireProbes,                              // v0.67.0 — firing self-test
+  hooksFromPluginManifest, syncSettingsHooks,                          // D2 — where the hooks live
   activeInstallPath, isStaleRelicContext,                              // v0.49.1 — stale-relic downgrade guard
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
   PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers

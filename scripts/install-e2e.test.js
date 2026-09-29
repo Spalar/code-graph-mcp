@@ -123,6 +123,16 @@ const EXPECTED_SETTINGS_HOOKS = [
   ['UserPromptSubmit', '', 'user-prompt-context.js'],
 ];
 
+// Decision D2: with the plugin installed its hooks.json carries every hook, and
+// settings.json must hold none of ours (both would fire each hook twice).
+function assertNoOurSettingsHooks(settings) {
+  const serialized = JSON.stringify(settings.hooks || {});
+  for (const [, , script] of EXPECTED_SETTINGS_HOOKS) {
+    assert.ok(!serialized.includes(script),
+      `settings.json must not carry ${script} next to the plugin's hooks.json: ${serialized}`);
+  }
+}
+
 function assertCurrentSettingsHooks(settings) {
   for (const [event, matcher, script] of EXPECTED_SETTINGS_HOOKS) {
     const entries = settings.hooks?.[event] || [];
@@ -178,11 +188,11 @@ test('§1.3 .mcp.json points to valid launcher script', () => {
   assert.ok(fs.existsSync(launcherPath), `Launcher script missing: ${launcherPath}`);
 });
 
-test('§1.4 hook split: cache hooks.json carries SessionStart only; install() registers the rest in settings.json', () => {
-  // v0.32.0 contract: current Claude Code only loads SessionStart from
-  // cache/<mp>/<plugin>/<ver>/hooks/hooks.json — PreToolUse/PostToolUse/
-  // UserPromptSubmit entries there are silently ignored (dead config), so
-  // lifecycle.js install/update writes those to ~/.claude/settings.json.
+test('§1.4 hook source: the plugin hooks.json carries every hook; settings.json only without a plugin', () => {
+  // Decision D2 (2026-09-28): current Claude Code loads a plugin's hooks.json
+  // for every event, so the plugin declares all of its hooks there and an
+  // install keeps settings.json free of ours. Only a surface with no plugin
+  // installed (npm global / dev checkout) registers them in settings.json.
   const cacheHooks = readJson(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'));
   assert.ok(cacheHooks.hooks, 'cache hooks.json must have a hooks key');
 
@@ -190,12 +200,13 @@ test('§1.4 hook split: cache hooks.json carries SessionStart only; install() re
     'cache hooks.SessionStart must have entries');
   assert.ok(cacheHooks.hooks.SessionStart[0].hooks[0].command.includes('session-init.js'));
   assert.match(cacheHooks.hooks.SessionStart[0].matcher, /startup/);
-  for (const event of ['PreToolUse', 'PostToolUse', 'UserPromptSubmit']) {
-    assert.equal(cacheHooks.hooks[event], undefined,
-      `cache hooks.${event} would be dead config (CC ignores it) — it belongs in settings.json`);
+  for (const [event, matcher, script] of EXPECTED_SETTINGS_HOOKS) {
+    const entry = (cacheHooks.hooks[event] || []).find((e) => (e.matcher || '') === matcher);
+    assert.ok(entry && entry.hooks[0].command === `node "\${CLAUDE_PLUGIN_ROOT}/scripts/${script}"`,
+      `hooks.json must declare ${event}:${matcher || '*'} → ${script}`);
   }
 
-  // install() must register the settings.json-owned events with current paths.
+  // With the plugin installed, install() writes none of them to settings.json.
   const homeDir = mkHome();
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
   const installedPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
@@ -207,8 +218,14 @@ test('§1.4 hook split: cache hooks.json carries SessionStart only; install() re
     env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
-  const settings = readJson(settingsPath);
-  assertCurrentSettingsHooks(settings);
+  assertNoOurSettingsHooks(readJson(settingsPath));
+
+  // Without a plugin installed, settings.json is the only place they can go.
+  const bareHome = mkHome();
+  const bareSettings = path.join(bareHome, '.claude', 'settings.json');
+  writeJson(bareSettings, {});
+  execFileSync(process.execPath, [LIFECYCLE, 'install'], { env: sandboxEnv(bareHome), stdio: 'pipe' });
+  assertCurrentSettingsHooks(readJson(bareSettings));
 });
 
 test('§1.5 plugin install creates install manifest with version', () => {
@@ -298,12 +315,12 @@ test('§1.7 plugin update strips legacy settings.json hooks and clears update ca
   });
 
   const settings = readJson(settingsPath);
-  // Legacy v0.8.2-era entry (old path) must be gone, replaced by fresh
-  // v0.32+ entries pointing at the current plugin root.
+  // Legacy v0.8.2-era entry (old path) must be gone, and — the plugin being
+  // installed — nothing written in its place: hooks.json carries them (D2).
   const hookSerialized = JSON.stringify(settings.hooks || {});
   assert.ok(!hookSerialized.includes('/old/code-graph/path/'),
     `update() must strip the legacy old-path hook entry, got: ${hookSerialized}`);
-  assertCurrentSettingsHooks(settings);
+  assertNoOurSettingsHooks(settings);
   // Update-check cache cleared (forces freshness post-update).
   assert.equal(fs.existsSync(updateCache), false);
 });
@@ -315,13 +332,17 @@ function runSyncLifecycleConfig(homeDir) {
   ], { env: sandboxEnv(homeDir), stdio: 'pipe' }).toString().trim();
 }
 
-function installIntoSandbox() {
+// `plugin: false` is the npm-global / dev surface with no plugin installed, the
+// one place settings.json still carries the hooks (decision D2).
+function installIntoSandbox({ plugin = true } = {}) {
   const homeDir = mkHome();
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
-  writeJson(settingsPath, { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } });
-  writeJson(path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json'), {
-    plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
-  });
+  writeJson(settingsPath, plugin ? { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } } : {});
+  if (plugin) {
+    writeJson(path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json'), {
+      plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
+    });
+  }
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
     env: sandboxEnv(homeDir), stdio: 'pipe',
   });
@@ -332,8 +353,9 @@ test('§1.9 session-init self-heals a stale-but-existing settings.json hook path
   // The binary-pin sibling: after a failed auto-update re-register, hooks can
   // point at an old plugin-cache version dir that still EXISTS on disk. The
   // pre-v0.49.1 self-heal only checked existence + matcher presence, so users
-  // kept running old hook code until doctor. session-init must heal it.
-  const { homeDir, settingsPath } = installIntoSandbox();
+  // kept running old hook code until doctor. session-init must heal it. Only a
+  // surface with no plugin keeps its hooks in settings.json (decision D2).
+  const { homeDir, settingsPath } = installIntoSandbox({ plugin: false });
 
   // Simulate: pre-edit-guide hook pinned at an old-version path that exists.
   // Must use the REAL plugin-cache layout (<marketplace>/<plugin>/<ver>/scripts):
@@ -1041,9 +1063,9 @@ test('§6.1 full lifecycle: fresh install → use → update → uninstall', () 
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], { env, stdio: 'pipe' });
   let settings = readJson(settingsPath);
-  // v0.32.0: install() registers PreToolUse/PostToolUse/UserPromptSubmit in
-  // settings.json (cache hooks.json only carries SessionStart).
-  assertCurrentSettingsHooks(settings);
+  // Decision D2: the installed plugin's hooks.json carries the hooks, so
+  // install() leaves settings.json free of ours.
+  assertNoOurSettingsHooks(settings);
   assert.ok(settings.statusLine, 'StatusLine configured');
   assert.match(settings.statusLine.command, /statusline-composite/);
   assert.ok(fs.existsSync(manifestPath), 'Manifest created');
