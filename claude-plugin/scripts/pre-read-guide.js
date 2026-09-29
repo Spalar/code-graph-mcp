@@ -142,7 +142,7 @@ function markHint(state, dir, now = Date.now()) {
 // unavailable or the dir has no overview.
 function buildHintWithAnswer(dir, answer) {
   const lines = [
-    `[code-graph] 5+ Reads into ${dir}/ — module overview from the AST index (saves the remaining file-by-file reads):`,
+    `[code-graph] 5+ Reads into ${dir}/ — module overview from the AST index:`,
     answer.text,
   ];
   if (answer.truncated) {

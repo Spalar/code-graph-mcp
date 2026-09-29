@@ -1120,7 +1120,7 @@ function buildHint() {
     '  • code-graph-mcp ast-search "<pat>" --type fn # filter by type/returns/params',
     '  • code-graph-mcp callgraph SYMBOL             # callers + callees, repo-wide',
     '  • code-graph-mcp show SYMBOL                  # one symbol: signature + source',
-    'Repo-wide index (LSP only sees open files). Skip this hint if you specifically need raw-text regex.',
+    'Repo-wide index. Skip this hint if you specifically need raw-text regex.',
   ].join('\n');
 }
 

@@ -89,7 +89,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "ONE named symbol: signature + source + opt impact/refs/similar. Use BEFORE editing X to see signature + blast radius. Repo-wide index (LSP only handles open files).".into(),
+                description: "ONE named symbol: signature + source + opt impact/refs/similar. Use BEFORE editing X to see signature + blast radius.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -197,7 +197,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Rename/remove audits — every site that imports/inherits/implements/calls a symbol. Repo-wide cross-language (LSP needs file open). Literals → Grep; 'who calls X?' → get_call_graph.".into(),
+                description: "Rename/remove audits — every site that imports/inherits/implements/calls a symbol, across languages; Grep after it for dynamic uses. Literals → Grep; 'who calls X?' → get_call_graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

@@ -231,7 +231,7 @@ and `code-graph-mcp doctor` prints the manual update command.
 
 #### Invited-memory mode (quieter prompts)
 
-By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on MEMORY.md + explicit tool calls, opt into invited-memory mode:
+By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on explicit tool calls, opt into invited-memory mode:
 
 1. Adopt the plugin contract into your project (idempotent, self-heals):
    ```bash
@@ -244,7 +244,7 @@ By default, every user prompt the plugin deems code-related gets a small context
      "env": { "CODE_GRAPH_QUIET_HOOKS": "1" }
    }
    ```
-3. Restart Claude Code. Session startup skips the project-map injection, UserPromptSubmit stops auto-injecting context, and the MCP `instructions` become a short pointer to the MEMORY.md file.
+3. Restart Claude Code. Session startup skips the project-map injection, UserPromptSubmit stops auto-injecting context, and the MCP `instructions` shrink to a one-line command pointer.
 
 ### Option 2: Claude Code MCP Server Only
 

@@ -117,12 +117,12 @@ test('memoryDir honors CLAUDE_CONFIG_DIR override (multi-account isolation)', ()
 
 // ── buildBlock — the managed CLAUDE.md block ────────────────────────────────
 
-test('buildBlock generic: v2 sentinel + 6 base rows + pointer', () => {
+test('buildBlock generic: v2 sentinel + 7 base rows + pointer', () => {
   const block = buildBlock('generic');
   assert.ok(block.startsWith(SENTINEL_BEGIN), 'opens with v2 BEGIN');
   assert.ok(block.endsWith(SENTINEL_END), 'closes with END');
   assert.ok(block.includes('| Who calls X / what X calls | `code-graph-mcp callgraph X` |'));
-  assert.ok(block.includes('| Impact before editing a fn | `code-graph-mcp impact X` |'));
+  assert.ok(block.includes('| Impact before changing a signature | `code-graph-mcp impact X` |'));
   assert.ok(block.includes('Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`'));
   assert.ok(!block.includes('trace'), 'generic has no HTTP-trace row');
 });
@@ -133,10 +133,13 @@ test('buildBlock web-rs inserts the HTTP-route → handler row', () => {
   assert.ok(block.includes('`code-graph-mcp trace "GET /api/x"`'));
 });
 
-test('buildBlock frontend surfaces a find-references audit row', () => {
-  const block = buildBlock('frontend');
-  assert.ok(block.includes('Rename / refactor audit (refs)'));
-  assert.ok(block.includes('`code-graph-mcp refs X`'));
+// Rename / remove audits are not a frontend concern only: `refs` is the one
+// command that lists every use, and `grep -w` covers what the graph misses.
+test('every project type carries the rename / remove audit row', () => {
+  for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
+    const block = buildBlock(type);
+    assert.ok(block.includes('| Rename / remove audit | `code-graph-mcp refs X`, then `grep -w X` |'), type);
+  }
 });
 
 test('buildBlock is deterministic (byte-identical across calls)', () => {
@@ -144,17 +147,16 @@ test('buildBlock is deterministic (byte-identical across calls)', () => {
   assert.strictEqual(buildBlock('generic'), buildBlock(undefined));
 });
 
-// issue #41: a plugin-only install never puts `code-graph-mcp` on PATH. The
-// binary the plugin manages for itself lands in ~/.cache/code-graph/bin
-// (auto-update.js `BINARY_CACHE_DIR` + `cachedBinaryPath`), and every row of
-// this block spends the bare name. The reporter's session therefore read a
-// table of commands their shell answers with "command not found".
-test('every project type tells a plugin-only install where the binary is', () => {
+// issue #41 was a plugin-only install whose shell answered the bare
+// `code-graph-mcp` with "command not found". Claude Code now puts the plugin's
+// `bin/` launcher on the Bash PATH, so the block spends the bare name only; the
+// `~/.cache/code-graph/bin` fallback it used to carry also could not run the
+// JS-dispatched `adopt`/`doctor` (2026-09-28 steering audit F5).
+test('the block spends only the bare name — no cache-path fallback', () => {
   for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
     const block = buildBlock(type);
-    assert.ok(block.includes('~/.cache/code-graph/bin/code-graph-mcp'),
-      `${type}: the block spends bare \`code-graph-mcp\` but never says where it is ` +
-      'for an install that has it nowhere on PATH');
+    assert.ok(block.includes('`code-graph-mcp callgraph X`'), type);
+    assert.ok(!block.includes('.cache/code-graph/bin'), `${type}: stale fallback path`);
   }
 });
 

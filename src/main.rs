@@ -638,7 +638,7 @@ fn print_help() {
         "                        unavailable). For an unconditional rebuild use rebuild-index."
     );
     println!("    health-check        Query index status");
-    println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
+    println!("                        (Note: there is no CLI watcher; the MCP server watches files while it runs)");
     println!("    doctor              Diagnose and repair environment issues");
     println!("    benchmark           Benchmark index speed, query latency, token savings");
     println!("    stats               Aggregate session metrics from .code-graph/usage.jsonl");

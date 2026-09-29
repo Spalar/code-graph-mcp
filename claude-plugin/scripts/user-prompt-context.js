@@ -530,7 +530,7 @@ function runMain() {
   if (query.type === 'symptom-hint') {
     markCooldown('symptom', cwd);
     process.stdout.write(
-      '[code-graph:hint] indexed repo — for vague-symptom prompts, try `semantic_code_search "<symptom>"` ' +
+      '[code-graph:hint] indexed repo — for vague-symptom prompts, try `code-graph-mcp search "<symptom words>"` ' +
       'or `module_overview <suspected-dir>` to surface candidate code structurally. Skip if not searching code.\n'
     );
     return;

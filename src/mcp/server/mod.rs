@@ -31,7 +31,7 @@ mod backfill;
 mod freshness;
 use freshness::RESULT_REFRESH_TOOLS;
 
-pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`; if the bare name does not resolve, `~/.cache/code-graph/bin/code-graph-mcp`.";
+pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready: `code-graph-mcp callgraph X` / `impact X` / `refs X` / `show X` / `overview <dir>`; all commands: `code-graph-mcp --help`.";
 
 /// MCP `instructions` field (default/noisy variant). v0.49: CLI form leads. In
 /// Claude Code the MCP tools are deferred (a ToolSearch load must precede the
@@ -41,14 +41,12 @@ pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{219
 /// the live clap CLI by `tests/doc_cli_alignment.rs`.
 pub const INSTRUCTIONS_NOISY: &str = concat!(
     "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
-    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; \"impact of X?\" or before editing a fn \u{2192} `code-graph-mcp impact X`; ",
+    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; before changing a fn's signature \u{2192} `code-graph-mcp impact X`; rename/remove audit \u{2192} `code-graph-mcp refs X`, then `grep -w X`; ",
     "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-i/-w/-F/-l, -c count, -t <lang>/-g <glob> scope, -A/-B/-C ctx, -M col-cap; grep exits).\n",
-    "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, semantic_code_search for concept search without an exact symbol.\n",
-    "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
+    "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, find_references, semantic_code_search for concept search without an exact symbol.\n",
+    "The graph holds the calls it could resolve: dynamic dispatch, reflection and unresolved imports leave no edge, so an empty caller list is not proof that nothing calls X.\n",
     "Still Grep for exact strings/regex; still Read files you will edit.\n",
-    "Diagnostics: `code-graph-mcp health-check`.\n",
-    "If your shell answers \"command not found\", this install's copy is at `~/.cache/code-graph/bin/code-graph-mcp` \u{2014} same subcommands.\n",
-    "Full decision table: CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
+    "Diagnostics: `code-graph-mcp health-check`."
 );
 
 // Compile-time guard: calibrated from observed Claude Code truncation at ~2048

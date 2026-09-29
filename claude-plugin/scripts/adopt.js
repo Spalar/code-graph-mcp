@@ -69,29 +69,25 @@ function writeFileAtomic(filePath, data, { followLink = false } = {}) {
 // The managed block written into <cwd>/CLAUDE.md. Concise + always-loaded: a
 // scannable trigger table that primes the right tool, ending with a pointer to
 // the full table at .claude/plugin_code_graph_mcp.md (opened on demand, never
-// auto-loaded). Project-type tailoring swaps a couple of rows (web → HTTP-route
-// tracing; frontend → reference audits) — body of the detail doc is unchanged.
+// auto-loaded). Project-type tailoring adds a row for web projects (HTTP-route
+// tracing) — body of the detail doc is unchanged.
 //
-// Every row spends the bare name `code-graph-mcp`, and a plugin-only install has
-// it nowhere on PATH: findBinary() resolves the plugin's own download at
-// ~/.cache/code-graph/bin (auto-update.js `cachedBinaryPath`), and the global-npm
-// tiers below it exist only for users who ran `npm i -g` themselves. Issue #41 is
-// what that reads like from the other side — a table of commands the user's shell
-// answers with "command not found". Hence the fallback line below the table.
+// Every row spends the bare name `code-graph-mcp`. Issue #41 was a plugin-only
+// install whose shell answered it with "command not found"; Claude Code now puts
+// the plugin's `bin/` launcher on the Bash PATH, so the `~/.cache/code-graph/bin`
+// fallback line this block used to carry is gone (it also could not run
+// `adopt`/`doctor`, which are JS-dispatched).
 //
-// It names a path SHAPE, never a resolved one. This file goes into a git-tracked
-// CLAUDE.md (the adopt output says so two screens down), so a resolved
-// /home/<user>/… is right on one machine and wrong on every teammate's — and
-// buildBlock's byte-determinism is exactly what needsRefresh diffs, so
-// machine-varying content would rewrite the block on every clone's next
-// SessionStart. No `.exe` variant for the same reason it is safe not to have one:
-// platformGuard() refuses adopt on win32, so this block never exists there.
+// The block is byte-deterministic and machine-independent: it goes into a
+// CLAUDE.md that may be git-tracked, and needsRefresh diffs it bytewise, so a
+// resolved /home/<user>/… path would be right on one machine only.
 const BLOCK_HEADING = '## Code Graph (repo-wide AST index)';
 
 function buildTriggerRows(projectType = 'generic') {
   const base = [
     ['Who calls X / what X calls', '`code-graph-mcp callgraph X`'],
-    ['Impact before editing a fn', '`code-graph-mcp impact X`'],
+    ['Impact before changing a signature', '`code-graph-mcp impact X`'],
+    ['Rename / remove audit', '`code-graph-mcp refs X`, then `grep -w X`'],
     ['Unfamiliar dir / module', '`code-graph-mcp overview <dir>`'],
     ['Symbol source / signature', '`code-graph-mcp show X`'],
     ['Concept search (no exact name)', '`code-graph-mcp search "…"` (vector: MCP `semantic_code_search`)'],
@@ -106,11 +102,6 @@ function buildTriggerRows(projectType = 'generic') {
       return [base[0], base[1],
         ['HTTP route → handler chain', '`code-graph-mcp trace "GET /api/x"`'],
         ...base.slice(2)];
-    case 'frontend':
-      // Rename/refactor audits dominate; surface find-references explicitly.
-      return [base[0],
-        ['Rename / refactor audit (refs)', '`code-graph-mcp refs X`'],
-        ...base.slice(1)];
     default:
       return base;
   }
@@ -126,14 +117,13 @@ function buildBlock(projectType = 'generic') {
   const body = [
     BLOCK_HEADING,
     '',
-    'AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for',
-    'structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:',
+    'Parsed index of the whole repo. For structural questions — who calls X, what a',
+    'change breaks, every use of a symbol — one call replaces rounds of Grep + Read:',
     '',
     table,
     '',
-    'Not on PATH? A plugin-only install keeps its own copy — same commands, run',
-    '`~/.cache/code-graph/bin/code-graph-mcp` (or `npm i -g @sdsrs/code-graph` once).',
-    '',
+    'Unresolved calls (dynamic dispatch, reflection, unresolved imports) leave no edge, so',
+    'an empty answer is not proof: confirm with grep before deleting or renaming.',
     "Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.",
     'Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`',
   ].join('\n');
