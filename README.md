@@ -547,7 +547,7 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_NO_AUTO_UPDATE=1` | Never check GitHub for a new release. |
 | `CODE_GRAPH_NO_AUTO_ADOPT=1` | Skip SessionStart's adoption check: no cleanup of this plugin's legacy memory-dir files and no notice about an out-of-date steering block. SessionStart never writes `CLAUDE.md` itself; `code-graph-mcp adopt` does. |
 | `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Do not report a steering block that has drifted from the current template (SessionStart only reports it; `code-graph-mcp adopt` refreshes it). |
-| `CODE_GRAPH_NO_GITIGNORE=1` | Never touch `.gitignore` — not even to add the `.code-graph/` entry. |
+| `CODE_GRAPH_NO_GITIGNORE=1` | Do not write the `.code-graph/` ignore rule. It goes to the repository's local `.git/info/exclude`, never to the tracked `.gitignore`, and only when neither file names the directory already. |
 | `CODE_GRAPH_QUIET_HOOKS=1` | Hooks inject a one-line pointer instead of the full decision table. |
 | `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |

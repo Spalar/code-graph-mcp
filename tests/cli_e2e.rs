@@ -7051,12 +7051,15 @@ fn test_cli_incremental_index() {
 // process-global `set_var` there races the four sibling tests that call the same
 // entry point), so the VARIABLE NAME and its `"1"` value are pinned only here —
 // a subprocess has its own environment, so this cannot race anything.
-// `setup_indexed_project` indexes through the library, which does not touch
-// `.gitignore`, so the file is absent until the CLI writes it.
+// `setup_indexed_project` indexes through the library, which writes no ignore
+// rule, so `.git/info/exclude` is absent until the CLI writes it.
 #[test]
 fn test_cli_incremental_index_gitignore_opt_out() {
     let project = setup_indexed_project();
-    let gitignore = project.path().join(".gitignore");
+    // A git work tree: the rule goes to `.git/info/exclude` (decision D3), so
+    // without a `.git` the control below would have nowhere to write.
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    let gitignore = project.path().join(".git/info/exclude");
 
     let (_, stderr, code) = run_cli_env(
         &project,
@@ -7066,8 +7069,9 @@ fn test_cli_incremental_index_gitignore_opt_out() {
     assert_eq!(code, 0, "indexing must still succeed; stderr={stderr}");
     assert!(
         !gitignore.exists(),
-        "the switch must suppress the .gitignore write entirely"
+        "the switch must suppress the ignore-rule write entirely"
     );
+    assert!(!project.path().join(".gitignore").exists());
 
     // Positive control: the same command with the switch OFF still writes, so the
     // assertion above is not green because indexing silently did nothing. Set the
@@ -7080,7 +7084,8 @@ fn test_cli_incremental_index_gitignore_opt_out() {
         &[("CODE_GRAPH_NO_GITIGNORE", "0")],
     );
     assert_eq!(code, 0, "control run must succeed; stderr={stderr}");
-    let content = std::fs::read_to_string(&gitignore).expect("control run must create .gitignore");
+    let content =
+        std::fs::read_to_string(&gitignore).expect("control run must write .git/info/exclude");
     assert!(
         content.contains(".code-graph/"),
         "control run should add the entry; got: {content:?}"
@@ -9628,9 +9633,10 @@ fn test_cli_report_refreshes_dead_code_line_numbers_after_an_edit() {
     );
 }
 
-/// DB-4: writing `.code-graph/` to `.gitignore` lived only in the MCP server's
+/// DB-4: writing the ignore rule lived only in the MCP server's
 /// `from_project_root`, so a pure-CLI user (hook-driven indexing, server never
 /// started) got an untracked 100 MB index that `git add -A` would commit.
+/// Since decision D3 the rule goes to `.git/info/exclude`, never `.gitignore`.
 #[test]
 fn test_cli_incremental_index_gitignores_the_index_dir() {
     let project = TempDir::new().unwrap();
@@ -9642,9 +9648,13 @@ fn test_cli_incremental_index_gitignores_the_index_dir() {
 
     let (_o, err, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
     assert_eq!(code, 0, "stderr: {err}");
-    let gitignore = project.path().join(".gitignore");
+    assert!(
+        !project.path().join(".gitignore").exists(),
+        "the tracked .gitignore must not be created"
+    );
+    let gitignore = project.path().join(".git/info/exclude");
     let content = std::fs::read_to_string(&gitignore)
-        .unwrap_or_else(|e| panic!("CLI indexing must create .gitignore: {e}"));
+        .unwrap_or_else(|e| panic!("CLI indexing must write .git/info/exclude: {e}"));
     assert!(
         content
             .lines()

@@ -552,7 +552,7 @@ impl McpServer {
         })
     }
 
-    /// Create from project root path: auto-creates .code-graph/ directory and .gitignore entry
+    /// Create from project root path: auto-creates .code-graph/ directory and its git ignore rule
     pub fn from_project_root(project_root: &Path) -> Result<Self> {
         let db_dir = project_root.join(CODE_GRAPH_DIR);
         // Same refusal the CLI index path makes: a symlinked `.code-graph`
@@ -561,7 +561,7 @@ impl McpServer {
         crate::utils::owned::ensure_owned_dir(&db_dir)?;
         let db_path = db_dir.join("index.db");
 
-        // Ensure .code-graph/ is in .gitignore. Shared with the CLI index
+        // Ensure git ignores .code-graph/ (via info/exclude). Shared with the CLI index
         // commands so the two entry points cannot drift: this used to be the
         // ONLY writer, which left pure-CLI installs (hook-driven
         // `incremental-index`, MCP server never started) one `git add -A` away
@@ -3448,8 +3448,10 @@ function handleLogin(req: Request) {
         let _server = McpServer::from_project_root(project_dir.path()).unwrap();
 
         assert!(project_dir.path().join(".code-graph/index.db").exists());
+        // Not a git repo: the ignore rule has nowhere to go, and the tracked
+        // .gitignore is never touched (decision D3).
         let gitignore = std::fs::read_to_string(project_dir.path().join(".gitignore")).unwrap();
-        assert!(gitignore.contains(".code-graph/"));
+        assert_eq!(gitignore, "node_modules/\n");
     }
 
     #[test]
