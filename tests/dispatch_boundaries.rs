@@ -105,11 +105,14 @@ fn cli_text_appends_the_block_after_each_empty_result() {
         format!("No references found for 'on_save'.\n{ON_SAVE_BLOCK}")
     );
 
+    // `on_save` is called only through `getattr`: no resolved caller, so the
+    // risk is UNKNOWN, never a LOW that would endorse the change.
     let (out, _) = cli(&p, &["impact", "on_save"]);
     assert_eq!(
         out,
         format!(
-            "Impact: on_save — Risk: LOW\n  0 direct, 0 callers total, 0 files, 0 routes (0 tests affected)\n{ON_SAVE_BLOCK}"
+            "Impact: on_save — Risk: UNKNOWN\n  (warning: {})\n  0 direct, 0 callers total, 0 files, 0 routes (0 tests affected)\n{ON_SAVE_BLOCK}",
+            code_graph_mcp::domain::NO_CALLERS_IMPACT_WARNING
         )
     );
 }

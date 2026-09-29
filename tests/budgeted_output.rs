@@ -237,6 +237,10 @@ fn strip_next_lines(out: &str) -> (String, Vec<String>) {
 /// afffd6b (md5 e891013b…) printed for these commands over `write_fixture`,
 /// indexed by `dump_fixture`. The new binary must print the same bytes once
 /// the `next:` lines are taken out, and exactly the listed next commands.
+/// One deliberate edit since: in `cli_show_run.txt` the 40 `C_i.run` methods,
+/// which nothing in the fixture calls, read `Impact: UNKNOWN` instead of
+/// `Impact: LOW` — a function with no caller in the graph has unknown risk
+/// (see `function_with_no_callers_at_all_is_unknown` in src/graph/impact.rs).
 #[test]
 fn default_text_answers_are_the_old_bytes_plus_next_lines() {
     let p = fixture();
