@@ -4025,6 +4025,33 @@ pub fn make_them() {
     project
 }
 
+/// C4 (2026-09-28 usage evaluation): Python `@overload` stubs type the one
+/// implementation after them. Indexed as definitions they made callgraph,
+/// impact and refs refuse every overloaded name (flask: `stream_with_context`,
+/// `locate_app`); the implementation now answers for it.
+#[test]
+fn test_cli_python_overloads_answer_as_their_implementation() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("lib.py"),
+        "import typing as t\n\n\
+         @t.overload\ndef wrap(g: int) -> int: ...\n\n\
+         @t.overload\ndef wrap(g: str) -> str: ...\n\n\
+         def wrap(g):\n    return g\n\n\
+         def use_it():\n    return wrap(1)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    for cmd in ["callgraph", "impact", "refs"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "wrap"]);
+        assert_eq!(code, 0, "{cmd} must answer; stderr={stderr:?}");
+        assert!(stdout.contains("use_it"), "{cmd}: {stdout}");
+    }
+}
+
 /// Seven non-test definitions of one name in one file — two more than an
 /// ambiguity envelope will list (`resolve::SUGGESTION_CAP`).
 fn setup_overflowing_overload_project() -> TempDir {

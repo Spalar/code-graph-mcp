@@ -611,6 +611,9 @@ fn extract_nodes(
         }
         // Python async functions
         "async_function_definition" => {
+            if python_overload_stub(&node, source) {
+                return;
+            }
             let nt = if parent_class.is_some() {
                 "method"
             } else {
@@ -666,6 +669,9 @@ fn extract_nodes(
                     }
                 }
             } else {
+                if python_overload_stub(&node, source) {
+                    return;
+                }
                 // Python and others: name is in "name" field
                 let nt = if parent_class.is_some() {
                     "method"
@@ -1459,6 +1465,66 @@ fn python_decorated_extent<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Nod
         Some(parent) if parent.kind() == "decorated_definition" => parent,
         _ => *node,
     }
+}
+
+/// A Python `@overload` stub with its implementation after it in the same
+/// block (`@t.overload def f(x: int) -> int: ...` then `def f(x): ...`). The
+/// stubs type the one runtime function that follows; as nodes they gave every
+/// overloaded name several same-file definitions, and callgraph/impact/refs
+/// refuse those (C4, 2026-09-28 usage evaluation: flask's
+/// `stream_with_context`, `locate_app`, `ConfigAttribute.__get__`). A stub with
+/// no implementation after it (a `.pyi` file, a Protocol) is all there is and
+/// stays. A decorator is `@overload` when its expression is `overload` or ends
+/// in `.overload` (`typing.`, `t.`, `typing_extensions.`).
+fn python_overload_stub(node: &tree_sitter::Node, source: &str) -> bool {
+    let Some(wrapper) = node.parent().filter(|p| p.kind() == "decorated_definition") else {
+        return false;
+    };
+    if !python_overload_decorated(&wrapper, source) {
+        return false;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let name = node_text(&name, source);
+    let mut next = wrapper.next_named_sibling();
+    while let Some(sibling) = next {
+        let (def, decorated) = if sibling.kind() == "decorated_definition" {
+            (sibling.child_by_field_name("definition"), true)
+        } else {
+            (Some(sibling), false)
+        };
+        let same_name = def
+            .filter(|d| {
+                matches!(
+                    d.kind(),
+                    "function_definition" | "async_function_definition"
+                )
+            })
+            .and_then(|d| d.child_by_field_name("name"))
+            .is_some_and(|n| node_text(&n, source) == name);
+        if same_name && !(decorated && python_overload_decorated(&sibling, source)) {
+            return true;
+        }
+        next = sibling.next_named_sibling();
+    }
+    false
+}
+
+/// Whether a `decorated_definition` carries `@overload` (see
+/// [`python_overload_stub`]).
+fn python_overload_decorated(wrapper: &tree_sitter::Node, source: &str) -> bool {
+    let mut cursor = wrapper.walk();
+    let found = wrapper
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "decorator")
+        .any(|d| {
+            d.named_child(0).is_some_and(|e| {
+                let text = node_text(&e, source);
+                text == "overload" || text.ends_with(".overload")
+            })
+        });
+    found
 }
 
 /// The owner type of a Go method, from its receiver: `func (s *Server) Start()`
@@ -3391,6 +3457,75 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"fetch_data"), "got: {:?}", names);
         assert!(names.contains(&"get"), "got: {:?}", names);
+    }
+
+    /// C4 (2026-09-28 usage evaluation): `@overload` stubs are type declarations
+    /// of the one runtime function that follows them, not definitions. As nodes
+    /// they gave flask's `stream_with_context`, `locate_app` and
+    /// `ConfigAttribute.__get__` three same-file definitions each, and
+    /// callgraph/impact/refs refuse those. A stub with no implementation after
+    /// it in its block (a `.pyi` file, a Protocol) is all there is: it stays.
+    #[test]
+    fn test_python_overload_stubs_before_an_implementation_are_no_nodes() {
+        let code = r#"import typing as t
+from typing import overload
+
+
+@t.overload
+def stream(g: int) -> int: ...
+
+
+@overload
+def stream(g: str) -> str: ...
+
+
+def stream(g):
+    return g
+
+
+class Attr:
+    @t.overload
+    def __get__(self, obj: None) -> "Attr": ...
+
+    @typing.overload
+    async def __get__(self, obj: int) -> int: ...
+
+    def __get__(self, obj):
+        return obj
+
+
+@overload
+def stub_only(x: int) -> int: ...
+
+
+@overload
+def stub_only(x: str) -> str: ...
+
+
+@t.overload
+def with_decorated_impl(x: int) -> int: ...
+
+
+@functools.cache
+def with_decorated_impl(x):
+    return x
+"#;
+        let nodes = parse_code(code, "python").unwrap();
+        let all: Vec<(&str, u32)> = nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.start_line))
+            .collect();
+        let lines = |name: &str| -> Vec<u32> {
+            nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .map(|n| n.start_line)
+                .collect()
+        };
+        assert_eq!(lines("stream"), vec![13], "{all:?}");
+        assert_eq!(lines("__get__"), vec![24], "{all:?}");
+        assert_eq!(lines("stub_only"), vec![28, 32], "{all:?}");
+        assert_eq!(lines("with_decorated_impl"), vec![40], "{all:?}");
     }
 
     /// Issue #31: `get_ast_node` stripped every decorator because the symbol was
