@@ -196,33 +196,60 @@ if (indexBuildInProgress(cwd)) process.exit(0);
 // path, which previously caused silent exits for the most common edit cases.
 const editedFile = (input.tool_input && input.tool_input.file_path) || '';
 const relFile = editedFile ? path.relative(cwd, editedFile) : '';
-let jsonResult;
 // Whatever is left of the registered 4 s, capped at this call's own 2500 ms.
 // `null` = the candidate loop above already spent the budget; running anyway is
 // what got the hook killed by Claude Code mid-Edit (audit 2026-09-05 JS-03).
-const impactBudget = remainingMs(2500);
-if (impactBudget === null) process.exit(0);
-try {
-  const args = ['impact', symbol, '--json'];
-  if (relFile && !relFile.startsWith('..')) args.push('--file', relFile);
-  // v0.49 — use the resolved binary (bare 'code-graph-mcp' was PATH-dependent,
-  // diverging from the findBinary() result the rest of the hook trusts).
-  const raw = execFileSync(binary, args, hidden({
-    cwd,
-    timeout: impactBudget,
-    encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: internalEnv,
-  }));
-  jsonResult = JSON.parse(raw);
-} catch {
-  // Symbol not found, timeout, or parse error — exit silently
-  process.exit(0);
+// A refusal exits 1 with its JSON on stdout, which is read too.
+function runImpact(args) {
+  const budget = remainingMs(2500);
+  if (budget === null) return null;
+  let raw;
+  try {
+    // v0.49 — use the resolved binary (bare 'code-graph-mcp' was PATH-dependent,
+    // diverging from the findBinary() result the rest of the hook trusts).
+    raw = execFileSync(binary, args, hidden({
+      cwd,
+      timeout: budget,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: internalEnv,
+    }));
+  } catch (e) {
+    raw = e && typeof e.stdout === 'string' ? e.stdout : '';
+  }
+  try { return JSON.parse(raw); } catch { return null; }
 }
 
-// CLI returns {"error": "..."} on ambiguous / not-found instead of throwing.
-// Treat as silent skip — direct_callers will be undefined.
-if (jsonResult && jsonResult.error) process.exit(0);
+// Q4 — the definition this edit changes, among same-file same-name ones: the
+// last candidate starting at or before the edited header's line. null when
+// the old_string is not in the file (the Edit will fail) or no candidate fits.
+function editedNodeId(suggestions, fileKey) {
+  let text;
+  try { text = fs.readFileSync(path.join(cwd, fileKey), 'utf8'); } catch { return null; }
+  const at = text.indexOf(oldStr);
+  if (at === -1) return null;
+  const line = text.slice(0, at + symbolAt).split('\n').length;
+  let best = null;
+  for (const c of suggestions) {
+    if (!c || c.file_path !== fileKey || !Number.isInteger(c.node_id) || !Number.isInteger(c.start_line)) continue;
+    if (c.start_line <= line && (best === null || c.start_line > best.start_line)) best = c;
+  }
+  return best ? best.node_id : null;
+}
+
+const impactArgs = ['impact', symbol, '--json'];
+if (relFile && !relFile.startsWith('..')) impactArgs.push('--file', relFile);
+let jsonResult = runImpact(impactArgs);
+// A file that defines the name more than once (two classes' `get`) makes
+// `--file` refuse and list each definition's node_id (174f9b6). Ask again for
+// the one being edited.
+if (jsonResult && jsonResult.error && Array.isArray(jsonResult.suggestions)) {
+  const nodeId = editedNodeId(jsonResult.suggestions, editedKey);
+  jsonResult = nodeId === null ? null : runImpact(['impact', '--node-id', String(nodeId), '--json']);
+}
+
+// Symbol not found, another refusal, timeout, or unparsable output — silent.
+if (!jsonResult || jsonResult.error) process.exit(0);
 
 // --- Inject when the symbol has any caller (1+) ---
 // Earlier gate was 2+ direct callers; reality is that editing a function with

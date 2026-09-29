@@ -359,6 +359,7 @@ function runPreEditHook(t, {
   relPath = 'src/payments.js',
   extraEnv = {},
   setup = () => {},
+  stubExec = null,
 } = {}) {
   const fs = require('node:fs');
   const os = require('node:os');
@@ -384,13 +385,13 @@ function runPreEditHook(t, {
     const cp = require('child_process');
     // grep --json answers as if every hit sat inside processPayment, so the
     // body-edit fallback (if the hook still had one) would resolve a symbol.
-    cp.execFileSync = (bin, args) => args[0] === 'grep'
+    cp.execFileSync = ${stubExec || `(bin, args) => args[0] === 'grep'
       ? JSON.stringify([{ file: 'src/payments.js', line: 3, container: { name: 'processPayment' } }])
       : JSON.stringify({
         direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
         callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
         test_callers: [],
-      });
+      })`};
     const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
     fb.findBinary = () => ${JSON.stringify(path.join(home, 'never-executed-binary'))};
   `);
@@ -503,4 +504,63 @@ test('scope: CODE_GRAPH_QUIET_HOOKS=1 silences the impact summary', (t) => {
   const { res } = runPreEditHook(t, { extraEnv: { CODE_GRAPH_QUIET_HOOKS: '1' } });
   assert.equal(res.status, 0, res.stderr);
   assert.equal(res.stdout.trim(), '', `QUIET must silence the hook, got: ${res.stdout}`);
+});
+
+// ── Q4: same-file same-name definitions ─────────────────────────────────────
+// `impact X --file F` refuses when F defines X more than once (two classes'
+// `fetch`), listing each definition's node_id and start line. The hook used to go
+// silent there; it now asks again with the node_id of the definition the edit
+// changes — the last one starting at or before the edited header's line.
+
+const TWO_GETS = 'class A:\n    def fetch(self, k):\n        return k\n\n\nclass B:\n    def fetch(self, k):\n        return k\n';
+
+// The stub binary: refuses by name (exit 1 with the refusal on stdout, as the
+// CLI does), answers by id with a caller named after the id it was asked for.
+const STUB_SAME_FILE = `(bin, args) => {
+  if (args.includes('--node-id')) {
+    const id = args[args.indexOf('--node-id') + 1];
+    return JSON.stringify({ direct_callers: 1, total_callers: 1, affected_files: 1, risk: 'low',
+      callers: [{ name: 'caller_of_' + id, file: 'src/use.py', depth: 1 }], test_callers: [] });
+  }
+  const e = new Error('exit 1');
+  e.status = 1;
+  e.stdout = JSON.stringify({ error: "Ambiguous symbol 'fetch': 2 definitions in the same file (src/app.py).",
+    suggestions: [
+      { name: 'fetch', file_path: 'src/other.py', type: 'method', node_id: 99, start_line: 7 },
+      { name: 'fetch', file_path: 'src/app.py', type: 'method', node_id: 11, start_line: 2 },
+      { name: 'fetch', file_path: 'src/app.py', type: 'method', node_id: 22, start_line: 7 },
+    ] });
+  throw e;
+}`;
+
+function writeTwoGets(proj) {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'app.py'), TWO_GETS);
+}
+
+test('Q4: a same-file same-name edit injects the impact of the edited definition', (t) => {
+  const second = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(second.res.status, 0, second.res.stderr);
+  assert.match(second.res.stdout, /caller_of_22/, 'B.fetch starts at line 7');
+  const first = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: '    def fetch(self, k):\n        return k\n\n\nclass B:', newString: '    def fetch(self, key):\n        return key\n\n\nclass B:',
+  });
+  assert.equal(first.res.status, 0, first.res.stderr);
+  assert.match(first.res.stdout, /caller_of_11/, 'A.fetch starts at line 2');
+});
+
+test('Q4: no candidate at or before the edited line → silent, never a guess', (t) => {
+  const stub = STUB_SAME_FILE.replace(/start_line: \d+ }/g, 'start_line: 50 }');
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: stub,
+    oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '');
 });

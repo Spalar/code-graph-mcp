@@ -6,7 +6,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::graph::query::get_call_graph_filtered;
+use crate::graph::query::{get_call_graph_seeded, CallGraphSeed};
 use crate::storage::queries::routes::fetch_route_metadata_map;
 use crate::storage::queries::CallerWithRouteInfo;
 
@@ -75,14 +75,25 @@ pub fn get_callers_with_route_info(
     max_depth: i32,
     min_confidence_rank: u8,
 ) -> Result<RouteCallers> {
-    let callers = get_call_graph_filtered(
+    get_callers_with_route_info_seeded(
         conn,
-        symbol_name,
-        "callers",
+        CallGraphSeed::Name {
+            name: symbol_name,
+            file_path,
+        },
         max_depth,
-        file_path,
         min_confidence_rank,
-    )?;
+    )
+}
+
+/// [`get_callers_with_route_info`] from any [`CallGraphSeed`].
+pub fn get_callers_with_route_info_seeded(
+    conn: &Connection,
+    seed: CallGraphSeed<'_>,
+    max_depth: i32,
+    min_confidence_rank: u8,
+) -> Result<RouteCallers> {
+    let callers = get_call_graph_seeded(conn, seed, "callers", max_depth, min_confidence_rank)?;
     // The flags are read off the traversal even when it returned nothing: a
     // depth request above the cap is still a capped answer, and reporting
     // "0 callers, complete" for it would be the same false-total this struct

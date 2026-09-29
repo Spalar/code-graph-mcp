@@ -321,13 +321,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 // same input as ambiguous. That is the 2026-06-03 #6 shape (one
                 // input, two surfaces, opposite verdicts) `crate::resolve` exists to
                 // prevent, and the bare-name arm below has carried this gate since
-                // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; note the
-                // shared same-file message points at `show --node-id <N>` rather
-                // than at this command's own `--node-id`, because it is written for
-                // callgraph/impact, which have no such flag. The node_ids it lists
-                // are the ones to pass here (pre-ship review 2026-09-07 — an earlier
-                // version of this comment claimed the message names `refs --node-id`,
-                // which it does not).
+                // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; the shared
+                // same-file message names it for every CLI symbol command (refs
+                // included, since callgraph/impact gained the flag in Q4), and the
+                // node_ids it lists are the ones to pass here.
                 if matched.len() > 1 {
                     let cands: Vec<queries::NameCandidate> = matched
                         .iter()

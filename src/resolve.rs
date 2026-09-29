@@ -262,9 +262,11 @@ pub fn candidates_to_json(cands: &[NameCandidate]) -> Vec<serde_json::Value> {
 /// Build the accurate ambiguity message for `name` given its candidate defs.
 ///
 /// Cross-file → advise the file selector (which works). Same-file overloads →
-/// advise the `node_id` path via the node-oriented tools, because `get_call_graph`
-/// / `impact` resolve by name and *cannot* split same-file defs; the file
-/// selector would be a dead end. `surface` only swaps flag/tool names.
+/// advise the `node_id` path, because the file selector would be a dead end:
+/// on the CLI every symbol command takes `--node-id` (callgraph/impact since
+/// Q4, 2026-09-29); MCP `get_call_graph` resolves by name and cannot split
+/// them, so the MCP wording points at the node-oriented tools. `surface` only
+/// swaps flag/tool names.
 pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) -> String {
     let n = cands.len();
     // SURF-34: `n` counts the definitions; the list under this message carries at
@@ -291,8 +293,8 @@ pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) 
         match surface {
             Surface::Cli => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \
-                 callgraph/impact resolve by name and can't split same-file overloads — \
-                 inspect a specific one with `show --node-id <N>` (node_ids below).{capped}"
+                 A file selector cannot split them — pass one of the node_ids below as \
+                 `--node-id <N>` (callgraph, impact, refs, show).{capped}"
             ),
             Surface::Mcp => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \

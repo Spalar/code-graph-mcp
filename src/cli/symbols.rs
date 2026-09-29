@@ -128,6 +128,105 @@ pub(crate) fn emit_fuzzy_ambiguity(
     std::process::exit(1);
 }
 
+/// `--node-id` on `impact` / `callgraph` (Q4): the one definition to answer
+/// for, and the identity it is re-found by after the command's own query-time
+/// refresh. `nodes.id` is a rowid alias with no AUTOINCREMENT, so a re-index
+/// reuses freed ids and the id alone can name another symbol afterwards
+/// (SURF-16); the identity is `resolve::reresolve_node_by_identity`'s, shared
+/// with `refs --node-id`, `show --node-id` and MCP `get_ast_node`.
+pub(crate) struct CliNodeTarget {
+    pub(crate) id: i64,
+    /// The id the caller passed, for messages after a re-resolution moved `id`.
+    requested: i64,
+    pub(crate) name: String,
+    file_path: String,
+    qualified_name: Option<String>,
+    node_type: String,
+}
+
+impl CliNodeTarget {
+    /// The node `nid` names, or exit 1: `{"error", "node_id"}` plus
+    /// `extra_json` (a command's own envelope keys, e.g. `results: []`).
+    pub(crate) fn lookup(
+        conn: &rusqlite::Connection,
+        nid: i64,
+        json_mode: bool,
+        extra_json: &serde_json::Value,
+    ) -> Result<Self> {
+        match queries::get_node_with_file_by_id(conn, nid)? {
+            Some(nwf) => Ok(Self {
+                id: nid,
+                requested: nid,
+                name: nwf.node.name,
+                file_path: nwf.file_path,
+                qualified_name: nwf.node.qualified_name,
+                node_type: nwf.node.node_type,
+            }),
+            None => Self::exit_missing(
+                nid,
+                "Node ID not found",
+                &format!("node_id {nid} not found in index"),
+                json_mode,
+                extra_json,
+            ),
+        }
+    }
+
+    /// Re-find the node after a refresh re-indexed its file. Exits 1 when the
+    /// definition is gone from the re-indexed source; the caller discloses the
+    /// refresh first (`on_gone`), since this exits.
+    pub(crate) fn reresolve(
+        &mut self,
+        conn: &rusqlite::Connection,
+        json_mode: bool,
+        extra_json: &serde_json::Value,
+        on_gone: impl FnOnce(),
+    ) -> Result<()> {
+        match crate::resolve::reresolve_node_by_identity(
+            conn,
+            &self.file_path,
+            &self.name,
+            self.qualified_name.as_deref(),
+            &self.node_type,
+        )? {
+            Some(found) => {
+                self.id = found.node.id;
+                Ok(())
+            }
+            None => {
+                on_gone();
+                Self::exit_missing(
+                    self.requested,
+                    "Node no longer in the re-indexed source",
+                    &format!(
+                        "node_id {} ('{}' in {}) is no longer in the re-indexed source — nothing to report.",
+                        self.requested, self.name, self.file_path
+                    ),
+                    json_mode,
+                    extra_json,
+                )
+            }
+        }
+    }
+
+    fn exit_missing(
+        nid: i64,
+        error: &str,
+        message: &str,
+        json_mode: bool,
+        extra_json: &serde_json::Value,
+    ) -> ! {
+        if json_mode {
+            let mut out = extra_json.clone();
+            out["error"] = serde_json::json!(error);
+            out["node_id"] = serde_json::json!(nid);
+            println!("{}", out);
+        }
+        eprintln!("[code-graph] {}", message);
+        std::process::exit(1);
+    }
+}
+
 /// The lookup chosen for a CLI symbol after qualified-name selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliSymbolLookup {

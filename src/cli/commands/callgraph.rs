@@ -7,8 +7,12 @@ use super::*;
     about = "Show call graph (callers/callees)"
 )]
 pub struct CallgraphArgs {
-    /// Symbol name to analyze
-    pub symbol: String,
+    /// Symbol name to analyze (required unless --node-id is given)
+    pub symbol: Option<String>,
+    /// Graph exactly this definition: a node_id from a same-file ambiguity
+    /// answer or `show --json` (authoritative over --file)
+    #[arg(long = "node-id")]
+    pub node_id: Option<i64>,
     // --direction stays an in-handler String (NOT a clap ValueEnum) so the exact
     // "must be one of: callers, callees, both" exit-1 message is preserved.
     /// Direction: callers, callees, or both
@@ -54,9 +58,9 @@ pub struct CallgraphArgs {
 /// ```
 pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // clap accepts an empty-string positional; preserve the non-empty guard.
-    let raw_symbol = args.symbol.as_str();
-    if raw_symbol.is_empty() {
-        anyhow::bail!("Usage: code-graph-mcp callgraph <symbol> [--direction callers|callees|both] [--depth N] [--file <path>] [--json]");
+    let raw_symbol = args.symbol.as_deref().unwrap_or("");
+    if raw_symbol.is_empty() && args.node_id.is_none() {
+        anyhow::bail!("Usage: code-graph-mcp callgraph <symbol> [--node-id N] [--direction callers|callees|both] [--depth N] [--file <path>] [--json]");
     }
 
     let direction = crate::domain::normalize_call_direction(args.direction.as_str())
@@ -72,6 +76,12 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         Some(f) => Some(normalize_user_path(project_root, f)?),
         None => None,
     };
+    // `--node-id` names one definition, so a file selector has nothing left to
+    // choose (same rule as `refs --node-id`).
+    if args.node_id.is_some() && explicit_file_owned.is_some() {
+        eprintln!("[code-graph] Note: --file is ignored when --node-id is given (node_id is authoritative).");
+    }
+    // Read only on the by-name paths below; a node target never consults it.
     let explicit_file = explicit_file_owned.as_deref();
 
     // Confidence floor: default 'inferred' hides the ambiguous by-name fan-out
@@ -83,11 +93,36 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
-    // A symbol in a file added since the last index (D2).
-    crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
     let conn = ctx.db.conn();
+    // callgraph's in-band error envelope carries `results: []` (see the
+    // not-found branch below).
+    let not_found_extra = serde_json::json!({ "results": [] });
+    let mut node_target = match args.node_id {
+        Some(nid) => Some(CliNodeTarget::lookup(
+            conn,
+            nid,
+            json_mode,
+            &not_found_extra,
+        )?),
+        None => None,
+    };
+    // A symbol in a file added since the last index (D2).
+    if node_target.is_none() {
+        crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
+    }
+    let target_name: Option<String> = node_target.as_ref().map(|target| target.name.clone());
+    let raw_symbol = target_name.as_deref().unwrap_or(raw_symbol);
 
-    let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+    let selected = match &node_target {
+        Some(target) => Ok(CliSymbolSelection {
+            lookup_name: target.name.clone(),
+            bare_name: target.name.clone(),
+            file_filter: None,
+            lookup: CliSymbolLookup::Bare,
+        }),
+        None => select_cli_symbol(conn, raw_symbol, explicit_file)?,
+    };
+    let selection = match selected {
         Ok(selection) => selection,
         Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
             emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
@@ -114,8 +149,8 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge call graphs.
     // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
-    // A file selector cannot split same-file definitions either.
-    if !is_exact_qualified {
+    // A file selector cannot split same-file definitions either; a node_id can.
+    if !is_exact_qualified && node_target.is_none() {
         let cands = match file_filter {
             None => crate::resolve::detect_ambiguity(conn, symbol)?,
             Some(fp) => crate::resolve::detect_same_file_ambiguity(conn, symbol, fp)?,
@@ -127,29 +162,33 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
 
     // Wrapped so a query-time freshness resync below can re-run it against the
     // refreshed index (parity with refs/show/… via refresh_files_if_stale).
-    let run_query = |sym: &str| {
-        crate::graph::query::get_call_graph_filtered(
-            conn,
-            sym,
-            direction,
-            depth,
-            file_filter,
-            min_conf_rank,
-        )
+    let run_query = |sym: &str, target: &Option<CliNodeTarget>| {
+        let seed = match target {
+            Some(target) => crate::graph::query::CallGraphSeed::Node(target.id),
+            None => crate::graph::query::CallGraphSeed::Name {
+                name: sym,
+                file_path: file_filter,
+            },
+        };
+        crate::graph::query::get_call_graph_seeded(conn, seed, direction, depth, min_conf_rank)
     };
 
-    let mut result = run_query(symbol)?;
+    let mut result = run_query(symbol, &node_target)?;
     // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
     // node with no edges) and no --file was specified, promote a unique fuzzy
     // match. Matches MCP get_call_graph behavior.
     let has_edges = result.nodes.iter().any(|n| n.depth > 0);
     let has_seed = result.nodes.iter().any(|n| n.depth == 0);
     let mut resolved_symbol: String = symbol.to_string();
-    if !(is_exact_qualified || has_edges || has_seed && file_filter.is_some()) {
+    if !(is_exact_qualified
+        || node_target.is_some()
+        || has_edges
+        || has_seed && file_filter.is_some())
+    {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
-                    result = run_query(&resolved)?;
+                    result = run_query(&resolved, &node_target)?;
                     eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
@@ -191,7 +230,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let files: Vec<String> = result.nodes.iter().map(|n| n.file_path.clone()).collect();
     let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
-        if is_exact_qualified {
+        // The re-index reused ids: re-find the node before re-running anything
+        // with its id (SURF-16).
+        if let Some(target) = node_target.as_mut() {
+            target.reresolve(conn, json_mode, &not_found_extra, || outcome.disclose())?;
+        } else if is_exact_qualified {
             match select_cli_symbol(conn, raw_symbol, explicit_file)? {
                 Ok(refreshed) if refreshed.lookup == CliSymbolLookup::ExactQualified => {}
                 Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
@@ -204,7 +247,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 }
             }
         }
-        result = run_query(symbol)?;
+        result = run_query(symbol, &node_target)?;
     }
     outcome.disclose();
 

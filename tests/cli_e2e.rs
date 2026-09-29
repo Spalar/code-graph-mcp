@@ -12183,3 +12183,246 @@ fn a_markdown_heading_does_not_shadow_the_method_it_documents() {
          result, not merely joined to it; got {files:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Q4 (2026-09-29 usage evaluation): `impact` / `callgraph --node-id`.
+//
+// Since 174f9b6 a file selector no longer merges same-file definitions: both
+// commands refuse and list each definition's `node_id`, but neither could
+// answer for one. The edit hook went silent on every signature edit of a
+// same-file same-name method (Python `__init__`, Rust `new`). `--node-id`
+// answers for exactly that definition, like `show` and `refs`.
+// ---------------------------------------------------------------------------
+
+/// Two `new` in one file, each with its own caller, so an answer that merged
+/// them (or took the other one) is visible in the caller list.
+fn setup_node_id_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct Foo;\npub struct Bar;\n\nimpl Foo {\n    pub fn new() -> Self { Foo }\n}\n\nimpl Bar {\n    pub fn new() -> Self { Bar }\n}\n\npub fn only_foo() -> Foo { Foo::new() }\n\npub fn only_bar() -> Bar { Bar::new() }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// (Foo::new id, Bar::new id), read off the same-file refusal the edit hook sees.
+fn foo_bar_new_ids(project: &TempDir) -> (i64, i64) {
+    let (out, _e, code) = run_cli(
+        project,
+        &["impact", "new", "--file", "src/lib.rs", "--json"],
+    );
+    assert_eq!(code, 1, "precondition: the file selector refuses: {out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let mut s: Vec<(i64, i64)> = v["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no suggestions: {out}"))
+        .iter()
+        .map(|c| {
+            (
+                c["start_line"].as_i64().unwrap(),
+                c["node_id"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    s.sort_unstable();
+    assert_eq!(s.len(), 2, "{out}");
+    (s[0].1, s[1].1)
+}
+
+fn impact_caller_names(out: &str) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+    let mut names: Vec<String> = v["callers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no callers: {out}"))
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn callgraph_names(out: &str) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+    let mut names: Vec<String> = v["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no results: {out}"))
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_answer_for_that_definition_only() {
+    let project = setup_node_id_project();
+    // The refusal points at the flag that now answers it.
+    for cmd in ["callgraph", "impact"] {
+        let (_o, stderr, code) = run_cli(&project, &[cmd, "new", "--file", "src/lib.rs"]);
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains("`--node-id <N>` (callgraph, impact, refs, show)")
+                && !stderr.contains("can't split"),
+            "{cmd}: {stderr}"
+        );
+    }
+    let (foo, bar) = foo_bar_new_ids(&project);
+    for (id, want) in [(foo, "only_foo"), (bar, "only_bar")] {
+        let id = id.to_string();
+        let (out, stderr, code) = run_cli(&project, &["impact", "--node-id", &id, "--json"]);
+        assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["symbol"].as_str(), Some("new"), "{out}");
+        assert_eq!(impact_caller_names(&out), vec![want.to_string()], "{out}");
+
+        let (text, stderr, code) = run_cli(&project, &["impact", "--node-id", &id]);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert!(
+            text.contains(want)
+                && !text.contains(if want == "only_foo" {
+                    "only_bar"
+                } else {
+                    "only_foo"
+                }),
+            "{text}"
+        );
+
+        let (out, stderr, code) = run_cli(
+            &project,
+            &[
+                "callgraph",
+                "--node-id",
+                &id,
+                "--direction",
+                "callers",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+        assert_eq!(callgraph_names(&out), vec![want.to_string()], "{out}");
+    }
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_refuse_an_unknown_id() {
+    let project = setup_node_id_project();
+    for cmd in ["impact", "callgraph"] {
+        let (out, _e, code) = run_cli(&project, &[cmd, "--node-id", "999999", "--json"]);
+        assert_eq!(code, 1, "{cmd}: {out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["node_id"].as_i64(), Some(999999), "{cmd}: {out}");
+        assert!(
+            v["error"].as_str().is_some_and(|e| e.contains("not found")),
+            "{cmd}: {out}"
+        );
+        let (_o, stderr, code) = run_cli(&project, &[cmd]);
+        assert_ne!(
+            code, 0,
+            "{cmd} with neither a symbol nor --node-id: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_ignore_the_file_selector_and_say_so() {
+    let project = setup_node_id_project();
+    let (foo, _bar) = foo_bar_new_ids(&project);
+    let id = foo.to_string();
+    for cmd in ["impact", "callgraph"] {
+        let (_out, stderr, code) =
+            run_cli(&project, &[cmd, "--node-id", &id, "--file", "src/other.rs"]);
+        assert_eq!(code, 0, "{cmd}: {stderr}");
+        assert!(
+            stderr.contains("--file is ignored when --node-id is given"),
+            "{cmd}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_answer_the_symbol_the_id_named_before_the_refresh() {
+    for cmd in ["impact", "callgraph"] {
+        let project = setup_refs_renumber_project();
+        let (out, stderr, code) = run_cli(&project, &["show", "helper", "--json"]);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let helper_id = v[0]["node_id"].as_i64().unwrap().to_string();
+
+        insert_zeta_pair(&project);
+
+        // First command after the edit: THIS run performs the refresh.
+        let args: Vec<&str> = if cmd == "impact" {
+            vec![cmd, "--node-id", &helper_id, "--json"]
+        } else {
+            vec![
+                cmd,
+                "--node-id",
+                &helper_id,
+                "--direction",
+                "callers",
+                "--json",
+            ]
+        };
+        let (out, stderr, code) = run_cli(&project, &args);
+        assert_eq!(code, 0, "{cmd} stderr:\n{stderr}\nstdout:\n{out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["symbol"].as_str(), Some("helper"), "{cmd}: {out}");
+        let names = if cmd == "impact" {
+            impact_caller_names(&out)
+        } else {
+            callgraph_names(&out)
+        };
+        assert_eq!(
+            names,
+            vec!["main_entry".to_string()],
+            "{cmd}: `helper` is called only by `main_entry`; anything else is the answer for \
+             whatever reused the id after the refresh: {out}"
+        );
+
+        // Anti-vacuity, read after the assertion so this probe is not the run
+        // that refreshes: the id really was reused by another symbol.
+        let (shown, _e, c) = run_cli(&project, &["show", "--node-id", &helper_id, "--json"]);
+        assert_eq!(c, 0, "{shown}");
+        let sv: serde_json::Value = serde_json::from_str(shown.trim()).unwrap();
+        assert_ne!(
+            sv[0]["name"].as_str(),
+            Some("helper"),
+            "fixture precondition: {shown}"
+        );
+    }
+}
+
+/// With no edges in the asked direction, a name takes callgraph's fuzzy "did
+/// you mean" path, which refuses a name defined twice. Named by node_id the
+/// definition is already exact: `Foo::new` has no callees, and the answer is
+/// that empty graph, not a refusal over the two `new`.
+#[test]
+fn callgraph_by_node_id_never_fuzzy_resolves_an_edgeless_direction() {
+    let project = setup_node_id_project();
+    let (foo, _bar) = foo_bar_new_ids(&project);
+    let id = foo.to_string();
+    let (out, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "--node-id",
+            &id,
+            "--direction",
+            "callees",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["symbol"].as_str(), Some("new"), "{out}");
+    assert_eq!(callgraph_names(&out), Vec::<String>::new(), "{out}");
+}
