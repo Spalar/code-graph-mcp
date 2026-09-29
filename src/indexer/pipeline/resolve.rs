@@ -4094,6 +4094,8 @@ pub(super) struct ProjectClassNames {
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
+    /// Every `method` node ([`Self::python_import_candidates`]); None until loaded.
+    methods: Option<HashSet<i64>>,
     /// Rust function id → its parameters ([`rust_call_shape_admits`]); None
     /// until loaded.
     rust_fn_shapes: Option<HashMap<i64, RustFnShape>>,
@@ -4594,6 +4596,40 @@ impl ProjectClassNames {
                     || self.rust_blanket.contains_key(id)
             })
             .collect()
+    }
+
+    /// A Python `from m import x` binds a module-level name, never a method:
+    /// neither a class member nor a nested `def` (typed as a method too) is an
+    /// attribute of its module. flask's `from flask import url_for` names a
+    /// re-export of `helpers.url_for`, which the module lookup cannot follow,
+    /// so the name chain took `Flask.url_for` beside it and every
+    /// `url_for(...)` of the importer bound both (C4, 2026-09-28 usage
+    /// evaluation). With the import unique, `prune_import_contradicted_call_edges`
+    /// drops the method from the calls too. Calls are left alone: a Python call
+    /// without metadata may still be `self.app.f()` or `imported_obj.f()`.
+    pub(super) fn python_import_candidates(
+        &mut self,
+        db: &crate::storage::db::Database,
+        language: &str,
+        candidates: Vec<i64>,
+    ) -> anyhow::Result<Vec<i64>> {
+        if language != "python" {
+            return Ok(candidates);
+        }
+        if self.methods.is_none() {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT id FROM nodes WHERE type = 'method'")?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<HashSet<i64>>>()?;
+            self.methods = Some(ids);
+        }
+        let methods = self.methods.as_ref().expect("loaded above");
+        Ok(candidates
+            .into_iter()
+            .filter(|id| !methods.contains(id))
+            .collect())
     }
 
     /// [`member_call_candidates`] from memory: the deferred pass and the pending

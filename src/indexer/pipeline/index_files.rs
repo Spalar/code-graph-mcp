@@ -4208,6 +4208,10 @@ fn resolve_deferred_relations(
                 all_target_ids.retain(|id| node_id_to_path.get(id) != Some(&d.rel_path));
             }
         }
+        // `from flask import url_for` imports no method (C4).
+        if d.relation == REL_IMPORTS {
+            all_target_ids = classes.python_import_candidates(db, &d.language, all_target_ids)?;
+        }
         // A supertype is a type, as at batch time.
         if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {
             if callable_ids.is_none() {

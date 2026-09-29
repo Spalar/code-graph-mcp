@@ -11046,3 +11046,70 @@ fn a_directory_require_and_a_re_exporting_index_are_file_imports() {
         assert!(has(e), "missing {e}: {edges:#?}");
     }
 }
+
+// C4: flask's examples call `url_for("x")` after `from flask import url_for`,
+// a re-export of `helpers.url_for` the module lookup cannot follow; the name
+// chain bound the import to `Flask.url_for` too, and every call of the importer
+// with it (caller precision 0/7). A `from m import x` names no method, and the
+// unique import then prunes the method from the calls. Calls themselves keep
+// methods of other files: `self.app.f()` and `imported_obj.f()` carry no
+// member metadata in Python either, and a first cut that filtered calls
+// dropped 18 correct flask edges for 7 wrong ones (SCIP oracle).
+#[test]
+fn a_python_from_import_binds_no_method() {
+    let files: &[(&str, &str)] = &[
+        (
+            "flask/__init__.py",
+            "from .helpers import url_for as url_for\n",
+        ),
+        (
+            "flask/app.py",
+            "class Flask:\n    def url_for(self, endpoint):\n        return endpoint\n\n\
+             \x20   def do_teardown(self):\n        return 1\n",
+        ),
+        (
+            "flask/helpers.py",
+            "def url_for(endpoint):\n    return endpoint\n",
+        ),
+        (
+            "flask/globals.py",
+            "class ProxyMixin:\n    def _get_current_object(self):\n        return self\n",
+        ),
+        (
+            "flask/ctx.py",
+            "from .globals import app_ctx\n\nclass AppContext:\n    def pop(self):\n        \
+             self.app.do_teardown()\n        return app_ctx._get_current_object()\n",
+        ),
+        (
+            "examples/auth.py",
+            "from flask import url_for\n\ndef login():\n    return url_for('x')\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    assert!(
+        has("examples/auth.py.<module> --imports--> flask/helpers.py.url_for"),
+        "{edges:#?}"
+    );
+    assert!(
+        !has("examples/auth.py.<module> --imports--> flask/app.py.url_for"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("examples/auth.py.login --calls--> flask/helpers.py.url_for"),
+        "{edges:#?}"
+    );
+    assert!(
+        !has("examples/auth.py.login --calls--> flask/app.py.url_for"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("flask/ctx.py.pop --calls--> flask/app.py.do_teardown"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("flask/ctx.py.pop --calls--> flask/globals.py._get_current_object"),
+        "{edges:#?}"
+    );
+}
