@@ -135,6 +135,7 @@ has a synthetic test in `test_oracle.py`, and a mutation of each turns it red):
 | `enclosing_from_index_span` | JS: a nested function's span taken from its node |
 | `unjudged_edges_unknown_binding` / `unjudged_edges_untyped_call` | JS/Python/C++: our edge to a name the caller calls through an unknown binding or an untyped receiver |
 | `call_sites_in_ambiguous_definition` | a call inside one of several same-file definitions of one symbol (overloads): no caller |
+| `definitions_on_an_overload_stub` | Python: a definition on an `@overload` stub, mapped to the implementation after it |
 | `call_sites_to_declaration_only_method` | a call to a pure virtual / abstract method: no callee, but its overrides are credited |
 | `edges_credited_via_override` | our edge to an override of the method the call names (virtual dispatch): correct |
 | `edges_credited_to_constructor_class` | our edge to the class of the constructor the call runs: correct |
@@ -157,7 +158,12 @@ that turns it red:
 - **Overloads.** `@overload` stubs and TS overload signatures share one symbol
   with the implementation. A call in any of their bodies has no known caller and
   is dropped (`call_sites_in_ambiguous_definition`), not credited to the
-  enclosing scope.
+  enclosing scope. scip-python 0.6.6 on flask instead gives an `@overload`
+  function ONE definition, on its first stub, enclosing only that stub: the
+  implementation below the stubs then stands for the symbol and its body is
+  the symbol's (`definitions_on_an_overload_stub`), whether or not the index
+  keeps the stubs as nodes. Before this rule every call in such a body went to
+  `<module>`, and an index that drops the stubs lost the symbol entirely.
 - **Duplicate occurrences** (same range, symbol and role) are counted once.
 
 ### C++ (scip-clang)

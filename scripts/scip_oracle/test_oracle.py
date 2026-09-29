@@ -584,6 +584,41 @@ class Python(unittest.TestCase):
                 self.assertNotIn("call_sites_attributed_to_module", r["funnel"])
                 self.assertEqual(r["funnel"]["unjudged_edges_unmapped_function"], 2)
 
+    def test_an_overload_with_one_definition_is_its_implementation(self):
+        # scip-python 0.6.6 on flask: ONE definition, on the first stub, whose
+        # enclosing range is that stub. The implementation stands for the symbol
+        # and its body is the symbol's, with the stubs indexed as nodes or not.
+        src = ("@overload\n"                   # 0
+               "def f(x: int) -> int: ...\n"  # 1
+               "@overload\n"                   # 2
+               "def f(x: str) -> str: ...\n"  # 3
+               "def f(x):\n"                   # 4
+               "    return g()\n"              # 5
+               "def g():\n"                    # 6
+               "    pass\n")                   # 7
+        p = "scip-python python demo 0 `lib.o`/"
+        d = document("lib/o.py", [
+            occ([1, 4, 5], p + "f().", True, [0, 0, 1, 25]),
+            occ([5, 11, 12], p + "g()."),
+            occ([6, 4, 5], p + "g().", True, [6, 0, 7, 8]),
+        ], language="python", encoding=0)
+        for stubs in (True, False):
+            nodes = ("(1, 1, 'function', 'f', 1, 2), (2, 1, 'function', 'f', 3, 4), "
+                     if stubs else "")
+            with self.subTest(stubs=stubs), tempfile.TemporaryDirectory() as tmp:
+                scip, db = _write_case(tmp, "lib/o.py", src, [d], f"""
+                    INSERT INTO files VALUES (1, 'lib/o.py', 'python');
+                    INSERT INTO nodes VALUES {nodes}(3, 1, 'function', 'f', 5, 6),
+                                             (4, 1, 'function', 'g', 7, 8),
+                                             (5, 1, 'module', '<module>', 1, 8);
+                """, [(3, 4, "extracted")])
+                r = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="python")
+                self.assertEqual(r["gold_pairs"], 1)
+                self.assertEqual(r["tiers"]["extracted"], {"judged": 1, "correct": 1})
+                self.assertEqual(r["funnel"]["definitions_on_an_overload_stub"], 1)
+                self.assertNotIn("call_sites_attributed_to_module", r["funnel"])
+                self.assertNotIn("unmapped_definitions", r["funnel"])
+
 
 # scip-clang: columns are UTF-8 bytes although position_encoding is unset, header
 # declarations are role-0 references shaped like calls, every occurrence in a header

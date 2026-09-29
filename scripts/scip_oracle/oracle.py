@@ -255,6 +255,12 @@ def evaluate(docs, db_path, root, samples=15, language="rust", dump_judged=False
                    for p, r, _e in defs[sym] for n in nodes_by_file[p]):
             del defs[sym]
 
+    def overload_implementation(path, name, line1):
+        """The node after an `@overload` stub at `line1` that is not one itself."""
+        after = sorted((n for n in nodes_by_file[path] if n[1] == name and n[2] > line1),
+                       key=lambda n: n[2])
+        return next((n for n in after if b"overload" not in lines[path][n[2] - 1]), None)
+
     sym_to_node = {}
     unmapped = []
     enclosers = defaultdict(list)  # path -> [(enclosing_range, key)]
@@ -267,6 +273,19 @@ def evaluate(docs, db_path, root, samples=15, language="rust", dump_judged=False
             if language == "cpp":
                 name = cpp_definition_name(lines[path][rng[0]], rng[1], name, sym)
             cands = [n for n in nodes_by_file[path] if n[1] == name and n[2] <= line1 <= n[3]]
+            # scip-python puts an `@overload` function's one definition, and its
+            # enclosing range, on the first stub: the implementation's body was
+            # no scope of the symbol, so its calls went to `<module>` whatever the
+            # index did. The implementation is the function that runs: it stands
+            # for the symbol and its body is the symbol's, whether or not the
+            # index also keeps the stubs as nodes (C4, 2026-09-29).
+            impl = None
+            if language == "python" and any(
+                    b"overload" in lines[path][i] for i in range(max(0, rng[0] - 3), rng[0])):
+                impl = overload_implementation(path, name, line1)
+            if impl:
+                cands = [impl]
+                funnel["definitions_on_an_overload_stub"] += 1
             if key is None:
                 # Overload stubs and their implementation (`@overload`, TS overload
                 # signatures): one symbol, several bodies. A call in one of them has
@@ -279,6 +298,8 @@ def evaluate(docs, db_path, root, samples=15, language="rust", dump_judged=False
                 continue
             if enc:
                 enclosers[path].append((enc, key))
+            if impl:
+                enclosers[path].append(((impl[2] - 1, 0, impl[3] - 1, 1 << 30), key))
             if cands:
                 node = min(cands, key=lambda n: n[3] - n[2])
                 sym_to_node[key] = node[0]
