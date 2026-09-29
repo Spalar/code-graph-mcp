@@ -4406,3 +4406,38 @@ test('searchesSameFiles: git failure, hidden ancestors, .rgignore, the walk limi
     assert.equal(d133r.searchesSameFiles({ root, target: pathE2e.join(outer, 'b'), verb: 'grep' }), false, 'absolute');
   });
 });
+
+// A linked worktree with no index of its own reads its main checkout's index
+// (resolveProjectRoot). A rewrite `cd`s to that root, so it would answer from
+// the OTHER tree: at v0.157.0, 2 of 2 rewrites seen in worktree-isolated agents
+// became `(cd <main checkout> …)` and were blocked by Claude Code for leaving
+// the worktree. At v0.163.0 this does not reproduce, and this test pins why:
+// from `<main>/.claude/worktrees/feat` the subdir rebase turns `src/` into
+// `.claude/worktrees/feat/src/`, which SRC_PATH (a source prefix after
+// whitespace or a quote) does not match, so shouldHint declines and the grep
+// runs as typed. Removing the D#76 operand gate alone leaves it green.
+test('e2e: a grep in a linked worktree reading its main checkout index is not rewritten', () => {
+  const uniq = `WtHit${Date.now()}`;
+  const fixture = e2eFixture(
+    `const a = process.argv.slice(2).filter((x, k, all) => !(x === '-m' || all[k - 1] === '-m' || x === '-M' || all[k - 1] === '-M'));\n` +
+    `process.stdout.write('src/foo.rs:7  fn ' + a[1] + '()\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, '.git', 'worktrees', 'feat'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    // Where Claude Code's EnterWorktree puts it: inside the main checkout.
+    const wt = pathE2e.join(fixture.dir, '.claude', 'worktrees', 'feat');
+    fsE2e.mkdirSync(pathE2e.join(wt, 'src'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(wt, '.git'),
+      `gitdir: ${pathE2e.join(fixture.dir, '.git', 'worktrees', 'feat')}\n`);
+    assert.equal(resolveProjectRoot(wt), fixture.dir, 'precondition: the worktree reads the main index');
+
+    // Control: from the main checkout the same grep IS rewritten.
+    rewriteOf(runHook(cmd, fixture));
+    const res = runHook(cmd, fixture, wt);
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), '', `a worktree grep must run as typed, got: ${res.stdout}`);
+  } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
