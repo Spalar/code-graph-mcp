@@ -10,10 +10,13 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Pr
 
 // PreToolUse(Edit) hook: auto-inject impact analysis when editing function definitions.
 // Only fires when:
-//   1. The old_string contains a function/method definition (signature being modified)
-//   2. The symbol has 2+ production callers (high impact)
-//   3. Same symbol not queried in last 2 minutes
-// Silently exits otherwise — zero noise for normal edits.
+//   1. The old_string contains a function/method definition AND the edit changes
+//      that definition's header (a body-only edit cannot break a caller)
+//   2. The edited file is inside the project
+//   3. The symbol has 1+ production callers
+//   4. Same symbol not queried in last 2 minutes
+// Silently exits otherwise — zero noise for normal edits. CODE_GRAPH_QUIET_HOOKS=1
+// silences it like the other injecting hooks.
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -65,7 +68,12 @@ const logEdit = (symbol) => {
 };
 logEdit(null);
 
+// An edit outside the project cannot be about this project's symbols; asking
+// the index anyway injected a same-named project function's callers.
+if (!editedRel || editedRel.startsWith('..') || path.isAbsolute(editedRel)) process.exit(0);
+
 const oldStr = (input.tool_input && input.tool_input.old_string) || '';
+const newStr = (input.tool_input && input.tool_input.new_string) || '';
 if (!oldStr || oldStr.length < 10) process.exit(0);
 
 // --- Extract function/method signature from the edited text ---
@@ -107,60 +115,16 @@ const fnPatterns = [
 // future author adds to the array without reading the note above.
 const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 
+// The EARLIEST definition in the hunk names the symbol. Taking the first
+// pattern in array order let the JS `function\s+(\w+)` arm read a Python
+// docstring's "function used" as the symbol `used`.
 let symbol = null;
+let symbolAt = -1;
 for (const pat of fnPatterns) {
   const m = scanned.match(pat);
-  if (m) {
-    // Find the first captured group
+  if (m && (symbolAt === -1 || m.index < symbolAt)) {
     symbol = m[1] || m[2];
-    break;
-  }
-}
-
-// Fallback: if old_string is inside a function body (not a definition),
-// extract a unique identifier from the code and grep for it to find the containing function
-if (!symbol || symbol.length < 3) {
-  const filePath = (input.tool_input && input.tool_input.file_path) || '';
-  if (filePath && oldStr.length >= 10) {
-    try {
-      // Extract identifiers from old_string, try the most specific one first
-      const identifiers = (oldStr.match(/\b([a-z]\w*(?:_\w+)+|[a-z]\w*(?:[A-Z]\w*)+|[A-Z]\w+\.\w+|[A-Z]\w+::\w+)\b/g) || [])
-        .filter(id => id.length >= 6);
-      const skipWords = new Set(['return', 'function', 'default', 'require', 'module', 'exports', 'import', 'console']);
-      // Sort by length descending (longer = more specific = fewer matches)
-      const candidates = [...new Set(identifiers)]
-        .filter(id => !skipWords.has(id.toLowerCase()))
-        .sort((a, b) => b.length - a.length);
-      // Two candidates, not five. They are sorted most-specific-first, so the
-      // 3rd–5th were the least likely to resolve AND the ones that pushed this
-      // loop past the hook's whole 4 s budget (5 × 2000 ms here + 2500 ms of
-      // impact below); the impact query they starve is the hook's actual output
-      // (audit 2026-09-05 JS-03).
-      for (const candidate of candidates.slice(0, 2)) {
-        const budget = remainingMs(2000);
-        if (budget === null) break;
-        try {
-          const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], hidden({
-            cwd, timeout: budget, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-            env: internalEnv,
-          }));
-          const grepResult = JSON.parse(raw);
-          // Pick this candidate if it has few matches (precise location)
-          const withContainer = (grepResult || []).filter(m => m.container && m.container.name);
-          if (withContainer.length > 0 && withContainer.length <= 5) {
-            // If multiple containers, vote for the most common one
-            const votes = {};
-            for (const m of withContainer) {
-              const cn = m.container.name;
-              votes[cn] = (votes[cn] || 0) + 1;
-            }
-            const best = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
-            symbol = best.includes('.') ? best.split('.').pop() : best.includes('::') ? best.split('::').pop() : best;
-            break;
-          }
-        } catch { /* try next candidate */ }
-      }
-    } catch { /* grep failed or no match — fall through */ }
+    symbolAt = m.index;
   }
 }
 
@@ -179,6 +143,21 @@ function isCommonKeyword(s) {
 // of what was edited — a second signature edit inside two minutes is exactly
 // the one the Stop check must still see.
 logEdit(symbol);
+
+// The definition's header, from where it starts to where its body opens. An
+// edit that leaves it verbatim changes only the body, which no caller can see.
+// (A body-only hunk with no definition in it exited above: the grep fallback
+// that used to guess its enclosing function named a wrong one for 108 of 608
+// TypeScript definitions, 2026-09-28 hook audit.)
+function headerAt(text, at) {
+  const rest = text.slice(at, at + 400);
+  const ends = [rest.indexOf('{'), rest.indexOf('=>'), rest.search(/:\s*(?:\n|$)/)]
+    .filter((i) => i >= 0);
+  return ends.length ? rest.slice(0, Math.min(...ends)) : rest.split('\n', 1)[0];
+}
+if (newStr.includes(headerAt(scanned, symbolAt))) process.exit(0);
+
+if (process.env.CODE_GRAPH_QUIET_HOOKS === '1') process.exit(0);
 
 // --- Per-symbol cooldown: 2 minutes ---
 // Project-scoped (see cwdHash in tmp-dir.js). A symbol name is the LEAST

@@ -353,7 +353,12 @@ test('emit: impact summary is delivered via the PreToolUse additionalContext env
 // `cgTmpDir()` on windows-latest and reddened
 // `js_test_suite_leaves_the_shared_tmp_dir_intact` in CI for v0.126.1.
 
-function runPreEditHook(t, { oldString = 'function processPayment(order) {', extraEnv = {} } = {}) {
+function runPreEditHook(t, {
+  oldString = 'function processPayment(order) {',
+  newString = 'x',
+  relPath = 'src/payments.js',
+  extraEnv = {},
+} = {}) {
   const fs = require('node:fs');
   const os = require('node:os');
   const path = require('node:path');
@@ -375,22 +380,26 @@ function runPreEditHook(t, { oldString = 'function processPayment(order) {', ext
   fs.writeFileSync(preload, `
     'use strict';
     const cp = require('child_process');
-    cp.execFileSync = () => JSON.stringify({
-      direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
-      callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
-      test_callers: [],
-    });
+    // grep --json answers as if every hit sat inside processPayment, so the
+    // body-edit fallback (if the hook still had one) would resolve a symbol.
+    cp.execFileSync = (bin, args) => args[0] === 'grep'
+      ? JSON.stringify([{ file: 'src/payments.js', line: 3, container: { name: 'processPayment' } }])
+      : JSON.stringify({
+        direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
+        callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
+        test_callers: [],
+      });
     const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
     fb.findBinary = () => ${JSON.stringify(path.join(home, 'never-executed-binary'))};
   `);
 
-  const editedFile = path.join(proj, 'src', 'payments.js');
+  const editedFile = path.resolve(proj, relPath);
   const res = spawnSync(process.execPath, ['--require', preload, path.join(__dirname, 'pre-edit-guide.js')], {
     cwd: proj,
     encoding: 'utf8',
     input: JSON.stringify({
       tool_name: 'Edit',
-      tool_input: { file_path: editedFile, old_string: oldString, new_string: 'x' },
+      tool_input: { file_path: editedFile, old_string: oldString, new_string: newString },
     }),
     env: {
       ...process.env,
@@ -424,4 +433,61 @@ test('emit(subprocess): the real hook emits additionalContext and NEVER auto-all
   assert.ok(!('permissionDecision' in out),
     `PreToolUse(Edit) must carry no permissionDecision; got ${JSON.stringify(out.permissionDecision)}`);
   assert.doesNotMatch(res.stdout, /"allow"/);
+});
+
+// ── Fires only when the edit changes a definition's header ──────────────────
+// The contract at the top of pre-edit-guide.js: impact is for a signature being
+// modified. Callers cannot break on a body-only edit, and the body-edit
+// fallback that guessed the enclosing function by grep picked a wrong symbol
+// for 108 of 608 TypeScript definitions in the 2026-09-28 hook audit.
+
+test('scope: a body-only edit (no definition in old_string) injects nothing', (t) => {
+  const { res } = runPreEditHook(t, {
+    oldString: '  const total = computeTax(order) + shippingFee;',
+    newString: '  const total = computeTax(order) + shippingFee + handlingFee;',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `body edit must stay silent, got: ${res.stdout}`);
+});
+
+test('scope: an edit that keeps the definition header unchanged injects nothing', (t) => {
+  const { res } = runPreEditHook(t, {
+    oldString: 'function processPayment(order) {\n  return charge(order);',
+    newString: 'function processPayment(order) {\n  return chargeWithRetry(order);',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `unchanged header must stay silent, got: ${res.stdout}`);
+});
+
+test('scope: a changed signature still injects the impact summary', (t) => {
+  const { res } = runPreEditHook(t, {
+    oldString: 'function processPayment(order) {\n  return charge(order);',
+    newString: 'function processPayment(order, currency) {\n  return charge(order, currency);',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /code-graph:impact\] processPayment\(\)/);
+});
+
+test('scope: the earliest definition in old_string names the symbol, not the first pattern to match', (t) => {
+  // The JS `function\s+(\w+)` arm is listed before Python's `def`, so the
+  // docstring's "function used" used to name the symbol `used`.
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py',
+    oldString: 'def send_static_file(self, filename):\n    """The function used to serve files."""',
+    newString: 'def send_static_file(self, filename, max_age=None):\n    """The function used to serve files."""',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /code-graph:impact\] send_static_file\(\)/);
+});
+
+test('scope: an edit to a file outside the project injects nothing', (t) => {
+  const { res } = runPreEditHook(t, { relPath: '../elsewhere/payments.js' });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `outside-project edit must stay silent, got: ${res.stdout}`);
+});
+
+test('scope: CODE_GRAPH_QUIET_HOOKS=1 silences the impact summary', (t) => {
+  const { res } = runPreEditHook(t, { extraEnv: { CODE_GRAPH_QUIET_HOOKS: '1' } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `QUIET must silence the hook, got: ${res.stdout}`);
 });
