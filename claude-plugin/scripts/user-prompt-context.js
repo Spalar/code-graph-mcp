@@ -420,8 +420,13 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, messag
   // The named file itself, not its parent dir: `src/context.ts` used to yield
   // an overview of all of src/ — 18,497 chars, none of it about that file.
   if (file && !cd('overview', file)) return { type: 'overview', path: file };
-  if ((intents.search || intents.implement || hasQualified) && symbols.symbols.length > 0 && !cd('search', sym)) return { type: 'search', symbol: sym };
-  if ((intents.understand || !hasAny) && symbols.symbols.length > 0 && !cd('search', sym)) return { type: 'search', symbol: sym };
+  // Search only for an identifier-shaped name, like impact and callgraph. A
+  // plain English word (`lowConfidence`) searched as a concept injected code
+  // unrelated to the prompt (`undefined` → JSX attribute types, `networkx` →
+  // doc headings; 2026-09-28 usage evaluation B8), and UPS search injections
+  // were followed up 2 times in 51.
+  if ((intents.search || intents.implement || hasQualified) && hasStrict && !cd('search', sym)) return { type: 'search', symbol: sym };
+  if ((intents.understand || !hasAny) && hasStrict && !cd('search', sym)) return { type: 'search', symbol: sym };
 
   // Phase E fallback: nothing actionable above, but message has symptom phrasing.
   // Emit ONE-LINE prose hint (no CLI execution). Default-empty `message` keeps

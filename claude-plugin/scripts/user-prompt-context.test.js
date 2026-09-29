@@ -368,16 +368,44 @@ test('priority: search intent + symbol → search', () => {
 
 test('priority: implement intent + symbol → search', () => {
   const intents = { impact: false, modify: false, implement: true, understand: false, callgraph: false, search: false };
-  const symbols = { symbols: ['embedding'], lowConfidence: true };
+  const symbols = { symbols: ['embedding_model'], lowConfidence: false };
   const result = determineQueryType(intents, symbols, []);
   assert.equal(result.type, 'search');
 });
 
 test('priority: understand + symbol → search', () => {
   const intents = { impact: false, modify: false, implement: false, understand: true, callgraph: false, search: false };
-  const symbols = { symbols: ['pipeline'], lowConfidence: true };
+  const symbols = { symbols: ['runPipeline'], lowConfidence: false };
   const result = determineQueryType(intents, symbols, []);
   assert.equal(result.type, 'search');
+});
+
+// A plain English word is not a symbol. Searched anyway, it injected code
+// unrelated to the prompt: `undefined` → JSX attribute types, `script` →
+// ScriptHTMLAttributes (2026-09-28 hook audit P2-10), and in the coding eval
+// `networkx` → doc headings and benchmarks (B8). Follow-through on UPS search
+// injections was 2/51 in 240 real sessions.
+test('priority: a low-confidence plain word never drives a search, whatever the intent', () => {
+  for (const intent of ['search', 'implement', 'understand', null]) {
+    const intents = { impact: false, modify: false, implement: false, understand: false, callgraph: false, search: false };
+    if (intent) intents[intent] = true;
+    for (const word of ['embedding', 'pipeline', 'networkx']) {
+      const result = determineQueryType(intents, { symbols: [word], lowConfidence: true }, []);
+      assert.equal(result, null, `${intent || 'no intent'} + plain word ${word}`);
+    }
+  }
+});
+
+test('B8: the coding-eval dead-helpers prompt injects nothing', () => {
+  const msg = 'Clean-up task in this networkx checkout: find module-level private functions '
+    + '(names starting with a single `_`) in the non-test modules under `networkx/algorithms/` '
+    + 'and `networkx/generators/` that are never called or referenced anywhere in the repository '
+    + '(code, tests, docs or benchmarks), and delete them, together with any imports that only '
+    + 'they used. Do not remove anything that is referenced somewhere. When you are done, list '
+    + 'what you removed.';
+  const symbols = extractSymbols(msg);
+  assert.deepEqual(symbols, { symbols: ['networkx', 'checkout'], lowConfidence: true }, 'precondition');
+  assert.equal(determineQueryType(detectIntents(msg), symbols, extractFilePaths(msg), null, msg), null);
 });
 
 test('priority: no intent, no symbol, no path → null', () => {
@@ -434,16 +462,24 @@ test('integration: refactor src/storage/queries.rs → overview (not impact on "
   assert.ok(r.query.path.includes('src/storage/'));
 });
 
-test('integration: help me understand the indexer pipeline → search', () => {
+// Plain words only (`pipeline`, `embedding`): no identifier to search for, so
+// nothing is injected (B8). The identifier-shaped variants still search.
+test('integration: help me understand the indexer pipeline → nothing (plain words)', () => {
   const r = analyze('help me understand the indexer pipeline');
-  assert.equal(r.query.type, 'search');
-  assert.equal(r.query.symbol, 'pipeline');
+  assert.equal(r.symbols.lowConfidence, true);
+  assert.equal(r.query, null);
 });
 
-test('integration: write tests for the embedding module → search', () => {
+test('integration: write tests for the embedding module → nothing (plain words)', () => {
   const r = analyze('write tests for the embedding module');
+  assert.equal(r.symbols.lowConfidence, true);
+  assert.equal(r.query, null);
+});
+
+test('integration: help me understand run_pipeline → search', () => {
+  const r = analyze('help me understand run_pipeline');
   assert.equal(r.query.type, 'search');
-  assert.equal(r.query.symbol, 'embedding');
+  assert.equal(r.query.symbol, 'run_pipeline');
 });
 
 test('integration: 修复这段逻辑的bug → not skipped (bug=3 chars)', () => {
