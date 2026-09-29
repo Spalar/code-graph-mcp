@@ -149,7 +149,18 @@ def run_pytest(workspace, target, timeout):
     return {"rc": proc.returncode, "summary": tail[0], **counts}
 
 
-def grade_run(run_dir, case, arm, meta, prompts, suite, scratch):
+def grade_run(run_dir, case, arm, meta, prompts, suite, scratch, keep_scratch=False):
+    """Grade one run; its workspace copy (~60 MB for networkx) is removed after
+    grading unless keep_scratch, so a 30-run grade does not leave 1.8 GB behind."""
+    workspace = Path(scratch) / Path(run_dir).name
+    try:
+        return _grade_run(run_dir, case, arm, meta, prompts, suite, workspace)
+    finally:
+        if not keep_scratch:
+            subprocess.run(["rm", "-rf", str(workspace)], check=False)
+
+
+def _grade_run(run_dir, case, arm, meta, prompts, suite, workspace):
     run_dir = Path(run_dir)
     for d in (run_dir, run_dir / "sealed"):
         if d.exists():
@@ -171,7 +182,6 @@ def grade_run(run_dir, case, arm, meta, prompts, suite, scratch):
     if not src.is_dir():
         out["error"] = "workspace not found"
         return out
-    workspace = Path(scratch) / run_dir.name
     subprocess.run(["rm", "-rf", str(workspace)], check=True)
     subprocess.run(["cp", "-a", str(src), str(workspace)], check=True)
     if case == "code-dead-helpers":
@@ -216,6 +226,8 @@ def main():
     ap.add_argument("--suite", action="store_true")
     ap.add_argument("--out")
     ap.add_argument("--scratch", default="/var/tmp/code-graph-eval/graded")
+    ap.add_argument("--keep-scratch", action="store_true",
+                    help="keep each graded workspace copy under --scratch")
     ap.add_argument("-j", "--jobs", type=int, default=4)
     args = ap.parse_args()
     prompts = case_prompts()
@@ -242,7 +254,8 @@ def main():
                 jobs.append((Path(trace).parent.parent, case["name"], arm, meta))
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = [
-            pool.submit(grade_run, d, c, a, m, prompts, args.suite, args.scratch)
+            pool.submit(grade_run, d, c, a, m, prompts, args.suite, args.scratch,
+                        args.keep_scratch)
             for d, c, a, m in jobs
         ]
         for fut in futures:
