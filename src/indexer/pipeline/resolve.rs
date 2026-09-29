@@ -582,6 +582,11 @@ pub(super) fn resolve_pending_calls_touching(
             all_file_paths.as_ref().unwrap_or(&no_files),
             candidates,
         )?;
+        let mut candidates = candidates;
+        if is_package_bound(row.metadata.as_deref()) {
+            let caller = source_id_to_path.get(&row.source_id);
+            candidates.retain(|id| node_id_to_path.get(id) != caller);
+        }
         if candidates.is_empty() {
             continue; // still unresolvable — leave buffered
         }
@@ -3666,6 +3671,15 @@ pub(super) fn rust_call_shape_admits(metadata: Option<&str>, callee: &RustFnShap
 fn rust_call_arity(metadata: Option<&str>) -> Option<usize> {
     let v: serde_json::Value = serde_json::from_str(metadata?).ok()?;
     usize::try_from(v.get("n")?.as_u64()?).ok()
+}
+
+/// Whether a call or import went through a package binding
+/// ([`crate::domain::CALL_Q_PACKAGE`]): its name then means no function of the
+/// caller's own file. One predicate for the batch, deferred and pending paths.
+pub(super) fn is_package_bound(metadata: Option<&str>) -> bool {
+    metadata
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .is_some_and(|v| v.get("q").and_then(|q| q.as_str()) == Some(crate::domain::CALL_Q_PACKAGE))
 }
 
 /// Candidates a call can reach given its metadata: a member call on an object

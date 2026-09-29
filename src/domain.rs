@@ -130,6 +130,16 @@ pub const CALL_META_MEMBER: &str = r#"{"q":"member"}"#;
 /// function the file `s` names exports as `a` (`resolve::js_import_targets`).
 pub const CALL_Q_IMPORT: &str = "imp";
 
+/// `q` of a JS/TS call or `require` import through a PACKAGE binding (D7): a
+/// bare `send(req)` whose nearest binding of `send` is `var send =
+/// require('send')` / `import send from 'send'`, and the `<module> imports
+/// send` of that require, stamped `{"q":"pkg","v":spec}`. The name cannot mean a
+/// function the caller's own file defines (`res.send = function send() {}` drew
+/// both at `extracted`), so the same-file tier skips it on every path
+/// (`resolve::is_package_bound`); a project function elsewhere (a workspace
+/// package) stays reachable by name.
+pub const CALL_Q_PACKAGE: &str = "pkg";
+
 // -- Import `q` markers --
 //
 // Stamped onto an import relation's metadata by the parser and read back in
@@ -378,7 +388,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 103; // v103 (2026-09-28, pre-tag review round 2): only a test / bench / example target's inherent `self` call looks at the no-layout files under its own directory (a `src/` crate never does); a `#[cfg]` on the caller's whole impl block no longer keeps another inherent block's `m` (it gates the caller too); a caller whose own inherent impl always defines `m` is decided by it, not handed to the crate for another inline `mod`'s namesake. // v102 (2026-09-28, pre-tag review): a `self: Pin<…>` call reaches `Pin`'s own method only when that pointer has it (`get_ref` on `Pin<&T>`, `get_mut` on `Pin<&mut T>`, `as_mut`/`set` on a mutable pointer, `as_ref` on any), else `Self`'s; another inherent impl's `m` is ruled out only when the caller's own `m` and its block carry no `#[cfg]`; a file whose impls of the type's name sit in different inline `mod`s leaves a `self` call to the crate (`"wide"`); an inherent `self` call past its crate looks at files no crate layout places (`tests/common/…`); `->` inside an impl type's generic arguments closes nothing (`Box<dyn Fn() -> u8>` is `Box`); a Rust `self`/`stype` caller is re-extracted when a method of its type and name appears or leaves in another file, deletions included. // Older entries (v101 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 104; // v104 (2026-09-29, D7): a JS/TS function literal assigned to a named member (`res.send = function send() {}`, `View.prototype.lookup = …` as method `View.lookup`, `exports.f` / `module.exports.f` as `exports.f`) and a class field holding a function (`json = () => {}` as method `Class.json`) are nodes, and the calls inside them are scoped to them instead of `<module>` or the class body; a chained `res.set = res.header = function () {}` is a node per member; a `this.x = …` assignment is none; a bare call or `require` import through a package binding (`var send = require('send')`, or a member of one: `var resolve = path.resolve`) binds no node of its own file, and such an import no project node at all (`q:"pkg"`); a member call on an unshadowed built-in global (`Object.create`, `JSON.parse`), and a bare call through one of Node's own modules (`path.resolve`), is no call edge. // v103 (2026-09-28, pre-tag review round 2): only a test / bench / example target's inherent `self` call looks at the no-layout files under its own directory (a `src/` crate never does); a `#[cfg]` on the caller's whole impl block no longer keeps another inherent block's `m` (it gates the caller too); a caller whose own inherent impl always defines `m` is decided by it, not handed to the crate for another inline `mod`'s namesake. // Older entries (v102 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before

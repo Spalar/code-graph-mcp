@@ -217,11 +217,20 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         .unwrap_or(normalized)
                         .to_string();
                     if !segment.is_empty() {
+                        // A package (`require('send')`) is no project file: its
+                        // import cannot bind a node of this file (D7).
+                        let package = !path.starts_with('.') && !path.starts_with('/');
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: segment,
                             relation: REL_IMPORTS.into(),
-                            metadata: None,
+                            metadata: package.then(|| {
+                                serde_json::json!({
+                                    "q": crate::domain::CALL_Q_PACKAGE,
+                                    "v": normalized,
+                                })
+                                .to_string()
+                            }),
                             source_language: String::new(),
                             source_line: None,
                         });
@@ -352,6 +361,11 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 || (ctx.language == "rust"
                     && matches!(qualifier, helpers::CalleeQualifier::SelfRecv(_))
                     && super::rust_impls::answered_by_the_self_wrapper(node, source, &callee));
+            // `Object.create(null)` runs no project code (D7): with
+            // `exports.create = function () {}` a node, express's seven bound it.
+            let shadowed = shadowed
+                || super::member::js_builtin_global_call(node, source, ctx.language)
+                || super::member::js_node_builtin_call(node, source, ctx.language);
             // The file's `use` names what the call's leading name stands for
             // (D#132): `use std::sync::Mutex; Mutex::new()` is std's.
             let use_root = if ctx.language == "rust" && !shadowed {
@@ -489,6 +503,18 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         }
                         None => (callee, metadata),
                     };
+                // `send(req)` through `var send = require('send')` (D7).
+                let metadata = match metadata {
+                    None => super::member::js_package_bound_call(node, source, ctx.config.name)
+                        .map(|spec| {
+                            serde_json::json!({
+                                "q": crate::domain::CALL_Q_PACKAGE,
+                                "v": spec,
+                            })
+                            .to_string()
+                        }),
+                    some => some,
+                };
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,

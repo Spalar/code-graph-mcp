@@ -1264,6 +1264,43 @@ fn extract_nodes(
                     source,
                     node_is_test,
                 ));
+            } else if let chain @ [_, ..] =
+                super::js_member_assignment_chain(&node, source).as_slice()
+            {
+                // D7: `res.send = function send() {}` — spans the assignment; its
+                // doc comment sits above the statement that holds it. A chained
+                // `res.set = res.header = function () {}` is a node per member.
+                for (name, qualified, kind, assign) in chain {
+                    let doc_anchor = assign
+                        .parent()
+                        .filter(|p| p.kind() == "expression_statement")
+                        .unwrap_or(*assign);
+                    results.push(assigned_function_node(
+                        kind,
+                        name.clone(),
+                        qualified.clone(),
+                        &node,
+                        assign,
+                        get_preceding_comment(&doc_anchor, source),
+                        source,
+                        node_is_test,
+                    ));
+                }
+            } else if let (Some(cls), Some(field)) =
+                (parent_class, super::js_class_field_function(&node, source))
+            {
+                // D7: a class field holding a function is that class's method.
+                let decl = node.parent().unwrap_or(node);
+                results.push(assigned_function_node(
+                    "method",
+                    field.clone(),
+                    format!("{cls}.{field}"),
+                    &node,
+                    &decl,
+                    get_preceding_comment(&decl, source),
+                    source,
+                    node_is_test,
+                ));
             }
             // fall through to extract_children below so nested fns still extract
         }
@@ -1353,6 +1390,36 @@ fn strip_nul_field(s: Option<String>) -> Option<String> {
             v
         }
     })
+}
+
+/// A function node whose name comes from what holds the function — an assigned
+/// member or a class field (D7). `span` is that holder: its lines and text are
+/// the node's; the signature is the function's own.
+#[allow(clippy::too_many_arguments)]
+fn assigned_function_node(
+    node_type: &str,
+    name: String,
+    qualified_name: String,
+    function: &tree_sitter::Node,
+    span: &tree_sitter::Node,
+    doc_comment: Option<String>,
+    source: &str,
+    is_test: bool,
+) -> ParsedNode {
+    let sig_info = extract_signature_info(function, source);
+    ParsedNode {
+        node_type: node_type.into(),
+        name,
+        qualified_name: Some(qualified_name),
+        start_line: span.start_position().row as u32 + 1,
+        end_line: span.end_position().row as u32 + 1,
+        code_content: truncate_code_content(node_text(span, source)).into_owned(),
+        signature: sig_info.signature,
+        doc_comment,
+        return_type: sig_info.return_type,
+        param_types: sig_info.param_types,
+        is_test,
+    }
 }
 
 fn make_simple_node(
@@ -4388,5 +4455,151 @@ def undocumented():
             .expect("add must carry its doc comment");
         // Byte-identical to the pre-cap behavior, trailing newline included.
         assert_eq!(doc, "/// Adds two numbers.\n");
+    }
+
+    // ── D7 (tasks/specs/js-ts-assigned-functions.md): functions assigned to a
+    // member, and class fields holding a function, are nodes. express 4.21.2
+    // defines 70 of its 107 `lib/` functions this way; hono's `Context` has 15
+    // arrow fields. None was indexed, so `show send` found nothing.
+
+    fn triples(code: &str, lang: &str) -> Vec<(String, String, String)> {
+        parse_code(code, lang)
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.qualified_name.unwrap_or_default(), n.node_type))
+            .collect()
+    }
+
+    #[test]
+    fn js_function_assigned_to_a_member_is_a_node() {
+        let code = r#"
+res.send = function send(body) { return body; };
+res.json = function (obj) { return this.send(obj); };
+View.prototype.lookup = function lookup(name) { return name; };
+exports.normalizeType = function (type) { return type; };
+module.exports.f = () => 1;
+x.y.z = function () {};
+obj[k] = function () {};
+a.b = someVar;
+a.c = require('x');
+app.get('/users', function handler(req, res) { res.send(1); });
+"#;
+        for lang in ["javascript", "typescript"] {
+            let got = triples(code, lang);
+            let want = [
+                ("send", "res.send", "function"),
+                ("json", "res.json", "function"),
+                ("lookup", "View.lookup", "method"),
+                ("normalizeType", "exports.normalizeType", "function"),
+                ("f", "exports.f", "function"),
+                ("z", "x.y.z", "function"),
+            ];
+            for (n, q, t) in want {
+                assert!(
+                    got.iter().any(|(gn, gq, gt)| gn == n && gq == q && gt == t),
+                    "{lang}: missing ({n}, {q}, {t}) in {got:?}"
+                );
+            }
+            // Not a member name (computed), not a function literal, and the route
+            // handler keeps its synthetic name.
+            for absent in ["k", "b", "c", "handler"] {
+                assert!(
+                    !got.iter().any(|(gn, _, _)| gn == absent),
+                    "{lang}: {absent} in {got:?}"
+                );
+            }
+            assert!(
+                got.iter().any(|(gn, _, _)| gn.starts_with("GET /users#L")),
+                "{lang}: {got:?}"
+            );
+        }
+    }
+
+    /// `res.set = res.header = function header() {}` gives one function two
+    /// member names (express: `req.get`/`req.header`, `res.type`/`res.contentType`);
+    /// a call through either must find it.
+    #[test]
+    fn a_chained_member_assignment_names_the_function_under_each_member() {
+        let code = "res.set = res.header = function header(field, val) { return this; };\n";
+        let got = triples(code, "javascript");
+        for q in ["res.header", "res.set"] {
+            assert!(
+                got.iter().any(|(_, gq, gt)| gq == q && gt == "function"),
+                "missing {q}: {got:?}"
+            );
+        }
+    }
+
+    /// `this.match = (m, p) => …` inside a class method replaces the method at
+    /// run time (hono's RegExpRouter); as a node named `this.match` it drew the
+    /// class's own `match` calls (2 wrong edges on hono). A `this`-rooted member
+    /// names no stable place, in a class or in a constructor function.
+    #[test]
+    fn a_this_rooted_member_assignment_is_no_node() {
+        let code = "class R {\n  match(m, p) {\n    this.match = (m2, p2) => m2;\n    return this.match(m, p);\n  }\n}\n\
+                    function Legacy() {\n  this.handle = function handle() {};\n}\n";
+        for lang in ["javascript", "typescript"] {
+            let got = triples(code, lang);
+            let matches: Vec<_> = got.iter().filter(|(n, _, _)| n == "match").collect();
+            assert_eq!(matches.len(), 1, "{lang}: only the method: {got:?}");
+            assert_eq!(matches[0].1, "R.match");
+            assert!(
+                !got.iter().any(|(n, _, _)| n == "handle"),
+                "{lang}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_assigned_function_node_spans_the_assignment() {
+        let code = "// Send a body.\nres.send = function send(body) {\n  return body;\n};\n";
+        let nodes = parse_code(code, "javascript").unwrap();
+        let n = nodes.iter().find(|n| n.name == "send").expect("send node");
+        assert_eq!((n.start_line, n.end_line), (2, 4));
+        assert!(
+            n.code_content.starts_with("res.send = function send(body)"),
+            "{}",
+            n.code_content
+        );
+        assert_eq!(n.signature.as_deref(), Some("(body)"));
+        assert_eq!(n.doc_comment.as_deref(), Some("// Send a body."));
+    }
+
+    #[test]
+    fn class_field_holding_a_function_is_a_method_node() {
+        let ts = r#"
+class Context {
+  json = (obj: unknown) => { return this.text(String(obj)); };
+  private readonly f = function () { return 1; };
+  count = 0;
+  text(s: string) { return s; }
+}
+"#;
+        let got = triples(ts, "typescript");
+        for (n, q) in [
+            ("json", "Context.json"),
+            ("f", "Context.f"),
+            ("text", "Context.text"),
+        ] {
+            assert!(
+                got.iter()
+                    .any(|(gn, gq, gt)| gn == n && gq == q && gt == "method"),
+                "missing ({n}, {q}, method) in {got:?}"
+            );
+        }
+        assert!(
+            !got.iter().any(|(gn, _, _)| gn == "count"),
+            "a plain value field is no node: {got:?}"
+        );
+
+        let js = "class A {\n  handler = () => { go(); };\n  static make = function () {};\n}\n";
+        let got = triples(js, "javascript");
+        for (n, q) in [("handler", "A.handler"), ("make", "A.make")] {
+            assert!(
+                got.iter()
+                    .any(|(gn, gq, gt)| gn == n && gq == q && gt == "method"),
+                "missing ({n}, {q}, method) in {got:?}"
+            );
+        }
     }
 }

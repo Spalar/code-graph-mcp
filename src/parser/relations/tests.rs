@@ -7775,3 +7775,53 @@ fn test_rust_self_path_in_a_trait_default_method_names_the_trait() {
         "{all:?}"
     );
 }
+
+// D7: calls inside a member-assigned function or a function-valued class field
+// are attributed to that function's node (its qualified name), not <module>.
+#[test]
+fn calls_inside_assigned_and_field_functions_scope_to_their_node() {
+    let js = "res.json = function (obj) { helperA(obj); };\n\
+              View.prototype.render = function render() { helperB(); };\n\
+              module.exports.f = () => helperC();\n";
+    let rels = extract_relations(js, "javascript").unwrap();
+    let source_of = |rels: &[crate::parser::relations::ParsedRelation], callee: &str| {
+        rels.iter()
+            .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == callee)
+            .map(|r| r.source_name.clone())
+            .unwrap_or_else(|| panic!("no call to {callee}"))
+    };
+    assert_eq!(source_of(&rels, "helperA"), "res.json");
+    assert_eq!(source_of(&rels, "helperB"), "View.render");
+    assert_eq!(source_of(&rels, "helperC"), "exports.f");
+
+    let ts = "class Context {\n  json = (obj: unknown) => { helperD(obj); };\n  \
+              f = function () { helperE(); };\n}\n";
+    let rels = extract_relations(ts, "typescript").unwrap();
+    assert_eq!(source_of(&rels, "helperD"), "Context.json");
+    assert_eq!(source_of(&rels, "helperE"), "Context.f");
+}
+
+// D7: a member call on a JS built-in global (`Object.create(null)`) runs no
+// project code. With `exports.create = function () {}` now a node, express's
+// seven `Object.create` calls bound it by name. A local of that name shadows the
+// global and keeps its call.
+#[test]
+fn a_member_call_on_a_builtin_global_is_no_call_edge() {
+    let js = "function f() { var o = Object.create(null); JSON.parse('{}'); Math.max(1, 2); \
+              process.nextTick(g); return Promise.resolve(o); }\n\
+              function h(Object) { return Object.create(1); }\n";
+    let rels = extract_relations(js, "javascript").unwrap();
+    let calls: Vec<(&str, &str)> = rels
+        .iter()
+        .filter(|r| r.relation == crate::domain::REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    for gone in ["parse", "max", "nextTick", "resolve"] {
+        assert!(!calls.iter().any(|(_, t)| *t == gone), "{gone}: {calls:?}");
+    }
+    assert!(!calls.contains(&("f", "create")), "{calls:?}");
+    assert!(
+        calls.contains(&("h", "create")),
+        "a parameter named Object shadows the global: {calls:?}"
+    );
+}

@@ -547,6 +547,23 @@ const REFERENCE_PASSES: &[ReferencePass] = &[
     },
 ];
 
+/// D7: the scope of a member-assigned (`res.send = function () {}`) or
+/// class-field (`json = () => {}`) function — the qualified name its node
+/// carries in the extractor (treesitter.rs), so the function's calls attach to
+/// it rather than to `<module>` or the enclosing class body.
+fn js_assigned_or_field_scope(
+    node: &tree_sitter::Node,
+    source: &str,
+    current_class: Option<&str>,
+) -> Option<String> {
+    super::js_member_assigned_function(node, source)
+        .map(|(_, qualified, _, _)| qualified)
+        .or_else(|| {
+            let field = super::js_class_field_function(node, source)?;
+            Some(format!("{}.{}", current_class?, field))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_for_relations(
     node: tree_sitter::Node,
@@ -619,24 +636,28 @@ fn walk_for_relations(
             // inherit the parent scope. (Returning `Some("<anonymous>")` would
             // emit unresolvable edges — no node is named that — silently dropping
             // callback calls and causing false-positive orphans.)
-            super::route_handler_name(&node, source).or_else(|| {
-                node.parent()
-                    .filter(|p| p.kind() == "variable_declarator")
-                    .and_then(|p| p.child_by_field_name("name"))
-                    .map(|n| {
-                        let name = node_text(&n, source).to_string();
-                        match current_class {
-                            Some(cls) => format!("{}.{}", cls, name),
-                            None => name,
-                        }
-                    })
-            })
+            super::route_handler_name(&node, source)
+                .or_else(|| {
+                    node.parent()
+                        .filter(|p| p.kind() == "variable_declarator")
+                        .and_then(|p| p.child_by_field_name("name"))
+                        .map(|n| {
+                            let name = node_text(&n, source).to_string();
+                            match current_class {
+                                Some(cls) => format!("{}.{}", cls, name),
+                                None => name,
+                            }
+                        })
+                })
+                .or_else(|| js_assigned_or_field_scope(&node, source, current_class))
         }
         "function_expression" => {
-            // Only materialized inline route handlers get a scope here; other
-            // function expressions keep inheriting the parent scope (no node is
-            // created for them, so a synthetic scope would dangle).
+            // Materialized inline route handlers and (D7) member-assigned or
+            // class-field functions get a scope here; other function expressions
+            // keep inheriting the parent scope (no node is created for them, so a
+            // synthetic scope would dangle).
             super::route_handler_name(&node, source)
+                .or_else(|| js_assigned_or_field_scope(&node, source, current_class))
         }
         // Dart: function_body is a sibling of either method_signature
         // (in class_body) or function_signature (top-level declaration).

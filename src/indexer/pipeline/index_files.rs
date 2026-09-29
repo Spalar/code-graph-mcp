@@ -2038,11 +2038,17 @@ fn resolve_batch_relations(
                 all_target_ids.retain(|id| !callables.contains(id));
             }
 
-            let same_file_targets: Vec<i64> = all_target_ids
-                .iter()
-                .filter(|id| local_ids.contains(id))
-                .copied()
-                .collect();
+            // A name bound to a package import means no node of this file (D7).
+            let same_file_targets: Vec<i64> =
+                if super::resolve::is_package_bound(rel.metadata.as_deref()) {
+                    Vec::new()
+                } else {
+                    all_target_ids
+                        .iter()
+                        .filter(|id| local_ids.contains(id))
+                        .copied()
+                        .collect()
+                };
 
             let source_lang = pf.language.as_str();
 
@@ -3751,7 +3757,10 @@ fn resolve_deferred_relations(
 
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
-            let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+            let mut all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+            if super::resolve::is_package_bound(d.metadata.as_deref()) {
+                all.retain(|id| node_id_to_path.get(id) != Some(&d.rel_path));
+            }
             let all = classes.rust_call_shape_candidates(
                 db,
                 &d.language,
@@ -4188,6 +4197,16 @@ fn resolve_deferred_relations(
         let mut all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
         if let Some(other) = other_root.as_deref() {
             all_target_ids.retain(|id| node_id_to_path.get(id).map(String::as_str) != Some(other));
+        }
+        if super::resolve::is_package_bound(d.metadata.as_deref()) {
+            // An import of a package names a module, never a project function
+            // that happens to share its last segment: it takes the sentinel.
+            // (A call keeps the cross-file pool, for a workspace package.)
+            if d.relation == REL_IMPORTS {
+                all_target_ids.clear();
+            } else {
+                all_target_ids.retain(|id| node_id_to_path.get(id) != Some(&d.rel_path));
+            }
         }
         // A supertype is a type, as at batch time.
         if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {

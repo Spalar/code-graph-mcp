@@ -327,6 +327,189 @@ pub(super) fn js_renamed_import_call(
     None
 }
 
+/// JS/Node built-in globals: a member call on one (`Object.create`, `JSON.parse`)
+/// runs no project code.
+const JS_BUILTIN_GLOBALS: &[&str] = &[
+    "Array",
+    "Atomics",
+    "BigInt",
+    "Boolean",
+    "Buffer",
+    "Date",
+    "Error",
+    "Intl",
+    "JSON",
+    "Map",
+    "Math",
+    "Number",
+    "Object",
+    "Promise",
+    "Proxy",
+    "Reflect",
+    "RegExp",
+    "Set",
+    "String",
+    "Symbol",
+    "WeakMap",
+    "WeakSet",
+    "console",
+    "globalThis",
+    "process",
+];
+
+/// Whether a JS/TS call is a member call on a built-in global the file does not
+/// rebind (a parameter, local or import of that name makes it the file's own).
+pub(super) fn js_builtin_global_call(call: tree_sitter::Node, source: &str, family: &str) -> bool {
+    if !matches!(family, "javascript" | "typescript" | "tsx") {
+        return false;
+    }
+    let Some(object) = call
+        .child_by_field_name("function")
+        .filter(|f| f.kind() == "member_expression")
+        .and_then(|f| f.child_by_field_name("object"))
+        .filter(|o| o.kind() == "identifier")
+    else {
+        return false;
+    };
+    let name = node_text(&object, source);
+    if !JS_BUILTIN_GLOBALS.contains(&name) {
+        return false;
+    }
+    let mut child = call;
+    while let Some(scope) = child.parent() {
+        if binding_in(scope, child, name, source).is_some() {
+            return false;
+        }
+        child = scope;
+    }
+    true
+}
+
+/// Node's own modules: never a project's workspace package, so a call through
+/// one (`resolve(p)` with `var resolve = require('path').resolve`) runs no
+/// project code — express's `res.download` bound `View.prototype.resolve`.
+const NODE_BUILTIN_MODULES: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// Whether a bare JS/TS call goes through a binding of one of Node's own
+/// modules (`node:path`, `path`, `fs/promises`): no project code runs.
+/// A renamed import (`const { resolve } = require('path')`) keeps its own path:
+/// it is recorded as a call of the export, which the resolver binds nothing for
+/// a package (`js_renamed_import_call`, D#120).
+pub(super) fn js_node_builtin_call(call: tree_sitter::Node, source: &str, family: &str) -> bool {
+    if js_renamed_import_call(call, source, family).is_some() {
+        return false;
+    }
+    js_package_bound_call(call, source, family).is_some_and(|spec| {
+        spec.starts_with("node:")
+            || NODE_BUILTIN_MODULES.contains(&spec.split('/').next().unwrap_or(&spec))
+    })
+}
+
+/// The package a bare JS/TS call goes through (`crate::domain::CALL_Q_PACKAGE`):
+/// `send(req)` whose nearest binding of `send` is the file's own `var send =
+/// require('send')` / `import send from 'send'`. A parameter or local of that
+/// name shadows the import, and a relative specifier is a project file, not a
+/// package: neither is one.
+pub(super) fn js_package_bound_call(
+    call: tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> Option<String> {
+    if !matches!(family, "javascript" | "typescript" | "tsx") {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&function, source);
+    let mut child = call;
+    let program = loop {
+        let scope = child.parent()?;
+        if binding_in(scope, child, name, source).is_some() {
+            break Some(scope).filter(|s| s.kind() == "program")?;
+        }
+        child = scope;
+    };
+    let package = |n: &str| {
+        IMPORT_BOUND
+            .with(|b| b.borrow().get(n).cloned().flatten())
+            .filter(|spec| !spec.starts_with('.') && !spec.starts_with('/'))
+    };
+    // `var send = require('send')`, `import send from 'send'`, or a member of one:
+    // `var resolve = path.resolve` with `path` a package (express's view.js
+    // bound `resolve(root, name)` to its own `View.prototype.resolve`).
+    package(name).or_else(|| {
+        (0..program.named_child_count())
+            .filter_map(|i| program.named_child(i))
+            .filter(|c| matches!(c.kind(), "lexical_declaration" | "variable_declaration"))
+            .flat_map(|decl| (0..decl.named_child_count()).filter_map(move |i| decl.named_child(i)))
+            .filter(|d| d.kind() == "variable_declarator")
+            .find(|d| {
+                d.child_by_field_name("name")
+                    .is_some_and(|n| n.kind() == "identifier" && node_text(&n, source) == name)
+            })
+            .and_then(|d| d.child_by_field_name("value"))
+            .filter(|v| v.kind() == "member_expression")
+            .and_then(|v| {
+                let mut root = v;
+                while let Some(obj) = root.child_by_field_name("object") {
+                    root = obj;
+                }
+                // `path.resolve` through a package binding, or
+                // `require('node:path').resolve` directly.
+                match root.kind() {
+                    "identifier" => package(node_text(&root, source)),
+                    _ => require_call(root, source)
+                        .filter(|spec| !spec.starts_with('.') && !spec.starts_with('/')),
+                }
+            })
+    })
+}
+
 /// Function-like nodes: a scope whose parameters bind names and whose `var`s
 /// hoist to it.
 fn is_function_like(kind: &str) -> bool {

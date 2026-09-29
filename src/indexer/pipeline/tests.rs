@@ -10879,3 +10879,129 @@ fn source_roots_are_written_only_beside_an_index_in_a_code_graph_dir() {
     assert!(!elsewhere.path().join(SOURCE_ROOTS_FILE).exists());
     assert!(read_source_roots(project.path()).is_none());
 }
+
+// D7: a member call reaches a function assigned to a member in another file
+// (express's `res.send = function send(){}` called as `res.send(...)`).
+#[test]
+fn member_call_reaches_a_member_assigned_function_across_files() {
+    let files: &[(&str, &str)] = &[
+        (
+            "lib/response.js",
+            "var res = module.exports = {};\n\
+             res.send = function send(body) { return body; };\n\
+             res.json = function json(obj) { return this.send(JSON.stringify(obj)); };\n",
+        ),
+        (
+            "lib/router.js",
+            "function handle(req, res) { res.json({ ok: true }); }\nmodule.exports = handle;\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    assert!(
+        has("lib/router.js.handle --calls--> lib/response.js.json"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("lib/response.js.json --calls--> lib/response.js.send"),
+        "{edges:#?}"
+    );
+}
+
+// D7: `send(req)` through `var send = require('send')` calls the package. With
+// `res.send = function send() {}` now a node in the same file, the same-file
+// tier bound it there at `extracted` (express: sendFile/sendfile → res.send,
+// acceptsEncodings → req.accepts, format → res.vary). A name the file binds to a
+// package import cannot mean a function the same file defines; a call through
+// `this` still reaches it, and a cross-file project function of that name (a
+// workspace package in a monorepo) stays reachable.
+#[test]
+fn a_bare_call_through_a_package_import_never_binds_a_same_file_function() {
+    let files: &[(&str, &str)] = &[
+        (
+            "lib/response.js",
+            "var send = require('send');\nvar vary = require('vary');\nvar res = module.exports = {};\n\
+             res.send = function send(body) { return body; };\n\
+             res.vary = function (field) { return field; };\n\
+             res.sendFile = function sendFile(path) { var file = send(this.req, path); return file; };\n\
+             res.format = function (obj) { vary(this, 'Accept'); return this.send(obj); };\n\
+             function wrapper() { function send(x) { return x; } return send(1); }\n",
+        ),
+        (
+            "lib/view.js",
+            "var path = require('path');\nvar resolve = path.resolve;\n\
+             View.prototype.lookup = function lookup(name) { return resolve(this.root, name); };\n\
+             View.prototype.resolve = function resolve(dir, file) { return dir + file; };\n",
+        ),
+        (
+            "packages/app/main.js",
+            "import { helper } from '@org/lib';\nexport function main() { return helper(1); }\n",
+        ),
+        ("packages/lib/index.js", "export function helper(x) { return x; }\n"),
+        ("lib/utils.js", "var send = require('send');\nexports.mime = send.mime;\n"),
+        (
+            "lib/download.js",
+            "var resolve = require('node:path').resolve;\nvar join = require('path').join;\n\
+             function download(p) { return resolve(join(p, 'x')); }\n",
+        ),
+    ];
+    let (project, _d, db) = fresh_index_of(files);
+    let check = |db: &Database, when: &str| {
+        let edges = edge_set(db);
+        let has = |e: &str| edges.iter().any(|x| x == e);
+        assert!(
+            !has("lib/response.js.sendFile --calls--> lib/response.js.send"),
+            "{when}: {edges:#?}"
+        );
+        assert!(
+            !has("lib/response.js.format --calls--> lib/response.js.vary"),
+            "{when}: {edges:#?}"
+        );
+        // `require('send')` imports the package, not the file's own `res.send`.
+        assert!(
+            !has("lib/response.js.<module> --imports--> lib/response.js.send"),
+            "{when}: {edges:#?}"
+        );
+        // `this.send(obj)` is a call on the object: kept.
+        assert!(
+            has("lib/response.js.format --calls--> lib/response.js.send"),
+            "{when}: {edges:#?}"
+        );
+        // `resolve` is `path.resolve`: a package's member, not View's method —
+        // and `path` is Node's own module, so not another file's `resolve` either.
+        assert!(
+            !has("lib/view.js.lookup --calls--> lib/view.js.resolve"),
+            "{when}: {edges:#?}"
+        );
+        assert!(
+            !has("lib/download.js.download --calls--> lib/view.js.resolve"),
+            "{when}: {edges:#?}"
+        );
+        // Nor another file's: a package import names a module, never a function
+        // that happens to share its last segment.
+        assert!(
+            !has("lib/utils.js.<module> --imports--> lib/response.js.send"),
+            "{when}: {edges:#?}"
+        );
+        // A nested `function send` shadows the import: that call is local.
+        assert!(
+            has("lib/response.js.wrapper --calls--> lib/response.js.send"),
+            "{when}: {edges:#?}"
+        );
+        // A package name the project itself holds: the cross-file bind stays.
+        assert!(
+            has("packages/app/main.js.main --calls--> packages/lib/index.js.helper"),
+            "{when}: {edges:#?}"
+        );
+    };
+    check(&db, "full index");
+    // The pending sweep re-resolves buffered calls on the next run.
+    fs::write(
+        project.path().join("lib/other.js"),
+        "function other() { return 1; }\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    check(&db, "after an incremental run");
+}
