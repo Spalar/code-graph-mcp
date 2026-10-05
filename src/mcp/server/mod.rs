@@ -31,7 +31,7 @@ mod backfill;
 mod freshness;
 use freshness::RESULT_REFRESH_TOOLS;
 
-pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`; if the bare name does not resolve, `~/.cache/code-graph/bin/code-graph-mcp`.";
+pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready: `code-graph-mcp callgraph X` / `impact X` / `affected <files>` / `refs X` / `show X` / `overview <dir>`; all commands: `code-graph-mcp --help`.";
 
 /// MCP `instructions` field (default/noisy variant). v0.49: CLI form leads. In
 /// Claude Code the MCP tools are deferred (a ToolSearch load must precede the
@@ -41,14 +41,12 @@ pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{219
 /// the live clap CLI by `tests/doc_cli_alignment.rs`.
 pub const INSTRUCTIONS_NOISY: &str = concat!(
     "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
-    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; \"impact of X?\" or before editing a fn \u{2192} `code-graph-mcp impact X`; ",
+    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; before changing a fn's signature \u{2192} `code-graph-mcp impact X`; tests to re-run after changing files \u{2192} `code-graph-mcp affected <files>`; rename/remove audit \u{2192} `code-graph-mcp refs X`, then `grep -w X`; ",
     "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-i/-w/-F/-l, -c count, -t <lang>/-g <glob> scope, -A/-B/-C ctx, -M col-cap; grep exits).\n",
-    "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, semantic_code_search for concept search without an exact symbol.\n",
-    "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
+    "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, find_references, semantic_code_search for concept search without an exact symbol.\n",
+    "The graph holds the calls it could resolve: dynamic dispatch, reflection and unresolved imports leave no edge, so an empty caller list is not proof that nothing calls X.\n",
     "Still Grep for exact strings/regex; still Read files you will edit.\n",
-    "Diagnostics: `code-graph-mcp health-check`.\n",
-    "If your shell answers \"command not found\", this install's copy is at `~/.cache/code-graph/bin/code-graph-mcp` \u{2014} same subcommands.\n",
-    "Full decision table: CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
+    "Diagnostics: `code-graph-mcp health-check`."
 );
 
 // Compile-time guard: calibrated from observed Claude Code truncation at ~2048
@@ -113,11 +111,21 @@ const HONORED_UNDECLARED_ARGS: &[(&str, &str)] = &[
 /// carry it unevenly: `direction`'s says "ignored when route_path is set",
 /// the other two say nothing. Disclosure at answer time is the one channel that
 /// cannot go stale relative to the code.
-const MODE_INERT_ARGS: &[(&str, &str, &[&str])] = &[(
-    "get_call_graph",
-    "route_path",
-    &["compact", "direction", "file_path"],
-)];
+///
+/// `max_tokens` (P1 #2) selects the budgeted answer, which is built from the
+/// full envelope and sized to the budget, so `compact` does nothing beside it.
+/// A numeric selector counts as selected when it is a number.
+const MODE_INERT_ARGS: &[(&str, &str, &[&str])] = &[
+    (
+        "get_call_graph",
+        "route_path",
+        &["compact", "direction", "file_path", "max_tokens"],
+    ),
+    ("get_call_graph", "max_tokens", &["compact"]),
+    ("project_map", "max_tokens", &["compact"]),
+    ("module_overview", "max_tokens", &["compact"]),
+    ("get_ast_node", "max_tokens", &["compact"]),
+];
 
 /// `(tool, argument, gate)` — `argument` is read only when `gate` is present and
 /// true. Used by `note_clamped_arguments` so a clamp is not reported for a value
@@ -238,13 +246,15 @@ impl TimingConfig {
     }
 }
 
-/// How long an incremental waits for an in-flight embedding backfill to release the write
-/// path before skipping (and leaving the incremental owed via `pending_incremental`).
-/// In tests, 0s so the skip-path test doesn't burn the full wait.
+/// How long an incremental waits for a backfill it asked to yield (D1): one batch
+/// of 32 nodes, plus a model load when the backfill is just starting. Past it the
+/// incremental skips and stays owed via `pending_incremental`. (It waited 2 s and
+/// asked nothing before.) Short in tests, where no backfill answers the skip-path
+/// test's request.
 #[cfg(not(test))]
-const EMBEDDING_WAIT_SECS: u64 = 2;
+const EMBEDDING_YIELD_WAIT_SECS: u64 = 20;
 #[cfg(test)]
-const EMBEDDING_WAIT_SECS: u64 = 0;
+const EMBEDDING_YIELD_WAIT_SECS: u64 = 2;
 
 /// Poll interval for the no-traffic embedding backfill driver.
 /// Nodes can be added to the index by a SHORT-LIVED CLI process — the PreToolUse
@@ -375,6 +385,12 @@ pub(super) struct IndexingState {
     /// next `ensure_indexed` honors this flag and runs the owed incremental even with
     /// no fresh watcher event; cleared once an incremental actually completes.
     pub(super) pending_incremental: Arc<AtomicBool>,
+    /// Set by an incremental that finds a backfill holding the write path: the
+    /// backfill stops at its next batch boundary and releases it (D1, 2026-09-28
+    /// usage evaluation — a first backfill runs for minutes, and a skip-only wait
+    /// left that whole window's edits out of every answer). Cleared when the
+    /// incremental is done; the backfill is then respawned.
+    pub(super) embedding_yield: Arc<AtomicBool>,
 }
 
 impl IndexingState {
@@ -389,6 +405,7 @@ impl IndexingState {
             startup_repair_done: Arc::new(AtomicBool::new(false)),
             periodic_backfill_started: Arc::new(AtomicBool::new(false)),
             pending_incremental: Arc::new(AtomicBool::new(false)),
+            embedding_yield: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -542,7 +559,7 @@ impl McpServer {
         })
     }
 
-    /// Create from project root path: auto-creates .code-graph/ directory and .gitignore entry
+    /// Create from project root path: auto-creates .code-graph/ directory and its git ignore rule
     pub fn from_project_root(project_root: &Path) -> Result<Self> {
         let db_dir = project_root.join(CODE_GRAPH_DIR);
         // Same refusal the CLI index path makes: a symlinked `.code-graph`
@@ -551,7 +568,7 @@ impl McpServer {
         crate::utils::owned::ensure_owned_dir(&db_dir)?;
         let db_path = db_dir.join("index.db");
 
-        // Ensure .code-graph/ is in .gitignore. Shared with the CLI index
+        // Ensure git ignores .code-graph/ (via info/exclude). Shared with the CLI index
         // commands so the two entry points cannot drift: this used to be the
         // ONLY writer, which left pure-CLI installs (hook-driven
         // `incremental-index`, MCP server never started) one `git add -A` away
@@ -618,6 +635,14 @@ impl McpServer {
         }
     }
 
+    /// Whether this instance may write to the index: it holds the write role, and
+    /// the index is not one a newer binary built. The second half is read live
+    /// (see [`Database::newer_index_version`]), because the newer binary can
+    /// rebuild the index while this server runs.
+    pub(super) fn may_write_index(&self) -> bool {
+        self.is_primary() && self.write_db().newer_index_version().is_none()
+    }
+
     /// Re-attempt the index lock from a secondary instance, throttled.
     ///
     /// `try_acquire_index_lock` used to run exactly once, in the constructor, so
@@ -659,6 +684,17 @@ impl McpServer {
                 return false;
             }
         };
+        // The lock is free because the old primary exited — possibly a newer
+        // binary's server that rebuilt the index. Promoting would start the
+        // startup repair and embedding, which write; stay a reader instead.
+        if let Some(newer) = write_db.newer_index_version() {
+            tracing::warn!(
+                "Won the index lock, but the index was built by a newer code-graph (v{} > v{}) — staying secondary",
+                newer,
+                crate::domain::INDEX_VERSION
+            );
+            return false;
+        }
         *lock_or_recover(&self.promoted_db, "promoted_db") = Some(write_db);
         *lock_or_recover(&self._index_lock, "index_lock") = Some(lock);
         self.is_primary.store(true, Ordering::Release);
@@ -910,6 +946,7 @@ impl McpServer {
         // own progress writes recreate it.
         let _ = std::fs::remove_file(&progress_file);
         let embedding_flag = Arc::clone(&self.indexing.embedding_in_progress);
+        let embedding_yield = Arc::clone(&self.indexing.embedding_yield);
         // Kept out of the closure so the spawn-failure path below can still clear
         // the flags the closure's IndexGuard would have cleared.
         let spawn_fail_flag = Arc::clone(&self.indexing.startup_indexing);
@@ -1043,7 +1080,7 @@ impl McpServer {
                 // with, spawning the backfill + its model-load attempt is pure per-session
                 // waste (the message-driven spawn_background_embedding is already guarded).
                 if cfg!(feature = "embed-model") {
-                    let _ = Self::run_guarded_backfill(&db_path, &embedding_flag);
+                    let _ = Self::run_guarded_backfill(&db_path, &embedding_flag, &embedding_yield);
                 }
             });
 
@@ -1177,7 +1214,9 @@ impl McpServer {
     /// (post-node-insert, before context_string/embedding commit). Primary-only:
     /// secondary instances can't write.
     fn spawn_startup_repair(&self, project_root: &Path) {
-        if !self.is_primary() {
+        // The repair rewrites context strings in this binary's format; not over an
+        // index a newer binary owns.
+        if !self.may_write_index() {
             return;
         }
         if self
@@ -1274,8 +1313,9 @@ impl McpServer {
             return; // already running
         }
         let flag = Arc::clone(&self.indexing.embedding_in_progress);
+        let yield_flag = Arc::clone(&self.indexing.embedding_yield);
         std::thread::spawn(move || {
-            let _ = Self::run_guarded_backfill(&db_path, &flag);
+            let _ = Self::run_guarded_backfill(&db_path, &flag, &yield_flag);
         });
     }
 
@@ -1534,6 +1574,20 @@ impl McpServer {
         // Consume result whether we waited or it completed before this call
         self.consume_startup_index_result();
 
+        // A newer binary rebuilt the index under this session. `index_files`
+        // refuses to write to it, so indexing here would fail every tool call;
+        // answer from it read-only instead, the way a secondary does, until the
+        // session restarts on the newer version.
+        if !self.may_write_index() {
+            let has_data = queries::get_index_status(self.db.conn(), false)
+                .map(|s| s.files_count > 0)
+                .unwrap_or(false);
+            if has_data {
+                *lock_or_recover(&self.indexed, "indexed") = true;
+            }
+            return Ok(());
+        }
+
         // Read the indexed flag (short lock scope to avoid holding across I/O)
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
 
@@ -1688,9 +1742,20 @@ impl McpServer {
         self.indexing
             .pending_incremental
             .store(true, Ordering::Release);
-        if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(EMBEDDING_WAIT_SECS);
+        let yielded = self.indexing.embedding_in_progress.load(Ordering::Acquire);
+        if yielded {
+            // Ask the backfill to stop at its next batch boundary (D1); withdrawn on
+            // every way out of this function, or each later backfill would stop at once.
+            struct Withdraw<'a>(&'a AtomicBool);
+            impl Drop for Withdraw<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            self.indexing.embedding_yield.store(true, Ordering::Release);
+            let _withdraw = Withdraw(&self.indexing.embedding_yield);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(EMBEDDING_YIELD_WAIT_SECS);
             while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
                 if std::time::Instant::now() > deadline {
                     // Embedding still holds the write path — skip; the incremental stays owed
@@ -1737,6 +1802,14 @@ impl McpServer {
                     // self-guards on model-present + vec_enabled + embedding_in_progress,
                     // so it's a cheap no-op when there's nothing to embed. This single
                     // call covers both incremental callers (watcher-changes + debounce).
+                    self.spawn_background_embedding();
+                }
+                if yielded && result.files_indexed == 0 {
+                    // The backfill stopped for us; resume it (with files indexed the
+                    // branch above already did).
+                    self.indexing
+                        .embedding_yield
+                        .store(false, Ordering::Release);
                     self.spawn_background_embedding();
                 }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
@@ -1959,7 +2032,7 @@ impl McpServer {
     fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         // CODE_GRAPH_QUIET_HOOKS=1 → ship a one-liner pointer; full decision
         // rules live in the project's .claude/plugin_code_graph_mcp.md (the
-        // CLAUDE.md managed block points to it; auto-installed on plugin SessionStart).
+        // CLAUDE.md managed block points to it; written by `code-graph-mcp adopt`).
         let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
         let instructions = if quiet {
             INSTRUCTIONS_QUIET
@@ -2322,8 +2395,18 @@ impl McpServer {
         // compaction path in this codebase is an explicit field allowlist, and a new
         // top-level key that forgets to enrol in one gets silently dropped — the exact
         // bug the v0.97.1 audit found for `deps`. Attaching last makes that impossible.
+        //
+        // A call that carries `max_tokens` was sized by its handler to what the
+        // caller asked for, so the threshold tier is skipped for it; a result
+        // the tier cut names the command that returns the rest (P1 #2).
         result
-            .map(centralized_compress)
+            .map(|value| {
+                if helpers::is_budgeted_call(name, args) {
+                    value
+                } else {
+                    helpers::attach_compression_next(name, args, centralized_compress(value))
+                }
+            })
             .map(|value| self.note_ignored_arguments(name, args, value))
             .map(|value| self.note_clamped_arguments(name, args, value))
     }
@@ -2401,8 +2484,7 @@ impl McpServer {
             }
             let mode_selected = sent
                 .get(*selector)
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.trim().is_empty());
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()) || v.is_number());
             if !mode_selected {
                 continue;
             }
@@ -2986,6 +3068,58 @@ function handleLogin(req: Request) {
         );
     }
 
+    /// C4 (2026-09-28 usage evaluation): `get_call_graph` with `file_path` skipped
+    /// the ambiguity gate and merged two same-file `new`s into one graph, while
+    /// `find_references` and `get_ast_node` refused the identical input.
+    #[test]
+    fn test_get_call_graph_file_path_discloses_same_file_overloads() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("overloads.rs"),
+            "struct A;\nstruct B;\nimpl A {\n    pub fn new() -> A { A }\n}\n\
+             impl B {\n    pub fn new() -> B { B }\n}\n\
+             pub fn make() { let _ = A::new(); let _ = B::new(); }\n",
+        )
+        .unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({ "file_path": "overloads.rs", "symbol_name": "new" }),
+        );
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("Ambiguous symbol 'new'") && err.contains("same file"),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["suggestions"].as_array().map(Vec::len),
+            Some(2),
+            "got: {result}"
+        );
+    }
+
+    /// C5: the dead-code summary says a non-Rust candidate list is experimental.
+    #[test]
+    fn test_find_dead_code_marks_non_rust_candidates_experimental() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("lib.py"),
+            "def unused_helper(x):\n    y = x + 1\n    return y\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+        let req = tool_call_json("find_dead_code", json!({ "min_lines": 1 }));
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        let summary = result["summary"].as_str().unwrap_or_default();
+        assert!(summary.contains("experimental"), "got: {result}");
+    }
+
     #[test]
     fn test_read_snippet_tool() {
         let project_dir = TempDir::new().unwrap();
@@ -3394,8 +3528,10 @@ function handleLogin(req: Request) {
         let _server = McpServer::from_project_root(project_dir.path()).unwrap();
 
         assert!(project_dir.path().join(".code-graph/index.db").exists());
+        // Not a git repo: the ignore rule has nowhere to go, and the tracked
+        // .gitignore is never touched (decision D3).
         let gitignore = std::fs::read_to_string(project_dir.path().join(".gitignore")).unwrap();
-        assert!(gitignore.contains(".code-graph/"));
+        assert_eq!(gitignore, "node_modules/\n");
     }
 
     #[test]
@@ -4156,6 +4292,10 @@ function handleLogin(req: Request) {
                 ("project_map", "centrality_limit") => json!({"include_centrality": true}),
                 ("semantic_code_search", "top_k") => json!({"query": "handler"}),
                 ("semantic_code_search", "limit") => json!({"query": "handler"}),
+                ("project_map", "max_tokens") => json!({}),
+                ("module_overview", "max_tokens") => json!({"path": "app.ts"}),
+                ("get_call_graph", "max_tokens") => json!({"symbol_name": "handler"}),
+                ("get_ast_node", "max_tokens") => json!({"symbol_name": "handler"}),
                 _ => return None,
             })
         };
@@ -5238,6 +5378,105 @@ app.post('/api/login', handleLogin);
                 .unwrap()
                 .is_empty(),
             "the previously-stranded beta.rs must be indexed once the owed incremental runs"
+        );
+    }
+
+    /// D1 (2026-09-28 usage evaluation): a first backfill can run for minutes, and an
+    /// incremental that only waited then skipped left every edit of that window out of
+    /// the answers. The incremental now asks the backfill to yield at its next batch
+    /// boundary and runs; the backfill restarts afterwards.
+    #[test]
+    fn test_incremental_asks_a_running_backfill_to_yield_and_runs() {
+        use std::fs;
+        let project = TempDir::new().unwrap();
+        fs::write(project.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+
+        // A backfill that honours the yield request at its next batch boundary.
+        server
+            .indexing
+            .embedding_in_progress
+            .store(true, Ordering::SeqCst);
+        let in_progress = Arc::clone(&server.indexing.embedding_in_progress);
+        let yield_flag = Arc::clone(&server.indexing.embedding_yield);
+        let backfill = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_secs(10) {
+                if yield_flag.load(Ordering::Acquire) {
+                    in_progress.store(false, Ordering::Release);
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        });
+        server
+            .run_incremental_with_cache_restore(project.path(), None)
+            .unwrap();
+        assert!(
+            backfill.join().unwrap(),
+            "the incremental must ask the backfill to yield"
+        );
+        assert!(
+            !crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "the incremental ran instead of skipping"
+        );
+        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst));
+        assert!(
+            !server.indexing.embedding_yield.load(Ordering::SeqCst),
+            "the request is withdrawn once the incremental is done, or every later backfill would stop at once"
+        );
+    }
+
+    /// The backfill side of D1: asked to yield, it stops before its next batch
+    /// (here the first) and reports it; not asked, it drains. Needs the embedding
+    /// model on disk; without it the backfill reports NoModel and there is nothing
+    /// to check.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn a_backfill_asked_to_yield_stops_between_batches() {
+        use std::fs;
+        let project = TempDir::new().unwrap();
+        fs::write(
+            project.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() { alpha(); }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let db_path = project.path().join(CODE_GRAPH_DIR).join("index.db");
+        let in_progress = AtomicBool::new(false);
+        let asked = AtomicBool::new(true);
+        match McpServer::run_guarded_backfill(&db_path, &in_progress, &asked) {
+            Some(super::backfill::BackfillOutcome::NoModel) => return,
+            Some(super::backfill::BackfillOutcome::Yielded) => {}
+            other => panic!("asked to yield, got {other:?}"),
+        }
+        assert!(
+            !in_progress.load(Ordering::SeqCst),
+            "the write path is released"
+        );
+        let not_asked = AtomicBool::new(false);
+        assert!(matches!(
+            McpServer::run_guarded_backfill(&db_path, &in_progress, &not_asked),
+            Some(super::backfill::BackfillOutcome::Drained)
+        ));
+    }
+
+    #[test]
+    fn a_yielded_backfill_leaves_the_floor_where_it_was() {
+        assert_eq!(
+            super::backfill::apply_backfill_outcome(
+                7,
+                1,
+                super::backfill::BackfillOutcome::Yielded,
+                40
+            ),
+            (7, 1)
         );
     }
 
@@ -6914,6 +7153,72 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// B7 (2026-09-29 usage evaluation): files past the 32-file scan cap were
+    /// never compared with the disk, yet they were counted into `stale_kept`
+    /// under a note saying they "changed on disk" — 40 untouched files read as
+    /// 8 changed ones. Unchecked is its own count, with its own wording.
+    #[test]
+    fn test_result_set_refresh_reports_files_past_the_scan_cap_as_unchecked() {
+        let project = TempDir::new().unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                project.path().join(format!("m{i:02}.rs")),
+                format!("fn b7cap_target_{i:02}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        close_other_freshness_paths(&mut server);
+
+        let req = tool_call_json(
+            "ast_search",
+            json!({ "query": "b7cap_target", "limit": 100 }),
+        );
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            payload["count"].as_u64(),
+            Some(40),
+            "precondition: the result names 40 files (display keeps fewer): {payload}"
+        );
+        let freshness = &payload["freshness"];
+        assert_eq!(freshness["unchecked"].as_u64(), Some(8), "{payload}");
+        assert_eq!(
+            freshness["stale_kept"].as_u64(),
+            Some(0),
+            "nothing changed on disk: {payload}"
+        );
+        let note = freshness["note"].as_str().unwrap_or_default();
+        assert!(
+            !note.contains("changed on disk") && note.contains("not checked"),
+            "{note}"
+        );
+
+        // Both at once: one checked file changed and kept (no budget), and the
+        // same eight past the cap.
+        server.result_refresh_budget = 0;
+        std::fs::write(
+            project.path().join("m00.rs"),
+            "\n\nfn b7cap_target_00() {}\n",
+        )
+        .unwrap();
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        let freshness = &payload["freshness"];
+        assert_eq!(freshness["stale_kept"].as_u64(), Some(1), "{payload}");
+        assert_eq!(freshness["unchecked"].as_u64(), Some(8), "{payload}");
+        let note = freshness["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("changed on disk") && note.contains("8 more were not checked"),
+            "{note}"
+        );
+    }
+
     #[test]
     fn test_db_busy_is_classified_as_transient_not_failure() {
         // The distinction decides whether a tool call returns an error or keeps
@@ -6949,6 +7254,236 @@ app.post('/api/login', handleLogin);
             vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/mod_dir"],
             "all three key spellings, nested arbitrarily deep; `<external>` and \
              empty placeholders excluded"
+        );
+    }
+
+    /// A server started before an upgrade keeps running after the upgraded binary
+    /// has rebuilt the index under it. It must keep answering from that index
+    /// and stop writing to it: every file it re-indexed used to be stored as its
+    /// older parse under the newer version stamp, which no later run repairs.
+    #[test]
+    fn test_older_server_answers_but_does_not_index_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+
+        let server = McpServer::new_test_with_project(project.path());
+        std::fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+        server
+            .ensure_indexed()
+            .expect("tool calls must keep working over a newer index");
+        assert_eq!(
+            queries::get_nodes_by_name(server.db.conn(), "alpha_fn")
+                .unwrap()
+                .len(),
+            1,
+            "the newer index still answers"
+        );
+        assert!(
+            queries::get_nodes_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "an older server must not write its parse into a newer index"
+        );
+        assert!(
+            *lock_or_recover(&server.indexed, "indexed"),
+            "the data it answers from counts as indexed, so later calls skip the indexing path"
+        );
+    }
+
+    /// The case the fix exists for: the server was ALREADY running when the newer
+    /// binary rebuilt and stamped the index. A version read once at open still
+    /// says "current", so the check has to look at the index as it is now.
+    #[test]
+    fn test_running_server_stops_writing_once_the_index_becomes_newer() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let other = Database::open(&project.path().join(CODE_GRAPH_DIR).join("index.db")).unwrap();
+        other
+            .conn()
+            .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+            .unwrap();
+        drop(other);
+
+        std::fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+        server
+            .indexing
+            .pending_incremental
+            .store(true, Ordering::Release);
+        server
+            .ensure_indexed()
+            .expect("tool calls must keep working after the index becomes newer");
+        assert!(
+            queries::get_nodes_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "a server opened before the newer stamp must not write into the newer index"
+        );
+    }
+
+    /// A tool given a `file_path` refreshes that file before answering. Over a
+    /// newer index the refresh is refused, and the tool must answer from the
+    /// index as it stands rather than turn the refusal into an error.
+    #[test]
+    fn test_file_path_tool_answers_over_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\n",
+        )
+        .unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\nfn gamma_fn() {}\n",
+        )
+        .unwrap();
+
+        for req in [
+            tool_call_json(
+                "get_call_graph",
+                json!({"symbol_name": "alpha_fn", "file_path": "alpha.rs", "direction": "callees"}),
+            ),
+            tool_call_json(
+                "find_references",
+                json!({"symbol_name": "beta_fn", "file_path": "alpha.rs"}),
+            ),
+        ] {
+            let resp = server.handle_message(&req).unwrap().unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            assert_ne!(
+                parsed["result"]["isError"],
+                serde_json::json!(true),
+                "a refused refresh must not fail the tool: {resp}"
+            );
+        }
+        assert!(
+            queries::get_nodes_by_name(server.db.conn(), "gamma_fn")
+                .unwrap()
+                .is_empty(),
+            "and the refresh must not have written"
+        );
+    }
+
+    /// A tool whose result names files cannot refresh them over a newer index,
+    /// and the response has to say why — not blame a budget or a busy database.
+    #[test]
+    fn test_result_set_tool_discloses_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\n",
+        )
+        .unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\nfn gamma_fn() {}\n",
+        )
+        .unwrap();
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({"symbol_name": "alpha_fn", "direction": "callees"}),
+        );
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("built by a newer code-graph"),
+            "the response must name the newer index as the reason: {text}"
+        );
+        assert!(
+            !text.contains("busy database"),
+            "and not blame a busy database: {text}"
+        );
+    }
+
+    /// The startup repair rewrites context strings in this binary's format, so it
+    /// is not armed over an index a newer binary owns.
+    #[test]
+    fn test_startup_repair_does_not_run_over_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        server.spawn_startup_repair(project.path());
+        assert!(
+            !server.indexing.startup_repair_done.load(Ordering::Acquire),
+            "the repair must not be started over a newer index"
+        );
+    }
+
+    /// A secondary whose primary exits must not promote itself over an index a
+    /// newer binary owns: promotion starts the startup repair and embedding,
+    /// which write.
+    #[cfg(unix)]
+    #[test]
+    fn test_secondary_does_not_promote_over_a_newer_index() {
+        use std::os::unix::io::AsRawFd;
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let cg_dir = project.path().join(CODE_GRAPH_DIR);
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cg_dir.join("index.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut server = McpServer::from_project_root(project.path()).unwrap();
+        assert!(!server.is_primary(), "precondition: secondary");
+        drop(holder);
+
+        server.timing.promotion_retry = std::time::Duration::ZERO;
+        server.ensure_indexed().unwrap();
+        assert!(
+            !server.is_primary(),
+            "the lock is free, but the index belongs to a newer binary"
         );
     }
 }

@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const os = require('os');
-const { launchBackgroundAutoUpdate, isHighIntentSource, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact, missingBinaryMessage } = require('./session-init');
+const { launchBackgroundAutoUpdate, isHighIntentSource, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, missingBinaryMessage } = require('./session-init');
 
 // Write an executable stub named `code-graph-mcp` that emits `json` to stdout on
 // `health-check` and exits with `exitCode`. Mirrors how the real binary behaves:
@@ -265,7 +265,7 @@ function runSessionInitHook(t, {
     JSON.stringify({ ts: new Date().toISOString(), failures: [] }));
   fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
   // Seeds detectHookDark (runs LATE, after adoption): 3 edit events, no
-  // grep/read events → it must emit its "may be dark" warning on stderr.
+  // grep/read events → it must emit its "may be dark" warning as a notice.
   fs.writeFileSync(path.join(proj, '.code-graph', 'recommendations.jsonl'),
     ['{"hook":"edit"}', '{"hook":"edit"}', '{"hook":"edit"}', ''].join('\n'));
 
@@ -301,6 +301,15 @@ function runSessionInitHook(t, {
   return { res, proj, home };
 }
 
+// SessionStart writes ONE JSON value on stdout (decision D5): the user-facing
+// notices as `systemMessage`, model context as `additionalContext`. Its stderr
+// is never shown when it exits 0, so that is not where a notice may go.
+function noticeOf(res) {
+  const out = (res.stdout || '').trim();
+  if (!out) return '';
+  return JSON.parse(out).systemMessage || '';
+}
+
 // install()/update() have reported `manifestUnwritable` since they stopped
 // throwing on it, and nothing read the field. It is not cosmetic:
 // syncLifecycleConfig keys entirely off `manifest.version`, so a manifest that
@@ -317,63 +326,44 @@ test('an unwritable plugin manifest is reported, not swallowed', (t) => {
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stdout, /manifest could not be written \(EACCES\)/,
+  assert.match(noticeOf(res), /manifest could not be written \(EACCES\)/,
     `the unwritable manifest must be surfaced; stdout was:\n${res.stdout}`);
-  assert.match(res.stdout, /every session/,
+  assert.match(noticeOf(res), /every session/,
     'the message must name the consequence, not just the error code');
 });
 
-// adopt() has reported `registryRecorded` since it stopped throwing on a broken
-// registry, and nothing read it. uninstall() walks that registry to strip our
-// managed block from each adopted project's CLAUDE.md, so an unrecorded project
-// keeps the block forever after uninstall — with no plugin code left to remove it.
-test('an unrecorded adoption warns that uninstall will not clean this project', (t) => {
-  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
-  const { res } = runSessionInitHook(t, {
-    prefix: 'cg-si-registry-',
-    preloadSrc: `
-      const ad = require(${adopt});
-      ad.maybeAutoAdopt = () => ({
-        attempted: true,
-        reason: 'installed',
-        result: { ok: true, detailWritten: true, registryRecorded: false },
-      });
-    `,
-  });
+// Decision D4: SessionStart no longer writes CLAUDE.md, so the adoption notices
+// ("Installed …", "Refreshed …", the unrecorded-registry note) are gone. What is
+// left is a block that has drifted from the shipped template: its guidance is
+// out of date, and only the user can refresh or remove it.
+const STALE_STUB = `
+  const ad = require(${JSON.stringify(path.join(__dirname, 'adopt.js'))});
+  ad.maybeAutoAdopt = () => ({ attempted: false, reason: 'stale' });
+`;
+
+test('a stale adoption block is reported with a refresh and a remove command', (t) => {
+  const { res } = runSessionInitHook(t, { prefix: 'cg-si-stale-', preloadSrc: STALE_STUB });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /adopted-projects registry/,
-    `an unrecorded adoption must be surfaced; stderr was:\n${res.stderr}`);
-  assert.match(res.stderr, /unadopt/,
-    'the message must name the manual remedy');
+  const n = noticeOf(res);
+  assert.match(n, /out-of-date code-graph block/, `stdout was:\n${res.stdout}`);
+  assert.match(n, /Refresh it: node '[^']+adopt\.js' adopt/);
+  assert.match(n, /Remove it: {2}node '[^']+adopt\.js' unadopt/);
 });
 
 // issue #41: the reporter uses the plugin only and has no `code-graph-mcp` on
-// PATH. Both remedies this hook prints — the Reverse line on a fresh adoption
-// and the unrecorded-registry note — spend the bare name, so the escape hatch
-// was exactly as unrunnable as the feature the user wanted out of. stderr is
+// PATH, so a remedy that spends the bare name is unrunnable. The notice is
 // per-machine and ephemeral, so unlike the CLAUDE.md block it may (and must)
 // name the path this install actually resolved.
-test('the adoption remedies name a command this install can actually run', (t) => {
-  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
-  const { res } = runSessionInitHook(t, {
-    prefix: 'cg-si-reverse-',
-    preloadSrc: `
-      const ad = require(${adopt});
-      ad.maybeAutoAdopt = () => ({
-        attempted: true,
-        reason: 'adopted',
-        result: { ok: true, detailWritten: true, registryRecorded: false },
-      });
-    `,
-  });
+test('the stale-block remedy names a command this install can actually run', (t) => {
+  const { res } = runSessionInitHook(t, { prefix: 'cg-si-reverse-', preloadSrc: STALE_STUB });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
 
   // Pull the command out of the message and run it, rather than matching a
-  // shape. The first version of this test stubbed findBinary to `/bin/true` and
-  // asserted the string — it stayed green while the real command exited 1 with
-  // "adopt.js not found" on every install layout except a dev checkout.
-  const m = res.stderr.match(/Reverse:\s+(node '[^']+' unadopt)/);
-  assert.ok(m, `the Reverse hint must be present and quoted; stderr was:\n${res.stderr}`);
+  // shape. An earlier version of this test stubbed findBinary to `/bin/true`
+  // and asserted the string — it stayed green while the real command exited 1
+  // with "adopt.js not found" on every install layout except a dev checkout.
+  const m = noticeOf(res).match(/Remove it:\s+(node '[^']+' unadopt)/);
+  assert.ok(m, `the remove hint must be present and quoted; stdout was:\n${res.stdout}`);
   const script = m[1].match(/'([^']+)'/)[1];
   assert.ok(fs.existsSync(script), `the hint points at a file that does not exist: ${script}`);
   assert.equal(path.basename(script), 'adopt.js',
@@ -398,33 +388,55 @@ test('the adoption remedies name a command this install can actually run', (t) =
   });
   assert.equal(ran.status, 0,
     `the printed command must RUN, not just read well. stdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`);
-
-  assert.match(res.stderr, /`node '[^']+adopt\.js' unadopt`/,
-    `the unrecorded-registry remedy must be the same runnable command; stderr was:\n${res.stderr}`);
 });
 
-// The hint must not depend on binary resolution at all — `unadopt` is dispatched
-// through adopt.js, which sits next to this hook in every install layout, so a
-// missing or unresolvable binary changes nothing about how you undo an adoption.
-test('the remedy does not change when no binary resolved', (t) => {
-  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
+// The hint must not depend on binary resolution at all — `adopt`/`unadopt` are
+// dispatched through adopt.js, which sits next to this hook in every install
+// layout, so a missing binary changes nothing about how you undo an adoption.
+test('the stale-block remedy does not change when no binary resolved', (t) => {
   const findBinary = JSON.stringify(path.join(__dirname, 'find-binary.js'));
   const { res } = runSessionInitHook(t, {
     prefix: 'cg-si-reverse-none-',
-    preloadSrc: `
-      const ad = require(${adopt});
-      ad.maybeAutoAdopt = () => ({
-        attempted: true,
-        reason: 'adopted',
-        result: { ok: true, detailWritten: true, registryRecorded: true },
-      });
+    preloadSrc: STALE_STUB + `
       const fb = require(${findBinary});
       fb.findBinary = () => null;
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /Reverse:\s+node '[^']+adopt\.js' unadopt/,
-    `no binary must not degrade the hint; stderr was:\n${res.stderr}`);
+  assert.match(noticeOf(res), /Remove it:\s+node '[^']+adopt\.js' unadopt/,
+    `no binary must not degrade the hint; stdout was:\n${res.stdout}`);
+});
+
+// A corrupt index answers every hook with nothing. A reader never rebuilds it
+// (it reports and preserves), and health-check's `reason:"corrupt"` used to read
+// as "not stale", so the hooks stayed dark and nobody was told (hook audit
+// 2026-09-28 P1-7). SessionStart now starts the indexer and says so.
+test('a corrupt index is rebuilt in the background and the user is told', (t) => {
+  const os = require('os');
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-corrupt-bin-'));
+  t.after(() => fs.rmSync(stubDir, { recursive: true, force: true }));
+  const marker = path.join(stubDir, 'rebuilt');
+  const stub = path.join(stubDir, 'code-graph-mcp');
+  fs.writeFileSync(stub, `#!/bin/sh
+case "$1" in
+  health-check) echo '{"healthy":false,"reason":"corrupt","issue":"index database is corrupt"}'; exit 1 ;;
+  incremental-index) touch ${JSON.stringify(marker)} ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-corrupt-',
+    indexDb: true,
+    preloadSrc: `
+      const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
+      fb.findBinary = () => ${JSON.stringify(stub)};
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  assert.match(noticeOf(res), /index at \.code-graph\/index\.db was corrupt/, `stdout was:\n${res.stdout}`);
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(marker) && Date.now() < deadline) { /* the rebuild is detached */ }
+  assert.ok(fs.existsSync(marker), 'the indexer must have been started to rebuild it');
 });
 
 // Control for the two tests above: the same harness with NO stubbed failure
@@ -441,9 +453,9 @@ test('the hook-dark detector reads the resolved project root, not the shell cwd'
     indexDb: true,
   });
   assert.equal(res.status, 0, `hook must exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /may be dark/,
+  assert.match(noticeOf(res), /may be dark/,
     'the seeded recommendations.jsonl sits at the project root; a subdir session ' +
-    `must still find it. stderr was:\n${res.stderr}`);
+    `must still find it. stdout was:\n${res.stdout}`);
 });
 
 // Control for the test above: with no index.db to walk up to, resolveProjectRoot
@@ -456,15 +468,15 @@ test('a subdir session with no indexed ancestor falls back to cwd and stays quie
     indexDb: false,
   });
   assert.equal(res.status, 0, `hook must exit 0; stderr:\n${res.stderr}`);
-  assert.doesNotMatch(res.stderr, /may be dark/,
+  assert.doesNotMatch(noticeOf(res), /may be dark/,
     'without an indexed ancestor there is no file to read and nothing to conclude');
 });
 
 test('a clean session start emits neither disclosure', (t) => {
   const { res } = runSessionInitHook(t, { prefix: 'cg-si-clean-' });
   assert.equal(res.status, 0, `stderr:\n${res.stderr}`);
-  assert.doesNotMatch(res.stdout, /manifest could not be written/);
-  assert.doesNotMatch(res.stderr, /adopted-projects registry/);
+  assert.doesNotMatch(noticeOf(res), /manifest could not be written/);
+  assert.doesNotMatch(noticeOf(res), /out-of-date code-graph block/);
 });
 
 test('SessionStart fails OPEN when adoption throws: exit 0, later steps still run', (t) => {
@@ -472,10 +484,8 @@ test('SessionStart fails OPEN when adoption throws: exit 0, later steps still ru
 
   assert.equal(res.status, 0,
     `a SessionStart hook must never exit non-zero on a bad CLAUDE.md; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /may be dark/,
+  assert.match(noticeOf(res), /may be dark/,
     'detectHookDark runs AFTER adoption — its warning proves the rest of the sequence still executed');
-  assert.match(res.stderr, /\[code-graph\]/,
-    'the failure itself must be reported, not swallowed');
   assert.doesNotMatch(res.stderr, /^\s*at .*session-init\.js/m,
     'a raw node stack trace in the user\'s session is not a report');
 });
@@ -485,7 +495,7 @@ test('the fail-open wrapper is scoped: a normal run still reaches the same late 
   // produced the "may be dark" line, this run would prove nothing.
   const { res } = runSessionInitHook(t, { adoptThrows: false, prefix: 'cg-si-normal-' });
   assert.equal(res.status, 0);
-  assert.match(res.stderr, /may be dark/);
+  assert.match(noticeOf(res), /may be dark/);
 });
 
 test('runSessionInit tears down cache + adoption on a genuine uninstall (order regression)', (t) => {
@@ -595,171 +605,6 @@ test('shouldInjectMap: only injects when available + not-quiet + adopted', () =>
   assert.equal(shouldInjectMap({ available: false, quietHooks: false, adopted: true }), false);
   // Missing args default to falsey → no injection.
   assert.equal(shouldInjectMap(), false);
-});
-
-// ──────────────────────────────────────────────────────────────────────────
-// v0.63 — SessionStart "live context": recent-change blast radius injection.
-// ──────────────────────────────────────────────────────────────────────────
-
-test('shouldInjectRecentImpact: default-ON for adopted projects (separate gate from the static map)', () => {
-  // Unlike shouldInjectMap, this does NOT require the verbose opt-in — it earns
-  // standing context because it's git-delta-derived, not duplicative of MEMORY.md.
-  assert.equal(shouldInjectRecentImpact({ available: true, adopted: true, env: {} }), true);
-});
-
-test('shouldInjectRecentImpact: hard kill-switch and dedicated opt-out suppress it', () => {
-  assert.equal(shouldInjectRecentImpact({ available: true, adopted: true, env: { CODE_GRAPH_QUIET_HOOKS: '1' } }), false);
-  assert.equal(shouldInjectRecentImpact({ available: true, adopted: true, env: { CODE_GRAPH_NO_RECENT_IMPACT: '1' } }), false);
-});
-
-test('shouldInjectRecentImpact: needs binary + adoption', () => {
-  assert.equal(shouldInjectRecentImpact({ available: false, adopted: true, env: {} }), false);
-  assert.equal(shouldInjectRecentImpact({ available: true, adopted: false, env: {} }), false);
-  assert.equal(shouldInjectRecentImpact(), false);
-});
-
-test('filterSourceFiles: keeps AST-bearing source, drops config/lock/doc', () => {
-  const diff = [
-    'src/domain.rs', 'Cargo.lock', 'Cargo.toml', 'CHANGELOG.md',
-    'package.json', 'src/parser/relations/mod.rs', 'claude-plugin/scripts/session-init.js',
-    'npm/linux-x64/package.json',
-  ].join('\n');
-  assert.deepEqual(filterSourceFiles(diff), [
-    'src/domain.rs', 'src/parser/relations/mod.rs', 'claude-plugin/scripts/session-init.js',
-  ]);
-});
-
-test('parseGitStatusPaths: extracts paths from modified / staged / untracked lines (finding #3)', () => {
-  // `git status --porcelain` columns: " M" unstaged-mod, "M " staged, "??" untracked,
-  // "A " added. The untracked line is exactly what diff-only missed.
-  const out = [
-    ' M src/domain.rs',
-    'M  src/cli.rs',
-    '?? src/brand_new.rs',
-    'A  src/staged_new.rs',
-    'D  src/gone.rs',
-  ].join('\n');
-  assert.deepEqual(parseGitStatusPaths(out), [
-    'src/domain.rs', 'src/cli.rs', 'src/brand_new.rs', 'src/staged_new.rs', 'src/gone.rs',
-  ]);
-});
-
-test('parseGitStatusPaths: rename takes the NEW path; quoted path is unquoted', () => {
-  assert.deepEqual(parseGitStatusPaths('R  src/old.rs -> src/new.rs'), ['src/new.rs']);
-  assert.deepEqual(parseGitStatusPaths('?? "src/with space.rs"'), ['src/with space.rs']);
-});
-
-test('parseGitStatusPaths: blank / too-short / non-string input → []', () => {
-  assert.deepEqual(parseGitStatusPaths(''), []);
-  assert.deepEqual(parseGitStatusPaths(null), []);
-  assert.deepEqual(parseGitStatusPaths('\n\n'), []);
-  assert.deepEqual(parseGitStatusPaths('??'), []); // no path after status
-});
-
-test('parseGitStatusPaths composes with filterSourceFiles: untracked source kept, config dropped', () => {
-  const out = [' M Cargo.toml', '?? src/new_feature.rs', '?? notes.txt'].join('\n');
-  assert.deepEqual(filterSourceFiles(parseGitStatusPaths(out)), ['src/new_feature.rs']);
-});
-
-test('formatRecentImpact: re-run command is runnable verbatim when ≤4 changed (finding #4)', () => {
-  const affected = { affected_files: [{ depth: 1, is_test: false, path: 'src/a.rs' }], tests: [] };
-  const text = formatRecentImpact(['src/x.rs', 'src/y.rs'], affected);
-  assert.match(text, /Re-run impacted tests: code-graph-mcp affected src\/x\.rs src\/y\.rs$/m);
-  assert.doesNotMatch(text, /more changed file/);
-  assert.doesNotMatch(text, / …/); // no bare ellipsis
-});
-
-test('formatRecentImpact: >4 changed → explicit "+N more", not a bare ellipsis (finding #4)', () => {
-  const affected = { affected_files: [{ depth: 1, is_test: false, path: 'src/a.rs' }], tests: [] };
-  const changed = ['s/1.rs', 's/2.rs', 's/3.rs', 's/4.rs', 's/5.rs', 's/6.rs'];
-  const text = formatRecentImpact(changed, affected);
-  assert.match(text, /code-graph-mcp affected s\/1\.rs s\/2\.rs s\/3\.rs s\/4\.rs {2}\(\+2 more changed file\(s\)/);
-  assert.doesNotMatch(text, / …/); // the misleading bare ellipsis is gone
-});
-
-test('filterSourceFiles: caps the list and tolerates blank/garbage input', () => {
-  assert.deepEqual(filterSourceFiles(''), []);
-  assert.deepEqual(filterSourceFiles(null), []);
-  const many = Array.from({ length: 40 }, (_, i) => `src/m${i}.rs`).join('\n');
-  assert.equal(filterSourceFiles(many).length, 25);
-  assert.equal(filterSourceFiles(many, 3).length, 3);
-});
-
-test('formatRecentImpact: renders changed + blast radius + direct dependents', () => {
-  const affected = {
-    affected_files: [
-      { depth: 1, is_test: false, path: 'src/cli.rs' },
-      { depth: 1, is_test: false, path: 'src/graph/impact.rs' },
-      { depth: 1, is_test: true, path: 'src/parser/relations/tests.rs' },
-      { depth: 2, is_test: false, path: 'src/main.rs' },
-    ],
-    changed: ['src/domain.rs'],
-    tests: ['src/parser/relations/tests.rs', 'tests/integration.rs'],
-  };
-  const text = formatRecentImpact(['src/domain.rs'], affected);
-  assert.match(text, /Recent changes/);
-  assert.match(text, /Changed: src\/domain\.rs/);
-  assert.match(text, /Impacts 4 file\(s\) \(2 direct dependent\(s\)\), 2 test file\(s\)/);
-  assert.match(text, /Direct dependents: src\/cli\.rs, src\/graph\/impact\.rs/);
-  assert.match(text, /code-graph-mcp affected src\/domain\.rs/);
-  // It is graph-unique — the copy says so (the whole point vs the static map).
-  assert.match(text, /not in MEMORY\.md/);
-});
-
-test('recentImpactWorthShowing: WIP always shows, regardless of source', () => {
-  assert.equal(recentImpactWorthShowing({ isWip: true, source: 'startup' }), true);
-  assert.equal(recentImpactWorthShowing({ isWip: true, source: 'compact' }), true);
-});
-
-test('recentImpactWorthShowing: clean tree (last-commit fallback) suppressed on cold startup, shown on resume', () => {
-  assert.equal(recentImpactWorthShowing({ isWip: false, source: 'startup' }), false);
-  assert.equal(recentImpactWorthShowing({ isWip: false, source: 'clear' }), true);
-  assert.equal(recentImpactWorthShowing({ isWip: false, source: 'compact' }), true);
-  assert.equal(recentImpactWorthShowing({ isWip: false, source: 'resume' }), true);
-  // Unknown source (direct call / test) defaults to showing — only explicit
-  // cold startup is the suppressed case.
-  assert.equal(recentImpactWorthShowing({ isWip: false }), true);
-  assert.equal(recentImpactWorthShowing(), true);
-});
-
-test('formatRecentImpact: high-fanout change drops the noisy name list, keeps risk + test scope', () => {
-  // >15 direct dependents = a constants/util node "touches everything"; the
-  // first-N names are arbitrary noise, so only risk + test count is surfaced.
-  const affected = {
-    affected_files: Array.from({ length: 20 }, (_, i) => ({ depth: 1, is_test: false, path: `src/f${i}.rs` })),
-    tests: ['tests/a.rs', 'tests/b.rs'],
-  };
-  const text = formatRecentImpact(['src/domain.rs'], affected);
-  assert.match(text, /High-fanout change/);
-  assert.match(text, /run the full suite \(2 test file\(s\)\)/);
-  assert.doesNotMatch(text, /Direct dependents:/); // name list suppressed
-});
-
-test('formatRecentImpact: at/under the fanout threshold the name list IS the signal', () => {
-  const affected = {
-    affected_files: Array.from({ length: 15 }, (_, i) => ({ depth: 1, is_test: false, path: `src/f${i}.rs` })),
-    tests: [],
-  };
-  const text = formatRecentImpact(['src/x.rs'], affected);
-  assert.doesNotMatch(text, /High-fanout/);
-  assert.match(text, /Direct dependents:/);
-});
-
-test('formatRecentImpact: caps direct-dependent list with a "+N more" overflow', () => {
-  const affected = {
-    affected_files: Array.from({ length: 10 }, (_, i) => ({ depth: 1, is_test: false, path: `src/f${i}.rs` })),
-    tests: [],
-  };
-  const text = formatRecentImpact(['src/domain.rs'], affected);
-  assert.match(text, /\+4 more/); // 10 direct, cap 6 → 4 hidden
-});
-
-test('formatRecentImpact: returns null when nothing graph-relevant (no dependents / no changes)', () => {
-  // A deps-only commit: changed files filtered to empty upstream → caller skips.
-  assert.equal(formatRecentImpact([], { affected_files: [] }), null);
-  // Changed source but zero indexed dependents → nothing actionable to say.
-  assert.equal(formatRecentImpact(['src/x.rs'], { affected_files: [], tests: [] }), null);
-  assert.equal(formatRecentImpact(['src/x.rs'], {}), null);
 });
 
 test('consistencyCheck returns version-mismatch when versions differ', (t) => {
@@ -916,4 +761,55 @@ test('a spent budget leaves the macOS quarantine probe unverified rather than si
   // what the probe establishes, and it did not run — so name that.
   assert.equal(result.available, true);
   assert.equal(result.issue, 'quarantine-probe-skipped');
+});
+
+// ── The SessionStart recent-change blast radius is gone (decision D6) ─────────
+// In 2026-09 sessions it was followed up 0 of 35 times, its `affected` command
+// never ran, and a comment-only edit reported 291 of 366 files impacted. A
+// source check, because the section was assembled from several helpers and any
+// one left behind would bring the text back.
+test('SessionStart no longer injects a recent-change blast radius', () => {
+  const mod = require('./session-init');
+  for (const name of ['injectRecentImpact', 'formatRecentImpact', 'shouldInjectRecentImpact']) {
+    assert.ok(!(name in mod), `${name} must be gone`);
+  }
+  const src = fs.readFileSync(path.join(__dirname, 'session-init.js'), 'utf8');
+  assert.doesNotMatch(src, /blast radius from the AST index/);
+  assert.doesNotMatch(src, /CODE_GRAPH_NO_RECENT_IMPACT/);
+});
+
+// Decision D2: an install from before 0.164 left its hooks in settings.json.
+// Run as the plugin (Claude Code sets CLAUDE_PLUGIN_ROOT for a hooks.json
+// SessionStart), the hook must take them out — hooks.json already carries them,
+// and both copies would fire every hook twice — and leave the user's own alone.
+test('a plugin SessionStart removes our hooks from settings.json and keeps the user\'s', (t) => {
+  const os = require('os');
+  const { execFileSync } = require('child_process');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-d2-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const cfg = path.join(sb, '.claude');
+  const proj = path.join(sb, 'proj');
+  fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p"}');
+  const base = { ...process.env, HOME: sb, USERPROFILE: sb, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' };
+  delete base.CLAUDE_PLUGIN_ROOT;
+  // The pre-0.164 state: install from a surface hooks.json does not reach.
+  execFileSync(process.execPath, [path.join(__dirname, 'lifecycle.js'), 'install'], { env: base, cwd: proj, stdio: 'ignore' });
+  const settingsFile = path.join(cfg, 'settings.json');
+  const before = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.ok(before.hooks && before.hooks.PreToolUse, 'precondition: hooks registered in settings.json');
+  before.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] });
+  fs.writeFileSync(settingsFile, JSON.stringify(before, null, 2));
+
+  const si = path.join(__dirname, 'session-init.js');
+  const res = JSON.parse(execFileSync(process.execPath, ['-e',
+    `process.stdout.write(JSON.stringify(require(${JSON.stringify(si)}).runSessionInit({source:'startup'})))`],
+    { env: { ...base, CLAUDE_PLUGIN_ROOT: path.resolve(__dirname, '..') }, cwd: proj }).toString());
+
+  assert.equal(res.lifecycle, 'removed-settings-hooks');
+  const after = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.deepEqual(after.hooks, { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }] },
+    'only the user hook is left');
+  assert.match(after.statusLine && after.statusLine.command, /statusline-composite/, 'the statusline stays');
 });

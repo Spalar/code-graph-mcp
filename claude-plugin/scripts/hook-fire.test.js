@@ -29,8 +29,9 @@ delete process.env.CLAUDE_CONFIG_DIR;
 
 test('verifyHooksFire: all real registered hooks run cleanly (exit 0)', () => {
   const { ok, results } = verifyHooksFire();
-  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit = 6 settings.json hooks
-  assert.ok(results.length >= 6, `expected >=6 hook probes, got ${results.length}`);
+  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit
+  // + 1 SubagentStart + 1 Stop = 8 settings.json hooks
+  assert.ok(results.length >= 8, `expected >=8 hook probes, got ${results.length}`);
   for (const r of results) {
     assert.ok(r.ok, `hook ${r.label} (${r.script}) did not fire cleanly: code=${r.code} err=${r.error}`);
   }

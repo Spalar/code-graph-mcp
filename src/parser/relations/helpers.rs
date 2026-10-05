@@ -95,6 +95,10 @@ pub(crate) enum CalleeQualifier {
     /// `OpenOptions::new().create(true)` — receiver is a call_expression
     /// (any chain).
     Chain,
+    /// `ctx.db.conn()` / `v[0].len()` — a method call whose receiver is any
+    /// other expression (a field, an index, a literal). Serialized as the
+    /// shared `{"q":"member"}`: its callee takes `self`, whatever the receiver.
+    Member,
 }
 
 /// Like `extract_callee_name` but also returns the qualifier shape.
@@ -151,22 +155,65 @@ pub(crate) fn extract_callee(
         )),
         "scoped_identifier" => extract_rust_scoped(&function, source),
         "field_expression" => extract_rust_field(&function, source),
+        // A turbofish wraps the callee: `f::<T>()`, `m::f::<T>()`,
+        // `x.collect::<Vec<_>>()`. Unwrapped, it is the call it spells.
+        "generic_function" => {
+            let inner = function.child_by_field_name("function")?;
+            match inner.kind() {
+                "identifier" => {
+                    Some((node_text(&inner, source).to_string(), CalleeQualifier::Bare))
+                }
+                "scoped_identifier" => extract_rust_scoped(&inner, source),
+                "field_expression" => extract_rust_field(&inner, source),
+                _ => None,
+            }
+        }
         _ => extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare)),
     }
 }
 
 /// Walk a scoped_identifier collecting all path segments + final name.
 /// `crate::a::b::foo` → segments=["crate","a","b"], name="foo"
+///
+/// A type segment may carry a turbofish (`a::Block::<u8>::new` → `a`, `Block`)
+/// or be a qualified self (`<a::S as Tr>::go` → `a`, `S`): the type is what
+/// the call goes through. A qualified self whose type has no name
+/// (`<&S as Tr>::go`, `<[u8] as Tr>::f`) goes through its trait.
 fn collect_scoped_path_segments(node: &tree_sitter::Node, source: &str, out: &mut Vec<String>) {
-    if node.kind() == "scoped_identifier" {
-        if let Some(path) = node.child_by_field_name("path") {
-            collect_scoped_path_segments(&path, source, out);
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                collect_scoped_path_segments(&path, source, out);
+            }
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(node_text(&name, source).to_string());
+            }
         }
-        if let Some(name) = node.child_by_field_name("name") {
-            out.push(node_text(&name, source).to_string());
+        "identifier" | "type_identifier" => out.push(node_text(node, source).to_string()),
+        "generic_type" => {
+            if let Some(ty) = node.child_by_field_name("type") {
+                collect_scoped_path_segments(&ty, source, out);
+            }
         }
-    } else if matches!(node.kind(), "identifier" | "type_identifier") {
-        out.push(node_text(node, source).to_string());
+        "bracketed_type" => {
+            let Some(inner) = node.named_child(0) else {
+                return;
+            };
+            if inner.kind() != "qualified_type" {
+                collect_scoped_path_segments(&inner, source, out);
+                return;
+            }
+            let before = out.len();
+            if let Some(ty) = inner.child_by_field_name("type") {
+                collect_scoped_path_segments(&ty, source, out);
+            }
+            if out.len() == before {
+                if let Some(alias) = inner.child_by_field_name("alias") {
+                    collect_scoped_path_segments(&alias, source, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -227,7 +274,7 @@ fn extract_rust_field(
             CalleeQualifier::Receiver(node_text(&value.unwrap(), source).to_string())
         }
         Some("call_expression") => CalleeQualifier::Chain,
-        _ => CalleeQualifier::Bare,
+        _ => CalleeQualifier::Member,
     };
     Some((name, qualifier))
 }

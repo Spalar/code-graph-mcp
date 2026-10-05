@@ -1,0 +1,137 @@
+Modules:
+<root> (1 file, 151 symbols, javascript)
+  callee_0, callee_1, callee_10, callee_100, callee_101, callee_102
+core (2 files, 58 symbols, python)
+  api_00, api_01, api_02, api_03, api_04, api_05
+util (1 file, 20 symbols, python)
+  h_0, h_1, h_10, h_11, h_12, h_13
+pkg_00 (1 file, 5 symbols, python)
+  f_0_0, f_0_1, f_0_2
+pkg_01 (1 file, 5 symbols, python)
+  f_1_0, f_1_1, f_1_2
+pkg_02 (1 file, 5 symbols, python)
+  f_2_0, f_2_1, f_2_2
+pkg_03 (1 file, 5 symbols, python)
+  f_3_0, f_3_1, f_3_2
+pkg_04 (1 file, 5 symbols, python)
+  f_4_0, f_4_1, f_4_2
+pkg_05 (1 file, 5 symbols, python)
+  f_5_0, f_5_1, f_5_2
+pkg_06 (1 file, 5 symbols, python)
+  f_6_0, f_6_1, f_6_2
+pkg_07 (1 file, 5 symbols, python)
+  f_7_0, f_7_1, f_7_2
+pkg_08 (1 file, 5 symbols, python)
+  f_8_0, f_8_1, f_8_2
+pkg_09 (1 file, 5 symbols, python)
+  f_9_0, f_9_1, f_9_2
+pkg_10 (1 file, 5 symbols, python)
+  f_10_0, f_10_1, f_10_2
+pkg_11 (1 file, 5 symbols, python)
+  f_11_0, f_11_1, f_11_2
+pkg_12 (1 file, 5 symbols, python)
+  f_12_0, f_12_1, f_12_2
+pkg_13 (1 file, 5 symbols, python)
+  f_13_0, f_13_1, f_13_2
+pkg_14 (1 file, 5 symbols, python)
+  f_14_0, f_14_1, f_14_2
+pkg_15 (1 file, 5 symbols, python)
+  f_15_0, f_15_1, f_15_2
+pkg_16 (1 file, 5 symbols, python)
+  f_16_0, f_16_1, f_16_2
+pkg_17 (1 file, 5 symbols, python)
+  f_17_0, f_17_1, f_17_2
+pkg_18 (1 file, 5 symbols, python)
+  f_18_0, f_18_1, f_18_2
+pkg_19 (1 file, 5 symbols, python)
+  f_19_0, f_19_1, f_19_2
+pkg_20 (1 file, 5 symbols, python)
+  f_20_0, f_20_1, f_20_2
+pkg_21 (1 file, 5 symbols, python)
+  f_21_0, f_21_1, f_21_2
+pkg_22 (1 file, 5 symbols, python)
+  f_22_0, f_22_1, f_22_2
+pkg_23 (1 file, 5 symbols, python)
+  f_23_0, f_23_1, f_23_2
+pkg_24 (1 file, 5 symbols, python)
+  f_24_0, f_24_1, f_24_2
+pkg_25 (1 file, 5 symbols, python)
+  f_25_0, f_25_1, f_25_2
+pkg_26 (1 file, 5 symbols, python)
+  f_26_0, f_26_1, f_26_2
+pkg_27 (1 file, 5 symbols, python)
+  f_27_0, f_27_1, f_27_2
+pkg_28 (1 file, 5 symbols, python)
+  f_28_0, f_28_1, f_28_2
+pkg_29 (1 file, 5 symbols, python)
+  f_29_0, f_29_1, f_29_2
+pkg_30 (1 file, 5 symbols, python)
+  f_30_0, f_30_1, f_30_2
+pkg_31 (1 file, 5 symbols, python)
+  f_31_0, f_31_1, f_31_2
+pkg_32 (1 file, 5 symbols, python)
+  f_32_0, f_32_1, f_32_2
+pkg_33 (1 file, 5 symbols, python)
+  f_33_0, f_33_1, f_33_2
+pkg_34 (1 file, 5 symbols, python)
+  f_34_0, f_34_1, f_34_2
+pkg_35 (1 file, 5 symbols, python)
+  f_35_0, f_35_1, f_35_2
+pkg_36 (1 file, 5 symbols, python)
+  f_36_0, f_36_1, f_36_2
+pkg_37 (1 file, 5 symbols, python)
+  f_37_0, f_37_1, f_37_2
+pkg_38 (1 file, 5 symbols, python)
+  f_38_0, f_38_1, f_38_2
+pkg_39 (1 file, 5 symbols, python)
+  f_39_0, f_39_1, f_39_2
+
+Dependencies:
+  pkg_01 → util (3 imports)
+  pkg_02 → util (3 imports)
+  pkg_03 → util (3 imports)
+  pkg_04 → util (3 imports)
+  pkg_05 → util (3 imports)
+  pkg_06 → util (3 imports)
+  pkg_07 → util (3 imports)
+  pkg_08 → util (3 imports)
+  pkg_09 → util (3 imports)
+  pkg_10 → util (3 imports)
+  pkg_11 → util (3 imports)
+  pkg_12 → util (3 imports)
+  pkg_13 → util (3 imports)
+  pkg_14 → util (3 imports)
+  pkg_15 → util (3 imports)
+  pkg_16 → util (3 imports)
+  pkg_17 → util (3 imports)
+  pkg_18 → util (3 imports)
+  pkg_19 → util (3 imports)
+  pkg_21 → util (3 imports)
+  pkg_22 → util (3 imports)
+  pkg_23 → util (3 imports)
+  pkg_24 → util (3 imports)
+  pkg_25 → util (3 imports)
+  pkg_26 → util (3 imports)
+  pkg_27 → util (3 imports)
+  pkg_28 → util (3 imports)
+  pkg_29 → util (3 imports)
+  pkg_30 → util (3 imports)
+  pkg_31 → util (3 imports)
+  ... and 50 more dependencies
+
+Hot Functions:
+  h_0 (function) — 40 callers (util/helpers.py)
+  f_0_0 (function) — 2 callers (pkg_00/mod.py)
+  f_10_0 (function) — 2 callers (pkg_10/mod.py)
+  f_11_0 (function) — 2 callers (pkg_11/mod.py)
+  f_12_0 (function) — 2 callers (pkg_12/mod.py)
+  f_13_0 (function) — 2 callers (pkg_13/mod.py)
+  f_14_0 (function) — 2 callers (pkg_14/mod.py)
+  f_15_0 (function) — 2 callers (pkg_15/mod.py)
+  f_16_0 (function) — 2 callers (pkg_16/mod.py)
+  f_17_0 (function) — 2 callers (pkg_17/mod.py)
+  f_18_0 (function) — 2 callers (pkg_18/mod.py)
+  f_19_0 (function) — 2 callers (pkg_19/mod.py)
+  f_1_0 (function) — 2 callers (pkg_01/mod.py)
+  f_20_0 (function) — 2 callers (pkg_20/mod.py)
+  f_21_0 (function) — 2 callers (pkg_21/mod.py)

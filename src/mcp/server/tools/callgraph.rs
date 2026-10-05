@@ -61,6 +61,23 @@ pub(super) fn attach_suppressed_ambiguous(
 }
 
 impl McpServer {
+    /// `boundaries` for an empty caller result (P1 #4): the dynamic-dispatch
+    /// sites naming `symbol`, shared by `get_call_graph`, `find_references` and
+    /// `get_ast_node include_impact`. `None` when it does not apply (no project
+    /// root, not a function, not an identifier).
+    pub(in crate::mcp::server) fn empty_result_boundaries(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(root) = self.project_root.as_deref() else {
+            return Ok(None);
+        };
+        Ok(
+            crate::graph::boundaries::for_empty_result(self.db.conn(), root, symbol)?
+                .map(|b| b.to_json()),
+        )
+    }
+
     pub(in crate::mcp::server) fn tool_get_call_graph(
         &self,
         args: &serde_json::Value,
@@ -108,6 +125,12 @@ impl McpServer {
                 )
             })?;
         let depth = arg_clamped(args, "depth", "get_call_graph", 3)? as i32;
+        // P1 #2: absent = the unbudgeted answer (flat list, or the rollup above
+        // the threshold).
+        let max_tokens = match &args["max_tokens"] {
+            serde_json::Value::Null => None,
+            _ => Some(arg_clamped(args, "max_tokens", "get_call_graph", 0)? as usize),
+        };
         // Empty file_path is identical to absent — without this the
         // disambiguation/fuzzy path treats Some("") as "filter by this exact
         // path" and silently returns no edges. Separator-normalized at entry
@@ -137,29 +160,34 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
-        // Disambiguate: if no file_path provided, check if symbol matches multiple
-        // distinct nodes (cross-file OR same-file overloads). Message + suggestion
-        // shape are shared with the CLI via crate::resolve (audit #6).
-        if file_path.is_none() {
-            if let Some(cands) = self.disambiguate_symbol(function_name)? {
-                return Ok(json!({
-                    "function": function_name,
-                    "direction": direction,
-                    "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
-                    // MUST stay capped in step with `ambiguity_message`, which
-                    // now says "Showing the first 5 of N" whenever it hides
-                    // something. This site renders the message but built its own
-                    // uncapped list, so SURF-34 turned a truthful envelope into
-                    // one that announced a cap it had not applied — 7 suggestions
-                    // under a note claiming 5. `ambiguity_response` (the other
-                    // four MCP sites) caps internally; this arm is hand-rolled
-                    // because it also carries `function`/`direction`.
-                    "suggestions": crate::resolve::candidates_to_json(&cands)
-                        .into_iter()
-                        .take(crate::resolve::SUGGESTION_CAP)
-                        .collect::<Vec<_>>(),
-                }));
+        // Disambiguate: the symbol may match several distinct nodes (cross-file
+        // OR same-file overloads), and a file_path cannot split same-file ones
+        // either. Message + suggestion shape are shared with the CLI via
+        // crate::resolve (audit #6).
+        let ambiguous = match file_path {
+            None => self.disambiguate_symbol(function_name)?,
+            Some(fp) => {
+                crate::resolve::detect_same_file_ambiguity(self.db.conn(), function_name, fp)?
             }
+        };
+        if let Some(cands) = ambiguous {
+            return Ok(json!({
+                "function": function_name,
+                "direction": direction,
+                "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
+                // MUST stay capped in step with `ambiguity_message`, which
+                // now says "Showing the first 5 of N" whenever it hides
+                // something. This site renders the message but built its own
+                // uncapped list, so SURF-34 turned a truthful envelope into
+                // one that announced a cap it had not applied — 7 suggestions
+                // under a note claiming 5. `ambiguity_response` (the other
+                // four MCP sites) caps internally; this arm is hand-rolled
+                // because it also carries `function`/`direction`.
+                "suggestions": crate::resolve::candidates_to_json(&cands)
+                    .into_iter()
+                    .take(crate::resolve::SUGGESTION_CAP)
+                    .collect::<Vec<_>>(),
+            }));
         }
 
         let results = crate::graph::query::get_call_graph_filtered(
@@ -191,6 +219,8 @@ impl McpServer {
                         &results2,
                         compact,
                         include_tests,
+                        max_tokens,
+                        args,
                     );
                 }
                 FuzzyResolution::Ambiguous(cands) => {
@@ -231,9 +261,21 @@ impl McpServer {
             }
         }
 
-        self.format_call_graph_response(function_name, direction, &results, compact, include_tests)
+        self.format_call_graph_response(
+            function_name,
+            direction,
+            &results,
+            compact,
+            include_tests,
+            max_tokens,
+            args,
+        )
     }
 
+    /// `max_tokens` and `args` (P1 #2): with a budget, the flat answer is fitted
+    /// to it instead of switching to the rollup; `args` rebuilds the CLI
+    /// command that returns what either leaves out.
+    #[allow(clippy::too_many_arguments)] // the six query facts plus the budget and the raw args the next-step command is built from
     pub(in crate::mcp::server) fn format_call_graph_response(
         &self,
         function_name: &str,
@@ -241,7 +283,18 @@ impl McpServer {
         results: &crate::graph::query::CallGraphResult,
         compact: bool,
         include_tests: bool,
+        max_tokens: Option<usize>,
+        args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let next = cli_next_command(
+            "get_call_graph",
+            args,
+            &json!({ "function": function_name }),
+        )
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+        // `compact` is inert beside a budget (reported in `ignored_arguments`).
+        let compact = compact && max_tokens.is_none();
         // Authoritative AST flag first, name heuristic as fallback — so inline
         // `#[cfg(test)]` unit tests (descriptive names the heuristic misses) don't
         // leak into the default caller/callee view. Shared with impact/trace/show.
@@ -313,7 +366,7 @@ impl McpServer {
         };
 
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
-        if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
+        if max_tokens.is_none() && est_tokens > COMPRESSION_TOKEN_THRESHOLD {
             // File-level rollup: group by (file_path, direction), emit counts + a small
             // sample of names/node_ids + depth range. Previously this path returned
             // `mode: compressed_call_graph` with the raw flat list (which still ate
@@ -389,6 +442,8 @@ impl McpServer {
             let mut rollup = json!({
                 "mode": "rollup_call_graph",
                 "message": "Call graph is dense; returned as file-level rollup. Pick any node_id and call get_ast_node(node_id) to expand a specific symbol.",
+                // Every node, by name and file, as the CLI tree (P1 #2).
+                "next": next,
                 "function": function_name,
                 "direction": direction,
                 "total_nodes": all_nodes.len(),
@@ -404,6 +459,11 @@ impl McpServer {
             attach_test_filtered(&mut rollup);
             attach_truncation_flags(&mut rollup, results);
             attach_suppressed_ambiguous(&mut rollup, results);
+            if direction != "callees" && caller_total == 0 {
+                if let Some(b) = self.empty_result_boundaries(function_name)? {
+                    rollup["boundaries"] = b;
+                }
+            }
             return Ok(rollup);
         }
 
@@ -425,6 +485,107 @@ impl McpServer {
         attach_test_filtered(&mut result);
         attach_truncation_flags(&mut result, results);
         attach_suppressed_ambiguous(&mut result, results);
+        // Empty caller side: disclose dynamic-dispatch sites, never as edges.
+        // Both response shapes owe it (the rollup arm above attaches the same).
+        if direction != "callees" && caller_nodes.is_empty() {
+            if let Some(b) = self.empty_result_boundaries(function_name)? {
+                result["boundaries"] = b;
+            }
+        }
+        if let Some(tokens) = max_tokens {
+            return self.call_graph_budgeted(result, &all_nodes, tokens, &next);
+        }
         Ok(result)
+    }
+
+    /// `get_call_graph` with `max_tokens`: the flat answer fitted to the budget.
+    ///
+    /// One unit per node. Least important first: deepest, then fewest callers
+    /// (call-edge in-degree), then latest listed. The shorter form drops
+    /// `type`. `budget` counts what was shortened or left out and names the
+    /// CLI tree that lists every node.
+    fn call_graph_budgeted(
+        &self,
+        full: serde_json::Value,
+        all_nodes: &[serde_json::Value],
+        tokens: usize,
+        next: &str,
+    ) -> Result<serde_json::Value> {
+        use crate::budget::{self, Level};
+        use std::cmp::Reverse;
+        let ids: Vec<i64> = all_nodes
+            .iter()
+            .filter_map(|n| n["node_id"].as_i64())
+            .collect();
+        let in_degree = budget::caller_counts(self.db.conn(), &ids)?;
+        let n = all_nodes.len();
+        let depth = |i: usize| all_nodes[i]["depth"].as_i64().unwrap_or(0);
+        let order = budget::order_by_importance(n, |i| {
+            let id = all_nodes[i]["node_id"].as_i64().unwrap_or(0);
+            (
+                Reverse(depth(i)),
+                in_degree.get(&id).copied().unwrap_or(0),
+                Reverse(i),
+            )
+        });
+        let steps = budget::standard_steps(&order, |_| true);
+        let render = |levels: &[Level]| -> serde_json::Value {
+            let pick = |dir: &str| -> Vec<serde_json::Value> {
+                all_nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, v)| v["direction"] == dir && levels[*i] != Level::Dropped)
+                    .map(|(i, v)| {
+                        let mut v = v.clone();
+                        if levels[i] == Level::Skeleton {
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("type");
+                            }
+                        }
+                        v
+                    })
+                    .collect()
+            };
+            let mut out = full.clone();
+            out["callers"] = json!(pick("callers"));
+            out["callees"] = json!(pick("callees"));
+            let dropped = |dir: &str| {
+                (0..n)
+                    .filter(|&i| all_nodes[i]["direction"] == dir && levels[i] == Level::Dropped)
+                    .count()
+            };
+            let (dc, de) = (dropped("callers"), dropped("callees"));
+            let short = levels.iter().filter(|l| **l == Level::Skeleton).count();
+            if dc + de + short > 0 {
+                let mut b = json!({ "max_tokens": tokens });
+                let mut omitted = serde_json::Map::new();
+                if dc > 0 {
+                    omitted.insert("callers".into(), json!(dc));
+                }
+                if de > 0 {
+                    omitted.insert("callees".into(), json!(de));
+                }
+                if !omitted.is_empty() {
+                    b["omitted"] = serde_json::Value::Object(omitted);
+                }
+                if short > 0 {
+                    b["nodes_without_type"] = json!(short);
+                }
+                b["next"] = json!(next);
+                out["budget"] = b;
+            }
+            out
+        };
+        Ok(budget::fit(
+            &vec![Level::Full; n],
+            &steps,
+            budget::budget_bytes(tokens),
+            |levels| {
+                let v = render(levels);
+                let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+                (v, len)
+            },
+        )
+        .output)
     }
 }

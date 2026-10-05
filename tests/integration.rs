@@ -131,9 +131,7 @@ export function handleLogin(req: Request, res: Response) {
     assert!(result["code_content"].as_str().unwrap().contains("verify"));
 
     // Rebuild index
-    let rebuild = tool_call_json("rebuild_index", serde_json::json!({"confirm": true}));
-    let resp = server.handle_message(&rebuild).unwrap();
-    let result = parse_tool_result(&resp);
+    let result = common::rebuild_until_done(&server);
     assert_eq!(result["status"], "rebuilt");
     assert!(result["files_indexed"].as_i64().unwrap() >= 2);
 
@@ -289,8 +287,7 @@ fn test_e2e_incremental_reindex() {
     fs::write(project.path().join("app.ts"), "function modified() {}").unwrap();
 
     // Explicit rebuild to sync before search (avoids timing-dependent incremental detection)
-    let rebuild = tool_call_json("rebuild_index", serde_json::json!({"confirm": true}));
-    let _ = server.handle_message(&rebuild).unwrap();
+    assert_eq!(common::rebuild_until_done(&server)["status"], "rebuilt");
 
     // Search again
     let search = tool_call_json(
@@ -3738,10 +3735,21 @@ fn test_code_explorer_agent_references_only_live_tools() {
         .map(|t| t.name.as_str())
         .collect();
 
-    const PREFIX: &str = "mcp__code-graph__";
+    // The plugin-hosted spelling is the one a live plugin install exposes
+    // (checked on Claude Code 2.1.284, 2026-09-28); the bare
+    // `mcp__code-graph__` half the allowlist once carried matched no tool.
+    let tools_line = agent_md
+        .lines()
+        .find(|l| l.starts_with("tools:"))
+        .expect("code-explorer.md frontmatter must declare its tools");
+    assert!(
+        !tools_line.contains("\"mcp__code-graph__"),
+        "the bare mcp__code-graph__ spelling matches no tool of a plugin install: {tools_line}"
+    );
+    const PREFIX: &str = "mcp__plugin_code-graph-mcp_code-graph__";
     let mut referenced = 0;
-    for (idx, _) in agent_md.match_indices(PREFIX) {
-        let name: String = agent_md[idx + PREFIX.len()..]
+    for (idx, _) in tools_line.match_indices(PREFIX) {
+        let name: String = tools_line[idx + PREFIX.len()..]
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
@@ -3753,9 +3761,10 @@ fn test_code_explorer_agent_references_only_live_tools() {
         );
         referenced += 1;
     }
-    assert!(
-        referenced >= 1,
-        "expected code-explorer.md to reference at least one mcp__code-graph__ tool"
+    assert_eq!(
+        referenced,
+        live.len(),
+        "code-explorer.md should allow every live tool under the plugin spelling"
     );
 }
 

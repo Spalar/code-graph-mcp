@@ -23,7 +23,9 @@
 //! (`CallCtx`) — splitting THAT per language would duplicate the walk.
 
 use super::helpers::{self, extract_callee, extract_string_from_subtree};
-use super::{node_text, serialize_callee_qualifier, serialize_rtype_metadata};
+use super::{
+    node_text, serialize_callee_qualifier, serialize_field_metadata, serialize_rtype_metadata,
+};
 use super::{LangKey, LanguageConfig, ParsedRelation};
 use crate::domain::{REL_CALLS, REL_IMPORTS};
 
@@ -215,12 +217,48 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         .unwrap_or(normalized)
                         .to_string();
                     if !segment.is_empty() {
+                        // A package (`require('send')`) is no project file: its
+                        // import cannot bind a node of this file (D7).
+                        let package = !path.starts_with('.') && !path.starts_with('/');
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: segment,
                             relation: REL_IMPORTS.into(),
-                            metadata: None,
+                            metadata: package.then(|| {
+                                serde_json::json!({
+                                    "q": crate::domain::CALL_Q_PACKAGE,
+                                    "v": normalized,
+                                })
+                                .to_string()
+                            }),
                             source_language: String::new(),
+                            source_line: None,
+                        });
+                    }
+
+                    // `module.exports = require('./lib/express')` (express's index.js;
+                    // `exports = module.exports = require(…)` too) re-exports that
+                    // file: bind this module to it, as a namespace require does, so
+                    // deps/affected follow the package through its index (D7 / C3).
+                    let reexport = node
+                        .parent()
+                        .filter(|p| p.kind() == "assignment_expression")
+                        .filter(|p| {
+                            p.child_by_field_name("right")
+                                .is_some_and(|r| r.id() == node.id())
+                        })
+                        .and_then(|p| p.child_by_field_name("left"))
+                        .is_some_and(|l| {
+                            matches!(node_text(&l, source), "module.exports" | "exports")
+                        });
+                    if reexport {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: "module.exports".into(),
+                            relation: REL_IMPORTS.into(),
+                            metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
+                            source_language: String::new(),
+                            source_line: None,
                         });
                     }
 
@@ -263,6 +301,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                                     relation: REL_IMPORTS.into(),
                                                     metadata: Some(metadata.clone()),
                                                     source_language: String::new(),
+                                                    source_line: None,
                                                 });
                                             }
                                         }
@@ -282,6 +321,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                         relation: REL_IMPORTS.into(),
                                         metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
                                         source_language: String::new(),
+                                        source_line: None,
                                     });
                                 }
                             }
@@ -318,7 +358,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
         None => None,
     };
     if let Some(scope) = call_scope {
-        if let Some((callee, mut qualifier)) =
+        if let Some((mut callee, mut qualifier)) =
             extract_callee(&node, source, ctx.language, ctx.current_rust_impl)
         {
             // A BARE Rust callee whose name is a local binding of the
@@ -328,10 +368,10 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             //
             // "Bare" must be decided STRUCTURALLY (the `function` field is
             // an `identifier`), NOT from `CalleeQualifier::Bare`: that
-            // variant is also `extract_rust_field`'s fallback arm for a
+            // variant was once `extract_rust_field`'s fallback arm for a
             // method call whose receiver is not self / a plain identifier /
             // a call. `ctx.db.conn()` has a `field_expression` receiver and
-            // so reports Bare — gating on the enum dropped 14 real
+            // so reported Bare — gating on the enum dropped 14 real
             // `Database::conn` edges in this repo alone, every `cmd_*` that
             // writes `let conn = ctx.db.conn();`, because the method name
             // matched the local it is assigned to.
@@ -341,6 +381,25 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             let shadowed = ctx.language == "rust"
                 && bare_call
                 && super::rust::shadowed_by_enclosing_local(&node, source, &callee);
+            // `self.get_mut()` with `self: Pin<&mut Self>` is `Pin::get_mut`, no
+            // project function (`rust_impls::answered_by_the_self_wrapper`).
+            let shadowed = shadowed
+                || (ctx.language == "rust"
+                    && matches!(qualifier, helpers::CalleeQualifier::SelfRecv(_))
+                    && super::rust_impls::answered_by_the_self_wrapper(node, source, &callee));
+            // `Object.create(null)` runs no project code (D7): with
+            // `exports.create = function () {}` a node, express's seven bound it.
+            let shadowed = shadowed
+                || super::member::js_builtin_global_call(node, source, ctx.language)
+                || super::member::js_node_builtin_call(node, source, ctx.language)
+                || super::member::js_node_builtin_member_call(node, source, ctx.language);
+            // The file's `use` names what the call's leading name stands for
+            // (D#132): `use std::sync::Mutex; Mutex::new()` is std's.
+            let use_root = if ctx.language == "rust" && !shadowed {
+                rust_use_rewrite(node, source, &mut callee, &mut qualifier)
+            } else {
+                None
+            };
             if !shadowed {
                 // Fill SelfRecv/SelfType payload from current impl context.
                 // The helper emits these with empty payload because it
@@ -354,24 +413,290 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         | helpers::CalleeQualifier::SelfType(t) => {
                             if let Some(impl_type) = ctx.current_rust_impl {
                                 *t = impl_type.to_string();
+                            } else if matches!(qualifier, helpers::CalleeQualifier::SelfRecv(_)) {
+                                // `self.f()` outside an impl (a trait's default
+                                // method) is still a method call: as a bare call it
+                                // could bind only a function not taking `self`.
+                                qualifier = helpers::CalleeQualifier::Member;
+                            } else if let Some(trait_name) = enclosing_rust_trait(node, source) {
+                                // `Self::f()` in a trait's default method names the
+                                // trait: as a bare call it could reach no
+                                // associated function at all.
+                                qualifier = helpers::CalleeQualifier::SelfType(trait_name);
                             } else {
-                                // self/Self called outside an impl block — drop qualifier (Bare).
+                                // `Self::f()` outside an impl block — drop qualifier (Bare).
                                 qualifier = helpers::CalleeQualifier::Bare;
                             }
                         }
                         _ => unreachable!(),
                     }
                 }
-                let metadata = serialize_callee_qualifier(&qualifier);
+                // A member call on an object (not this / a module binding) can
+                // only run a method: tell the resolver (see `member.rs`). A JS
+                // identifier receiver arrives as `Receiver`, kept only when it is
+                // an import binding, whose namespace resolution needs it.
+                let unqualified = matches!(
+                    qualifier,
+                    helpers::CalleeQualifier::Bare | helpers::CalleeQualifier::Receiver(_)
+                );
+                let member =
+                    unqualified && super::member::is_member_call(node, source, ctx.config.name);
+                // A receiver whose class the source writes down binds that class's
+                // method (see `receiver.rs`).
+                let receiver_type = unqualified
+                    .then(|| super::receiver::receiver_type(node, source, ctx.config.name))
+                    .flatten();
+                // A field the enclosing function cannot see declared (an
+                // out-of-line member, a gtest body): typed at resolution.
+                let field = (receiver_type.is_none() && member)
+                    .then(|| super::receiver::cpp_field_receiver(node, source, ctx.config.name))
+                    .flatten();
+                // A receiver that is itself a member access or call: typed at
+                // resolution through recorded fields and return types.
+                // (`this->opts_.env->f()` is one too, though its root is `this`.)
+                let chain = (receiver_type.is_none() && field.is_none() && unqualified)
+                    .then(|| super::receiver::cpp_chain_receiver(node, source, ctx.config.name))
+                    .flatten();
+                let metadata = if let Some(ty) = receiver_type {
+                    Some(serialize_rtype_metadata(&ty))
+                } else if let Some((class, field, arrow)) = field {
+                    Some(serialize_field_metadata(&class, &field, arrow))
+                } else if chain.is_some() {
+                    chain
+                } else if member {
+                    Some(super::member::MEMBER_META.to_string())
+                } else if ctx.config.name == "cpp" && is_cpp_scoped_call(node) {
+                    // `DB::Put()` names its class: tell the resolver it is not a
+                    // bare `Put()` (whose implicit `this` prefers the caller's
+                    // own class). Resolves as a bare name otherwise.
+                    Some(CPP_SCOPED_META.to_string())
+                } else {
+                    serialize_callee_qualifier(&qualifier)
+                };
+                // A qualified Rust call carries its argument count: with no
+                // overloading, default or variadic parameters, it reaches only a
+                // function taking that many (`resolve::rust_call_shape_admits`).
+                let metadata = if ctx.language == "rust" {
+                    // A method call on a receiver whose type the source writes
+                    // down carries it (D#112, `rust_receiver.rs`).
+                    let receiver = matches!(
+                        qualifier,
+                        helpers::CalleeQualifier::Receiver(_)
+                            | helpers::CalleeQualifier::Member
+                            | helpers::CalleeQualifier::Chain
+                    )
+                    .then(|| super::rust_receiver::receiver_type(node, source))
+                    .flatten();
+                    // A `self`/`Self` call cannot reach the same-named method of
+                    // another impl the language keeps apart (`rust_impls.rs`).
+                    // In an inherent impl it never leaves the crate either.
+                    let (facts, inherent) = match &qualifier {
+                        helpers::CalleeQualifier::SelfRecv(_)
+                        | helpers::CalleeQualifier::SelfType(_)
+                            if ctx.current_rust_impl.is_some() =>
+                        {
+                            (
+                                super::rust_impls::self_call_facts(node, source, &callee),
+                                super::rust_impls::in_inherent_impl(node),
+                            )
+                        }
+                        _ => (super::rust_impls::SelfCallFacts::default(), false),
+                    };
+                    metadata.map(|m| {
+                        with_self_call_facts(
+                            with_receiver_type(
+                                with_use_root(with_rust_arity(m, node), use_root),
+                                receiver,
+                            ),
+                            &facts,
+                            inherent,
+                        )
+                    })
+                } else {
+                    metadata
+                };
+                // `b()` through `import { a as b }` / `const { a: b } =
+                // require()` calls the export `a` (D#120, `member.rs`).
+                let (callee, metadata) =
+                    match super::member::js_renamed_import_call(node, source, ctx.config.name) {
+                        Some((export, module)) => {
+                            let metadata = serde_json::json!({
+                                "q": crate::domain::CALL_Q_IMPORT,
+                                "js_module": module,
+                                "v": export,
+                            })
+                            .to_string();
+                            (export, Some(metadata))
+                        }
+                        None => (callee, metadata),
+                    };
+                // `send(req)` through `var send = require('send')` (D7).
+                let metadata = match metadata {
+                    None => super::member::js_package_bound_call(node, source, ctx.config.name)
+                        .map(|spec| {
+                            serde_json::json!({
+                                "q": crate::domain::CALL_Q_PACKAGE,
+                                "v": spec,
+                            })
+                            .to_string()
+                        }),
+                    some => some,
+                };
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,
                     relation: REL_CALLS.into(),
                     metadata,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
+    }
+}
+
+/// Apply what the file's `use` declarations make of a Rust call (see
+/// [`super::rust_use`]) to its callee and qualifier: a name bound to a path
+/// (a renamed project import too) becomes a path call through it. Returns the root kind of a rewritten path, for [`with_use_root`].
+/// Only a callee spelled with a plain leading name is looked up: `crate::`,
+/// `self::`, `super::`, `Self::`, a leading `::` and `<T as Tr>::` bind nothing.
+pub(super) fn rust_use_rewrite(
+    node: tree_sitter::Node,
+    source: &str,
+    callee: &mut String,
+    qualifier: &mut helpers::CalleeQualifier,
+) -> Option<super::rust_use::UseRoot> {
+    use super::rust_use::{leftmost_name, rewrite_call, UseRewrite};
+    let function = node.child_by_field_name("function")?;
+    let lead = leftmost_name(&function)?;
+    let lead = node_text(&lead, source);
+    let rewrite = match &*qualifier {
+        helpers::CalleeQualifier::Bare if lead == callee => {
+            rewrite_call(&node, source, callee, None)
+        }
+        helpers::CalleeQualifier::Path(path) if path.first().is_some_and(|f| f == lead) => {
+            rewrite_call(&node, source, callee, Some(path))
+        }
+        _ => None,
+    }?;
+    let UseRewrite::Path {
+        name,
+        segments,
+        root,
+    } = rewrite;
+    *callee = name;
+    *qualifier = helpers::CalleeQualifier::Path(segments);
+    Some(root)
+}
+
+/// `metadata` with `"u"`: a path a `use` spelled out, rooted at this crate
+/// (`"c"`: `crate`/`self`/`super`, counted from the file's module) or at a crate
+/// name (`"x"`). See `resolve::rust_use_anchor`.
+pub(super) fn with_use_root(metadata: String, root: Option<super::rust_use::UseRoot>) -> String {
+    let Some(root) = root else {
+        return metadata;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    let tag = match root {
+        super::rust_use::UseRoot::Project => "c",
+        super::rust_use::UseRoot::Extern => "x",
+    };
+    map.insert("u".into(), tag.into());
+    serde_json::Value::Object(map).to_string()
+}
+
+/// `metadata` with the receiver type keys of [`super::rust_receiver`].
+fn with_receiver_type(metadata: String, receiver: Option<super::rust_receiver::RecvTy>) -> String {
+    let Some(ty) = receiver else {
+        return metadata;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    for (k, v) in super::rust_receiver::receiver_keys(&ty) {
+        map.insert(k.into(), v.into());
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// `metadata` with what a `self`/`Self` call's own file tells the resolver
+/// (`rust_impls::self_call_facts`): `"xl"`, the start lines of same-file methods
+/// the call cannot reach; `"wide"`, set when the file defines the type's method
+/// of that name only in trait impls, which an inherent one elsewhere outranks;
+/// and `"inh"`, set in an inherent impl, whose calls stay in the crate
+/// (`rust_impls::in_inherent_impl`). Unchanged when there is none of these.
+fn with_self_call_facts(
+    metadata: String,
+    facts: &super::rust_impls::SelfCallFacts,
+    inherent: bool,
+) -> String {
+    if facts.excluded.is_empty() && !facts.trait_only_here && !inherent {
+        return metadata;
+    }
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    if !facts.excluded.is_empty() {
+        map.insert("xl".into(), serde_json::json!(facts.excluded));
+    }
+    if facts.trait_only_here {
+        map.insert("wide".into(), serde_json::json!(1));
+    }
+    if inherent {
+        map.insert("inh".into(), serde_json::json!(1));
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// The name of the `trait` whose body holds `node`, stopping at an `impl`.
+fn enclosing_rust_trait(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "trait_item" => {
+                return n
+                    .child_by_field_name("name")
+                    .map(|name| node_text(&name, source).to_string());
+            }
+            "impl_item" => return None,
+            _ => cur = n.parent(),
+        }
+    }
+    None
+}
+
+/// `metadata` with `"n"`: the arguments `call` passes. Comments and attributes
+/// in the list are not arguments.
+fn with_rust_arity(metadata: String, call: tree_sitter::Node) -> String {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return metadata;
+    };
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(&metadata) else {
+        return metadata;
+    };
+    let n = (0..args.named_child_count())
+        .filter_map(|i| args.named_child(i))
+        .filter(|a| !a.is_extra() && a.kind() != "attribute_item")
+        .count();
+    map.insert("n".into(), n.into());
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Metadata of a C++ call through a scope (`DB::Put()`, `ns::f<T>()`).
+pub(crate) const CPP_SCOPED_META: &str = r#"{"q":"scoped"}"#;
+
+fn is_cpp_scoped_call(call: tree_sitter::Node) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    match function.kind() {
+        "qualified_identifier" => true,
+        "template_function" => function
+            .child_by_field_name("name")
+            .is_some_and(|n| n.kind() == "qualified_identifier"),
+        _ => false,
     }
 }
 
@@ -391,6 +716,7 @@ fn extract_struct_literal(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -444,6 +770,7 @@ fn extract_js_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 relation: REL_CALLS.into(),
                 metadata: serialize_callee_qualifier(&qualifier),
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -477,6 +804,7 @@ fn extract_csharp_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -514,6 +842,7 @@ fn extract_php_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -542,14 +871,25 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
         // the ambiguous by-name fan-out across every same-named method.
         // Falls back to the bare, metadata-less form (unchanged behavior)
         // whenever the type can't be proven — never emits a wrong-type edge.
-        let metadata = super::infer_python_call_receiver_type(&node, source)
-            .map(|ty| serialize_rtype_metadata(&ty));
+        let metadata = super::python::infer_python_super_type(&node, source)
+            .map(|ty| serde_json::json!({ "q": "super", "v": ty }).to_string())
+            .or_else(|| {
+                super::infer_python_call_receiver_type(&node, source)
+                    .map(|ty| serialize_rtype_metadata(&ty))
+            })
+            .or_else(|| {
+                super::member::is_member_call(node, source, "python")
+                    .then(|| super::member::MEMBER_META.to_string())
+            })
+            .or_else(|| super::member::python_module_call_meta(node, source))
+            .or_else(|| super::member::python_untyped_receiver_meta(node, source));
         results.push(ParsedRelation {
             source_name: scope.to_string(),
             target_name: callee,
             relation: REL_CALLS.into(),
             metadata,
             source_language: String::new(),
+            source_line: None,
         });
     }
 }
@@ -571,6 +911,7 @@ fn extract_ruby_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             relation: REL_IMPORTS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -586,6 +927,7 @@ fn extract_ruby_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 relation: REL_CALLS.into(),
                 metadata: None,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -612,6 +954,7 @@ fn extract_java_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -663,6 +1006,7 @@ fn extract_php_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 relation: REL_CALLS.into(),
                 metadata: None,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -696,6 +1040,7 @@ fn extract_csharp_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -747,6 +1092,7 @@ fn extract_bash_command(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             relation: REL_IMPORTS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -782,6 +1128,7 @@ fn extract_bash_command(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }

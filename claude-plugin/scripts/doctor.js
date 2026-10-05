@@ -7,7 +7,7 @@ const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const {
   getPluginVersion, readJson, readJsonResult, healthCheck, scanForBrokenPaths,
-  settingsPath, surveyHookCoverage,
+  settingsPath, surveyHookCoverage, hooksFromPluginManifest,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');
 const { UPDATE_STATE_FILE, uninstallTombstoneActive } = require('./cache-paths');
@@ -537,6 +537,25 @@ function runDiagnostics({ checkOnly = false } = {}) {
         status: 'warn',
         detail: 'not determinable — settings.json could not be read or parsed',
       });
+    } else if (hooksFromPluginManifest(settings)) {
+      // Decision D2: the installed plugin's hooks.json carries every hook, so an
+      // empty settings.json is the healthy state and our entries in it — left
+      // by a pre-0.164 install — fire each hook a second time.
+      if (cov.present.length === 0) {
+        results.push({
+          name: 'Hook coverage',
+          status: 'ok',
+          detail: "hooks come from the plugin's hooks.json; settings.json holds none of ours",
+        });
+      } else {
+        results.push({
+          name: 'Hook coverage',
+          status: 'warn',
+          detail: `${cov.present.length} code-graph hook entr${cov.present.length === 1 ? 'y' : 'ies'} in settings.json ` +
+            `run next to the plugin's hooks.json, so each fires twice: ${cov.present.join(', ')}`,
+          fixId: 'legacy-hooks-in-settings',
+        });
+      }
     } else if (cov.missing.length === 0 && cov.stale.length === 0) {
       results.push({
         name: 'Hook coverage',
@@ -1243,6 +1262,26 @@ function runRepairs(results, {
         } else {
           console.log(`  \u274c ${remaining.length} hook path(s) still invalid \u2014 plugin scripts may be missing.`);
           console.log('     Reinstall: npm install -g @sdsrs/code-graph  (or re-run the plugin installer)');
+        }
+        break;
+      }
+
+      case 'legacy-hooks-in-settings': {
+        console.log("\n  Removing code-graph hooks from settings.json (the plugin's hooks.json carries them)...");
+        if (relicRepairGuard()) break;
+        if (teardownRepairGuard()) break;
+        const { install } = require('./lifecycle');
+        const r = install({ clearTombstone: true });
+        if (r.settingsUnwritable) {
+          console.log('  \u274c settings.json is not writable \u2014 entries NOT removed');
+          console.log('     Fix the permissions on it (or on ~/.claude) and re-run; see the error above.');
+        } else if (r.settingsUnreadable) {
+          console.log('  \u274c settings.json could not be read or parsed \u2014 entries NOT removed');
+        } else if (r.hooksRegistered) {
+          console.log('  \u2705 settings.json updated — restart Claude Code to apply');
+          fixed++;
+        } else {
+          console.log('  \u2796 install reported no change');
         }
         break;
       }

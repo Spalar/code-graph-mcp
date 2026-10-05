@@ -117,6 +117,37 @@ pub fn is_external_import_meta(metadata: Option<&str>) -> bool {
     metadata == Some(IMPORT_EXTERNAL_META)
 }
 
+/// Call metadata of a member call on an object (`x.f()`): it cannot reach a free
+/// function. Written by the parser (`relations/member.rs`) and by the resolver
+/// when a typed receiver's class lacks the method and the call falls back to
+/// untyped member resolution — so the edge is classified like one.
+pub const CALL_META_MEMBER: &str = r#"{"q":"member"}"#;
+
+/// Call `q` of a JS/TS call through a renamed import (D#120): `b()` where the
+/// nearest binding of `b` is `import { a as b } from 's'`, `const { a: b } =
+/// require('s')` or `const b = require('s').a` is recorded as a call of `a`
+/// stamped `{"q":"imp","js_module":s,"v":a}`. It binds only the top-level
+/// function the file `s` names exports as `a` (`resolve::js_import_targets`).
+pub const CALL_Q_IMPORT: &str = "imp";
+
+/// `q` of a JS/TS call or `require` import through a PACKAGE binding (D7): a
+/// bare `send(req)` whose nearest binding of `send` is `var send =
+/// require('send')` / `import send from 'send'`, and the `<module> imports
+/// send` of that require, stamped `{"q":"pkg","v":spec}`. The name cannot mean a
+/// function the caller's own file defines (`res.send = function send() {}` drew
+/// both at `extracted`), so the same-file tier skips it on every path
+/// (`resolve::is_package_bound`); a project function elsewhere (a workspace
+/// package) stays reachable by name.
+pub const CALL_Q_PACKAGE: &str = "pkg";
+
+/// Key of a Python call's metadata whose receiver the source leaves untyped
+/// (D10B): `{"ur":"attr"}` for an attribute of the instance (`self.x.f()`,
+/// `cls.x.f()`), `{"ur":"rel"}` for a name a relative import binds
+/// (`_cv_app.get()`). It carries no `q`, so every resolver path treats the call
+/// as bare; only the confidence pass reads it, labelling a same-file bind by its
+/// name count as it does a cross-file one.
+pub const CALL_KEY_UNTYPED_RECEIVER: &str = "ur";
+
 // -- Import `q` markers --
 //
 // Stamped onto an import relation's metadata by the parser and read back in
@@ -153,6 +184,10 @@ pub const IMPORT_Q_DEFAULT: &str = "default_import";
 //
 // - extracted: same-file resolution, or a structural relation (imports / inherits
 //   / implements / routes_to / exports) resolved by explicit path/parent. Precise.
+//   Except a same-file Rust method call on a receiver the source leaves untyped
+//   (`self.0.m()`, `f().m()`): bound by name alone, it is labelled like a
+//   cross-file call (D#162). So is a same-file Python call on an attribute of
+//   `self` or on a name a relative import binds (D10B, `CALL_KEY_UNTYPED_RECEIVER`).
 // - inferred:  a cross-file `calls`/`references` edge resolved by bare name where
 //   the target name is UNIQUE among same-language nodes. Likely correct.
 // - ambiguous: a cross-file `calls`/`references` edge whose target name has >1
@@ -362,7 +397,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 72; // v72 (2026-09-25): tree-sitter 0.24 -> 0.25 and tree-sitter-rust 0.23 -> 0.24. The 0.23 Rust grammar read a borrow of a binding named `raw` (`&raw`, `&raw[..]`, `&raw.field`) as the start of the `&raw const`/`&raw mut` operator and turned the expression, sometimes the whole function, into ERROR nodes: this repo indexed fresh had 9 Rust files over a damaged parse and lost `cmd_affected` outright; now 0. Measured over a 4,491-file, 19-language corpus (old vs new binary, nodes and edges compared by content, ids dropped): in every file that parses clean the other 18 languages keep the same symbols and edges — only `context_string` moves, where a caller/callee summary names a symbol in a damaged file. Every other difference is in a file that was ALREADY damaged, where core 0.25 recovers differently: C++ +15 real symbols (13 gmock, 2 fmt), one bogus `FMT_VISIBILITY` struct gone, one template specialization no longer cut short before its `>>` (renames it and its 6 methods); one bogus C# `if` method gone; one Swift class lost (Alamofire `Protected`, body holds `#if`/`#error`), its 3 methods de-scoped and 12 inbound calls dropped. A file re-parses only when its content changes, so an old index keeps the lost Rust symbols with no automatic route back — hence the bump. // v71 (D#24, found 2026-09-08 while adding scope-completeness tests for CORE-06, fixed 2026-09-11): a run that introduced a SECOND definition of a name never reached the bare-name callers of that name, so an incrementally grown index carried fewer `calls` edges than a rebuild of the same tree. A bare call fans out to EVERY same-name candidate; adding `c.py` with a second `helper` must give `b.py:caller` an edge to BOTH definitions, and a rebuild does. The incremental run carried only the original, because `b.py` did not change and a file's relations are only re-emitted when its own content does — and the post passes cannot close it, since they relabel edges that exist rather than create the one that should now exist. They did their half correctly: the surviving edge WAS relabelled `ambiguous`, which is what made the gap invisible. User-visible as `callgraph` and `impact` under-reporting a caller until its own file was next touched, with nothing prompting that, and independent of `PostPassScope` — reproduced unchanged with `SCOPED_POST_PASS_MAX_FILES` forced to 0. Fixed by a second extraction round driven from the CALLER (`fan_out_to_new_duplicate_definitions`), not by a post pass that synthesises the edge: re-extraction is the only mechanism that reproduces extraction's own shape, the doctrine PIPE-02 (v70, below) cost a self-reinforcing divergence to establish. `index_files` itself is unchanged — the round is a second call to it, so its "files in this run" invariants never see a set that moved. The round fires only when a name's definition count inside the run's own paths ROSE, and covers only callers whose edge Phase 2e labelled `ambiguous`, which is exactly "resolved by a bare name among same-name siblings" and excludes import-bound and type-qualified calls by construction. Old indexes are missing those edges with no other AUTOMATIC route back — editing the caller's own file restores them, which is exactly the thing nothing prompts — hence the bump. Also covers `references`, not only `calls`: `classify_edge_confidence` binds its relation pair as `params![REL_CALLS, REL_REFERENCES]`, so a type mentioned in a signature fans out by bare name the same way a call does. // Older entries (v70 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 113; // v113 (2026-09-29, pre-tag review): a JS/TS function assigned to a member is no node when the member's root is a parameter or local of an enclosing function or a host global (`global.fetch = …`, a test mock's `fake.end = () => {}`), as `this.x = …` already was; `exports` / `module`, a prototype chain, a top-level binding and a global another script defines (`jQuery.fn.x`) still name one. As nodes they drew production calls by name: 20 wrong `inferred` edges on this repo, all into test stubs. // v112 (2026-09-29, B9): a JS/TS member call whose receiver is one of Node's own modules (`path.resolve(p)`, `fs.promises.readFile(p)`, `require('path').join(p)`) emits no call: it bound a project function or method of that name elsewhere (express: `path.resolve` → `View.prototype.resolve`; this repo: `fs.renameSync` → a test's mock, `assert.ok` → a local `const ok`): it removes 9 edges over three corpora, all 9 wrong (8 cross-file, 1 same-file). // Older entries (v111 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before
@@ -637,10 +672,16 @@ pub fn is_function_node_type(node_type: &str) -> bool {
     matches!(node_type, "function" | "method")
 }
 
+/// Warning surfaced by impact analysis when a function has no caller at all in
+/// the call graph — neither production nor test. The graph cannot tell "nothing
+/// calls it" from "its callers were not resolved", so the risk reads `UNKNOWN`
+/// rather than a `LOW` that would endorse the change.
+pub const NO_CALLERS_IMPACT_WARNING: &str = "No caller of this function is in the call graph. Either nothing calls it, or its callers were not resolved (dynamic dispatch, an unresolved import, use from outside the indexed code). Check `code-graph-mcp refs <symbol>` and `code-graph-mcp grep -w <symbol>` before treating the change as safe.";
+
 /// Warning surfaced by impact analysis when the target is non-function-like
-/// and has zero call-graph callers. Prevents the risk level from reading as
-/// a misleading `LOW` for constants / types / traits whose real users are
-/// imports or type references, not calls.
+/// and its calls cannot rate it: none, or few enough for `LOW`. Prevents the
+/// risk level from reading as a misleading `LOW` for constants / types /
+/// traits whose real users are imports or type references, not calls.
 pub const NON_FUNCTION_IMPACT_WARNING: &str = "Impact analysis tracks function call chains. This symbol is not a function — actual usage (imports, field access, type annotations, instantiation) may be broader than shown. Use `find_references` (MCP) or `code-graph-mcp refs <symbol>` (CLI) to find all references.";
 
 // -- Test symbol detection --

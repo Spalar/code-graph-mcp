@@ -287,7 +287,7 @@ test('SEC-04: the scan window is bounded in the hook itself', () => {
   // Belt to the quantifier caps' braces, and the part that bounds a pattern a
   // future author adds without reading the note.
   assert.match(SOURCE, /oldStr\.length > 8192 \? oldStr\.slice\(0, 8192\)/);
-  assert.match(SOURCE, /for \(const pat of fnPatterns\) \{\n\s*const m = scanned\.match\(pat\)/);
+  assert.match(SOURCE, /for \(const pat of fnPatterns\) \{\n\s*const m = scanned\.match\(new RegExp\(pat\.source, `\$\{pat\.flags\}d`\)\)/);
 });
 
 // ── Covering-test targeting (edit-time PUSH) ────────────
@@ -353,7 +353,14 @@ test('emit: impact summary is delivered via the PreToolUse additionalContext env
 // `cgTmpDir()` on windows-latest and reddened
 // `js_test_suite_leaves_the_shared_tmp_dir_intact` in CI for v0.126.1.
 
-function runPreEditHook(t, { oldString = 'function processPayment(order) {', extraEnv = {} } = {}) {
+function runPreEditHook(t, {
+  oldString = 'function processPayment(order) {',
+  newString = 'x',
+  relPath = 'src/payments.js',
+  extraEnv = {},
+  setup = () => {},
+  stubExec = null,
+} = {}) {
   const fs = require('node:fs');
   const os = require('node:os');
   const path = require('node:path');
@@ -370,27 +377,32 @@ function runPreEditHook(t, { oldString = 'function processPayment(order) {', ext
   fs.mkdirSync(path.join(proj, '.code-graph'), { recursive: true });
   fs.writeFileSync(path.join(proj, '.code-graph', 'index.db'), '');
   fs.mkdirSync(path.join(home, 'tmp'), { recursive: true });
+  setup(proj);
 
   const preload = path.join(home, 'stub-preload.js');
   fs.writeFileSync(preload, `
     'use strict';
     const cp = require('child_process');
-    cp.execFileSync = () => JSON.stringify({
-      direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
-      callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
-      test_callers: [],
-    });
+    // grep --json answers as if every hit sat inside processPayment, so the
+    // body-edit fallback (if the hook still had one) would resolve a symbol.
+    cp.execFileSync = ${stubExec || `(bin, args) => args[0] === 'grep'
+      ? JSON.stringify([{ file: 'src/payments.js', line: 3, container: { name: 'processPayment' } }])
+      : JSON.stringify({
+        direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
+        callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
+        test_callers: [],
+      })`};
     const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
     fb.findBinary = () => ${JSON.stringify(path.join(home, 'never-executed-binary'))};
   `);
 
-  const editedFile = path.join(proj, 'src', 'payments.js');
+  const editedFile = path.resolve(proj, relPath);
   const res = spawnSync(process.execPath, ['--require', preload, path.join(__dirname, 'pre-edit-guide.js')], {
     cwd: proj,
     encoding: 'utf8',
     input: JSON.stringify({
       tool_name: 'Edit',
-      tool_input: { file_path: editedFile, old_string: oldString, new_string: 'x' },
+      tool_input: { file_path: editedFile, old_string: oldString, new_string: newString },
     }),
     env: {
       ...process.env,
@@ -424,4 +436,227 @@ test('emit(subprocess): the real hook emits additionalContext and NEVER auto-all
   assert.ok(!('permissionDecision' in out),
     `PreToolUse(Edit) must carry no permissionDecision; got ${JSON.stringify(out.permissionDecision)}`);
   assert.doesNotMatch(res.stdout, /"allow"/);
+});
+
+test('D5: no impact while the startup index is being written', (t) => {
+  // "2 callers, LOW" from a half-built index is a wrong risk, not a short one.
+  const building = (proj) => require('node:fs').writeFileSync(
+    require('node:path').join(proj, '.code-graph', 'indexing-status.json'),
+    JSON.stringify({ s: 'indexing', d: 3, t: 50 }));
+  const { res } = runPreEditHook(t, { setup: building });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '');
+  // Control: the same edit with no build in progress injects (the first test above).
+});
+
+// ── Fires only when the edit changes a definition's header ──────────────────
+// The contract at the top of pre-edit-guide.js: impact is for a signature being
+// modified. Callers cannot break on a body-only edit, and the body-edit
+// fallback that guessed the enclosing function by grep picked a wrong symbol
+// for 108 of 608 TypeScript definitions in the 2026-09-28 hook audit.
+
+test('scope: a body-only edit (no definition in old_string) injects nothing', (t) => {
+  const { res } = runPreEditHook(t, {
+    oldString: '  const total = computeTax(order) + shippingFee;',
+    newString: '  const total = computeTax(order) + shippingFee + handlingFee;',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `body edit must stay silent, got: ${res.stdout}`);
+});
+
+test('scope: an edit that keeps the definition header unchanged injects nothing', (t) => {
+  const { res } = runPreEditHook(t, {
+    oldString: 'function processPayment(order) {\n  return charge(order);',
+    newString: 'function processPayment(order) {\n  return chargeWithRetry(order);',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `unchanged header must stay silent, got: ${res.stdout}`);
+});
+
+test('scope: a changed signature still injects the impact summary', (t) => {
+  const { res } = runPreEditHook(t, {
+    oldString: 'function processPayment(order) {\n  return charge(order);',
+    newString: 'function processPayment(order, currency) {\n  return charge(order, currency);',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /code-graph:impact\] processPayment\(\)/);
+});
+
+// Shapes 0.163.0's first-pattern-wins rule names right and efe41d0's
+// earliest-match rule named wrong, which left both this hook and the Stop check
+// blind to a signature change (pre-tag review 2026-09-29). The rule is
+// 0.163.0's again; these pin it.
+for (const [label, relPath, oldString, newString, name] of [
+  ['a Rust doc comment\'s prose', 'src/a.rs',
+    '/// Adds one; the function that every caller in b.rs uses.\npub fn target(a: i32) -> i32 {',
+    '/// Adds one; the function that every caller in b.rs uses.\npub fn target(a: i32, b: i32) -> i32 {',
+    'target'],
+  ['a Rust `if` on a member call', 'src/a.rs',
+    '    if v.is_empty() {\n        return 0;\n    }\n    v.len()\n}\n\npub fn target(a: i32) -> i32 {',
+    '    if v.is_empty() {\n        return 0;\n    }\n    v.len()\n}\n\npub fn target(a: i32, b: i32) -> i32 {',
+    'target'],
+  ['a JS `if` statement', 'src/payments.js',
+    '  if (x > 0) {\n    return 1;\n  }\n}\n\nfunction processPayment(order) {',
+    '  if (x > 0) {\n    return 1;\n  }\n}\n\nfunction processPayment(order, currency) {',
+    'processPayment'],
+]) {
+  test(`scope: ${label} ahead of a changed header does not name the symbol`, (t) => {
+    const { res } = runPreEditHook(t, { relPath, oldString, newString });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, new RegExp(`code-graph:impact\\] ${name}\\(\\)`));
+  });
+}
+
+// The hook's own loop, per language (second review round, 2026-09-29): the
+// fn-extract tests above run the patterns first-match in array order, so they
+// never saw that the first repair's allow-list of JS modifiers rejected every
+// definition whose return type or keyword comes first. Each case changes the
+// header and must inject its own name.
+for (const [label, relPath, header, changed, name] of [
+  ['C', 'src/parse.c', 'int parse_header(const char *buf, int n) {', 'int parse_header(const char *buf, int n, int flags) {', 'parse_header'],
+  ['C++ out-of-line', 'src/db.cc', 'Status DBImpl::Write(const WriteOptions& o) {', 'Status DBImpl::Write(const WriteOptions& o, int x) {', 'Write'],
+  ['Java package-private', 'src/A.java', 'void recalculate(int depth) {', 'void recalculate(int depth, int max) {', 'recalculate'],
+  ['Kotlin', 'src/App.kt', 'fun processOrder(order: Int) {', 'fun processOrder(order: Int, rush: Boolean) {', 'processOrder'],
+  ['Kotlin extension', 'src/Ext.kt', 'fun String.toSlug(sep: Char) {', 'fun String.toSlug(sep: Char, max: Int) {', 'toSlug'],
+  ['C#', 'src/Repo.cs', 'public async Task SaveAsync(int order)\n{', 'public async Task SaveAsync(int order, bool flush)\n{', 'SaveAsync'],
+  ['Dart', 'lib/w.dart', 'Widget build(BuildContext context) {', 'Widget build(BuildContext context, int n) {', 'build'],
+  ['JS generator', 'src/store.js', '  *entries(prefix) {', '  *entries(prefix, limit) {', 'entries'],
+  ['Rust after a comment ending in async', 'src/a.rs', '// TODO: make this async\nfn load_all(p: &Path) -> Vec<u8> {', '// TODO: make this async\nfn load_all(p: &Path, n: usize) -> Vec<u8> {', 'load_all'],
+  ['PHP after a foreach', 'src/a.php', '    foreach ($items as $item) {\n        $x++;\n    }\n}\n\npublic function store($request) {', '    foreach ($items as $item) {\n        $x++;\n    }\n}\n\npublic function store($request, $opts) {', 'store'],
+  ['JS after a describe callback', 'src/a.js', "describe('x', function () {\n  it('y');\n});\n\nfunction save(a) {", "describe('x', function () {\n  it('y');\n});\n\nfunction save(a, b) {", 'save'],
+]) {
+  test(`scope: a ${label} definition whose header changed names itself`, (t) => {
+    const { res } = runPreEditHook(t, { relPath, oldString: header, newString: changed });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, new RegExp(`code-graph:impact\\] ${name}\\(\\)`), `got: ${res.stdout}`);
+  });
+}
+
+test('scope: an edit to a file outside the project injects nothing', (t) => {
+  const { res } = runPreEditHook(t, { relPath: '../elsewhere/payments.js' });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `outside-project edit must stay silent, got: ${res.stdout}`);
+});
+
+test('scope: CODE_GRAPH_QUIET_HOOKS=1 silences the impact summary', (t) => {
+  const { res } = runPreEditHook(t, { extraEnv: { CODE_GRAPH_QUIET_HOOKS: '1' } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `QUIET must silence the hook, got: ${res.stdout}`);
+});
+
+// ── Q4: same-file same-name definitions ─────────────────────────────────────
+// `impact X --file F` refuses when F defines X more than once (two classes'
+// `fetch`), listing each definition's node_id and start line. The hook used to go
+// silent there; it now asks again with the node_id of the definition the edit
+// changes — the last one starting at or before the edited header's line.
+
+const TWO_GETS = 'class A:\n    def fetch(self, k):\n        return k\n\n\nclass B:\n    def fetch(self, k):\n        return k\n';
+
+// The stub binary: refuses by name (exit 1 with the refusal on stdout, as the
+// CLI does), answers by id with a caller named after the id it was asked for.
+const STUB_SAME_FILE = `(bin, args) => {
+  if (args.includes('--node-id')) {
+    const id = args[args.indexOf('--node-id') + 1];
+    return JSON.stringify({ direct_callers: 1, total_callers: 1, affected_files: 1, risk: 'low',
+      callers: [{ name: 'caller_of_' + id, file: 'src/use.py', depth: 1 }], test_callers: [] });
+  }
+  const e = new Error('exit 1');
+  e.status = 1;
+  e.stdout = JSON.stringify({ error: "Ambiguous symbol 'fetch': 2 definitions in the same file (src/app.py).",
+    suggestions: [
+      { name: 'fetch', file_path: 'src/other.py', type: 'method', node_id: 99, start_line: 7 },
+      { name: 'fetch', file_path: 'src/app.py', type: 'method', node_id: 11, start_line: 2 },
+      { name: 'fetch', file_path: 'src/app.py', type: 'method', node_id: 22, start_line: 7 },
+    ] });
+  throw e;
+}`;
+
+function writeTwoGets(proj) {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'app.py'), TWO_GETS);
+}
+
+test('Q4: a same-file same-name edit injects the impact of the edited definition', (t) => {
+  const second = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(second.res.status, 0, second.res.stderr);
+  assert.match(second.res.stdout, /caller_of_22/, 'B.fetch starts at line 7');
+  const first = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: '    def fetch(self, k):\n        return k\n\n\nclass B:', newString: '    def fetch(self, key):\n        return key\n\n\nclass B:',
+  });
+  assert.equal(first.res.status, 0, first.res.stderr);
+  assert.match(first.res.stdout, /caller_of_11/, 'A.fetch starts at line 2');
+});
+
+// The refusal lists at most five definitions (`total` says how many exist, in
+// source order). An edit past the last listed one may be an unlisted
+// definition: picking the last listed named `go_5`'s caller for C7.run
+// (pre-tag review 2026-09-29). Only there the hook stays silent.
+const SEVEN_RUNS = Array.from({ length: 7 }, (_, i) =>
+  `class C${i + 1}:\n    def run(self):\n        return ${i + 1}\n\n`).join('');
+const STUB_CUT_LIST = `(bin, args) => {
+  if (args.includes('--node-id')) {
+    const id = args[args.indexOf('--node-id') + 1];
+    return JSON.stringify({ direct_callers: 1, total_callers: 1, affected_files: 1, risk: 'low',
+      callers: [{ name: 'caller_of_' + id, file: 'src/views.py', depth: 1 }], test_callers: [] });
+  }
+  const e = new Error('exit 1');
+  e.status = 1;
+  e.stdout = JSON.stringify({ error: "Ambiguous symbol 'run': 7 definitions in the same file (src/views.py). Showing the first 5 of 7.",
+    suggestions: [2, 6, 10, 14, 18].map((line, i) =>
+      ({ name: 'run', file_path: 'src/views.py', type: 'method', node_id: 101 + i, start_line: line })),
+    total: 7 });
+  throw e;
+}`;
+for (const [k, expect] of [[7, null], [2, 'caller_of_102'], [5, 'caller_of_105']]) {
+  test(`Q4: C${k}.run with the refusal list cut at five → ${expect || 'silent'}`, (t) => {
+    const { res } = runPreEditHook(t, {
+      relPath: 'src/views.py', stubExec: STUB_CUT_LIST,
+      setup: (proj) => {
+        require('node:fs').mkdirSync(require('node:path').join(proj, 'src'), { recursive: true });
+        require('node:fs').writeFileSync(require('node:path').join(proj, 'src', 'views.py'), SEVEN_RUNS);
+      },
+      oldString: `class C${k}:\n    def run(self):`, newString: `class C${k}:\n    def run(self, fast=False, *, x):`,
+    });
+    assert.equal(res.status, 0, res.stderr);
+    if (expect) assert.match(res.stdout, new RegExp(expect));
+    else assert.equal(res.stdout.trim(), '', `must stay silent, got: ${res.stdout}`);
+  });
+}
+
+// Where a definition starts is its name's line: `// TODO: make this async\n
+// fn load(` matches from the comment line, and counting from there picked
+// the previous `load` of the file.
+const TWO_LOADS = 'impl A {\n    // TODO: make this async\n    fn load(&self) {}\n}\n\nimpl B {\n    // TODO: make this async\n    fn load(&self) {}\n}\n';
+const STUB_TWO_LOADS = STUB_SAME_FILE
+  .replace("'Ambiguous symbol \\'fetch\\'", "'Ambiguous symbol \\'load\\'")
+  .replace(/file_path: 'src\/app.py', type: 'method', node_id: 11, start_line: 2/, "file_path: 'src/lib.rs', type: 'method', node_id: 11, start_line: 3")
+  .replace(/file_path: 'src\/app.py', type: 'method', node_id: 22, start_line: 7/, "file_path: 'src/lib.rs', type: 'method', node_id: 22, start_line: 8");
+test('Q4: a match that starts on a comment line counts from its name\'s line', (t) => {
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/lib.rs', stubExec: STUB_TWO_LOADS,
+    setup: (proj) => {
+      require('node:fs').mkdirSync(require('node:path').join(proj, 'src'), { recursive: true });
+      require('node:fs').writeFileSync(require('node:path').join(proj, 'src', 'lib.rs'), TWO_LOADS);
+    },
+    oldString: 'impl B {\n    // TODO: make this async\n    fn load(&self) {}',
+    newString: 'impl B {\n    // TODO: make this async\n    fn load(&self, n: usize) {}',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_22/, `B.load starts at line 8; got: ${res.stdout}`);
+});
+
+test('Q4: no candidate at or before the edited line → silent, never a guess', (t) => {
+  const stub = STUB_SAME_FILE.replace(/start_line: \d+ }/g, 'start_line: 50 }');
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: stub,
+    oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '');
 });

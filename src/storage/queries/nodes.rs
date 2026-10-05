@@ -244,17 +244,17 @@ pub fn get_nodes_with_files_by_qualified_name(
 }
 
 /// Collect cross-file inbound edges before deleting a file's nodes.
-/// Returns (source_id, source_file_id, target_name, relation, metadata) for
-/// edges where:
+/// Returns (source_id, source_file_id, target_name, relation, metadata,
+/// target qualified_name) for edges where:
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
 pub fn get_inbound_cross_file_edges(
     conn: &Connection,
     file_id: i64,
-) -> Result<Vec<(i64, i64, String, String, Option<String>)>> {
+) -> Result<Vec<(i64, i64, String, String, Option<String>, Option<String>)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata
+        "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata, nt.qualified_name
          FROM edges e
          JOIN nodes nt ON nt.id = e.target_id
          JOIN nodes ns ON ns.id = e.source_id
@@ -267,6 +267,7 @@ pub fn get_inbound_cross_file_edges(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -981,6 +982,141 @@ pub fn filter_method_ids(
         }
     }
     Ok(kept)
+}
+
+/// `node_ids` minus the free functions (`type = 'function'`): what a member call
+/// on an object can reach. A function with a dotted qualified name is kept: in
+/// JS that is a nested function its factory returns in an object literal
+/// (`makeStub.attemptUpgrade`), a member of the returned object. Order is not
+/// preserved. Chunked under MAX_IN_PARAMS.
+pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut kept = Vec::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let sql = format!(
+            "SELECT id FROM nodes WHERE id IN ({})
+             AND (type <> 'function' OR qualified_name LIKE '%.%')",
+            make_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for row in rows {
+            kept.push(row?);
+        }
+    }
+    Ok(kept)
+}
+
+/// Every function and method node: what an `inherits` / `implements` edge can
+/// never point at (a C++ constructor shares its class's name; a method may be
+/// named like a library base, `testing::Test` vs a `Test()` method).
+pub fn callable_node_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE type IN ('function', 'method')")?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A recorded C++ field: `(class node id, field, dot type, arrow type)`.
+pub type CppFieldRow = (i64, String, Option<String>, Option<String>);
+
+/// Record C++ class fields.
+pub fn insert_cpp_fields(conn: &Connection, rows: &[CppFieldRow]) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO cpp_fields (class_id, field, dot_type, arrow_type) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (class_id, field, dot, arrow) in rows {
+        stmt.execute(rusqlite::params![class_id, field, dot, arrow])?;
+    }
+    Ok(())
+}
+
+/// Every recorded C++ field.
+pub fn cpp_fields(conn: &Connection) -> Result<Vec<CppFieldRow>> {
+    let mut stmt = conn.prepare("SELECT class_id, field, dot_type, arrow_type FROM cpp_fields")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Node types that define a class-like type, for receiver-type resolution.
+const CLASS_LIKE_TYPES: &str = "('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')";
+
+/// Every class-like node: `(id, file id, spelling, nested)`, the spelling being
+/// `qualified_name` else `name`, and `nested` whether another class-like node of
+/// its file encloses it by line span — a C++ class defined in another's body
+/// keeps a bare name (`Iterator` inside `SkipList`), and only its span tells it
+/// apart from a top-level one. One scan, read once per resolution pass.
+pub fn class_like_names(conn: &Connection) -> Result<Vec<(i64, i64, String, bool)>> {
+    // Nesting is decided here rather than by a correlated subquery per class,
+    // which cost 141 ms on django's 10,342 class nodes — on every incremental run.
+    let sql = format!(
+        "SELECT id, file_id, COALESCE(qualified_name, name), start_line, end_line
+         FROM nodes WHERE type IN {CLASS_LIKE_TYPES}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut by_file: HashMap<i64, Vec<(i64, i64, i64)>> = HashMap::new();
+    for (id, file_id, _, start, end) in &rows {
+        by_file
+            .entry(*file_id)
+            .or_default()
+            .push((*id, *start, *end));
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(id, file_id, name, start, end)| {
+            let nested = by_file[&file_id]
+                .iter()
+                .any(|&(o, s, e)| o != id && s <= start && e >= end);
+            (id, file_id, name, nested)
+        })
+        .collect())
+}
+
+/// Every `inherits` edge as `(subclass id, superclass id)`.
+pub fn inherits_edges(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT source_id, target_id FROM edges WHERE relation = ?1")?;
+    let rows = stmt.query_map([crate::domain::REL_INHERITS], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// `id → (file id, qualified_name or '')` for `node_ids`. Chunked under
+/// MAX_IN_PARAMS.
+pub fn get_node_files_and_qualified_names(
+    conn: &Connection,
+    node_ids: &[i64],
+) -> Result<HashMap<i64, (i64, String)>> {
+    let mut out = HashMap::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let sql = format!(
+            "SELECT id, file_id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
+            make_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?;
+        for row in rows {
+            let (id, v) = row?;
+            out.insert(id, v);
+        }
+    }
+    Ok(out)
 }
 
 /// Find nodes that are missing context strings (likely from a failed Phase 3).

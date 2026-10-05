@@ -1162,24 +1162,23 @@ fn edge_identities(db: &Database) -> Vec<String> {
 fn python_resolution_tier_inventory_is_pinned() {
     let (_p, db) = python_resolution_fixture();
     let expected = [
-        // Two fan-outs, two edges each, and both are the conservative answer:
-        // `go -> execute` binds to BOTH `Command.execute` and `Builder.execute`
-        // because receiver `cmd` is untyped; `child.run -> helper` is resolved by
-        // bare name, so it reaches the unrelated `other.py:helper` as well as the
-        // inherited `base.py:helper`. Precision work targets exactly these four.
-        // Narrowing either pair to its one true target is an improvement;
-        // dropping a pair to zero edges is not — and only the identities tell
-        // those two apart.
+        // A fan-out, the conservative answer: `go -> execute` binds to BOTH
+        // `Command.execute` and `Builder.execute` because receiver `cmd` is
+        // untyped. Narrowing it to its one true target is an improvement;
+        // dropping it to zero edges is not — and only the identities tell those
+        // two apart.
         "calls ambiguous app.py:go -> builder.py:Builder.execute",
         "calls ambiguous app.py:go -> cmd.py:Command.execute",
-        "calls ambiguous child.py:Child.run -> base.py:Base.helper",
-        "calls ambiguous child.py:Child.run -> other.py:Other.helper",
         // A constructor call inside one file.
         "calls extracted builder.py:make_builder -> builder.py:Builder",
         // The import-mediated calls, plus the project `def open` that shadows
         // the builtin.
         "calls inferred app.py:go -> builder.py:make_builder",
         "calls inferred caller.py:call_it -> shadow.py:open",
+        // `self.helper()` in `Child(Base)` binds the `helper` it inherits,
+        // decided (v77). It was a bare-name fan-out that also reached the
+        // unrelated `other.py:Other.helper`, both edges `ambiguous`.
+        "calls inferred child.py:Child.run -> base.py:Base.helper",
         "calls inferred dotted.py:run -> pkg/models.py:load",
         "calls inferred dotted.py:run -> pkg/views.py:render",
         "imports extracted app.py:<module> -> builder.py:<module>",

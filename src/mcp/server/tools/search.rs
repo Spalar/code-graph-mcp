@@ -107,9 +107,14 @@ impl McpServer {
         // The query is embedded ONCE here even though retrieval can run twice
         // (the pool-exhaustion retry below): embedding is the expensive half.
         let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
-        let vector_available = model_guard.is_some() && self.db.vec_enabled();
+        // A loaded model over an index with no vectors yet is the FTS5 channel
+        // alone (B7); a failed probe keeps the prior reading.
+        let channel = vector_channel(model_guard.is_some() && self.db.vec_enabled(), || {
+            queries::any_node_vector(self.db.conn()).unwrap_or(true)
+        });
+        let vector_available = channel == VectorChannel::Ready;
         let query_embedding: Option<Vec<f32>> = match *model_guard {
-            Some(ref model) if self.db.vec_enabled() => model.embed(query).ok(),
+            Some(ref model) if vector_available => model.embed(query).ok(),
             _ => None,
         };
         drop(model_guard);
@@ -569,6 +574,7 @@ impl McpServer {
             // same mechanism; the envelope contract is what makes one attach
             // point cover all three shapes.
             shortfall.attach(&mut compressed);
+            note_vector_channel(&mut compressed, channel);
             return Ok(compressed);
         }
 
@@ -581,6 +587,7 @@ impl McpServer {
                 vector_available,
             );
             shortfall.attach(&mut out);
+            note_vector_channel(&mut out, channel);
             return Ok(out);
         }
 
@@ -597,6 +604,7 @@ impl McpServer {
             vector_available,
         );
         shortfall.attach(&mut out);
+        note_vector_channel(&mut out, channel);
         Ok(out)
     }
 }
@@ -952,8 +960,9 @@ fn explain_empty_results(
             // The envelope contract ("ONE envelope on every path", see
             // `finalize_search_results`) — this was the only branch that omitted
             // both fields, so a caller reading `search_mode` had to special-case
-            // the filter-emptied answer. No `note` here: the cause is known and
-            // named, and it is the filter, not the missing vector channel.
+            // the filter-emptied answer. No `note` is built here; the caller
+            // adds the vector-channel note (`note_vector_channel`) to this
+            // answer as to every other.
             "search_mode": if vector_available { "hybrid" } else { "fts_only" },
             "vector_available": vector_available
         });
@@ -1044,6 +1053,44 @@ fn explain_empty_results(
 /// in the corpus) while they returned relevant results. The message states the
 /// mechanic and explicitly does not claim the results are wrong.
 const VECTOR_ONLY_WARNING: &str = "No exact text matches — results are ranked by vector similarity alone (no keyword anchor). Vague or natural-language queries often land here yet still return relevant symbols, so judge by the results; if they miss, add a concrete identifier or use ast_search with type/returns/params filters.";
+
+/// What the vector half of a semantic search has to work with (B7,
+/// 2026-09-29 usage evaluation). `search_mode` said `hybrid` whenever the model
+/// was loaded — also before the backfill had embedded anything, when the KNN
+/// half returns nothing and every result is FTS5's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorChannel {
+    Ready,
+    /// No model loaded, or no vector storage: [`fts_only_note`].
+    NoModel,
+    /// A loaded model and an empty vector table: the backfill has not stored
+    /// its first batch yet.
+    NotEmbedded,
+}
+
+/// The channel, probing the vector table only when a model is loaded.
+fn vector_channel(model_loaded: bool, has_vectors: impl FnOnce() -> bool) -> VectorChannel {
+    if !model_loaded {
+        VectorChannel::NoModel
+    } else if has_vectors() {
+        VectorChannel::Ready
+    } else {
+        VectorChannel::NotEmbedded
+    }
+}
+
+/// Replace the no-model note with the right cause when the model IS loaded
+/// but nothing is embedded yet. The answer's `search_mode` / `vector_available`
+/// already read `fts_only` / `false` from `vector_available`.
+fn note_vector_channel(out: &mut serde_json::Value, channel: VectorChannel) {
+    if channel == VectorChannel::NotEmbedded {
+        out["note"] = json!(
+            "The embedding model is loaded, but this index is not embedded yet (the background \
+             backfill has not stored its first batch) — results are FTS5-only until it does. \
+             `code-graph-mcp health-check` shows embedding progress."
+        );
+    }
+}
 
 /// The one wording for "this answer had no vector channel", shared by every
 /// branch that owes it.
@@ -1490,6 +1537,87 @@ mod tests {
         assert!(
             note.contains("embed-model"),
             "the note must name the missing feature — it is the only remedy, got: {note}"
+        );
+    }
+
+    /// B7: `search_mode` said `hybrid` whenever the model was loaded — also
+    /// over an index with no vectors yet, where KNN returns nothing and every
+    /// result is FTS5's. The channel is ready only with a model AND vectors.
+    #[test]
+    fn the_vector_channel_needs_a_model_and_at_least_one_vector() {
+        assert_eq!(vector_channel(false, || true), VectorChannel::NoModel);
+        assert_eq!(vector_channel(true, || false), VectorChannel::NotEmbedded);
+        assert_eq!(vector_channel(true, || true), VectorChannel::Ready);
+        // No model: the vector table is not even asked.
+        assert_eq!(
+            vector_channel(false, || panic!("probed without a model")),
+            VectorChannel::NoModel
+        );
+    }
+
+    #[test]
+    fn a_loaded_model_with_nothing_embedded_says_so_not_model_not_loaded() {
+        let mut out = finalize_search_results(dummy_results(), 0.90, false, false, false);
+        note_vector_channel(&mut out, VectorChannel::NotEmbedded);
+        let note = out["note"].as_str().unwrap_or_default();
+        assert!(note.contains("not embedded yet"), "{note}");
+        assert!(!note.contains("not loaded"), "{note}");
+        assert_eq!(out["search_mode"], "fts_only");
+
+        let mut ready = finalize_search_results(dummy_results(), 0.90, false, false, true);
+        note_vector_channel(&mut ready, VectorChannel::Ready);
+        assert!(ready.get("note").is_none(), "{ready}");
+        let mut none = finalize_search_results(dummy_results(), 0.90, false, false, false);
+        let before = none["note"].clone();
+        note_vector_channel(&mut none, VectorChannel::NoModel);
+        assert_eq!(none["note"], before, "the no-model note is left as it was");
+    }
+
+    /// End to end with the real model: loaded, over an index whose vector
+    /// table is empty. Needs the model on disk; without it there is nothing to
+    /// check.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn a_search_before_any_vector_exists_reports_fts_only() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("a.rs"),
+            "fn widget_alpha() {}\nfn widget_beta() { widget_alpha(); }\n",
+        )
+        .unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        // The test server opens without vector storage; a real one has it.
+        server.db = crate::storage::db::Database::open_with_vec(
+            &project.path().join(CODE_GRAPH_DIR).join("index.db"),
+        )
+        .unwrap();
+        server.ensure_indexed().unwrap();
+        let Some(model) = crate::embedding::model::EmbeddingModel::load().unwrap() else {
+            return;
+        };
+        *lock_or_recover(&server.embedding_model, "embedding_model") = Some(model);
+        // An index the backfill has not reached yet. (Indexing here can already
+        // store vectors, copied from the embedding cache.)
+        server
+            .db
+            .conn()
+            .execute("DELETE FROM node_vectors", [])
+            .unwrap();
+        assert!(
+            !crate::storage::queries::any_node_vector(server.db.conn()).unwrap_or(true),
+            "precondition: nothing embedded"
+        );
+        let out = server
+            .tool_semantic_search(&json!({ "query": "widget" }))
+            .unwrap();
+        assert_eq!(out["search_mode"], "fts_only", "{out}");
+        assert_eq!(out["vector_available"], false, "{out}");
+        assert!(
+            out["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not embedded yet"),
+            "{out}"
         );
     }
 

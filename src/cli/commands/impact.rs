@@ -7,8 +7,12 @@ use super::*;
     about = "Impact analysis (callers, routes, risk level)"
 )]
 pub struct ImpactArgs {
-    /// Symbol name to analyze
-    pub symbol: String,
+    /// Symbol name to analyze (required unless --node-id is given)
+    pub symbol: Option<String>,
+    /// Analyze exactly this definition: a node_id from a same-file ambiguity
+    /// answer or `show --json` (authoritative over --file)
+    #[arg(long = "node-id")]
+    pub node_id: Option<i64>,
     // The bound stays in the handler and is DERIVED from the traversal's own cap,
     // not typed here; clap parse-errors (exit 2) on non-numeric.
     /// Max traversal depth (default: 3)
@@ -38,9 +42,9 @@ pub struct ImpactArgs {
 /// Shows callers with route info and risk level.
 pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // clap accepts an empty-string positional; preserve the non-empty guard.
-    let raw_symbol = args.symbol.as_str();
-    if raw_symbol.is_empty() {
-        anyhow::bail!("Usage: code-graph-mcp impact <symbol> [--depth N] [--file <path>] [--change-type signature|behavior|remove] [--json]");
+    let raw_symbol = args.symbol.as_deref().unwrap_or("");
+    if raw_symbol.is_empty() && args.node_id.is_none() {
+        anyhow::bail!("Usage: code-graph-mcp impact <symbol> [--node-id N] [--depth N] [--file <path>] [--change-type signature|behavior|remove] [--json]");
     }
 
     // 1..=CALL_GRAPH_MAX_DEPTH, taken from the constant the traversal enforces
@@ -57,7 +61,14 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         Some(f) => Some(normalize_user_path(project_root, f)?),
         None => None,
     };
-    let explicit_file = explicit_file_owned.as_deref();
+    // `--node-id` names one definition, so a file selector has nothing left to
+    // choose (same rule as `refs --node-id`).
+    if args.node_id.is_some() && explicit_file_owned.is_some() {
+        eprintln!("[code-graph] Note: --file is ignored when --node-id is given (node_id is authoritative).");
+    }
+    let explicit_file = explicit_file_owned
+        .as_deref()
+        .filter(|_| args.node_id.is_none());
     let change_type = args.change_type.as_str();
     if !matches!(change_type, "signature" | "behavior" | "remove") {
         anyhow::bail!("--change-type must be one of: signature, behavior, remove");
@@ -73,8 +84,33 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
+    let not_found_extra = serde_json::json!({});
+    let mut node_target = match args.node_id {
+        Some(nid) => Some(CliNodeTarget::lookup(
+            conn,
+            nid,
+            json_mode,
+            &not_found_extra,
+        )?),
+        None => None,
+    };
+    // A symbol in a file added since the last index (D2).
+    if node_target.is_none() {
+        crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
+    }
+    let target_name: Option<String> = node_target.as_ref().map(|target| target.name.clone());
+    let raw_symbol = target_name.as_deref().unwrap_or(raw_symbol);
 
-    let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+    let selected = match &node_target {
+        Some(target) => Ok(CliSymbolSelection {
+            lookup_name: target.name.clone(),
+            bare_name: target.name.clone(),
+            file_filter: None,
+            lookup: CliSymbolLookup::Bare,
+        }),
+        None => select_cli_symbol(conn, raw_symbol, explicit_file)?,
+    };
+    let selection = match selected {
         Ok(selection) => selection,
         Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
             emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
@@ -139,24 +175,36 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let symbol = selection.lookup_name.as_str();
     let output_symbol = selection.bare_name.as_str();
     let file_filter = selection.file_filter.as_deref();
+    // Refresh the selector's own file before anything reads it. The same-file
+    // gate below lists node_ids and start lines, and the edit hook picks one by
+    // the line on disk: from an index an unindexed edit had shifted, it picked
+    // the neighbour (pre-tag review 2026-09-29).
+    if let Some(fp) = file_filter {
+        refresh_files_if_stale(&ctx.db, &ctx.project_root, &[fp.to_string()]).disclose();
+    }
 
-    let fetch_nodes = |sym: &str| -> Result<Vec<queries::NodeResult>> {
-        if is_exact_qualified {
-            let ids = crate::resolve::selectable_qualified_definitions(conn, sym, file_filter)?
-                .into_iter()
-                .map(|candidate| candidate.node.id)
-                .collect::<Vec<_>>();
-            Ok(ids
-                .into_iter()
-                .filter_map(|id| queries::get_node_by_id(conn, id).ok().flatten())
-                .collect())
-        } else {
-            queries::get_nodes_by_name(conn, sym)
-        }
-    };
+    let fetch_nodes =
+        |sym: &str, target: &Option<CliNodeTarget>| -> Result<Vec<queries::NodeResult>> {
+            if let Some(target) = target {
+                Ok(queries::get_node_by_id(conn, target.id)?
+                    .into_iter()
+                    .collect())
+            } else if is_exact_qualified {
+                let ids = crate::resolve::selectable_qualified_definitions(conn, sym, file_filter)?
+                    .into_iter()
+                    .map(|candidate| candidate.node.id)
+                    .collect::<Vec<_>>();
+                Ok(ids
+                    .into_iter()
+                    .filter_map(|id| queries::get_node_by_id(conn, id).ok().flatten())
+                    .collect())
+            } else {
+                queries::get_nodes_by_name(conn, sym)
+            }
+        };
 
     // Verify symbol exists before running impact analysis
-    let mut symbol_nodes = fetch_nodes(symbol)?;
+    let mut symbol_nodes = fetch_nodes(symbol, &node_target)?;
     if symbol_nodes.is_empty() {
         if json_mode {
             println!(
@@ -254,16 +302,27 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge callers across
     // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
-    if file_filter.is_none() && !is_exact_qualified {
-        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+    // A file selector cannot split same-file definitions either; a node_id can.
+    if !is_exact_qualified && node_target.is_none() {
+        let cands = match file_filter {
+            None => crate::resolve::detect_ambiguity(conn, symbol)?,
+            Some(fp) => crate::resolve::detect_same_file_ambiguity(conn, symbol, fp)?,
+        };
+        if let Some(cands) = cands {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }
 
-    let mut caller_set = crate::graph::routes::get_callers_with_route_info(
+    let seed_of = |target: &Option<CliNodeTarget>| match target {
+        Some(target) => crate::graph::query::CallGraphSeed::Node(target.id),
+        None => crate::graph::query::CallGraphSeed::Name {
+            name: symbol,
+            file_path: file_filter,
+        },
+    };
+    let mut caller_set = crate::graph::routes::get_callers_with_route_info_seeded(
         conn,
-        symbol,
-        file_filter,
+        seed_of(&node_target),
         depth,
         min_conf_rank,
     )?;
@@ -282,7 +341,11 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
         let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
         if outcome.any_changed {
-            if is_exact_qualified {
+            // The re-index reused ids: re-find the node before re-running
+            // anything with its id (SURF-16).
+            if let Some(target) = node_target.as_mut() {
+                target.reresolve(conn, json_mode, &not_found_extra, || outcome.disclose())?;
+            } else if is_exact_qualified {
                 match select_cli_symbol(conn, raw_symbol, explicit_file)? {
                     Ok(refreshed) if refreshed.lookup == CliSymbolLookup::ExactQualified => {}
                     Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
@@ -305,14 +368,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                     }
                 }
             }
-            caller_set = crate::graph::routes::get_callers_with_route_info(
+            caller_set = crate::graph::routes::get_callers_with_route_info_seeded(
                 conn,
-                symbol,
-                file_filter,
+                seed_of(&node_target),
                 depth,
                 min_conf_rank,
             )?;
-            symbol_nodes = fetch_nodes(symbol)?;
+            symbol_nodes = fetch_nodes(symbol, &node_target)?;
         }
         outcome.disclose();
         outcome
@@ -329,10 +391,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         .map(|c| c.node_id)
         .collect();
     let ambiguous_callers_excluded =
-        crate::graph::query::count_suppressed_seed_edges(
+        crate::graph::query::count_suppressed_seed_edges_seeded(
             conn,
-            symbol,
-            file_filter,
+            seed_of(&node_target),
             crate::graph::query::Direction::Callers,
             min_conf_rank,
         )? + crate::graph::query::count_suppressed_into(conn, &caller_ids, min_conf_rank)?;
@@ -378,6 +439,14 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         seen.len()
     };
 
+    // No production caller: disclose where the name is dispatched dynamically
+    // (P1 #4). Not folded into any count above — these are not edges.
+    let boundaries = if prod_callers.is_empty() {
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+    } else {
+        None
+    };
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
@@ -421,6 +490,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         if let Some(note) = caller_set.truncation_note() {
             result["callers_truncated"] = serde_json::json!(true);
             result["callers_truncated_note"] = serde_json::json!(note);
+        }
+        if let Some(b) = &boundaries {
+            result["boundaries"] = b.to_json();
         }
         fresh_outcome.attach_partial(&mut result);
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
@@ -486,6 +558,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 indent, c.name, c.node_type, c.file_path
             )?;
         }
+    }
+    if let Some(b) = &boundaries {
+        b.render_text(&mut stdout, "  ")?;
     }
 
     Ok(())

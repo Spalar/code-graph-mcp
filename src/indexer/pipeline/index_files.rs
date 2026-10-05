@@ -31,7 +31,9 @@ use crate::domain::{
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::hash_file;
-use crate::parser::relations::extract_relations_from_tree;
+use crate::parser::relations::{
+    cpp_class_fields, extract_relations_from_tree, CppField, ParsedRelation,
+};
 use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree};
 use crate::storage::db::Database;
 use crate::storage::queries::{
@@ -50,11 +52,11 @@ use super::js_modules::{
     resolve_php_include_path,
 };
 use super::python_modules::{
-    build_python_module_map, project_module_files, resolve_python_module_targets,
+    build_python_module_map, project_module_files_from, resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
-    refine_ambiguous_targets, resolve_pending_calls,
+    refine_ambiguous_targets,
 };
 use super::{IndexPhase, IndexResult, IndexStats, ProgressFn};
 
@@ -91,9 +93,12 @@ pub(super) const BATCH_SIZE: usize = 500;
 /// Measured (2026-09-08) on a generated TypeScript corpus of 500 KiB files,
 /// each half the 1 MiB per-file cap, indexed by the release binary: peak RSS ran
 /// at ~70x the batch's source bytes and scaled linearly with it — 29 MB source
-/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB. The amplification is the
+/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB. The amplification was the
 /// trees plus `ParsedNode::code_content`, which stores each node's own text, so
-/// nested declarations carry their bodies more than once.
+/// nested declarations carry their bodies more than once. Since Phase 1a
+/// extracts relations and drops each tree in its worker, a batch holds its
+/// nodes and relations instead of its trees, and peak RSS fell on every corpus
+/// measured (2026-09-27, generated TypeScript: 1,496 -> 1,131 MiB).
 ///
 /// 16 MiB leaves the common case untouched: this repo indexes ~6 MiB of source
 /// across 333 tracked files (mean 26.6 KiB), so an ordinary run still forms one
@@ -232,10 +237,18 @@ struct FilePreParsed {
     rel_path: String,
     source: String,
     language: String,
-    tree: tree_sitter::Tree,
     hash: String,
     last_modified: i64,
     parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+    /// The file's relations, extracted here beside its nodes: a pure function
+    /// of the tree, and the costliest one (django: 3.6 s of a 12.5 s full index
+    /// while it ran sequentially in Phase 2). The tree is dropped with the
+    /// worker's closure instead of being held through Phase 2. Kept in walk
+    /// order: resolution depends on it (reversing it changed 32–86 edges per
+    /// corpus), so nothing between here and Phase 2 may reorder it.
+    relations: Vec<ParsedRelation>,
+    /// C++ only: each class body's typed fields (`record_cpp_fields`).
+    cpp_fields: Vec<CppField>,
     /// This file's tree carried ERROR node(s). Travels beside the `parse_errors`
     /// counter rather than replacing it: the counter is this run's total, this
     /// flag is which file, and only the second can be folded into the index's
@@ -246,14 +259,14 @@ struct FilePreParsed {
 }
 
 // Heavyweight per-file data used during Phase 1+2, dropped after each batch.
-// No blanket `#[allow(dead_code)]`: all nine fields have real readers, and the
+// No blanket `#[allow(dead_code)]`: every field has a real reader, and the
 // allow was suppressing FIELD-level dead-code detection for the struct that
 // carries a whole batch's parse state (audit 2026-08-29 ARC-04).
 struct FileParsed {
     rel_path: String,
-    source: String,
     language: String,
-    tree: tree_sitter::Tree,
+    relations: Vec<ParsedRelation>,
+    cpp_fields: Vec<CppField>,
     file_id: i64,
     node_ids: Vec<i64>,
     node_names: Vec<String>,
@@ -266,6 +279,29 @@ struct FileParsed {
     // source resolution can reject a same-named function/method (a C++ inline
     // constructor shares its class's name) — only a type node can be a supertype.
     node_types: Vec<String>,
+    // 1-based (start, end) lines parallel to node_ids: a relation's source_line
+    // picks among same-named source nodes by containment.
+    node_lines: Vec<(u32, u32)>,
+    // Rust function id → its parameters, for this file's functions: the
+    // batch-time half of `resolve::rust_call_shape_admits`.
+    rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape>,
+}
+
+impl FileParsed {
+    /// Drop the candidates this file's Rust call cannot reach by its syntax
+    /// (`resolve::rust_call_shape_admits`). Only this file's functions are known
+    /// here, and only same-file binds are decided at batch time; the deferred
+    /// pass applies the rule to the whole pool.
+    fn retain_rust_call_shape(&self, rel: &ParsedRelation, candidates: &mut Vec<i64>) {
+        if self.language != "rust" {
+            return;
+        }
+        candidates.retain(|id| {
+            self.rust_fn_shapes.get(id).is_none_or(|shape| {
+                super::resolve::rust_call_shape_admits(rel.metadata.as_deref(), shape)
+            })
+        });
+    }
 }
 
 /// The counters Phase 1a bumps from rayon worker threads, so they are atomics
@@ -366,8 +402,26 @@ enum PreParseOutcome {
     Nothing,
 }
 
+/// Phase 1a's workers. They run the relation walk, which recurses to
+/// `MAX_RELATION_DEPTH`, so they get the index thread's stack budget
+/// ([`crate::domain::INDEX_THREAD_STACK_SIZE`]) instead of rayon's default,
+/// `thread::spawn`'s 2 MiB. None when the pool cannot be built: Phase 1a then
+/// runs on the calling thread.
+fn parse_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("code-graph-parse-{i}"))
+            .stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)
+            .build()
+            .map_err(|e| tracing::warn!("[index] parse pool unavailable, parsing serially: {e}"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Phase 1a: the parallel, CPU-bound half of indexing one batch — read, parse,
-/// extract nodes. Touches no DB state (Phase 1b does the inserts sequentially),
+/// extract nodes and relations. Touches no DB state (Phase 1b does the inserts sequentially),
 /// which is what makes it safe to fan out over rayon. Files it cannot handle
 /// are counted in `counters`; those whose hash is nonetheless known come back
 /// as [`SkippedFile`] so Phase 1b can record them instead of leaving stale
@@ -378,172 +432,180 @@ fn pre_parse_batch(
     hashes: &HashMap<String, String>,
     counters: &SkipCounters,
 ) -> PreParsed {
-    let outcomes: Vec<PreParseOutcome> = batch
-        .par_iter()
-        .map(|rel_path| {
-            let mut language = match detect_language(rel_path) {
-                Some(l) => l,
-                None => {
-                    counters.language.fetch_add(1, AtomicOrdering::Relaxed);
-                    return PreParseOutcome::Nothing;
-                }
-            };
-            let abs_path = root.join(rel_path);
-
-            let file_meta = std::fs::metadata(&abs_path).ok();
-            let last_modified = file_meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            // Resolve the hash up front so an oversize file can still be
-            // RECORDED (we know exactly which bytes we are declining to parse).
-            // Falls back to hashing only when the caller did not supply one.
-            // A caller with hashes already in hand (the incremental paths, the
-            // query-time refresh) supplies them; a full index does not, and for
-            // those the hash comes from the bytes read below rather than from a
-            // second full read of the same file (audit 2026-08-22 P2-16).
-            let provided_hash = hashes.get(rel_path.as_str()).cloned();
-            if let Some(ref meta) = file_meta {
-                if meta.len() > max_file_size() {
-                    tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
-                    counters.size.fetch_add(1, AtomicOrdering::Relaxed);
-                    // This branch never reads the file, so an unsupplied hash
-                    // still costs one read — unchanged from before, and it
-                    // applies only to files we refuse to parse.
-                    let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
-                    return match known_hash {
-                        Some(hash) => PreParseOutcome::Skipped(SkippedFile {
-                            rel_path: rel_path.clone(),
-                            hash,
-                            last_modified,
-                            language: language.to_string(),
-                        }),
-                        None => PreParseOutcome::Nothing,
-                    };
-                }
+    let parse_one = |rel_path: &String| {
+        let mut language = match detect_language(rel_path) {
+            Some(l) => l,
+            None => {
+                counters.language.fetch_add(1, AtomicOrdering::Relaxed);
+                return PreParseOutcome::Nothing;
             }
+        };
+        let abs_path = root.join(rel_path);
 
-            // Read as BYTES, then decode — so the encoding verdict and the hash we
-            // record come from the SAME read and cannot describe different content.
-            //
-            // The first cut used `read_to_string` and, on failure, `hash_file`,
-            // which is an independent second `File::open` (merkle.rs). Its comment
-            // claimed that "succeeds exactly where the failure was an encoding one";
-            // it does not — it succeeds wherever the bytes are readable at that
-            // later moment, a strictly larger set. So a TRANSIENT first-read failure
-            // (fd exhaustion under this rayon fan-out, an EIO blip, a concurrent
-            // non-atomic writer caught mid-multibyte) would fail read 1, succeed
-            // read 2, and record a `files` row whose hash matches what is on disk —
-            // after `buffer_then_delete_files` had already purged the file's
-            // symbols. `compute_diff` then sees it as unchanged and never re-offers
-            // it, so the symbols stay gone until the content changes again or
-            // INDEX_VERSION moves. Under the old `Nothing` that case was
-            // self-healing (pre-tag review P2-2).
-            //
-            // One read makes the two agree by construction: an identity is recorded
-            // only for bytes actually held.
-            let bytes = match read_source_bytes(&abs_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("Skipping file {}: {}", rel_path, e);
-                    counters.read.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Genuinely unreadable — deleted mid-scan, EACCES, EIO. No bytes
-                    // in hand, so no identity can honestly be claimed: keep the old
-                    // `Nothing` and let the file re-diff until a read succeeds.
-                    return PreParseOutcome::Nothing;
-                }
-            };
-            let source = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        "Skipping file {}: not valid UTF-8 ({})",
-                        rel_path,
-                        e.utf8_error()
-                    );
-                    counters.read.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Same reasoning as the parse-failure branch below: the file
-                    // exists and we hold exactly the bytes we are declining, so
-                    // record the identity. Without it a Latin-1 source (legacy
-                    // C/C++/Java trees) was listed as changed on EVERY run forever,
-                    // and symbols indexed before the file stopped being UTF-8 were
-                    // never purged (audit 2026-09-02 P2-1).
-                    //
-                    // Hashed from `e.as_bytes()` rather than `provided_hash`: the
-                    // scan's hash was taken earlier and may already describe
-                    // different content, which is the same disagreement this branch
-                    // exists to avoid.
-                    return PreParseOutcome::Skipped(SkippedFile {
-                        rel_path: rel_path.clone(),
-                        hash: crate::indexer::merkle::hash_bytes(e.as_bytes()),
-                        last_modified,
-                        language: language.to_string(),
-                    });
-                }
-            };
-
-            // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
-            // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
-            // declared in a `.h` header (the MOST common C++ layout) — and their
-            // base-class `inherits` edges — were silently dropped. When the header's
-            // content actually contains C++ constructs, parse it as C++ so those
-            // symbols are captured. Gated on markers so a pure-C header stays C;
-            // false positives are low-harm (the C++ grammar is a near-superset of C).
-            if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
-                language = "cpp";
-            }
-
-            // `read_to_string` succeeded, so these bytes ARE the file's bytes —
-            // `hash_file` streams the same content through the same hasher.
-            let hash = provided_hash
-                .unwrap_or_else(|| blake3::hash(source.as_bytes()).to_hex().to_string());
-
-            let tree = match parse_tree(&source, language) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Parse failed for {}: {}", rel_path, e);
-                    counters.parse.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Readable and hashed, just not parseable by this grammar:
-                    // record the identity so its stale symbols go away and the
-                    // file stops re-diffing on every run.
-                    return PreParseOutcome::Skipped(SkippedFile {
+        let file_meta = std::fs::metadata(&abs_path).ok();
+        let last_modified = file_meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Resolve the hash up front so an oversize file can still be
+        // RECORDED (we know exactly which bytes we are declining to parse).
+        // Falls back to hashing only when the caller did not supply one.
+        // A caller with hashes already in hand (the incremental paths, the
+        // query-time refresh) supplies them; a full index does not, and for
+        // those the hash comes from the bytes read below rather than from a
+        // second full read of the same file (audit 2026-08-22 P2-16).
+        let provided_hash = hashes.get(rel_path.as_str()).cloned();
+        if let Some(ref meta) = file_meta {
+            if meta.len() > max_file_size() {
+                tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
+                counters.size.fetch_add(1, AtomicOrdering::Relaxed);
+                // This branch never reads the file, so an unsupplied hash
+                // still costs one read — unchanged from before, and it
+                // applies only to files we refuse to parse.
+                let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
+                return match known_hash {
+                    Some(hash) => PreParseOutcome::Skipped(SkippedFile {
                         rel_path: rel_path.clone(),
                         hash,
                         last_modified,
                         language: language.to_string(),
-                    });
-                }
-            };
+                    }),
+                    None => PreParseOutcome::Nothing,
+                };
+            }
+        }
 
-            // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
-            // nodes and still returning a tree, so parse "succeeds" but symbol
-            // extraction below runs over a damaged parse and can silently drop
-            // symbols. Surface it: warn once per file and count the pass total.
-            let has_parse_errors = tree.root_node().has_error();
-            if has_parse_errors {
+        // Read as BYTES, then decode — so the encoding verdict and the hash we
+        // record come from the SAME read and cannot describe different content.
+        //
+        // The first cut used `read_to_string` and, on failure, `hash_file`,
+        // which is an independent second `File::open` (merkle.rs). Its comment
+        // claimed that "succeeds exactly where the failure was an encoding one";
+        // it does not — it succeeds wherever the bytes are readable at that
+        // later moment, a strictly larger set. So a TRANSIENT first-read failure
+        // (fd exhaustion under this rayon fan-out, an EIO blip, a concurrent
+        // non-atomic writer caught mid-multibyte) would fail read 1, succeed
+        // read 2, and record a `files` row whose hash matches what is on disk —
+        // after `buffer_then_delete_files` had already purged the file's
+        // symbols. `compute_diff` then sees it as unchanged and never re-offers
+        // it, so the symbols stay gone until the content changes again or
+        // INDEX_VERSION moves. Under the old `Nothing` that case was
+        // self-healing (pre-tag review P2-2).
+        //
+        // One read makes the two agree by construction: an identity is recorded
+        // only for bytes actually held.
+        let bytes = match read_source_bytes(&abs_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Skipping file {}: {}", rel_path, e);
+                counters.read.fetch_add(1, AtomicOrdering::Relaxed);
+                // Genuinely unreadable — deleted mid-scan, EACCES, EIO. No bytes
+                // in hand, so no identity can honestly be claimed: keep the old
+                // `Nothing` and let the file re-diff until a read succeeds.
+                return PreParseOutcome::Nothing;
+            }
+        };
+        let source = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
                 tracing::warn!(
+                    "Skipping file {}: not valid UTF-8 ({})",
+                    rel_path,
+                    e.utf8_error()
+                );
+                counters.read.fetch_add(1, AtomicOrdering::Relaxed);
+                // Same reasoning as the parse-failure branch below: the file
+                // exists and we hold exactly the bytes we are declining, so
+                // record the identity. Without it a Latin-1 source (legacy
+                // C/C++/Java trees) was listed as changed on EVERY run forever,
+                // and symbols indexed before the file stopped being UTF-8 were
+                // never purged (audit 2026-09-02 P2-1).
+                //
+                // Hashed from `e.as_bytes()` rather than `provided_hash`: the
+                // scan's hash was taken earlier and may already describe
+                // different content, which is the same disagreement this branch
+                // exists to avoid.
+                return PreParseOutcome::Skipped(SkippedFile {
+                    rel_path: rel_path.clone(),
+                    hash: crate::indexer::merkle::hash_bytes(e.as_bytes()),
+                    last_modified,
+                    language: language.to_string(),
+                });
+            }
+        };
+
+        // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
+        // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
+        // declared in a `.h` header (the MOST common C++ layout) — and their
+        // base-class `inherits` edges — were silently dropped. When the header's
+        // content actually contains C++ constructs, parse it as C++ so those
+        // symbols are captured. Gated on markers so a pure-C header stays C;
+        // false positives are low-harm (the C++ grammar is a near-superset of C).
+        if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
+            language = "cpp";
+        }
+
+        // `read_to_string` succeeded, so these bytes ARE the file's bytes —
+        // `hash_file` streams the same content through the same hasher.
+        let hash =
+            provided_hash.unwrap_or_else(|| blake3::hash(source.as_bytes()).to_hex().to_string());
+
+        let tree = match parse_tree(&source, language) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Parse failed for {}: {}", rel_path, e);
+                counters.parse.fetch_add(1, AtomicOrdering::Relaxed);
+                // Readable and hashed, just not parseable by this grammar:
+                // record the identity so its stale symbols go away and the
+                // file stops re-diffing on every run.
+                return PreParseOutcome::Skipped(SkippedFile {
+                    rel_path: rel_path.clone(),
+                    hash,
+                    last_modified,
+                    language: language.to_string(),
+                });
+            }
+        };
+
+        // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
+        // nodes and still returning a tree, so parse "succeeds" but symbol
+        // extraction below runs over a damaged parse and can silently drop
+        // symbols. Surface it: warn once per file and count the pass total.
+        let has_parse_errors = tree.root_node().has_error();
+        if has_parse_errors {
+            tracing::warn!(
                     "Syntax errors in {} — symbols may be incomplete (parsed with tree-sitter error recovery)",
                     rel_path
                 );
-                counters.parse_errors.fetch_add(1, AtomicOrdering::Relaxed);
-            }
+            counters.parse_errors.fetch_add(1, AtomicOrdering::Relaxed);
+        }
 
-            let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+        let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+        let relations = extract_relations_from_tree(&tree, &source, language);
+        let cpp_fields = if language == "cpp" {
+            cpp_class_fields(&tree, &source)
+        } else {
+            Vec::new()
+        };
 
-            PreParseOutcome::Parsed(Box::new(FilePreParsed {
-                rel_path: rel_path.clone(),
-                source,
-                language: language.to_string(),
-                tree,
-                hash,
-                last_modified,
-                parsed_nodes,
-                has_parse_errors,
-            }))
-        })
-        .collect();
+        PreParseOutcome::Parsed(Box::new(FilePreParsed {
+            rel_path: rel_path.clone(),
+            source,
+            language: language.to_string(),
+            hash,
+            last_modified,
+            parsed_nodes,
+            has_parse_errors,
+            relations,
+            cpp_fields,
+        }))
+    };
+    let outcomes: Vec<PreParseOutcome> = match parse_pool() {
+        Some(pool) => pool.install(|| batch.par_iter().map(parse_one).collect()),
+        None => batch.iter().map(parse_one).collect(),
+    };
 
     let mut out = PreParsed::default();
     for outcome in outcomes {
@@ -567,7 +629,15 @@ struct BatchInserted {
     /// every same-name node in the batch (which fanned out cross-file /
     /// cross-language).
     #[allow(clippy::type_complexity)]
-    saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)>,
+    saved_inbound_edges: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )>,
     /// File ids in this batch, so Phase 2c can skip intra-batch edges.
     file_ids: HashSet<i64>,
     nodes_created: usize,
@@ -583,12 +653,21 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
     let mut parsed: Vec<FileParsed> = Vec::new();
     let mut nodes_created = 0usize;
     // Saved inbound edges from other files → batch files (to restore after cascade delete)
-    // Tuple: (source_id, source_file_id, target_file_id, target_name, relation, metadata).
+    // Tuple: (source_id, source_file_id, target_file_id, target_name, relation,
+    // metadata, target qualified_name).
     // target_file_id is the re-indexed file the edge pointed INTO; the restore
     // re-binds ONLY to the new same-name node in THAT file, not every same-name
     // node in the batch (which fanned out cross-file / cross-language).
     #[allow(clippy::type_complexity)]
-    let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
+    let mut saved_inbound_edges: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
     // Track file_ids in this batch to filter intra-batch edges in Phase 2c
     let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
@@ -609,8 +688,8 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         saved_inbound_edges.extend(
             get_inbound_cross_file_edges(db.conn(), file_id)?
                 .into_iter()
-                .map(|(src, src_file, tname, rel, meta)| {
-                    (src, src_file, file_id, tname, rel, meta)
+                .map(|(src, src_file, tname, rel, meta, tqual)| {
+                    (src, src_file, file_id, tname, rel, meta, tqual)
                 }),
         );
         batch_file_ids.insert(file_id);
@@ -621,6 +700,8 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_names = Vec::new();
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
+        let mut node_lines: Vec<(u32, u32)> = Vec::new();
+        let mut rust_fns: Vec<super::resolve::RustFnRow> = Vec::new();
 
         let module_node_id = insert_node_cached(
             db.conn(),
@@ -646,6 +727,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         // <module> resolves by its bare name; no qualified form.
         node_qualified_names.push(None);
         node_types.push("module".into());
+        node_lines.push((1, u32::MAX));
         nodes_created += 1;
 
         for pn in &pp.parsed_nodes {
@@ -673,19 +755,36 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_names.push(pn.name.clone());
             node_qualified_names.push(pn.qualified_name.clone());
             node_types.push(pn.node_type.clone());
+            node_lines.push((pn.start_line, pn.end_line));
+            if pp.language == "rust" && pn.node_type == "function" {
+                rust_fns.push(super::resolve::RustFnRow {
+                    id: node_id,
+                    signature: pn.signature.as_deref(),
+                    qualified_name: pn.qualified_name.as_deref(),
+                    lines: (pn.start_line, pn.end_line),
+                    code: &pn.code_content,
+                });
+            }
             nodes_created += 1;
         }
+        let rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape> =
+            super::resolve::rust_fn_shapes_of_file(&pp.rel_path, &rust_fns)
+                .into_iter()
+                .collect();
+        drop(rust_fns);
 
         parsed.push(FileParsed {
             rel_path: pp.rel_path,
-            source: pp.source,
             language: pp.language,
-            tree: pp.tree,
+            relations: pp.relations,
+            cpp_fields: pp.cpp_fields,
             file_id,
             node_ids,
             node_names,
             node_qualified_names,
             node_types,
+            node_lines,
+            rust_fn_shapes,
         });
     }
 
@@ -734,6 +833,38 @@ fn module_node_of(
 ///
 /// Returns the number of rows actually created; `insert_edge_cached` dedups,
 /// so a repeat of an existing edge counts zero.
+/// Bind a typed call to `targets` minus what its receiver's type rules out
+/// ([`super::resolve::RecvNever`]). A call that leaves with nothing, ruled out
+/// by what other files say of the type, is buffered instead, so a change there
+/// finds it (`typed_callers_of_class_drift`).
+fn bind_unless_ruled_out(
+    db: &Database,
+    sources: &[i64],
+    targets: &[i64],
+    never: &super::resolve::RecvNever,
+    d: &DeferredRelation,
+    metadata: Option<&str>,
+) -> Result<usize> {
+    let kept: Vec<i64> = targets
+        .iter()
+        .copied()
+        .filter(|id| !never.ids.contains(id))
+        .collect();
+    if kept.is_empty() && !targets.is_empty() && never.read_elsewhere {
+        for &src_id in sources {
+            crate::storage::queries::insert_pending_unresolved_call(
+                db.conn(),
+                src_id,
+                &d.target_name,
+                &d.language,
+                metadata,
+            )?;
+        }
+        return Ok(0);
+    }
+    insert_relation_edges(db, sources, &kept, &d.relation, metadata, false)
+}
+
 fn insert_relation_edges(
     db: &Database,
     sources: &[i64],
@@ -860,7 +991,7 @@ fn buffer_inbound_before_node_purge(
         crate::storage::queries::insert_pending_unresolved_call(
             db.conn(),
             source_id,
-            &target_name,
+            &super::resolve::js_import_pending_name(metadata.as_deref(), &target_name),
             &source_language,
             metadata.as_deref(),
         )?;
@@ -933,6 +1064,132 @@ pub(super) fn sentinel_name_matches_stem(name: &str, stem: &str) -> bool {
     let seg_no_ext = seg.rsplit_once('.').map(|(head, _)| head).unwrap_or(seg);
     let dotted_last = name.rsplit('.').next().unwrap_or(name);
     seg == stem || seg_no_ext == stem || dotted_last == stem
+}
+
+/// Metadata key of a `routes_to` edge whose handler was found outside the
+/// route's own file: the ROUTE file (D6, 2026-09-29 usage evaluation). Such an
+/// edge is the handler's self-edge, so both of its ends sit in the handler's
+/// file and nothing else says which file wrote it: re-indexing the handler's
+/// file dropped it (hono's `app.use(mw1, mw2)` in `types.test.ts`, bound to
+/// `hono.test.ts`'s `mw2`), and a route file that stopped routing to it left
+/// it behind.
+pub(super) const ROUTE_FILE_KEY: &str = "rf";
+
+/// The route file [`ROUTE_FILE_KEY`] records on a `routes_to` edge.
+pub(super) fn route_file_of(metadata: Option<&str>) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(metadata?)
+        .ok()?
+        .get(ROUTE_FILE_KEY)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `metadata` with [`ROUTE_FILE_KEY`] set to `route_file`.
+fn with_route_file(metadata: Option<&str>, route_file: &str) -> Option<String> {
+    let mut map = metadata
+        .and_then(|m| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(m).ok())
+        .unwrap_or_default();
+    map.insert(ROUTE_FILE_KEY.to_string(), route_file.into());
+    serde_json::to_string(&map).ok()
+}
+
+/// Every `routes_to` edge a route file wrote into another file's handler, as
+/// (source id, target id, handler name, metadata, route file, source path,
+/// target path). Routes are few, so one read serves the whole run.
+#[allow(clippy::type_complexity)]
+fn foreign_route_edges(
+    db: &Database,
+) -> Result<Vec<(i64, i64, String, Option<String>, String, String, String)>> {
+    let mut stmt = db.conn().prepare_cached(
+        "SELECT e.source_id, e.target_id, nt.name, e.metadata, fs.path, ft.path
+         FROM edges e
+         JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id
+         JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id
+         WHERE e.relation = ?1 AND e.metadata LIKE '%\"rf\":%'",
+    )?;
+    let rows = stmt
+        .query_map([REL_ROUTES_TO], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(src, tgt, name, meta, sp, tp)| {
+            let rf = route_file_of(meta.as_deref())?;
+            Some((src, tgt, name, meta, rf, sp, tp))
+        })
+        .collect())
+}
+
+/// D6 before any file of the run is purged: the routes another file wrote
+/// into a file of this run.
+///
+/// - Written by a file this run re-extracts or deletes: stale, since that
+///   file's extraction writes the ones it still has. Deleted now. (The
+///   handler's context string follows through the route file's own import or
+///   value reference of it, which puts the handler in the caller's dirty set.)
+/// - Written by a file outside the run into a handler of the run: the purge
+///   takes the edge, and the handler's own extraction never writes it. Its
+///   route file's relation is requeued, so the deferred pass resolves the
+///   handler exactly as a rebuild does.
+fn settle_foreign_routes(
+    db: &Database,
+    files: &[String],
+    delete_paths: &[String],
+    deferred: &mut Vec<DeferredRelation>,
+) -> Result<()> {
+    let edges = foreign_route_edges(db)?;
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let run: HashSet<&str> = files
+        .iter()
+        .chain(delete_paths.iter())
+        .map(|s| s.as_str())
+        .collect();
+    let tx = db.savepoint("idx_foreign_routes")?;
+    let mut requeued: HashSet<(String, String, Option<String>)> = HashSet::new();
+    for (src, tgt, name, meta, rf, src_path, tgt_path) in edges {
+        if run.contains(rf.as_str()) {
+            db.conn().execute(
+                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2
+                 AND relation = ?3 AND metadata IS ?4",
+                rusqlite::params![src, tgt, REL_ROUTES_TO, meta],
+            )?;
+        } else if (run.contains(src_path.as_str()) || run.contains(tgt_path.as_str()))
+            && requeued.insert((rf.clone(), name.clone(), meta.clone()))
+        {
+            let language: Option<String> = db
+                .conn()
+                .query_row("SELECT language FROM files WHERE path = ?1", [&rf], |row| {
+                    row.get(0)
+                })
+                .ok()
+                .flatten();
+            let Some(language) = language else {
+                continue;
+            };
+            deferred.push(DeferredRelation {
+                source_ids: Vec::new(),
+                source_name: name.clone(),
+                target_name: name,
+                relation: REL_ROUTES_TO.to_string(),
+                metadata: meta,
+                rel_path: rf,
+                language,
+                ns_file: None,
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Files this run must re-extract because a file they depend on just appeared or
@@ -1047,6 +1304,7 @@ pub(super) struct FileIndexed {
 /// else is buffered here and re-run once after the batch loop, when
 /// `global_name_map` finally holds the whole tree
 /// (`resolve_deferred_relations`).
+#[derive(Clone)]
 struct DeferredRelation {
     /// Source node ids resolved at batch time (the source side is same-file,
     /// so it is complete then). Empty only for the `routes_to` imported-handler
@@ -1092,11 +1350,39 @@ struct BatchRelations {
     /// project file — the caller mints `<external>` sentinels for them.
     external_python_imports: Vec<(i64, String)>,
     /// `(source_id, target_name, relation)` likewise, for non-import targets.
-    unresolved_externals: Vec<(i64, String, String)>,
+    unresolved_externals: Vec<ExternalRef>,
 }
 
-/// Phase 2 for ONE batch: extract every relation from the batch's parsed
-/// trees and insert the edges it can resolve, deferring the rest.
+/// Record the typed fields of a C++ file's class bodies against their class
+/// nodes (`cpp_fields`), for calls through them from files that never see the
+/// class body. A class specifier's node is the innermost same-named class-like
+/// node whose lines contain it.
+fn record_cpp_fields(db: &Database, pf: &FileParsed) -> Result<()> {
+    let fields = &pf.cpp_fields;
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let mut rows = Vec::with_capacity(fields.len());
+    for f in fields {
+        let (start, end) = f.class_lines;
+        let class_id = (0..pf.node_ids.len())
+            .filter(|&i| {
+                matches!(pf.node_types[i].as_str(), "class" | "struct")
+                    && pf.node_names[i] == f.class_name
+                    && pf.node_lines[i].0 <= start
+                    && pf.node_lines[i].1 >= end
+            })
+            .min_by_key(|&i| pf.node_lines[i].1 - pf.node_lines[i].0)
+            .map(|i| pf.node_ids[i]);
+        if let Some(class_id) = class_id {
+            rows.push((class_id, f.field.clone(), f.dot.clone(), f.arrow.clone()));
+        }
+    }
+    crate::storage::queries::insert_cpp_fields(db.conn(), &rows)
+}
+
+/// Phase 2 for ONE batch: resolve every relation Phase 1a extracted from the
+/// batch's files and insert the edges it can resolve, deferring the rest.
 ///
 /// Extracted from `index_files` (audit 2026-08-22 P2-15), which was 1,242
 /// lines with this as 770 of them. It runs INSIDE the caller's batch savepoint
@@ -1115,6 +1401,7 @@ fn resolve_batch_relations(
     all_file_paths: &HashSet<String>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<BatchRelations> {
+    let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
     let mut edges_created = 0usize;
     // --- Phase 2: Extract relations + insert edges ---
     // These three pools are rebuilt from `global_name_map` on EVERY batch —
@@ -1169,18 +1456,30 @@ fn resolve_batch_relations(
     let mut external_python_imports: Vec<(i64, String)> = Vec::new();
     // Track unresolved external symbols for sentinel node creation:
     // (source_id, target_name, relation) — e.g., implements edges to external traits
-    let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
+    let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
 
+    // Loaded on the first supertype relation: this batch's nodes are inserted.
+    let mut callable_ids: Option<HashSet<i64>> = None;
     for pf in batch_parsed {
-        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        let relations = &pf.relations;
+        if pf.language == "cpp" {
+            record_cpp_fields(db, pf)?;
+        }
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
+        // Same-file qualified names, for C++ implicit-`this` member lookup below.
+        let local_qualified: HashMap<i64, &str> = pf
+            .node_ids
+            .iter()
+            .zip(pf.node_qualified_names.iter())
+            .filter_map(|(id, q)| q.as_deref().map(|q| (*id, q)))
+            .collect();
 
         // Pre-scan this file's require-namespace bindings
         // (`const m = require('./x')`, stamped `{"q":"ns_require",...}`) →
         // resolved file path, so `m.foo()` member calls (CalleeMeta::Receiver)
         // bind to the required module in the call-resolution pass below.
         let mut ns_module_map: HashMap<String, String> = HashMap::new();
-        for rel in &relations {
+        for rel in relations {
             if rel.relation != REL_IMPORTS {
                 continue;
             }
@@ -1205,7 +1504,7 @@ fn resolve_batch_relations(
             }
         }
 
-        for rel in &relations {
+        for rel in relations {
             // Contract: extract_relations_from_tree stamps every relation with
             // source_language equal to the language argument. The
             // same-language resolution at line 811+ depends on it. Hard
@@ -1235,14 +1534,56 @@ fn resolve_batch_relations(
             // Widget`; without this both matched `source_name == "Widget"` and the
             // constructor got a bogus `inherits` edge. Blacklist fn/method (rather
             // than whitelist type kinds) so no language's type node is missed.
+            // A Rust impl's type is never a trait either (a trait is a type only
+            // as `dyn Trait`): `impl Semaphore for bounded::Semaphore` names a
+            // `Semaphore` that is not this file's trait of that name.
             let type_source_only = rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS;
+            let rust_impl = pf.language == "rust" && rel.relation == REL_IMPLEMENTS;
+            // `impl Tr for crate::a::Type` names this file's `Type` only when
+            // `a` is this file's module path (the parser keeps such a path
+            // whole; see `rust::extract_rust_impl_trait`).
+            let source_name: &str = match rel.source_name.strip_prefix("crate::") {
+                Some(rest) if rust_impl => {
+                    let segments: Vec<&str> = rest.split("::").collect();
+                    let (name, module) = segments.split_last().expect("split yields one");
+                    let here = super::resolve::rust_crate_layout(&pf.rel_path)
+                        .map(|(_, _, m)| m)
+                        .unwrap_or_default();
+                    if module.iter().copied().eq(here.iter().map(String::as_str)) {
+                        name
+                    } else {
+                        rel.source_name.as_str()
+                    }
+                }
+                _ => rel.source_name.as_str(),
+            };
             let mut source_ids = (0..pf.node_ids.len())
                 .filter(|&i| {
-                    (pf.node_names[i] == rel.source_name
-                        || pf.node_qualified_names[i].as_deref() == Some(rel.source_name.as_str()))
+                    (pf.node_names[i] == source_name
+                        || pf.node_qualified_names[i].as_deref() == Some(source_name))
                         && (!type_source_only
                             || !matches!(pf.node_types[i].as_str(), "function" | "method"))
+                        && !(rust_impl && pf.node_types[i] == "interface")
                 })
+                .collect::<Vec<_>>();
+            // Same-named definitions in one file (cfg twins, `@overload` stubs,
+            // nested `def index()` handlers) all match by name. The relation's
+            // scope start line picks the innermost one containing it; with no
+            // line, or no node containing it, every name match stays (as before).
+            if source_ids.len() > 1 {
+                if let Some(line) = rel.source_line {
+                    let innermost = source_ids
+                        .iter()
+                        .copied()
+                        .filter(|&i| pf.node_lines[i].0 <= line && line <= pf.node_lines[i].1)
+                        .min_by_key(|&i| pf.node_lines[i].1 - pf.node_lines[i].0);
+                    if let Some(i) = innermost {
+                        source_ids = vec![i];
+                    }
+                }
+            }
+            let mut source_ids = source_ids
+                .into_iter()
                 .map(|i| pf.node_ids[i])
                 .collect::<Vec<_>>();
 
@@ -1360,7 +1701,7 @@ fn resolve_batch_relations(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if let Some(module_files) =
-                        project_module_files(python_module, python_module_map)
+                        project_module_files_from(python_module, &pf.rel_path, python_module_map)
                     {
                         // Internal module — try constrained resolution
                         if let Some(module_targets) = resolve_python_module_targets(
@@ -1562,7 +1903,41 @@ fn resolve_batch_relations(
             // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
             if rel.relation == REL_CALLS {
                 use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
+                // A receiver type narrows the pool by the owners of every
+                // candidate, which later batches may hold (D#112): decided in
+                // the deferred pass, against the whole pool.
+                if pf.language == "rust"
+                    && rel
+                        .metadata
+                        .as_deref()
+                        .is_some_and(|m| m.contains(r#""rt":"#))
+                {
+                    deferred.push(DeferredRelation::of(
+                        &source_ids,
+                        rel,
+                        &pf.rel_path,
+                        &pf.language,
+                    ));
+                    continue;
+                }
                 match parse_callee_metadata(rel.metadata.as_deref()) {
+                    // `click.echo()` through an import of a library module: no
+                    // project code can run. A project module resolves as bare.
+                    Some(CalleeMeta::Module(module)) if !py_modules.contains(&module) => {
+                        continue;
+                    }
+                    // `b()` through a renamed import (D#120) binds by the
+                    // exporting file's nodes and export map, which a later batch
+                    // may hold: decided in the deferred pass, from the database.
+                    Some(CalleeMeta::Import { .. }) => {
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
                     Some(CalleeMeta::Receiver(recv))
                         if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
                     {
@@ -1628,10 +2003,11 @@ fn resolve_batch_relations(
                         if is_cross_file_call_noise(&rel.target_name, pf.language.as_str()) {
                             continue;
                         }
-                        let all = name_to_ids
+                        let mut all = name_to_ids
                             .get(&rel.target_name)
                             .cloned()
                             .unwrap_or_default();
+                        pf.retain_rust_call_shape(rel, &mut all);
                         let same_lang: Vec<i64> = all
                             .iter()
                             .filter(|id| {
@@ -1702,7 +2078,12 @@ fn resolve_batch_relations(
                         ));
                         continue;
                     }
-                    Some(CalleeMeta::RecvType(_)) => {
+                    Some(CalleeMeta::RecvType(_))
+                    | Some(CalleeMeta::SuperType(_))
+                    | Some(CalleeMeta::Field { .. })
+                    | Some(CalleeMeta::Via) => {
+                        // A field's type is recorded by its class's file, which may
+                        // be in a later batch: typed in the deferred pass.
                         // Same partial-view argument as SelfRecv/SelfType
                         // above; additionally this arm's EMPTY case falls
                         // through to bare default resolution rather than
@@ -1751,6 +2132,7 @@ fn resolve_batch_relations(
                         src_id,
                         rel.target_name.clone(),
                         rel.relation.clone(),
+                        None,
                     ));
                 }
                 continue;
@@ -1760,16 +2142,39 @@ fn resolve_batch_relations(
             // Tier order: same-file → same-language → (calls: drop) / (other: global).
             // Dropping calls without a same-language match prevents Rust `hasher.update()`
             // binding to an unrelated JS `function update()` via bare-name collision.
-            let all_target_ids = name_to_ids
+            let mut all_target_ids = name_to_ids
                 .get(&rel.target_name)
                 .cloned()
                 .unwrap_or_default();
+            if rel.relation == REL_CALLS {
+                all_target_ids = super::resolve::member_call_candidates(
+                    rel.metadata.as_deref(),
+                    all_target_ids,
+                    db,
+                )?;
+                pf.retain_rust_call_shape(rel, &mut all_target_ids);
+            }
+            // A supertype is a type: never a same-named constructor or method
+            // (`class DBTest : public testing::Test` bound a `Harness::Test()`).
+            if rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS {
+                if callable_ids.is_none() {
+                    callable_ids = Some(crate::storage::queries::callable_node_ids(db.conn())?);
+                }
+                let callables = callable_ids.as_ref().expect("loaded above");
+                all_target_ids.retain(|id| !callables.contains(id));
+            }
 
-            let same_file_targets: Vec<i64> = all_target_ids
-                .iter()
-                .filter(|id| local_ids.contains(id))
-                .copied()
-                .collect();
+            // A name bound to a package import means no node of this file (D7).
+            let same_file_targets: Vec<i64> =
+                if super::resolve::is_package_bound(rel.metadata.as_deref()) {
+                    Vec::new()
+                } else {
+                    all_target_ids
+                        .iter()
+                        .filter(|id| local_ids.contains(id))
+                        .copied()
+                        .collect()
+                };
 
             let source_lang = pf.language.as_str();
 
@@ -1784,7 +2189,7 @@ fn resolve_batch_relations(
             // repo at BATCH_SIZE 25: `test_db` bound three src/graph/*
             // twins instead of the path-closest helpers.rs one).
             let target_ids = if !same_file_targets.is_empty() {
-                same_file_targets
+                cpp_implicit_this_members(&pf.language, rel, same_file_targets, &local_qualified)
             } else if rel.relation == REL_CALLS
                 && is_cross_file_call_noise(&rel.target_name, source_lang)
             {
@@ -1868,6 +2273,42 @@ fn resolve_batch_relations(
         unresolved_externals,
     })
 }
+/// C++ name lookup: a bare `f()` inside a member function (`Cls::m`, scope
+/// `Cls.m`, or a gtest `TEST_F(Suite, Case)` body, scope `Suite.Case`, which is a
+/// member of a class derived from `Suite`) finds the class's own `f` before any
+/// other. When the file defines `Cls.f`, only it is the target; otherwise every
+/// same-file candidate stays (a free function, or a member inherited from a base
+/// this file does not define). Only for a truly bare call: `DB::Put()` carries
+/// `{"q":"scoped"}` metadata and names its class itself, and `Cls(...)` inside a
+/// `Cls` member is a constructor call.
+fn cpp_implicit_this_members(
+    language: &str,
+    rel: &crate::parser::relations::ParsedRelation,
+    same_file_targets: Vec<i64>,
+    local_qualified: &HashMap<i64, &str>,
+) -> Vec<i64> {
+    if language != "cpp" || rel.relation != REL_CALLS || rel.metadata.is_some() {
+        return same_file_targets;
+    }
+    let Some((class, _)) = rel.source_name.rsplit_once('.') else {
+        return same_file_targets;
+    };
+    if rel.target_name == class.rsplit('.').next().unwrap_or(class) {
+        return same_file_targets; // `Status(...)` in a Status member: a constructor call
+    }
+    let own = format!("{class}.{}", rel.target_name);
+    let members: Vec<i64> = same_file_targets
+        .iter()
+        .copied()
+        .filter(|id| local_qualified.get(id) == Some(&own.as_str()))
+        .collect();
+    if members.is_empty() {
+        same_file_targets
+    } else {
+        members
+    }
+}
+
 pub(super) fn index_files(
     db: &Database,
     root: &Path,
@@ -1877,6 +2318,20 @@ pub(super) fn index_files(
     delete_paths: &[String],
     progress: Option<ProgressFn>,
 ) -> Result<IndexResult> {
+    // An index built by a newer INDEX_VERSION belongs to the newer binary. Every
+    // parse this one stored would sit under the newer stamp, looking current, and
+    // an unchanged file is never re-parsed — so refuse before the first write.
+    // An error, not an empty result: `wipe_and_rebuild` deletes every row in the
+    // same transaction first, and only an error rolls that back.
+    if let Some(stored) = db.newer_index_version() {
+        anyhow::bail!(
+            "index was built by a newer code-graph (index v{} > this binary v{}); not writing to it. \
+Restart every code-graph server on this project so they run one version.",
+            stored,
+            crate::domain::INDEX_VERSION
+        );
+    }
+
     // Phase transactions use `db.savepoint(...)`, NOT `conn().unchecked_transaction()`,
     // so this pipeline is atomic whether run standalone (CLI / incremental — a
     // top-level SAVEPOINT auto-starts a transaction, RELEASE commits it) OR nested
@@ -1898,7 +2353,7 @@ pub(super) fn index_files(
     // run (a handful of `Cargo.toml` reads) and handed to every Path-qualifier
     // filter so `my_crate::module::f()` strips its crate root the way
     // `crate::module::f()` already does. See `resolve::path_filter_candidates`.
-    let crate_roots = super::resolve::collect_crate_root_names(root);
+    let crate_roots = super::resolve::collect_rust_crates(root);
 
     // Every caller derives `files` from HashMap iteration — `run_full_index`
     // from `scan_directory`'s hash map keys, both incremental entries from
@@ -2065,6 +2520,12 @@ pub(super) fn index_files(
             crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
             "1",
         )?;
+    }
+
+    // Phase 0-routes (D6): routes another file wrote into this run's files, and
+    // the ones this run's files wrote elsewhere, before any purge takes them.
+    if has_work {
+        settle_foreign_routes(db, &files, delete_paths, &mut deferred)?;
     }
 
     // Phase 0: Delete removed files in own transaction.
@@ -2263,7 +2724,7 @@ pub(super) fn index_files(
         }
         global_name_map.retain(|_, entries| !entries.is_empty());
 
-        // Convert to lightweight records — drops Tree and source string
+        // Convert to lightweight records — drops the relations and node vectors
         for pf in batch_parsed {
             // Add newly committed nodes to the global map
             let pf_lang = Some(pf.language.clone());
@@ -2279,7 +2740,7 @@ pub(super) fn index_files(
                 node_ids: pf.node_ids,
                 node_names: pf.node_names,
             });
-            // pf.tree and pf.source are dropped here — memory freed
+            // pf.relations are dropped here — memory freed
         }
 
         // Report progress after each batch
@@ -2412,10 +2873,11 @@ pub(super) fn index_files(
     // Attempts now count resolution OPPORTUNITIES.
     //
     // Deletions do not qualify: removing nodes can only shrink the candidate set.
+    let mut pending_sources = std::collections::BTreeSet::new();
     let pending_resolved = if all_indexed.is_empty() {
         0
     } else {
-        resolve_pending_calls(db, &crate_roots)?
+        super::resolve::resolve_pending_calls_touching(db, &crate_roots, &mut pending_sources)?
     };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
@@ -2512,8 +2974,13 @@ pub(super) fn index_files(
             // the global path and the whole change was inert — 1.08 s, the
             // number it was written to remove. Widening by the touched sources
             // costs a handful of file ids instead.
-            let deferred_sources: std::collections::BTreeSet<&str> =
-                deferred.iter().map(|d| d.rel_path.as_str()).collect();
+            // The pending sweep's binds have the same shape, from callers this
+            // run may not have opened either.
+            let deferred_sources: std::collections::BTreeSet<&str> = deferred
+                .iter()
+                .map(|d| d.rel_path.as_str())
+                .chain(pending_sources.iter().map(String::as_str))
+                .collect();
             if !deferred_sources.is_empty() {
                 let conn = db.conn();
                 let mut stmt =
@@ -2584,6 +3051,10 @@ pub(super) fn index_files(
     })
 }
 
+/// A relation left for an `<external>` sentinel: (source id, target name,
+/// relation, the edge's metadata).
+type ExternalRef = (i64, String, String, Option<String>);
+
 /// Phases 2b / 2b-ext: mint the `<external>` pseudo-file's sentinel nodes.
 ///
 /// Two channels feed it. Python `import flask` with no project file behind it
@@ -2598,7 +3069,7 @@ pub(super) fn index_files(
 fn mint_external_sentinels(
     db: &Database,
     external_python_imports: &[(i64, String)],
-    unresolved_externals: &[(i64, String, String)],
+    unresolved_externals: &[ExternalRef],
 ) -> Result<(usize, usize)> {
     let mut nodes_created = 0usize;
     let mut edges_created = 0usize;
@@ -2706,7 +3177,7 @@ fn mint_external_sentinels(
         // Sorted before insert so the ids are stable too.
         let unique_targets: Vec<(&str, &str)> = {
             let mut by_name: HashMap<&str, &str> = HashMap::new();
-            for (_, name, rel) in unresolved_externals {
+            for (_, name, rel, _) in unresolved_externals {
                 let node_type = if rel == REL_IMPLEMENTS {
                     "trait"
                 } else {
@@ -2767,9 +3238,10 @@ fn mint_external_sentinels(
             }
         }
 
-        for (source_id, target_name, relation) in unresolved_externals {
+        for (source_id, target_name, relation, metadata) in unresolved_externals {
             if let Some(&ext_id) = ext_node_ids.get(target_name.as_str()) {
-                if insert_edge_cached(db.conn(), *source_id, ext_id, relation, None)? {
+                if insert_edge_cached(db.conn(), *source_id, ext_id, relation, metadata.as_deref())?
+                {
                     edges_created += 1;
                 }
             }
@@ -2792,7 +3264,15 @@ fn restore_inbound_edges(
     db: &Database,
     batch_parsed: &[FileParsed],
     batch_file_ids: &HashSet<i64>,
-    saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+    saved_inbound_edges: &[(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )],
     run_file_paths: &HashSet<&str>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
@@ -2807,15 +3287,30 @@ fn restore_inbound_edges(
         // file sharing the symbol name (or a cross-language same-name node in the
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
-        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>, &str)>> =
+            HashMap::new();
         for pf in batch_parsed {
-            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+            for (((id, name), q), ty) in pf
+                .node_ids
+                .iter()
+                .zip(pf.node_names.iter())
+                .zip(pf.node_qualified_names.iter())
+                .zip(pf.node_types.iter())
+            {
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
-                    .push(*id);
+                    .push((*id, q.as_deref(), ty.as_str()));
             }
         }
+
+        // A call is restored only onto a function its syntax can reach, as a
+        // fresh resolution would bind it (`resolve::rust_call_shape_admits`).
+        let rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape> = batch_parsed
+            .iter()
+            .flat_map(|pf| pf.rust_fn_shapes.iter().map(|(id, t)| (*id, t.clone())))
+            .collect();
 
         // Memoized source-file lookup for the requeue path below.
         let mut src_file_info: HashMap<i64, (String, String)> = HashMap::new();
@@ -2823,8 +3318,16 @@ fn restore_inbound_edges(
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
         let mut requeued = 0usize;
-        for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
-            saved_inbound_edges
+        let mut requeued_typed: HashSet<(i64, &str, Option<&str>)> = HashSet::new();
+        for (
+            source_id,
+            source_file_id,
+            target_file_id,
+            target_name,
+            relation,
+            metadata,
+            target_qualified,
+        ) in saved_inbound_edges
         {
             // Source file is also in this batch — source_id is stale (deleted + re-created).
             // Phase 2 already resolves cross-file edges for intra-batch files.
@@ -2832,10 +3335,75 @@ fn restore_inbound_edges(
                 skipped_intra_batch += 1;
                 continue;
             }
-            if let Some(new_target_ids) =
-                batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
-            {
-                for &new_tgt_id in new_target_ids {
+            // A call the resolver bound through its metadata (a receiver's class,
+            // `super()`, a member call's candidates nearest the caller) went to
+            // particular methods: restore each edge to the method of the same
+            // qualified name. Restoring it to every same-named node in the file
+            // bound sibling classes' methods — labelled `inferred` when typed —
+            // until the caller's own file changed; a rebuild binds them to none.
+            let typed = relation.as_str() == REL_CALLS
+                && super::resolve::parse_callee_metadata(metadata.as_deref()).is_some();
+            // A supertype is a type, as at resolution: never the class's own
+            // same-named constructor.
+            let supertype =
+                relation.as_str() == REL_INHERITS || relation.as_str() == REL_IMPLEMENTS;
+            // The caller's file: crate visibility needs it below, and a requeue
+            // records it.
+            let (src_path, src_lang) = src_file_info
+                .entry(*source_file_id)
+                .or_insert_with(|| {
+                    db.conn()
+                        .query_row(
+                            "SELECT path, COALESCE(language, '') FROM files WHERE id = ?1",
+                            [*source_file_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .unwrap_or_default()
+                })
+                .clone();
+            // A call through a renamed import (D#120) is decided by the file's
+            // export map, not by the name its old target had: re-resolved from
+            // the pending buffer, never restored onto a same-named node.
+            let renamed_import = relation.as_str() == REL_CALLS
+                && matches!(
+                    super::resolve::parse_callee_metadata(metadata.as_deref()),
+                    Some(super::resolve::CalleeMeta::Import { .. })
+                );
+            // A Rust call typed by its receiver (D#112) is decided by what the
+            // target's impl can run on, which an edit of the target's file can
+            // change while its qualified name stays: `impl<T: Display> Yell for
+            // T` rewritten as `impl Yell for T` keeps `T.yell`, and a `String`
+            // receiver loses it on a rebuild. Re-resolved in the deferred pass
+            // under the full rules, never restored by name (batch-1 review
+            // round 2). Only the Rust parser writes `rt`.
+            let receiver_typed = relation.as_str() == REL_CALLS
+                && metadata.as_deref().is_some_and(|m| m.contains(r#""rt":"#));
+            let new_target_ids: Option<Vec<i64>> = (!renamed_import && !receiver_typed)
+                .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
+                .flatten()
+                .map(|found| {
+                    found
+                        .iter()
+                        .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
+                        .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
+                        .filter(|(id, _, _)| {
+                            relation.as_str() != REL_CALLS
+                                || rust_fn_shapes.get(id).is_none_or(|shape| {
+                                    super::resolve::rust_call_shape_admits(
+                                        metadata.as_deref(),
+                                        shape,
+                                    ) && super::resolve::rust_crate_admits(
+                                        Some(src_path.as_str()).filter(|p| !p.is_empty()),
+                                        shape,
+                                    )
+                                })
+                        })
+                        .map(|(id, _, _)| *id)
+                        .collect::<Vec<i64>>()
+                })
+                .filter(|ids| !ids.is_empty());
+            if let Some(new_target_ids) = new_target_ids {
+                for &new_tgt_id in &new_target_ids {
                     if *source_id != new_tgt_id
                         && insert_edge_cached(
                             db.conn(),
@@ -2859,18 +3427,6 @@ fn restore_inbound_edges(
                 // edit path never did). Requeue instead: calls through the
                 // persistent pending buffer, everything else through the deferred
                 // pass, both of which apply the normal resolution rules.
-                let (src_path, src_lang) = src_file_info
-                    .entry(*source_file_id)
-                    .or_insert_with(|| {
-                        db.conn()
-                            .query_row(
-                                "SELECT path, COALESCE(language, '') FROM files WHERE id = ?1",
-                                [*source_file_id],
-                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                            )
-                            .unwrap_or_default()
-                    })
-                    .clone();
                 if src_path.is_empty() {
                     continue; // source file row gone — nothing to requeue for
                 }
@@ -2888,11 +3444,37 @@ fn restore_inbound_edges(
                     skipped_intra_batch += 1;
                     continue;
                 }
+                // A receiver-typed call goes through the deferred pass, as its
+                // first resolution did: the pending buffer keeps one row per
+                // caller and name, so requeued there it displaced (or was
+                // displaced by) the same caller's other `spawn_local` call, and
+                // tokio's `local.spawn_local(..)` lost its edge. One entry per
+                // call, though it was bound to several targets.
+                if receiver_typed {
+                    if requeued_typed.insert((
+                        *source_id,
+                        target_name.as_str(),
+                        metadata.as_deref(),
+                    )) {
+                        deferred.push(DeferredRelation {
+                            source_ids: vec![*source_id],
+                            source_name: String::new(),
+                            target_name: target_name.clone(),
+                            relation: relation.clone(),
+                            metadata: metadata.clone(),
+                            rel_path: src_path,
+                            language: src_lang,
+                            ns_file: None,
+                        });
+                        requeued += 1;
+                    }
+                    continue;
+                }
                 if relation.as_str() == REL_CALLS {
                     crate::storage::queries::insert_pending_unresolved_call(
                         db.conn(),
                         *source_id,
-                        target_name,
+                        &super::resolve::js_import_pending_name(metadata.as_deref(), target_name),
                         &src_lang,
                         metadata.as_deref(),
                     )?;
@@ -2943,12 +3525,16 @@ fn resolve_deferred_relations(
     global_name_map: &HashMap<String, Vec<crate::storage::queries::NameEntry>>,
     all_file_paths: &HashSet<String>,
     python_module_map: &HashMap<String, Vec<String>>,
-    crate_roots: &HashSet<String>,
+    crate_roots: &super::resolve::RustCrates,
 ) -> Result<(usize, usize)> {
     use super::resolve::{
-        method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates,
-        CalleeMeta,
+        method_candidates, parse_callee_metadata, path_filter_candidates, recv_type_targets,
+        self_filter_candidates, CalleeMeta, ProjectClassNames, RecvTypeTargets,
     };
+    let mut classes = ProjectClassNames::default();
+    let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
+    let mut callable_ids: Option<HashSet<i64>> = None;
+    let mut js_exports = super::resolve::JsExports::default();
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
     // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
@@ -3012,9 +3598,38 @@ fn resolve_deferred_relations(
     };
 
     let mut edges_created = 0usize;
-    let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
+    let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
 
-    for d in deferred {
+    // Calls last: a typed receiver's call also binds overrides, found through
+    // `inherits` edges that may themselves be among the deferred.
+    let ordered = deferred
+        .iter()
+        .filter(|d| d.relation != REL_CALLS)
+        .chain(deferred.iter().filter(|d| d.relation == REL_CALLS));
+    // Loaded at the first C++ call through a field or a chain, which comes after
+    // every other relation: the `inherits` edges its bases are read from may be
+    // among this pass's own (a full index defers every cross-file one), and a
+    // load before them typed differently from an incremental run.
+    let mut field_types: Option<super::resolve::CppFieldTypes> = None;
+    let mut typed_call: DeferredRelation;
+    for d in ordered {
+        let d = if d.relation == REL_CALLS
+            && d.metadata
+                .as_deref()
+                .is_some_and(|m| m.contains(r#""q":"field""#) || m.contains(r#""q":"via""#))
+        {
+            if field_types.is_none() {
+                field_types = Some(super::resolve::CppFieldTypes::load(db.conn())?);
+            }
+            typed_call = d.clone();
+            typed_call.metadata = field_types
+                .as_ref()
+                .and_then(|t| t.rewrite(d.metadata.as_deref()))
+                .or_else(|| d.metadata.clone());
+            &typed_call
+        } else {
+            d
+        };
         // routes_to whose imported-handler source never resolved at batch time.
         let source_ids: Vec<i64> = if d.relation == REL_ROUTES_TO && d.source_ids.is_empty() {
             let all = name_to_ids.get(&d.source_name).cloned().unwrap_or_default();
@@ -3046,6 +3661,66 @@ fn resolve_deferred_relations(
         };
         if source_ids.is_empty() {
             continue;
+        }
+
+        // D6: a handler found outside the route's own file gets the route's
+        // self-edge in ITS file, so the edge records which file wrote it.
+        let routed: DeferredRelation;
+        let d = if d.relation == REL_ROUTES_TO
+            && source_ids
+                .iter()
+                .all(|id| node_id_to_path.get(id) != Some(&d.rel_path))
+        {
+            routed = DeferredRelation {
+                metadata: with_route_file(d.metadata.as_deref(), &d.rel_path),
+                ..d.clone()
+            };
+            &routed
+        } else {
+            d
+        };
+
+        // A call through a renamed import (D#120): the export in the file its
+        // specifier names, else buffered while that file lacks it, else nothing.
+        if d.relation == REL_CALLS {
+            if let Some(CalleeMeta::Import { module, export }) =
+                parse_callee_metadata(d.metadata.as_deref())
+            {
+                match super::resolve::js_import_targets(
+                    db.conn(),
+                    &mut js_exports,
+                    &d.rel_path,
+                    &module,
+                    &export,
+                    all_file_paths,
+                )? {
+                    Some(ids) if ids.is_empty() => {
+                        let pending_name =
+                            super::resolve::js_import_pending_name(d.metadata.as_deref(), &export);
+                        for source_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                *source_id,
+                                &pending_name,
+                                &d.language,
+                                d.metadata.as_deref(),
+                            )?;
+                        }
+                    }
+                    Some(ids) => {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &ids,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    }
+                    None => {}
+                }
+                continue;
+            }
         }
 
         let import_meta: Option<serde_json::Value> = if d.relation == REL_IMPORTS {
@@ -3091,7 +3766,9 @@ fn resolve_deferred_relations(
                     .get("is_module_import")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if let Some(module_files) = project_module_files(python_module, python_module_map) {
+                if let Some(module_files) =
+                    project_module_files_from(python_module, &d.rel_path, python_module_map)
+                {
                     if let Some(module_targets) = resolve_python_module_targets(
                         &module_files,
                         is_module_import,
@@ -3108,6 +3785,38 @@ fn resolve_deferred_relations(
                             false,
                         )?;
                         continue;
+                    }
+                    // A relative import stays inside its package (D10): a name
+                    // that is no node of the module is a submodule (`from .
+                    // import typing`), a variable (`from .signals import
+                    // request_started`) or `*`, and binds the file it names —
+                    // never a same-named node elsewhere via the name chain.
+                    if python_module.starts_with('.') && !is_module_import {
+                        let submodule = if python_module.ends_with('.') {
+                            format!("{python_module}{}", d.target_name)
+                        } else {
+                            format!("{python_module}.{}", d.target_name)
+                        };
+                        let files =
+                            project_module_files_from(&submodule, &d.rel_path, python_module_map)
+                                .unwrap_or(module_files);
+                        if let Some(module_nodes) = resolve_python_module_targets(
+                            &files,
+                            true,
+                            &d.target_name,
+                            &node_id_to_path,
+                            &name_to_ids,
+                        ) {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &module_nodes,
+                                &d.relation,
+                                d.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
                     }
                 }
             }
@@ -3164,6 +3873,38 @@ fn resolve_deferred_relations(
             }
         }
 
+        // 4b. Rust `use crate::a::b::name` / `use super::name`: the module path
+        //     names the item's file (D#71). No such item there (a re-export, a
+        //     macro-made item) → the name-based chain below, as before, without
+        //     the root of the other crate of a lib.rs + main.rs package (D#136).
+        let other_root = import_meta
+            .as_ref()
+            .and_then(|meta| super::resolve::rust_use_other_root(meta, &d.rel_path, crate_roots));
+        if let Some(files) = import_meta.as_ref().and_then(|meta| {
+            super::resolve::rust_use_files(meta, &d.rel_path, all_file_paths, crate_roots)
+        }) {
+            let targets: Vec<i64> = name_to_ids
+                .get(&d.target_name)
+                .map(|ids| {
+                    ids.iter()
+                        .copied()
+                        .filter(|id| node_id_to_path.get(id).is_some_and(|p| files.contains(p)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !targets.is_empty() {
+                edges_created += insert_relation_edges(
+                    db,
+                    &source_ids,
+                    &targets,
+                    &d.relation,
+                    d.metadata.as_deref(),
+                    false,
+                )?;
+                continue;
+            }
+        }
+
         // 5. Rust trait-impl method edges (q:"impl_method").
         if d.relation == REL_IMPLEMENTS {
             if let Some(ref meta_str) = d.metadata {
@@ -3171,7 +3912,15 @@ fn resolve_deferred_relations(
                     if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method") {
                         if let Some(impl_type) = meta.get("v").and_then(|v| v.as_str()) {
                             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
-                            let filtered = self_filter_candidates(impl_type, &all, db)?;
+                            let filtered = self_filter_candidates(
+                                impl_type,
+                                &all,
+                                &source_ids,
+                                &d.rel_path,
+                                &node_id_to_path,
+                                None,
+                                db,
+                            )?;
                             if !filtered.is_empty() {
                                 edges_created += insert_relation_edges(
                                     db,
@@ -3191,7 +3940,39 @@ fn resolve_deferred_relations(
 
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
-            let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+            let mut all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+            if super::resolve::is_package_bound(d.metadata.as_deref()) {
+                all.retain(|id| node_id_to_path.get(id) != Some(&d.rel_path));
+            }
+            let all = classes.rust_call_shape_candidates(
+                db,
+                &d.language,
+                d.metadata.as_deref(),
+                Some(&d.rel_path),
+                all,
+            )?;
+            let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
+            // What the receiver's type rules out: dropped from what is bound
+            // below, never from the pool it is chosen from.
+            let never = classes.rust_receiver_never(
+                db,
+                &d.language,
+                &d.target_name,
+                d.metadata.as_deref(),
+                crate_roots,
+                &d.rel_path,
+                &all,
+            )?;
+            let all = classes.rust_receiver_candidates(
+                db,
+                &d.language,
+                d.metadata.as_deref(),
+                crate_roots,
+                &d.rel_path,
+                &node_id_to_path,
+                all_file_paths,
+                all,
+            )?;
 
             // 6a. JS namespace-receiver constraint captured at batch time
             //     (`m.foo()` where `m` is a require/import-namespace binding).
@@ -3222,7 +4003,20 @@ fn resolve_deferred_relations(
             }
 
             let mut handled = true;
+            let opaque_meta: Option<String>;
+            let mut call_meta = d.metadata.as_deref();
+            let guessed = d
+                .metadata
+                .as_deref()
+                .filter(|m| m.contains(r#""rtype""#) || m.contains(r#""super""#))
+                .map(super::resolve::ambiguous_meta);
             match parse_callee_metadata(d.metadata.as_deref()) {
+                Some(CalleeMeta::Module(module)) => {
+                    if !py_modules.contains(&module) {
+                        continue; // a library module's function, as at batch time
+                    }
+                    handled = false;
+                }
                 Some(CalleeMeta::Receiver(_))
                     if matches!(d.language.as_str(), "javascript" | "typescript" | "tsx") =>
                 {
@@ -3246,66 +4040,240 @@ fn resolve_deferred_relations(
                             Some(same_file_methods[0])
                         } else if same_file_methods.is_empty() && methods.len() == 1 {
                             Some(methods[0])
+                        } else if methods.is_empty() {
+                            // No such method anywhere yet: buffer the call, so the
+                            // run that adds one binds it as a rebuild would (D#117).
+                            for &src_id in &source_ids {
+                                crate::storage::queries::insert_pending_unresolved_call(
+                                    db.conn(),
+                                    src_id,
+                                    &d.target_name,
+                                    &d.language,
+                                    call_meta,
+                                )?;
+                            }
+                            None
+                        } else if d.language == "rust"
+                            && super::resolve::rust_receiver(call_meta, crate_roots).is_some()
+                        {
+                            // A typed receiver's call is decided by its type's own
+                            // method, which a later run may add: buffer it, as a
+                            // rebuild would then bind it (D#112).
+                            for &src_id in &source_ids {
+                                crate::storage::queries::insert_pending_unresolved_call(
+                                    db.conn(),
+                                    src_id,
+                                    &d.target_name,
+                                    &d.language,
+                                    call_meta,
+                                )?;
+                            }
+                            None
                         } else {
                             None // ambiguous either way → drop, as at batch time
                         };
                         if let Some(tgt_id) = target {
-                            edges_created += insert_relation_edges(
+                            edges_created += bind_unless_ruled_out(
                                 db,
                                 &source_ids,
                                 &[tgt_id],
-                                &d.relation,
-                                d.metadata.as_deref(),
-                                false,
+                                &never,
+                                d,
+                                call_meta,
                             )?;
                         }
                     }
                 }
                 Some(CalleeMeta::SelfRecv(impl_type)) | Some(CalleeMeta::SelfType(impl_type)) => {
                     let same_lang = same_lang_of(&all, &d.language, &[]);
-                    let filtered = self_filter_candidates(&impl_type, &same_lang, db)?;
+                    let filtered = self_filter_candidates(
+                        &impl_type,
+                        &same_lang,
+                        &source_ids,
+                        &d.rel_path,
+                        &node_id_to_path,
+                        call_meta,
+                        db,
+                    )?;
                     if !filtered.is_empty() {
                         edges_created += insert_relation_edges(
                             db,
                             &source_ids,
                             &filtered,
                             &d.relation,
-                            d.metadata.as_deref(),
+                            call_meta,
                             false,
                         )?;
                     }
                     // empty → drop: qualifier is fixed and the pool is now complete.
                 }
-                Some(CalleeMeta::RecvType(recv_type)) => {
-                    // Bind precisely to the inferred type's own methods; an EMPTY
-                    // filter (inherited method / mis-inferred type) falls through
-                    // to the bare default chain below — rtype is strictly additive
-                    // precision and must never drop an edge the bare path would
-                    // have resolved (mirrors the batch-time arm).
+                Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
+                    let (recv_type, dispatch) = match meta {
+                        CalleeMeta::RecvType(t) => (t, true),
+                        CalleeMeta::SuperType(t) => (t, false),
+                        _ => unreachable!("matched above"),
+                    };
+                    // The receiver's class's own method; a project class without
+                    // it (inherited method) falls through to the default chain
+                    // below, over `all`, which already excludes free functions;
+                    // a class the project does not define binds nothing.
                     let same_lang = same_lang_of(&all, &d.language, &[]);
-                    let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
-                    if !filtered.is_empty() {
-                        edges_created += insert_relation_edges(
-                            db,
-                            &source_ids,
-                            &filtered,
-                            &d.relation,
-                            d.metadata.as_deref(),
-                            false,
-                        )?;
+                    if same_lang.is_empty() {
+                        // Nothing by that name yet: buffer it for a later run. Not
+                        // through the default chain, whose noise-name drop is for
+                        // untyped guesses (`q.build()` on a `Q` is no guess).
+                        for &src_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                src_id,
+                                &d.target_name,
+                                &d.language,
+                                call_meta,
+                            )?;
+                        }
                     } else {
-                        handled = false;
+                        match recv_type_targets(
+                            &recv_type,
+                            dispatch,
+                            &same_lang,
+                            db,
+                            &mut classes,
+                            &d.rel_path,
+                            &node_id_to_path,
+                        )? {
+                            RecvTypeTargets::Bind(own) => {
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &own,
+                                    &d.relation,
+                                    call_meta,
+                                    false,
+                                )?;
+                            }
+                            RecvTypeTargets::Ambiguous(own) => {
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &own,
+                                    &d.relation,
+                                    guessed.as_deref(),
+                                    false,
+                                )?;
+                            }
+                            RecvTypeTargets::Fallback => {
+                                // Resolved as the untyped member call it now is, and
+                                // marked so its edges are classified like one.
+                                call_meta = guessed.as_deref();
+                                handled = false;
+                            }
+                            // No project class of that name (yet): buffer it, so a
+                            // later run that adds the class can still bind it.
+                            RecvTypeTargets::Drop => {
+                                for &src_id in &source_ids {
+                                    crate::storage::queries::insert_pending_unresolved_call(
+                                        db.conn(),
+                                        src_id,
+                                        &d.target_name,
+                                        &d.language,
+                                        call_meta,
+                                    )?;
+                                }
+                            }
+                        }
                     }
                 }
                 Some(CalleeMeta::Path(segments)) => {
+                    use super::resolve::{Anchored, UseAnchor};
                     let same_lang = same_lang_of(&all, &d.language, &[]);
-                    let filtered = path_filter_candidates(
+                    // A path a `use` spelled out (D#132): std's binds nothing, a
+                    // project crate's is looked for in that crate.
+                    let segments = match super::resolve::rust_use_anchor(
+                        call_meta,
                         &segments,
-                        &same_lang,
-                        &node_id_to_path,
-                        db,
+                        &d.rel_path,
                         crate_roots,
-                    )?;
+                    ) {
+                        UseAnchor::None => segments,
+                        UseAnchor::Unplaced(stripped) => stripped,
+                        UseAnchor::Opaque(stripped) if !stripped.is_empty() => stripped,
+                        // A bare call through a crate no manifest could be read
+                        // for: by its name, as before D#132 (the default chain
+                        // below), and classified like any bare call.
+                        UseAnchor::Opaque(_) => {
+                            opaque_meta = call_meta.map(super::resolve::ambiguous_meta);
+                            call_meta = opaque_meta.as_deref();
+                            handled = false;
+                            Vec::new()
+                        }
+                        UseAnchor::Foreign => continue,
+                        UseAnchor::At(anchor) => {
+                            match super::resolve::rust_anchored_targets(
+                                &anchor,
+                                &same_lang,
+                                &node_id_to_path,
+                                db,
+                                all_file_paths,
+                            )? {
+                                Anchored::Named(ids) => {
+                                    edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &ids,
+                                        &d.relation,
+                                        call_meta,
+                                        false,
+                                    )?;
+                                }
+                                Anchored::Elsewhere(ids) => {
+                                    let ids = if ids.len() > 1 {
+                                        refine_ambiguous_targets(
+                                            &ids,
+                                            &d.rel_path,
+                                            &node_id_to_path,
+                                        )
+                                    } else {
+                                        ids
+                                    };
+                                    let meta = call_meta.map(|m| {
+                                        super::resolve::reexport_meta(m, &anchor.dir, ids.len() > 1)
+                                    });
+                                    edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &ids,
+                                        &d.relation,
+                                        meta.as_deref(),
+                                        false,
+                                    )?;
+                                }
+                                // Buffered: the run that adds the item binds it.
+                                Anchored::Nothing => {
+                                    for &src_id in &source_ids {
+                                        crate::storage::queries::insert_pending_unresolved_call(
+                                            db.conn(),
+                                            src_id,
+                                            &d.target_name,
+                                            &d.language,
+                                            call_meta,
+                                        )?;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    let filtered = if handled {
+                        path_filter_candidates(
+                            &segments,
+                            &same_lang,
+                            &node_id_to_path,
+                            db,
+                            crate_roots,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
                     if !filtered.is_empty() {
                         let final_targets = if filtered.len() > 1 {
                             refine_ambiguous_targets(&filtered, &d.rel_path, &node_id_to_path)
@@ -3317,7 +4285,7 @@ fn resolve_deferred_relations(
                             &source_ids,
                             &final_targets,
                             &d.relation,
-                            d.metadata.as_deref(),
+                            call_meta,
                             false,
                         )?;
                     }
@@ -3341,17 +4309,36 @@ fn resolve_deferred_relations(
                 })
                 .collect();
             if !same_file_targets.is_empty() {
-                edges_created += insert_relation_edges(
+                edges_created += bind_unless_ruled_out(
                     db,
                     &source_ids,
                     &same_file_targets,
-                    &d.relation,
-                    d.metadata.as_deref(),
-                    false,
+                    &never,
+                    d,
+                    call_meta,
                 )?;
                 continue;
             }
             if is_cross_file_call_noise(&d.target_name, &d.language) {
+                // A typed call its class hierarchy could not answer (`x.build()`
+                // on a `Foo` without `build`) is no guess to drop: buffer it, as
+                // a call on a class the project lacks is, so a later run that
+                // gives the class the method can bind it and a class change can
+                // find it (`typed_callers_of_class_drift`).
+                if matches!(
+                    parse_callee_metadata(call_meta),
+                    Some(CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))
+                ) {
+                    for &src_id in &source_ids {
+                        crate::storage::queries::insert_pending_unresolved_call(
+                            db.conn(),
+                            src_id,
+                            &d.target_name,
+                            &d.language,
+                            call_meta,
+                        )?;
+                    }
+                }
                 continue;
             }
             // Cross-file pool: batch-time exclusion is BY SOURCE FILE (local_ids),
@@ -3369,14 +4356,8 @@ fn resolve_deferred_relations(
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
-                edges_created += insert_relation_edges(
-                    db,
-                    &source_ids,
-                    &final_targets,
-                    &d.relation,
-                    d.metadata.as_deref(),
-                    false,
-                )?;
+                edges_created +=
+                    bind_unless_ruled_out(db, &source_ids, &final_targets, &never, d, call_meta)?;
                 continue;
             }
             // Still unresolved after seeing the WHOLE tree — this is what the
@@ -3388,7 +4369,7 @@ fn resolve_deferred_relations(
                     src_id,
                     &d.target_name,
                     &d.language,
-                    d.metadata.as_deref(),
+                    call_meta,
                 )?;
             }
             continue;
@@ -3396,7 +4377,32 @@ fn resolve_deferred_relations(
 
         // 7. Default name chain: same-file → same-language (refined) →
         //    (references: drop) / (structural: family pool → sentinel/drop).
-        let all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+        let mut all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+        if let Some(other) = other_root.as_deref() {
+            all_target_ids.retain(|id| node_id_to_path.get(id).map(String::as_str) != Some(other));
+        }
+        if super::resolve::is_package_bound(d.metadata.as_deref()) {
+            // An import of a package names a module, never a project function
+            // that happens to share its last segment: it takes the sentinel.
+            // (A call keeps the cross-file pool, for a workspace package.)
+            if d.relation == REL_IMPORTS {
+                all_target_ids.clear();
+            } else {
+                all_target_ids.retain(|id| node_id_to_path.get(id) != Some(&d.rel_path));
+            }
+        }
+        // `from flask import url_for` imports no method (C4).
+        if d.relation == REL_IMPORTS {
+            all_target_ids = classes.python_import_candidates(db, &d.language, all_target_ids)?;
+        }
+        // A supertype is a type, as at batch time.
+        if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {
+            if callable_ids.is_none() {
+                callable_ids = Some(crate::storage::queries::callable_node_ids(db.conn())?);
+            }
+            let callables = callable_ids.as_ref().expect("loaded above");
+            all_target_ids.retain(|id| !callables.contains(id));
+        }
         let same_file_targets: Vec<i64> = all_target_ids
             .iter()
             .filter(|id| node_id_to_path.get(id).map(|p| p.as_str()) == Some(d.rel_path.as_str()))
@@ -3432,8 +4438,20 @@ fn resolve_deferred_relations(
         };
 
         if target_ids.is_empty() && (d.relation == REL_IMPLEMENTS || d.relation == REL_IMPORTS) {
+            // A Rust `use` path keeps its module path on the sentinel edge, so a
+            // later definition in the module it names re-extracts the importer
+            // (`bare_name_callers_of_new_duplicates`).
+            let metadata = d
+                .metadata
+                .clone()
+                .filter(|m| d.relation == REL_IMPORTS && m.contains(r#""ru""#));
             for &src_id in &source_ids {
-                unresolved_externals.push((src_id, d.target_name.clone(), d.relation.clone()));
+                unresolved_externals.push((
+                    src_id,
+                    d.target_name.clone(),
+                    d.relation.clone(),
+                    metadata.clone(),
+                ));
             }
         } else {
             edges_created += insert_relation_edges(

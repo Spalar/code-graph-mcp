@@ -95,6 +95,8 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
             ))?;
+        // A symbol in a file added since the last index (D2).
+        crate::cli::freshness::index_new_files_if_absent(db, &ctx.project_root, symbol);
         // Ambiguity FIRST, through the shared resolver — the same verdict
         // `callgraph`/`impact`/`refs` give. `get_first_node_id_by_name` alone
         // meant `similar new` silently answered about ONE arbitrary definition

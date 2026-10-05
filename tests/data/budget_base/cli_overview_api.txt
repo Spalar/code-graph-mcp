@@ -1,0 +1,58 @@
+core/api.py
+  L1-2  function  api_00 (1×)  (request, payload, options=None)
+  L5-6  function  api_01 (1×)  (request, payload, options=None)
+  L9-10  function  api_02 (1×)  (request, payload, options=None)
+  L13-14  function  api_03 (1×)  (request, payload, options=None)
+  L17-18  function  api_04 (1×)  (request, payload, options=None)
+  L21-22  function  api_05 (1×)  (request, payload, options=None)
+  L25-26  function  api_06 (1×)  (request, payload, options=None)
+  L29-30  function  api_07 (1×)  (request, payload, options=None)
+  L33-34  function  api_08 (1×)  (request, payload, options=None)
+  L37-38  function  api_09 (1×)  (request, payload, options=None)
+  L41-42  function  api_10 (1×)  (request, payload, options=None)
+  L45-46  function  api_11 (1×)  (request, payload, options=None)
+  L49-50  function  api_12 (1×)  (request, payload, options=None)
+  L53-54  function  api_13 (1×)  (request, payload, options=None)
+  L57-58  function  api_14 (1×)  (request, payload, options=None)
+  L61-62  function  api_15 (1×)  (request, payload, options=None)
+  L65-66  function  api_16 (1×)  (request, payload, options=None)
+  L69-70  function  api_17 (1×)  (request, payload, options=None)
+  L73-74  function  api_18 (1×)  (request, payload, options=None)
+  L77-78  function  api_19 (1×)  (request, payload, options=None)
+  L81-82  function  api_20 (1×)  (request, payload, options=None)
+  L85-86  function  api_21 (1×)  (request, payload, options=None)
+  L89-90  function  api_22 (1×)  (request, payload, options=None)
+  L93-94  function  api_23 (1×)  (request, payload, options=None)
+  L97-98  function  api_24 (1×)  (request, payload, options=None)
+  L101-102  function  api_25 (1×)  (request, payload, options=None)
+  L105-106  function  api_26 (1×)  (request, payload, options=None)
+  L109-110  function  api_27 (1×)  (request, payload, options=None)
+  L113-114  function  api_28 (1×)  (request, payload, options=None)
+  L117-118  function  api_29 (1×)  (request, payload, options=None)
+  L121-122  function  api_30 (1×)  (request, payload, options=None)
+  L125-126  function  api_31 (1×)  (request, payload, options=None)
+  L129-130  function  api_32 (1×)  (request, payload, options=None)
+  L133-134  function  api_33 (1×)  (request, payload, options=None)
+  L137-138  function  api_34 (1×)  (request, payload, options=None)
+  L141-142  function  unused_00  ()
+  L145-146  function  unused_01  ()
+  L149-150  function  unused_02  ()
+  L153-154  function  unused_03  ()
+  L157-158  function  unused_04  ()
+  L161-162  function  unused_05  ()
+  L165-166  function  unused_06  ()
+  L169-170  function  unused_07  ()
+  L173-174  function  unused_08  ()
+  L177-178  function  unused_09  ()
+  L181-182  function  unused_10  ()
+  L185-186  function  unused_11  ()
+  L189-190  class  Unused00
+  L193-194  class  Unused01
+  L197-198  class  Unused02
+  L201-202  class  Unused03
+  L205-206  class  Unused04
+  L209-210  class  Unused05
+  L213-214  class  Unused06
+  L217-218  class  Unused07
+  L221-222  class  Unused08
+  L225-226  class  Unused09

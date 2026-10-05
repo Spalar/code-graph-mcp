@@ -61,59 +61,69 @@ pub(super) fn extract_rust_use_imports(
     results: &mut Vec<ParsedRelation>,
 ) {
     const EXTERNAL_ROOTS: &[&str] = &["std", "core", "alloc", "proc_macro"];
-    fn collect_use_names(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>) {
-        collect_use_names_inner(node, source, names, 0);
-    }
-    fn collect_use_names_inner(
+    /// Each imported name with the path segments written before it
+    /// (`crate::a::{b::f, g}` → `f` [crate, a, b], `g` [crate, a]). An alias
+    /// imports the original name, as it always has.
+    fn collect_use_paths(
         node: &tree_sitter::Node,
         source: &str,
-        names: &mut Vec<String>,
+        prefix: &[String],
+        out: &mut Vec<(String, Vec<String>)>,
         depth: usize,
     ) {
         if depth > MAX_SUBTREE_DEPTH {
             return;
         }
+        let segments = |path: Option<tree_sitter::Node>| -> Vec<String> {
+            let mut segs = prefix.to_vec();
+            if let Some(p) = path {
+                segs.extend(
+                    node_text(&p, source)
+                        .split("::")
+                        .map(|seg| seg.trim().to_string())
+                        .filter(|seg| !seg.is_empty()),
+                );
+            }
+            segs
+        };
         match node.kind() {
             "use_as_clause" => {
                 if let Some(child) = node.named_child(0) {
-                    collect_use_names_inner(&child, source, names, depth + 1);
+                    collect_use_paths(&child, source, prefix, out, depth + 1);
                 }
             }
             "use_wildcard" => {}
             "use_list" => {
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
-                        collect_use_names_inner(&child, source, names, depth + 1);
+                        collect_use_paths(&child, source, prefix, out, depth + 1);
                     }
                 }
             }
             "scoped_use_list" => {
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i) {
-                        if child.kind() != "scoped_identifier" && child.kind() != "identifier" {
-                            collect_use_names_inner(&child, source, names, depth + 1);
-                        }
-                    }
+                let segs = segments(node.child_by_field_name("path"));
+                if let Some(list) = node.child_by_field_name("list") {
+                    collect_use_paths(&list, source, &segs, out, depth + 1);
                 }
             }
             "scoped_identifier" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = node_text(&name_node, source);
                     if !name.is_empty() && name != "*" && name != "self" {
-                        names.push(name.to_string());
+                        out.push((name.to_string(), segments(node.child_by_field_name("path"))));
                     }
                 }
             }
             "identifier" | "type_identifier" => {
                 let name = node_text(node, source);
                 if !name.is_empty() && name != "self" {
-                    names.push(name.to_string());
+                    out.push((name.to_string(), prefix.to_vec()));
                 }
             }
             _ => {
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
-                        collect_use_names_inner(&child, source, names, depth + 1);
+                        collect_use_paths(&child, source, prefix, out, depth + 1);
                     }
                 }
             }
@@ -144,6 +154,7 @@ pub(super) fn extract_rust_use_imports(
     }
 
     let scope_name = scope.unwrap_or("<module>");
+    let inline_mods = enclosing_inline_mods(node, source);
     for member in members {
         // A leading `::` (`use ::std::mem::swap`) is part of the root token's
         // text but not of the crate name, so the raw comparison missed it and the
@@ -151,17 +162,101 @@ pub(super) fn extract_rust_use_imports(
         let root = use_path_root(&member, source).trim_start_matches("::");
         let external = EXTERNAL_ROOTS.contains(&root);
         let mut names = Vec::new();
-        collect_use_names(&member, source, &mut names);
-        for name in names {
+        collect_use_paths(&member, source, &[], &mut names, 0);
+        for (name, segments) in names {
+            let metadata = if external {
+                Some(crate::domain::IMPORT_EXTERNAL_META.to_string())
+            } else {
+                import_metadata(node, source, &name, &segments, &inline_mods)
+            };
             results.push(ParsedRelation {
                 source_name: scope_name.to_string(),
                 target_name: name,
                 relation: REL_IMPORTS.into(),
-                metadata: external.then(|| crate::domain::IMPORT_EXTERNAL_META.to_string()),
+                metadata,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
+}
+
+/// The metadata of an import `name` written after `segments` (D#71, D#132).
+/// The path's root is read as the file's `use` reads it
+/// ([`super::rust_use::normalize_use_path`]): a module this module declares
+/// (`mod util; use util::f;`) or a name another `use` binds is followed. A path
+/// rooted at a crate name carries `{"ru":"ext","c":<crate>,"m":[…]}`: the
+/// resolver names its file when the crate is a package of this project; a
+/// std path reached through another `use` is the external marker.
+fn import_metadata(
+    node: &tree_sitter::Node,
+    source: &str,
+    name: &str,
+    segments: &[String],
+    inline_mods: &[String],
+) -> Option<String> {
+    let mut full = segments.to_vec();
+    full.push(name.to_string());
+    let Some((normalized, root)) = super::rust_use::normalize_use_path(node, source, &full) else {
+        return use_module_metadata(segments, inline_mods);
+    };
+    let (_, module) = normalized.split_last()?;
+    match root {
+        super::rust_use::UseRoot::Project => use_module_metadata(module, &[]),
+        super::rust_use::UseRoot::Extern => {
+            let (krate, rest) = module.split_first()?;
+            if matches!(krate.as_str(), "std" | "core" | "alloc" | "proc_macro") {
+                return Some(crate::domain::IMPORT_EXTERNAL_META.to_string());
+            }
+            Some(serde_json::json!({ "ru": "ext", "c": krate, "m": rest }).to_string())
+        }
+    }
+}
+
+/// Names of the inline `mod name { … }` blocks around `node`, outermost first.
+pub(super) fn enclosing_inline_mods(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+    let mut mods = Vec::new();
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "mod_item" {
+            if let Some(name) = n.child_by_field_name("name") {
+                mods.push(node_text(&name, source).to_string());
+            }
+        }
+        cur = n.parent();
+    }
+    mods.reverse();
+    mods
+}
+
+/// The module a project `use` path names (D#71), for the resolver to pick the
+/// item's file by: `{"ru":"crate","m":[…]}` below the crate root, or
+/// `{"ru":"file","up":n,"m":[…]}` below the module `n` levels above the file's
+/// own (`self::` / `super::`, net of the inline `mod` blocks around the `use`).
+/// Any other root (another crate, a module in scope) carries nothing: the name
+/// resolves as it always has.
+fn use_module_metadata(segments: &[String], inline_mods: &[String]) -> Option<String> {
+    let (first, rest) = segments.split_first()?;
+    let (root, up, module): (&str, usize, Vec<String>) = match first.as_str() {
+        "crate" => ("crate", 0, rest.to_vec()),
+        "self" | "super" => {
+            let supers = segments.iter().take_while(|s| *s == "super").count();
+            let tail = &segments[supers.max(usize::from(first == "self"))..];
+            if supers <= inline_mods.len() {
+                let mut module = inline_mods[..inline_mods.len() - supers].to_vec();
+                module.extend(tail.iter().cloned());
+                ("file", 0, module)
+            } else {
+                ("file", supers - inline_mods.len(), tail.to_vec())
+            }
+        }
+        _ => return None,
+    };
+    let mut meta = serde_json::json!({ "ru": root, "m": module });
+    if up > 0 {
+        meta["up"] = serde_json::json!(up);
+    }
+    Some(meta.to_string())
 }
 
 /// Extract `impl Trait for Type` → Type implements Trait
@@ -173,18 +268,32 @@ pub(super) fn extract_rust_impl_trait(
     let trait_node = node.child_by_field_name("trait")?;
     let type_node = node.child_by_field_name("type")?;
     let trait_name = node_text(&trait_node, source).to_string();
-    let type_text = node_text(&type_node, source).to_string();
-    // Strip generics so source resolution can match the bare struct name.
-    // The `type` field on a generic impl block returns the full `Type<'a, W>`
-    // text; Phase 2 source resolution (index_files.rs) does exact-name match
-    // against local node names ("Type"), so without stripping, no edge would
-    // emit for any generic trait impl — every method appears dead.
-    let type_name = type_text
-        .split('<')
-        .next()
-        .unwrap_or(&type_text)
-        .trim()
-        .to_string();
+    // Phase 2 source resolution (index_files.rs) matches this name against the
+    // file's own nodes, so it may be the bare type name only where the path
+    // provably names an item of this file: a single segment (`Type<'a, W>`),
+    // `self::Type`, or `super::Type` from inside an inline `mod` (tokio's
+    // `mod imp { impl Drop for super::Counters }`). `crate::…::Type` is kept
+    // whole for the resolver, which knows the file's module path. Any other
+    // path (`std::io::Error`, `bounded::Semaphore`) is kept whole and matches
+    // nothing: the file's own `Error` is not std's.
+    let path = crate::parser::rust_type_path(node_text(&type_node, source));
+    let in_inline_mod = {
+        let mut cur = node.parent();
+        let mut found = false;
+        while let Some(n) = cur {
+            if n.kind() == "mod_item" {
+                found = true;
+                break;
+            }
+            cur = n.parent();
+        }
+        found
+    };
+    let type_name = match path.as_slice() {
+        [name] => name.clone(),
+        [root, name] if root == "self" || (root == "super" && in_inline_mod) => name.clone(),
+        _ => path.join("::"),
+    };
     if trait_name.is_empty() || type_name.is_empty() {
         return None;
     }
@@ -194,6 +303,7 @@ pub(super) fn extract_rust_impl_trait(
         relation: REL_IMPLEMENTS.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -287,6 +397,7 @@ pub(super) fn extract_rust_path_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -373,6 +484,7 @@ pub(super) fn extract_rust_type_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -509,12 +621,27 @@ pub(super) fn extract_rust_macro_token_call(
     if shadowed_by_enclosing_local(node, source, name) {
         return None;
     }
+    // What the file's `use` makes of the name, as for a call outside a macro
+    // (D#132): `assert!(tempdir().is_ok())` after `use tempfile::tempdir`.
+    use super::rust_use::UseRewrite;
+    let (target_name, metadata) = match super::rust_use::rewrite_call(node, source, name, None) {
+        Some(UseRewrite::Path {
+            name,
+            segments,
+            root,
+        }) => {
+            let meta = serde_json::json!({ "q": "path", "v": segments.join("::") }).to_string();
+            (name, Some(super::calls::with_use_root(meta, Some(root))))
+        }
+        None => (name.to_string(), None),
+    };
     Some(ParsedRelation {
         source_name: scope.to_string(),
-        target_name: name.to_string(),
+        target_name,
         relation: REL_CALLS.into(),
-        metadata: None,
+        metadata,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -721,6 +848,7 @@ pub(super) fn extract_rust_value_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 

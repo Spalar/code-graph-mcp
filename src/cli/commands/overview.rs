@@ -15,6 +15,13 @@ pub struct OverviewArgs {
     /// Compact output (no caller counts)
     #[arg(long)]
     pub compact: bool,
+    /// Token budget for the text answer (bytes/3, 100-100000): symbols with
+    /// the fewest callers lose their signature first (a single file), files
+    /// with the fewest callers shrink to a count first (a directory), then the
+    /// lowest-ranked are left out; one file gets at most 70% of the budget;
+    /// ends with a command that prints the rest
+    #[arg(long, conflicts_with_all = ["json", "compact"])]
+    pub budget: Option<u64>,
 }
 
 /// Module overview: all symbols in files under a path prefix.
@@ -150,6 +157,19 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
         by_file.entry(&e.file_path).or_default().push(e);
     }
 
+    if let Some(requested) = args.budget {
+        let tokens = clamp_arg(
+            "--budget",
+            requested,
+            crate::budget::MIN_BUDGET_TOKENS,
+            crate::budget::MAX_BUDGET_TOKENS,
+        ) as usize;
+        let next = crate::budget::NextCommand::new("overview").path(raw_path);
+        let text = overview_budget_text(&by_file, disclosure.as_deref(), tokens, &next);
+        write!(stdout, "{}", text)?;
+        return Ok(());
+    }
+
     // Single-file path → outline format (sorted by line, signature + line range visible).
     // Replaces Read on huge files: a 3000+ line source emits ~symbol-count lines instead.
     if by_file.len() == 1 {
@@ -158,39 +178,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
         let mut sorted: Vec<&queries::ModuleExport> = symbols.to_vec();
         sorted.sort_by_key(|e| e.start_line);
         for s in sorted {
-            let callers = if s.caller_count > 0 {
-                format!(" ({}×)", s.caller_count)
-            } else {
-                String::new()
-            };
-            if compact {
-                writeln!(
-                    stdout,
-                    "  L{}-{}  {}  {}{}",
-                    s.start_line,
-                    s.end_line,
-                    s.node_type,
-                    s.display_name(),
-                    callers
-                )?;
-            } else {
-                let sig = s.signature.as_deref().unwrap_or("");
-                let sig_display = if sig.is_empty() {
-                    String::new()
-                } else {
-                    format!("  {}", sig.lines().next().unwrap_or("").trim())
-                };
-                writeln!(
-                    stdout,
-                    "  L{}-{}  {}  {}{}{}",
-                    s.start_line,
-                    s.end_line,
-                    s.node_type,
-                    s.display_name(),
-                    callers,
-                    sig_display
-                )?;
-            }
+            writeln!(stdout, "{}", outline_line(s, !compact))?;
         }
         if let Some(msg) = &disclosure {
             writeln!(stdout, "  ({})", msg)?;
@@ -207,18 +195,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
             by_type.entry(&s.node_type).or_default().push(s);
         }
         for (typ, syms) in &by_type {
-            let names: Vec<String> = syms
-                .iter()
-                .map(|s| {
-                    if compact {
-                        s.display_name().to_string()
-                    } else if s.caller_count > 0 {
-                        format!("{} ({}×)", s.display_name(), s.caller_count)
-                    } else {
-                        s.display_name().to_string()
-                    }
-                })
-                .collect();
+            let names: Vec<String> = syms.iter().map(|s| listed_name(s, compact)).collect();
             writeln!(stdout, "  {}: {}", typ, names.join(", "))?;
         }
     }
@@ -227,6 +204,221 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// One symbol of the single-file outline: `  L{start}-{end}  {type}  {name}
+/// ({callers}×)  {signature}`; `with_signature: false` is the compact line.
+fn outline_line(s: &queries::ModuleExport, with_signature: bool) -> String {
+    let callers = if s.caller_count > 0 {
+        format!(" ({}×)", s.caller_count)
+    } else {
+        String::new()
+    };
+    let sig = if with_signature {
+        s.signature.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+    let sig_display = if sig.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", sig.lines().next().unwrap_or("").trim())
+    };
+    format!(
+        "  L{}-{}  {}  {}{}{}",
+        s.start_line,
+        s.end_line,
+        s.node_type,
+        s.display_name(),
+        callers,
+        sig_display
+    )
+}
+
+/// One name in a directory listing's `  type: a (3×), b` line.
+fn listed_name(s: &queries::ModuleExport, compact: bool) -> String {
+    if compact || s.caller_count <= 0 {
+        s.display_name().to_string()
+    } else {
+        format!("{} ({}×)", s.display_name(), s.caller_count)
+    }
+}
+
+/// `overview --budget`: the text answer fitted to `tokens`.
+///
+/// A single file: one unit per symbol, ranked by caller count; the shorter
+/// form drops the signature. A directory: one unit per file, ranked by the sum
+/// of its symbols' caller counts; the shorter form is `path (N symbols)`.
+/// Where files are the unit, one file's block is first held to
+/// [`crate::budget::FILE_SHARE_PERCENT`] of the budget by leaving out its
+/// lowest-ranked names.
+pub(crate) fn overview_budget_text(
+    by_file: &std::collections::BTreeMap<&str, Vec<&queries::ModuleExport>>,
+    disclosure: Option<&str>,
+    tokens: usize,
+    next: &crate::budget::NextCommand,
+) -> String {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    let budget_b = budget::budget_bytes(tokens);
+    let disclosure_line = |indent: &str| disclosure.map(|m| format!("{indent}({m})\n"));
+
+    if by_file.len() == 1 {
+        let (file, symbols) = by_file.iter().next().unwrap();
+        let mut sorted: Vec<&queries::ModuleExport> = symbols.to_vec();
+        sorted.sort_by_key(|e| e.start_line);
+        let n = sorted.len();
+        let order = budget::order_by_importance(n, |i| (sorted[i].caller_count, Reverse(i)));
+        let has_sig = |i: usize| {
+            sorted[i]
+                .signature
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+        };
+        let steps = budget::standard_steps(&order, has_sig);
+        let render = |levels: &[Level]| -> String {
+            let mut out = format!("{file}\n");
+            for (i, s) in sorted.iter().enumerate() {
+                match levels[i] {
+                    Level::Full => out.push_str(&outline_line(s, true)),
+                    Level::Skeleton => out.push_str(&outline_line(s, false)),
+                    Level::Dropped => continue,
+                }
+                out.push('\n');
+            }
+            if let Some(d) = disclosure_line("  ") {
+                out.push_str(&d);
+            }
+            let dropped = levels.iter().filter(|l| **l == Level::Dropped).count();
+            let skel = levels.iter().filter(|l| **l == Level::Skeleton).count();
+            if let Some(n) = budget::notice(
+                "  ",
+                tokens,
+                &[
+                    (dropped, "symbol omitted", "symbols omitted"),
+                    (skel, "without signature", "without signature"),
+                ],
+            ) {
+                out.push_str(&format!("{n}\n  next: {next}\n"));
+            }
+            out
+        };
+        return budget::fit(&vec![Level::Full; n], &steps, budget_b, |l| {
+            let s = render(l);
+            let len = s.len();
+            (s, len)
+        })
+        .output;
+    }
+
+    // Directory: files are the unit.
+    let files: Vec<(&str, &Vec<&queries::ModuleExport>)> =
+        by_file.iter().map(|(f, v)| (*f, v)).collect();
+    // Per file, the names kept after the 70% share (in rank order, most first).
+    let share = budget_b * budget::FILE_SHARE_PERCENT / 100;
+    let file_block = |file: &str, syms: &[&queries::ModuleExport], keep: &[bool]| -> String {
+        let mut by_type: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (i, s) in syms.iter().enumerate() {
+            if keep[i] {
+                by_type
+                    .entry(&s.node_type)
+                    .or_default()
+                    .push(listed_name(s, false));
+            }
+        }
+        let mut out = format!("{file}\n");
+        for (typ, names) in &by_type {
+            out.push_str(&format!("  {}: {}\n", typ, names.join(", ")));
+        }
+        let cut = keep.iter().filter(|k| !**k).count();
+        if cut > 0 {
+            out.push_str(&format!("  (+{cut} lower-ranked symbols not shown)\n"));
+        }
+        out
+    };
+    let mut kept_names: Vec<Vec<bool>> = Vec::with_capacity(files.len());
+    for (file, syms) in &files {
+        let m = syms.len();
+        let mut levels = vec![Level::Full; m];
+        let order = budget::order_by_importance(m, |i| (syms[i].caller_count, Reverse(i)));
+        // Additive per name: the name plus its ", " separator.
+        let cost = |i: usize, l: Level| {
+            if l == Level::Full {
+                listed_name(syms[i], false).len() + 2
+            } else {
+                0
+            }
+        };
+        let head = file.len() + 64;
+        budget::cap_group(
+            &mut levels,
+            &order,
+            |_| false,
+            cost,
+            share.saturating_sub(head),
+        );
+        let keep: Vec<bool> = levels.iter().map(|l| *l == Level::Full).collect();
+        kept_names.push(keep);
+    }
+    let blocks: Vec<String> = files
+        .iter()
+        .zip(&kept_names)
+        .map(|((f, syms), keep)| file_block(f, syms, keep))
+        .collect();
+    let n = files.len();
+    let order = budget::order_by_importance(n, |i| {
+        let callers: i64 = files[i].1.iter().map(|s| s.caller_count.max(0)).sum();
+        (callers, files[i].1.len(), Reverse(i))
+    });
+    let steps = budget::standard_steps(&order, |_| true);
+    let render = |levels: &[Level]| -> String {
+        let mut out = String::new();
+        for (i, (file, syms)) in files.iter().enumerate() {
+            match levels[i] {
+                Level::Full => out.push_str(&blocks[i]),
+                Level::Skeleton => out.push_str(&format!(
+                    "{file} ({})\n",
+                    plural(syms.len() as i64, "symbol")
+                )),
+                Level::Dropped => {}
+            }
+        }
+        if let Some(d) = disclosure_line("") {
+            out.push_str(&d);
+        }
+        let count = |lv: Level| levels.iter().filter(|l| **l == lv).count();
+        let cut_in_full: usize = (0..n)
+            .filter(|&i| levels[i] == Level::Full)
+            .map(|i| kept_names[i].iter().filter(|k| !**k).count())
+            .sum();
+        if let Some(line) = budget::notice(
+            "",
+            tokens,
+            &[
+                (count(Level::Dropped), "file omitted", "files omitted"),
+                (
+                    count(Level::Skeleton),
+                    "file as a count only",
+                    "files as a count only",
+                ),
+                (
+                    cut_in_full,
+                    "symbol past its file's 70% share",
+                    "symbols past their file's 70% share",
+                ),
+            ],
+        ) {
+            out.push_str(&format!("{line}\nnext: {next}\n"));
+        }
+        out
+    };
+    budget::fit(&vec![Level::Full; n], &steps, budget_b, |l| {
+        let s = render(l);
+        let len = s.len();
+        (s, len)
+    })
+    .output
 }
 
 // --- show subcommand ---

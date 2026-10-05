@@ -402,7 +402,25 @@ impl DeadCodeReport {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+
+    /// [`DEAD_CODE_NON_RUST_NOTE`] when a candidate is outside Rust, the one
+    /// language where the call graph sees what keeps a symbol alive.
+    pub fn non_rust_note(&self) -> Option<&'static str> {
+        self.items
+            .iter()
+            .any(|it| crate::utils::config::detect_language(&it.file_path) != Some("rust"))
+            .then_some(DEAD_CODE_NON_RUST_NOTE)
+    }
 }
+
+/// C5 (2026-09-28 usage evaluation): on the evaluation corpora 0–25% of the
+/// non-Rust candidates were really unused, because what keeps them alive is
+/// invisible to the call graph. Shared by the CLI report and MCP
+/// `find_dead_code`.
+pub const DEAD_CODE_NON_RUST_NOTE: &str = "Outside Rust this list is experimental: on the \
+     evaluation corpora 0-25% of such candidates were really unused (entry points such as Go \
+     `init`, interface and override methods, `__init__.py` re-exports read as dead). Confirm \
+     each with `refs` or grep before deleting.";
 
 /// Reject a type filter that normalizes to empty (a typo like `fucntion`),
 /// which would otherwise fall through to a literal `n.type = :x` match and

@@ -236,6 +236,1258 @@ fn self_method_resolves_across_split_impl_blocks() {
     );
 }
 
+fn index_one_file(content: &str) -> (TempDir, Database) {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "src/lib.rs", content);
+    let db_path = tmp.path().join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, tmp.path(), None, None).unwrap();
+    (tmp, db)
+}
+
+fn qualified_names(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT qualified_name FROM nodes WHERE type IN ('function', 'method') ORDER BY 1")
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Every `calls` edge to `target`, as `caller_line -> callee_line` in one file.
+fn call_lines(db: &Database, target: &str) -> Vec<(i64, i64)> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT s.start_line, t.start_line FROM edges e
+             JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id
+             WHERE e.relation = 'calls' AND t.name = ? ORDER BY 1, 2",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([target], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+#[test]
+fn self_call_skips_other_impls_of_the_same_trait() {
+    // Impls of one trait for `Cursor<Vec<u8>>` and `Cursor<Box<[u8]>>` both
+    // name their type `Cursor`. Coherence keeps their types apart, so
+    // `self.flush()` in one is never the other's `flush`.
+    let (_tmp, db) = index_one_file(
+        r#"pub trait W { fn flush(&self); fn shutdown(&self); }
+pub struct Cursor<T>(T);
+impl W for Cursor<Vec<u8>> {
+    fn flush(&self) {}
+    fn shutdown(&self) { self.flush() }
+}
+impl W for Cursor<Box<[u8]>> {
+    fn flush(&self) {}
+    fn shutdown(&self) { self.flush() }
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "flush"), vec![(5, 4), (9, 8)]);
+}
+
+#[test]
+fn self_call_to_a_trait_default_skips_other_impls_of_the_trait() {
+    // `Cursor<u16>`'s impl does not define `flush`: its `self.flush()` runs the
+    // trait's default, never `Cursor<u8>`'s override.
+    let (_tmp, db) = index_one_file(
+        r#"pub trait W { fn flush(&self) {} fn shutdown(&self); }
+pub struct Cursor<T>(T);
+impl W for Cursor<u8> {
+    fn flush(&self) {}
+    fn shutdown(&self) {}
+}
+impl W for Cursor<u16> {
+    fn shutdown(&self) { self.flush() }
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "flush"), vec![]);
+}
+
+#[test]
+fn self_call_on_a_pinned_self_runs_pins_own_method() {
+    // `self: Pin<&mut Self>` makes `self` a `Pin`: `self.get_mut()` is
+    // `Pin::get_mut`, found on the receiver's own type before any deref reaches
+    // `Framed`. Its other calls still reach `Framed`, and so does `get_mut` on
+    // a plain `&mut self`.
+    let (_tmp, db) = index_one_file(
+        r#"use std::pin::Pin;
+pub struct Framed;
+impl Framed {
+    pub fn get_mut(&mut self) -> &mut u8 { unimplemented!() }
+    pub fn helper(&self) {}
+    pub fn plain(&mut self) { self.get_mut(); }
+}
+pub trait S { fn next(self: Pin<&mut Self>); }
+impl S for Framed {
+    fn next(self: Pin<&mut Self>) {
+        self.helper();
+        let _ = self.get_mut();
+    }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "get_mut"), vec!["Framed.plain".to_string()]);
+    assert_eq!(callers_of(&db, "helper"), vec!["Framed.next".to_string()]);
+}
+
+#[test]
+fn a_pinned_self_reaches_self_for_a_method_its_pointer_lacks() {
+    // Which `Pin` methods exist depends on the pointer: `get_ref` only on
+    // `Pin<&T>`, `get_mut` only on `Pin<&mut T>`, `as_mut` on a mutable pointer,
+    // `as_ref` on every `Pin`. A method this `Pin` lacks is found on `Self`
+    // through `Deref`, so it keeps its edge (pre-tag review). Checked with
+    // rustc: with `W::get_ref` returning `&u16`, `let a: &u16 = self.get_ref()`
+    // compiles in `unique` and `boxed`, `let r: &W = self.get_ref()` in `shared`.
+    let (_tmp, db) = index_one_file(
+        r#"use std::pin::Pin;
+pub struct W { inner: u8 }
+impl W {
+    pub fn get_ref(&self) -> &u16 { unimplemented!() }
+    pub fn as_mut(&mut self) -> &mut u16 { unimplemented!() }
+    pub fn as_ref(&self) -> &u16 { unimplemented!() }
+    pub fn get_mut(&mut self) -> &mut u16 { unimplemented!() }
+}
+pub trait P {
+    fn unique(self: Pin<&mut Self>) -> u8;
+    fn shared(self: Pin<&Self>) -> u8;
+    fn boxed(self: Pin<Box<Self>>) -> u8;
+}
+impl P for W {
+    fn unique(self: Pin<&mut Self>) -> u8 { let a: &u16 = self.get_ref(); let b: Pin<&W> = self.as_ref(); 0 }
+    fn shared(self: Pin<&Self>) -> u8 { let r: &W = self.get_ref(); r.inner }
+    fn boxed(mut self: Pin<Box<Self>>) -> u8 { let a: &u16 = self.get_ref(); let b: &mut u16 = self.get_mut(); let c: Pin<&mut W> = self.as_mut(); 0 }
+}
+"#,
+    );
+    let mut get_ref = callers_of(&db, "get_ref");
+    get_ref.sort();
+    assert_eq!(get_ref, vec!["W.boxed".to_string(), "W.unique".to_string()]);
+    assert_eq!(callers_of(&db, "get_mut"), vec!["W.boxed".to_string()]);
+    assert_eq!(callers_of(&db, "as_mut"), Vec::<String>::new());
+    assert_eq!(callers_of(&db, "as_ref"), Vec::<String>::new());
+}
+
+#[test]
+fn a_cfg_gated_method_does_not_rule_out_its_twin_in_another_impl() {
+    // E0592 keeps two inherent `raw`s of one type apart only when both exist
+    // in one build. With `#[cfg(unix)]` on the caller's own `raw` and
+    // `#[cfg(not(unix))]` on the other block, a non-unix build runs the other
+    // one (pre-tag review, fixture `c1`, compiles).
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Sys {
+    fd: i32,
+}
+impl Sys {
+    #[cfg(unix)]
+    pub fn raw(&self) -> i32 { self.fd }
+    pub fn go(&self) -> i32 { self.raw() }
+}
+#[cfg(not(unix))]
+impl Sys {
+    pub fn raw(&self) -> i32 { -self.fd }
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "raw"), vec![(7, 6), (7, 11)]);
+}
+
+#[test]
+fn a_same_named_type_in_an_inline_module_leaves_the_crate_to_decide() {
+    // `ops.rs` adds methods to `crate::conn::Conn` and has a test module with a
+    // mock `Conn` of its own. The file then holds two types of one name, so its
+    // own `ping` is no proof: the crate decides, which holds the real one
+    // (pre-tag review, fixture `om`: `cargo test` passes with `check() == 1`).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"om\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "pub mod conn;\npub mod ops;\n");
+    write(
+        root,
+        "src/conn.rs",
+        "pub struct Conn;\nimpl Conn {\n    pub fn ping(&self) -> u8 { 1 }\n}\n",
+    );
+    write(
+        root,
+        "src/ops.rs",
+        r#"use crate::conn::Conn;
+impl Conn {
+    pub fn check(&self) -> u8 { self.ping() }
+}
+#[cfg(test)]
+mod tests {
+    struct Conn;
+    impl Conn {
+        fn ping(&self) -> u8 { 2 }
+    }
+}
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of_in_file(&db, "ping", "src/conn.rs"),
+        vec!["Conn.check".to_string()],
+        "the real `ping` must be a callee"
+    );
+}
+
+#[test]
+fn an_inherent_self_call_reaches_a_module_the_layout_cannot_place() {
+    // `tests/it.rs` is a test crate whose `mod common;` is `tests/common/mod.rs`,
+    // a file no crate layout names. An inherent impl's call stops at its crate,
+    // and that module is the next nearest place its type's methods can be
+    // (pre-tag review, fixture `tc`: `cargo test` passes with `go() == 1`).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"tc\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        "pub struct Harness;\nimpl Harness {\n    pub fn m(&self) -> u8 { 2 }\n}\n",
+    );
+    write(
+        root,
+        "tests/common/mod.rs",
+        "pub struct Harness;\nimpl Harness {\n    pub fn m(&self) -> u8 { 1 }\n}\n",
+    );
+    write(
+        root,
+        "tests/it.rs",
+        "mod common;\nuse common::Harness;\nimpl Harness {\n    fn go(&self) -> u8 { self.m() }\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of_in_file(&db, "m", "tests/common/mod.rs"),
+        vec!["Harness.go".to_string()]
+    );
+    assert_eq!(
+        callers_of_in_file(&db, "m", "src/lib.rs"),
+        Vec::<String>::new(),
+        "another crate's `Harness`"
+    );
+}
+
+#[test]
+fn a_lib_self_call_never_reaches_a_test_modules_namesake() {
+    // Only a test / bench / example target may own the files no crate layout
+    // places under its directory (`mod common;`). `src/lib.rs` cannot: its
+    // `self.borrow()` is std's blanket `Borrow`, `self.clone()` the derive
+    // (pre-tag review round 2, fixture `c4`, `cargo check --tests` passes).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c4\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        r#"use std::borrow::Borrow;
+pub struct Holder;
+impl Holder {
+    pub fn same(&self) -> &Self { self.borrow() }
+}
+#[derive(Clone)]
+pub struct List;
+impl List {
+    pub fn dup(&self) -> Self { self.clone() }
+}
+"#,
+    );
+    write(
+        root,
+        "tests/common/mod.rs",
+        "pub struct Holder;\nimpl Holder {\n    pub fn borrow(&self) -> &Self { self }\n}\npub struct List;\nimpl Clone for List {\n    fn clone(&self) -> Self { List }\n}\n",
+    );
+    write(root, "tests/t.rs", "mod common;\n");
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of_in_file(&db, "borrow", "tests/common/mod.rs"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        callers_of_in_file(&db, "clone", "tests/common/mod.rs"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_cfg_on_the_callers_own_block_gates_the_caller_too() {
+    // The caller's block is `#[cfg(feature = "x")]`: whenever `go` exists, its
+    // own `k` does, so the other block's `k` stays another type's (E0592).
+    // Only a `#[cfg]` on the method itself can leave the other `k` the one
+    // that runs (pre-tag review round 2, fixture `c3/s6`).
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Z;
+#[cfg(feature = "x")]
+impl Z {
+    pub fn k(&self) -> u8 { 1 }
+    pub fn go(&self) -> u8 { self.k() }
+}
+impl Z {
+    #[cfg(not(feature = "x"))]
+    pub fn k(&self) -> u8 { 2 }
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "k"), vec![(5, 4)]);
+}
+
+#[test]
+fn an_inherent_impl_defining_the_method_decides_despite_a_nested_namesake() {
+    // `a::W`'s own inherent impl always defines `id`, so `self.id()` is that
+    // `id` (E0592): another module's `W` in the file does not hand the call to
+    // the crate, which would also bind `other.rs`'s `W::id` (pre-tag review
+    // round 2, fixture `c3/s5`).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c3\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "pub mod s5;\npub mod other;\n");
+    write(
+        root,
+        "src/s5.rs",
+        r#"pub mod a {
+    pub struct W;
+    impl W {
+        pub fn go(&self) -> u8 { self.id() }
+        pub fn id(&self) -> u8 { 1 }
+    }
+    pub mod b {
+        pub struct W;
+        impl W { pub fn id(&self) -> u8 { 2 } }
+    }
+}
+"#,
+    );
+    write(
+        root,
+        "src/other.rs",
+        "pub struct W;\nimpl W {\n    pub fn id(&self) -> u8 { 9 }\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(call_lines(&db, "id"), vec![(4, 5)]);
+}
+
+#[test]
+fn self_call_exclusion_never_falls_through_to_another_file() {
+    // The only same-file `flush` is another impl's of the same trait, so it
+    // goes; the crate's other file has a third impl's `flush`. Removing the
+    // first must not promote the second: the rule only takes edges away.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        r#"mod more;
+pub trait W { fn flush(&self) {} fn shutdown(&self); }
+pub struct Cursor<T>(T);
+impl W for Cursor<u8> {
+    fn flush(&self) {}
+    fn shutdown(&self) {}
+}
+impl W for Cursor<u16> {
+    fn shutdown(&self) { self.flush() }
+}
+"#,
+    );
+    write(
+        root,
+        "src/more.rs",
+        "use crate::{Cursor, W};\nimpl W for Cursor<u32> {\n    fn flush(&self) {}\n    fn shutdown(&self) {}\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(callers_of(&db, "flush"), Vec::<String>::new());
+}
+
+#[test]
+fn self_call_skips_the_other_inherent_impl_defining_the_name() {
+    // Two inherent impls may not both define `m` for one type (E0592), so when
+    // the caller's own impl defines it, the other impl's `m` is another type's.
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Foo<T>(T);
+impl Foo<u8> {
+    pub fn m(&self) {}
+    pub fn x(&self) { self.m() }
+}
+impl Foo<u16> {
+    pub fn m(&self) {}
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "m"), vec![(4, 3)]);
+}
+
+#[test]
+fn self_call_still_reaches_a_split_inherent_impl() {
+    // Inherent impls of ONE type may be split: the caller's impl does not
+    // define `b`, so the other block's `b` may well be its own.
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Foo;
+impl Foo {
+    pub fn a(&self) { self.b() }
+}
+impl Foo {
+    pub fn b(&self) {}
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "b"), vec![(3, 6)]);
+}
+
+#[test]
+fn self_call_from_a_trait_impl_still_reaches_an_inherent_method() {
+    // Only impls of the SAME trait are kept apart: `helper` lives in the
+    // type's inherent impl, which the trait impl's `self.helper()` reaches.
+    let (_tmp, db) = index_one_file(
+        r#"pub trait W { fn flush(&self); }
+pub struct Cursor<T>(T);
+impl Cursor<u8> {
+    pub fn helper(&self) {}
+}
+impl W for Cursor<u8> {
+    fn flush(&self) { self.helper() }
+}
+"#,
+    );
+    assert_eq!(call_lines(&db, "helper"), vec![(7, 4)]);
+}
+
+#[test]
+fn clone_of_an_arc_of_an_imported_type_is_std_clone() {
+    // `Inner` comes from another file, so nothing is known of its methods or
+    // `Deref`; the pointer still decides: `Arc<Inner>::clone` is `Arc`'s.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "mod inner;\nmod holder;\n");
+    write(root, "src/inner.rs", "pub struct Inner;\n");
+    write(
+        root,
+        "src/holder.rs",
+        r#"use std::sync::Arc;
+use crate::inner::Inner;
+pub struct Token;
+impl Clone for Token {
+    fn clone(&self) -> Self { Token }
+}
+pub struct Holder { inner: Arc<Inner> }
+impl Holder {
+    pub fn go(&self) -> Arc<Inner> { self.inner.clone() }
+}
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(callers_of(&db, "clone"), Vec::<String>::new());
+}
+
+#[test]
+fn typed_receiver_of_a_local_type_never_binds_another_types_method() {
+    // `self.inner` is an `Inner`, a struct of this very file with no `Deref`
+    // and no `poke`: `Token::poke`, another concrete type's method, cannot be
+    // what runs. Before, a typed receiver whose type had no such method fell
+    // back to the name and bound it.
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Inner;
+pub struct Token;
+impl Token {
+    pub fn poke(&self) {}
+}
+pub struct Holder { inner: Inner }
+impl Holder {
+    pub fn go(&self) { self.inner.poke(); }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "poke"), Vec::<String>::new());
+}
+
+#[test]
+fn a_buffered_typed_call_never_binds_what_its_type_rules_out() {
+    // `self.l` is a `Local` of this file, with no `poke` and no `Deref`, so
+    // another file's `Token::poke` cannot be what runs. Later runs — one that
+    // parses another file, one that adds another `poke` — must not bind it
+    // either. (The sweep's own result filter is not reached here: the call
+    // stays buffered, since every candidate is ruled out.)
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "pub mod a;\npub mod b;\n");
+    write(
+        root,
+        "src/a.rs",
+        "pub struct Local;\npub struct Holder { l: Local }\nimpl Holder {\n    pub fn go(&self) { self.l.poke(); }\n}\n",
+    );
+    write(
+        root,
+        "src/b.rs",
+        "pub struct Token;\nimpl Token {\n    pub fn poke(&self) {}\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(callers_of(&db, "poke"), Vec::<String>::new(), "full index");
+    write(root, "src/c.rs", "pub fn unrelated() {}\n");
+    run_incremental_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of(&db, "poke"),
+        Vec::<String>::new(),
+        "a run that parses another file"
+    );
+    write(
+        root,
+        "src/d.rs",
+        "pub struct Other;\nimpl Other {\n    pub fn poke(&self) {}\n}\n",
+    );
+    run_incremental_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of(&db, "poke"),
+        Vec::<String>::new(),
+        "a run adding another `poke`"
+    );
+}
+
+#[test]
+fn typed_receiver_behind_deref_still_binds_the_target_types_method() {
+    // `Wrap: Deref<Target = Token>`: `self.w.poke()` is `Token::poke` through
+    // the deref, which the index cannot follow, so the name decides as before.
+    let (_tmp, db) = index_one_file(
+        r#"use std::ops::Deref;
+pub struct Token;
+impl Token {
+    pub fn poke(&self) {}
+}
+pub struct Wrap(Token);
+impl Deref for Wrap {
+    type Target = Token;
+    fn deref(&self) -> &Token { &self.0 }
+}
+pub struct Holder { w: Wrap }
+impl Holder {
+    pub fn go(&self) { self.w.poke(); }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "poke"), vec!["Holder.go".to_string()]);
+}
+
+#[test]
+fn typed_receiver_through_an_alias_still_binds() {
+    // `Al` is an alias of `Token`, not a struct of the file: the receiver's
+    // real type is unknown to the index, so the name decides as before.
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Token;
+impl Token {
+    pub fn poke(&self) {}
+}
+pub type Al = Token;
+pub struct Holder { a: Al }
+impl Holder {
+    pub fn go(&self) { self.a.poke(); }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "poke"), vec!["Holder.go".to_string()]);
+}
+
+#[test]
+fn typed_receiver_keeps_a_trait_default_method() {
+    // `Inner: Nudge` gets `nudge` from the trait's default body: a trait's
+    // method is no other concrete type's, so it stays a candidate.
+    let (_tmp, db) = index_one_file(
+        r#"pub trait Nudge { fn nudge(&self) {} }
+pub struct Inner;
+impl Nudge for Inner {}
+pub struct Holder { inner: Inner }
+impl Holder {
+    pub fn go(&self) { self.inner.nudge(); }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "nudge"), vec!["Holder.go".to_string()]);
+}
+
+#[test]
+fn clone_of_an_arc_is_std_clone() {
+    // `Arc<T>: Clone` for every `T`, and method lookup meets it at `&Arc<T>`
+    // before any deref: `self.inner.clone()` is `Arc::clone`, never the
+    // file's `Token::clone`.
+    let (_tmp, db) = index_one_file(
+        r#"use std::sync::Arc;
+pub struct Inner;
+pub struct Token;
+impl Clone for Token {
+    fn clone(&self) -> Self { Token }
+}
+pub struct Holder { inner: Arc<Inner> }
+impl Holder {
+    pub fn go(&self) -> Arc<Inner> { self.inner.clone() }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "clone"), Vec::<String>::new());
+}
+
+#[test]
+fn self_method_resolves_in_generic_impl() {
+    // The receiver's impl type was recorded as `Gen<T>`, so the method filter
+    // looked for `Gen<T>.%` and found nothing: every `self.m()` call inside a
+    // generic impl had no edge at all.
+    let (_tmp, db) = index_one_file(
+        r#"
+        pub struct Gen<T>(T);
+        impl<T> Gen<T> {
+            pub fn a(&self) { self.b() }
+            pub fn b(&self) {}
+        }
+        pub struct Other;
+        impl Other {
+            pub fn b(&self) {}
+        }
+    "#,
+    );
+    let mut callers = callers_of(&db, "b");
+    callers.sort();
+    assert_eq!(callers, vec!["Gen.a".to_string()]);
+}
+
+#[test]
+fn generic_impl_with_a_path_in_its_arguments_names_its_type() {
+    // `L::Target` inside the generic arguments: splitting on `::` before
+    // dropping the arguments named the type `Target>`.
+    let (_tmp, db) = index_one_file(
+        r#"
+        pub trait Link { type Target; }
+        pub struct List<L, T>(L, T);
+        impl<L: Link> List<L, L::Target> {
+            pub fn push(&self) { self.grow() }
+            pub fn grow(&self) {}
+        }
+    "#,
+    );
+    assert_eq!(
+        qualified_names(&db),
+        vec!["List.grow".to_string(), "List.push".to_string()]
+    );
+    assert_eq!(callers_of(&db, "grow"), vec!["List.push".to_string()]);
+}
+
+#[test]
+fn self_method_stays_in_its_own_crate() {
+    // Two workspace crates each define a `Wheel` with a `level_for`: a
+    // `self.level_for()` names the caller's own type, which only its own crate
+    // can hold. Matching by type name alone bound both.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let wheel = |doc: &str| {
+        format!(
+            r#"
+            /// {doc}
+            pub struct Wheel<T>(T);
+            impl<T> Wheel<T> {{
+                pub fn insert(&self) {{ self.level_for(); }}
+                fn level_for(&self) {{}}
+            }}
+        "#
+        )
+    };
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    write(
+        root,
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "a/src/lib.rs", "mod wheel;\n");
+    write(root, "a/src/wheel.rs", &wheel("a"));
+    write(
+        root,
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "b/src/lib.rs", "mod wheel;\n");
+    write(root, "b/src/wheel.rs", &wheel("b"));
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT sf.path, tf.path FROM edges e
+             JOIN nodes s ON s.id = e.source_id JOIN files sf ON sf.id = s.file_id
+             JOIN nodes t ON t.id = e.target_id JOIN files tf ON tf.id = t.file_id
+             WHERE e.relation = 'calls' AND t.name = 'level_for' ORDER BY 1, 2",
+        )
+        .unwrap();
+    let pairs: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("a/src/wheel.rs".to_string(), "a/src/wheel.rs".to_string()),
+            ("b/src/wheel.rs".to_string(), "b/src/wheel.rs".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn self_method_in_a_split_impl_stays_in_its_own_crate() {
+    // The callee sits in another file of the caller's crate (a split impl), so
+    // the own-file rule finds nothing; the other crate's `Wheel` has one too.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    write(
+        root,
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "a/src/lib.rs", "mod wheel;\nmod wheel_ext;\n");
+    write(
+        root,
+        "a/src/wheel.rs",
+        "pub struct Wheel;\nimpl Wheel {\n    pub fn insert(&self) { self.level_for(); }\n}\n",
+    );
+    write(
+        root,
+        "a/src/wheel_ext.rs",
+        "impl crate::wheel::Wheel {\n    pub(crate) fn level_for(&self) {}\n}\n",
+    );
+    write(
+        root,
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "b/src/lib.rs",
+        "pub struct Wheel;\nimpl Wheel {\n    pub fn level_for(&self) {}\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert_eq!(
+        callers_of_in_file(&db, "level_for", "a/src/wheel_ext.rs"),
+        vec!["Wheel.insert".to_string()]
+    );
+    assert!(callers_of_in_file(&db, "level_for", "b/src/lib.rs").is_empty());
+}
+
+#[test]
+fn self_call_still_reaches_an_inherent_method_that_outranks_the_files_trait_method() {
+    // The file's only `m` of `Foo` is its `Tr` impl's; an inherent `Foo::m` in
+    // another file of the crate takes precedence in method lookup, so the
+    // own-file rule must not hide it.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        "mod more;\npub trait Tr { fn m(&self); }\npub struct Foo;\nimpl Tr for Foo {\n    fn m(&self) {}\n}\nimpl Foo {\n    pub fn x(&self) { self.m() }\n}\n",
+    );
+    write(
+        root,
+        "src/more.rs",
+        "impl crate::Foo {\n    pub fn m(&self) {}\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(
+        callers_of_in_file(&db, "m", "src/more.rs"),
+        vec!["Foo.x".to_string()]
+    );
+}
+
+#[test]
+fn self_call_in_an_inherent_impl_never_leaves_its_crate() {
+    // tokio's `impl<'a> Builder<'a> { fn new() -> Self { Self::default() } }`:
+    // `default` is derived, so no node answers in the crate, and tokio-util's
+    // `Builder::default` bound instead. An inherent impl lives in its type's
+    // crate, and so does every impl that crate can call on it.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    write(
+        root,
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "a/src/lib.rs",
+        "#[derive(Default)]\npub struct Builder<'a>(Option<&'a str>);\nimpl<'a> Builder<'a> {\n    pub fn new() -> Self { Self::default() }\n}\n",
+    );
+    write(
+        root,
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "b/src/lib.rs",
+        "pub struct Builder;\nimpl Default for Builder {\n    fn default() -> Self { Builder }\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert_eq!(callers_of(&db, "default"), Vec::<String>::new());
+}
+
+#[test]
+fn self_method_of_a_type_from_another_crate_still_binds() {
+    // A trait impl may sit in another crate than its type (`impl Display for
+    // a::Foo` in b): `self.name()` there is `a`'s method, and nothing in b
+    // defines one, so the crate rule must not drop it.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    write(
+        root,
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "a/src/lib.rs",
+        "pub struct Foo;\nimpl Foo {\n    pub fn name(&self) -> u8 { 0 }\n}\n",
+    );
+    write(
+        root,
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "b/src/lib.rs",
+        "pub trait Show { fn show(&self); }\nimpl Show for a::Foo {\n    fn show(&self) { self.name(); }\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert_eq!(callers_of(&db, "name"), vec!["Foo.show".to_string()]);
+}
+
+#[test]
+fn self_method_prefers_its_own_file_among_same_named_types_of_one_crate() {
+    // broadcast's and mpsc's `Receiver` in one crate: `self.recv()` in one of
+    // them is its own file's, not the other module's.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let receiver = "pub struct Receiver;\nimpl Receiver {\n    pub fn recv(&self) {}\n    pub fn poll(&self) { self.recv(); }\n}\n";
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "mod broadcast;\nmod mpsc;\n");
+    write(root, "src/broadcast.rs", receiver);
+    write(root, "src/mpsc.rs", receiver);
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    for file in ["src/broadcast.rs", "src/mpsc.rs"] {
+        assert_eq!(
+            callers_of_in_file(&db, "recv", file),
+            vec!["Receiver.poll".to_string()],
+            "{file}"
+        );
+    }
+    assert_eq!(callers_of(&db, "recv").len(), 2);
+}
+
+#[test]
+fn trait_method_calling_its_types_inherent_namesake_binds_across_crates() {
+    // tokio-util's `impl Listener for tokio::net::TcpListener` calls the
+    // inherent `poll_accept` from its own `poll_accept`: the only same-crate
+    // candidate is the caller itself, which says nothing about the callee.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    write(
+        root,
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "a/src/lib.rs",
+        "pub struct TcpListener;\nimpl TcpListener {\n    pub fn poll_accept(&mut self) {}\n}\n",
+    );
+    write(
+        root,
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "b/src/lib.rs",
+        "pub trait Listener { fn poll_accept(&mut self); }\nimpl Listener for a::TcpListener {\n    fn poll_accept(&mut self) { Self::poll_accept(self) }\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert_eq!(
+        callers_of_in_file(&db, "poll_accept", "a/src/lib.rs"),
+        vec!["TcpListener.poll_accept".to_string()]
+    );
+}
+
+#[test]
+fn trait_impl_for_a_foreign_path_is_not_sourced_at_a_local_namesake() {
+    // tokio's `impl From<Elapsed> for std::io::Error` in a file defining its own
+    // `Error`: the path names std's type, not the file's.
+    let (_tmp, db) = index_one_file(
+        r#"pub struct Error;
+pub struct Elapsed;
+impl From<Elapsed> for std::io::Error {
+    fn from(_e: Elapsed) -> std::io::Error { unimplemented!() }
+}
+"#,
+    );
+    let n: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE relation = 'implements'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn trait_impl_for_a_super_path_inside_an_inline_module_binds_the_files_type() {
+    // tokio's counters.rs: `mod imp { impl Drop for super::Counters { … } }`
+    // with `struct Counters` at the file's top level.
+    let (_tmp, db) = index_one_file(
+        r#"mod imp {
+    impl Drop for super::Counters {
+        fn drop(&mut self) {}
+    }
+}
+pub struct Counters;
+"#,
+    );
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT s.name, COALESCE(t.qualified_name, t.name) FROM edges e
+             JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id
+             WHERE e.relation = 'implements' AND t.name != 'Drop' ORDER BY 1, 2",
+        )
+        .unwrap();
+    let edges: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        edges,
+        vec![("Counters".to_string(), "Counters.drop".to_string())]
+    );
+}
+
+#[test]
+fn trait_impl_for_a_namesake_type_elsewhere_is_not_sourced_at_the_trait() {
+    // tokio's `impl Semaphore for bounded::Semaphore` in chan.rs: the type is
+    // named `Semaphore` like the trait of this file. A Rust impl's type is
+    // never a trait, so the trait node is no source for its edges. The type
+    // is written bare here so its name reaches the trait node: a path
+    // (`bounded::Semaphore`) is kept whole and matches no node at all, which
+    // left this test passing without the guard (pre-tag review).
+    let (_tmp, db) = index_one_file(
+        r#"pub trait Semaphore { fn close(&self); }
+impl Semaphore for Semaphore {
+    fn close(&self) {}
+}
+"#,
+    );
+    let n: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id
+             WHERE e.relation = 'implements' AND s.type = 'interface'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn an_excluded_line_drops_only_the_callers_own_file_method() {
+    // `"xl"` names start lines of the caller's file. Here the file has `flush`
+    // only in trait impls (`V`'s, and `W`'s for another `Cursor`, excluded), so
+    // the crate decides; its tier also holds `more.rs`'s inherent `flush` on
+    // the excluded line's number. That one is the callee (inherent outranks
+    // trait) and must not be dropped with the excluded one (pre-tag review:
+    // applying `"xl"` to every file's candidates survived the suite).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        r#"mod more;
+pub trait W { fn flush(&self) {} fn shutdown(&self); }
+pub trait V { fn flush(&self); }
+pub struct Cursor<T>(T);
+impl W for Cursor<u8> {
+    fn flush(&self) {}
+    fn shutdown(&self) {}
+}
+impl V for Cursor<u16> {
+    fn flush(&self) {}
+}
+impl W for Cursor<u16> {
+    fn shutdown(&self) { self.flush() }
+}
+"#,
+    );
+    write(
+        root,
+        "src/more.rs",
+        "use crate::Cursor;\n\n\n\nimpl<T> Cursor<T> {\n    pub fn flush(&self) {}\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    let line_of = |path: &str| -> Vec<i64> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT n.start_line FROM nodes n JOIN files f ON f.id = n.file_id
+                 WHERE f.path = ?1 AND n.name = 'flush' ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([path], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        line_of("src/more.rs"),
+        vec![6],
+        "precondition: more.rs's `flush` on line 6"
+    );
+    assert!(
+        line_of("src/lib.rs").contains(&6),
+        "precondition: lib.rs's excluded `flush` on line 6"
+    );
+    assert_eq!(
+        callers_of_in_file(&db, "flush", "src/more.rs"),
+        vec!["Cursor.shutdown".to_string()]
+    );
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT f.path || ':' || t.start_line FROM edges e
+             JOIN nodes t ON t.id = e.target_id JOIN files f ON f.id = t.file_id
+             WHERE e.relation = 'calls' AND t.name = 'flush' ORDER BY 1",
+        )
+        .unwrap();
+    let callees: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        callees,
+        vec!["src/lib.rs:10".to_string(), "src/more.rs:6".to_string()]
+    );
+}
+
+#[test]
+fn clone_of_an_arc_self_is_the_pointers_clone() {
+    // `self: Arc<Self>`: `self.clone()` is `Arc::clone`, not `Shared::clone`;
+    // on `&self` it is `Shared::clone`.
+    let (_tmp, db) = index_one_file(
+        r#"use std::sync::Arc;
+pub struct Shared;
+impl Clone for Shared {
+    fn clone(&self) -> Self { Shared }
+}
+impl Shared {
+    pub fn spawn(self: Arc<Self>) { let _me = self.clone(); }
+    pub fn copy(&self) -> Shared { self.clone() }
+}
+"#,
+    );
+    assert_eq!(callers_of(&db, "clone"), vec!["Shared.copy".to_string()]);
+}
+
+#[test]
+fn trait_impl_for_another_modules_type_is_not_sourced_at_this_files_namesake() {
+    // `impl Tr for crate::a::Foo` in `src/b.rs` names module `a`'s `Foo`, not
+    // the `Foo` this file defines.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        root,
+        "src/lib.rs",
+        "pub mod a;\npub mod b;\npub trait Tr { fn m(&self); }\n",
+    );
+    write(root, "src/a.rs", "pub struct Foo;\n");
+    write(
+        root,
+        "src/b.rs",
+        "pub struct Foo;\nimpl crate::Tr for crate::a::Foo {\n    fn m(&self) {}\n}\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    let n: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id
+             JOIN files f ON f.id = s.file_id
+             WHERE e.relation = 'implements' AND f.path = 'src/b.rs' AND s.name = 'Foo'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "b.rs's own Foo implements nothing");
+}
+
+#[test]
+fn trait_impl_on_a_path_qualified_type_binds_its_type() {
+    // `impl Tr for crate::Foo<u8>` kept the path (`crate::Foo`), so neither the
+    // type's `implements` edge nor its method-level one found the `Foo` nodes.
+    let (_tmp, db) = index_one_file(
+        r#"
+        pub trait Tr { fn m(&self); }
+        pub struct Foo<T>(T);
+        impl Tr for crate::Foo<u8> {
+            fn m(&self) {}
+        }
+    "#,
+    );
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(src.qualified_name, src.name), COALESCE(tgt.qualified_name, tgt.name)
+             FROM edges e
+             JOIN nodes src ON src.id = e.source_id
+             JOIN nodes tgt ON tgt.id = e.target_id
+             WHERE e.relation = 'implements' ORDER BY 1, 2",
+        )
+        .unwrap();
+    let edges: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        edges,
+        vec![
+            ("Foo".to_string(), "Foo.m".to_string()),
+            ("Foo".to_string(), "Tr".to_string()),
+        ]
+    );
+}
+
 #[test]
 fn non_rust_callgraph_unchanged() {
     let tmp = TempDir::new().unwrap();

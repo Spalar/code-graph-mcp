@@ -267,6 +267,8 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
+        // A symbol in a file added since the last index (D2).
+        crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
         let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
             Ok(selection) => selection,
             Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
@@ -319,13 +321,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 // same input as ambiguous. That is the 2026-06-03 #6 shape (one
                 // input, two surfaces, opposite verdicts) `crate::resolve` exists to
                 // prevent, and the bare-name arm below has carried this gate since
-                // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; note the
-                // shared same-file message points at `show --node-id <N>` rather
-                // than at this command's own `--node-id`, because it is written for
-                // callgraph/impact, which have no such flag. The node_ids it lists
-                // are the ones to pass here (pre-ship review 2026-09-07 — an earlier
-                // version of this comment claimed the message names `refs --node-id`,
-                // which it does not).
+                // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; the shared
+                // same-file message names it for every CLI symbol command (refs
+                // included, since callgraph/impact gained the flag in Q4), and the
+                // node_ids it lists are the ones to pass here.
                 if matched.len() > 1 {
                     let cands: Vec<queries::NameCandidate> = matched
                         .iter()
@@ -492,6 +491,20 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         outcome.disclose();
     }
 
+    // Empty answer to "who uses it": disclose the dynamic-dispatch sites that
+    // name it (P1 #4). Only for the relation filters a dispatch site could
+    // have satisfied; `--relation imports` coming back empty says nothing about
+    // dispatch.
+    let boundaries = if all_refs.is_empty()
+        && matches!(
+            relation_filter,
+            None | Some(crate::domain::REL_CALLS) | Some(crate::domain::REL_REFERENCES)
+        ) {
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+    } else {
+        None
+    };
+
     if json_mode {
         let items: Vec<serde_json::Value> = all_refs
             .iter()
@@ -537,6 +550,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         // 2026-08-02 MED-1.
         if conf_filtered > 0 {
             envelope["confidence_filtered"] = serde_json::json!(conf_filtered);
+        }
+        if let Some(b) = &boundaries {
+            envelope["boundaries"] = b.to_json();
         }
         outcome.attach_partial(&mut envelope);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -584,6 +600,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 "({} lower-confidence ref(s) hidden by --min-confidence)",
                 conf_filtered
             )?;
+        }
+        if let Some(b) = &boundaries {
+            b.render_text(&mut stdout, "  ")?;
         }
     }
 

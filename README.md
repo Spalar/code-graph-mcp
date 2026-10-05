@@ -151,6 +151,14 @@ known boundaries, not bugs to report:
   `impact` reports separately as `value reference(s) — callbacks / fn-pointers /
   type positions`. Together with the row above, this is why `include_dead`
   results are candidates to verify rather than a verdict.
+- **Dispatch by name.** A function reached through a string key, a reflection
+  call or an event name (`handlers["save"]`, `getattr(obj, "save")`,
+  `send(:save)`, `bus.on("save", …)`) has no edge. When `callgraph`, `impact`
+  or `refs` finds no caller for a function, the answer lists up to 5 lines
+  where the name appears in such a shape or is passed as a value (`boundaries`
+  in `--json` and MCP), and a `code-graph-mcp grep` that shows every
+  occurrence. It is a disclosure, not an edge, and a lexical one: a line it
+  does not list is not proof that nothing dispatches to the function.
 
 ## Architecture
 
@@ -159,6 +167,7 @@ src/
 ├── domain.rs     # Shared constants, relation types, env-var config
 ├── resolve.rs    # Shared symbol resolution + ambiguity verdicts (CLI and MCP)
 ├── outcome.rs    # Retrieval-adoption metrics from session transcripts
+├── budget.rs     # Output budgets (--budget / max_tokens): rank, shorten, drop, next step
 ├── cli/          # Every `code-graph-mcp <cmd>` subcommand (one file per command)
 ├── mcp/          # MCP protocol layer (JSON-RPC, tool registry, server)
 │   └── server/   # McpServer with IndexingState + CacheState sub-structs
@@ -222,7 +231,7 @@ and `code-graph-mcp doctor` prints the manual update command.
 
 #### Invited-memory mode (quieter prompts)
 
-By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on MEMORY.md + explicit tool calls, opt into invited-memory mode:
+By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on explicit tool calls, opt into invited-memory mode:
 
 1. Adopt the plugin contract into your project (idempotent, self-heals):
    ```bash
@@ -235,7 +244,7 @@ By default, every user prompt the plugin deems code-related gets a small context
      "env": { "CODE_GRAPH_QUIET_HOOKS": "1" }
    }
    ```
-3. Restart Claude Code. Session startup skips the project-map injection, UserPromptSubmit stops auto-injecting context, and the MCP `instructions` become a short pointer to the MEMORY.md file.
+3. Restart Claude Code. Session startup skips the project-map injection, UserPromptSubmit stops auto-injecting context, and the MCP `instructions` shrink to a one-line command pointer.
 
 ### Option 2: Claude Code MCP Server Only
 
@@ -341,6 +350,8 @@ cargo uninstall code-graph-mcp       # or delete the target/release binary
 | `ast_search` | Search AST nodes by text and/or structural filters (type, return type, params) |
 | `find_references` | Find all references to a symbol (callers, importers, inheritors, implementors, value/type references). Supports `compact` mode |
 
+**Output budget.** `project_map`, `module_overview`, `get_call_graph` and `get_ast_node` take an optional `max_tokens` (100-100000, counted as bytes/3 of the JSON answer). The answer is ranked by caller count; lower-ranked items are first shortened (no key symbols, no signature, no source body), then left out, and never cut in the middle. A `budget` object reports what was shortened or left out and `budget.next` holds the CLI command that returns it (one per section that lost entries, joined by `; `). On `module_overview` and `project_map`, `budget.over_budget` is `true` when even the fixed part of the answer is larger than the budget. Without `max_tokens` the answer is unchanged. Every existing size cut in these four tools (`hot_functions_truncated`, `active_capped`, the call-graph rollup, `compressed_node`, `_truncated`) now carries a `next` command too.
+
 **Hidden aliases.** These names are not in `tools/list` but still dispatch via `tools/call`, so existing clients keep working: `trace_http_chain` / `find_http_route` (→ `get_call_graph` with `route_path`), `read_snippet` (→ `get_ast_node`), `dependency_graph`, `find_similar_code`, `find_dead_code`, plus the management tools `start_watch`, `stop_watch`, `get_index_status` and `rebuild_index`. `impact_analysis` is **removed** — calling it returns `Unknown tool`; use `get_ast_node` with `include_impact=true`, or the CLI's `impact --json` for the full report.
 
 ## CLI Commands
@@ -383,6 +394,8 @@ All tools are also available as CLI subcommands for shell scripts, hooks, and te
 | `serve` | — | Start the MCP JSON-RPC server on stdio (the default with no subcommand) |
 
 Common options: `--json` (JSON output), `--compact` (compact output), `--limit N`, `--depth N`, `--file <path>`.
+
+`map`, `overview`, `callgraph` and `show` take `--budget <tokens>` (100-100000, counted as bytes/3 of the text answer; not with `--json` or `--compact`). Items with the fewest callers are shortened first (a module loses its key symbols, a symbol its signature, a definition its body, a call-graph node its type), then left out, deepest call-graph nodes first. Nothing is cut in the middle, and in `overview` of a directory one file takes at most 70% of the budget. A notice line says what was left out and is followed by `next: <command>`, which prints it. The existing `... and N more` lines of `map` are followed by a `next:` line too.
 
 As of **v0.37.0** the CLI is [clap](https://docs.rs/clap)-based: **every subcommand has `--help`** for its full flag list (`code-graph-mcp <command> --help`), value flags accept both `--flag value` and `--flag=value`, and unknown flags or malformed arguments fail fast with a clear error and a non-zero exit code (`2`) instead of being silently ignored. For example, `trace` hides downstream middleware with `--no-middleware` (shown by default), and `snapshot` is a `create`/`inspect` subcommand pair.
 
@@ -532,14 +545,13 @@ defaults are what you get by doing nothing.
 | Variable | Effect |
 |---|---|
 | `CODE_GRAPH_NO_AUTO_UPDATE=1` | Never check GitHub for a new release. |
-| `CODE_GRAPH_NO_AUTO_ADOPT=1` | Do not write the steering block into a project's `CLAUDE.md` on SessionStart. |
-| `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Keep hand edits to the generated steering block — it is otherwise refreshed to the current template. |
-| `CODE_GRAPH_NO_GITIGNORE=1` | Never touch `.gitignore` — not even to add the `.code-graph/` entry. |
+| `CODE_GRAPH_NO_AUTO_ADOPT=1` | Skip SessionStart's adoption check: no cleanup of this plugin's legacy memory-dir files and no notice about an out-of-date steering block. SessionStart never writes `CLAUDE.md` itself; `code-graph-mcp adopt` does. |
+| `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Do not report a steering block that has drifted from the current template (SessionStart only reports it; `code-graph-mcp adopt` refreshes it). |
+| `CODE_GRAPH_NO_GITIGNORE=1` | Do not write the `.code-graph/` ignore rule. It goes to the repository's local `.git/info/exclude`, never to the tracked `.gitignore`, and only when neither file names the directory already. |
 | `CODE_GRAPH_QUIET_HOOKS=1` | Hooks inject a one-line pointer instead of the full decision table. |
 | `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |
 | `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
-| `CODE_GRAPH_NO_RECENT_IMPACT=1` | Skip the recent-impact section of the SessionStart briefing. |
 | `CODE_GRAPH_HOOK_INDEX=on\|off` | Force the incremental-index hook on or off instead of letting it decide. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |

@@ -42,6 +42,9 @@ pub(super) enum BackfillOutcome {
     /// - `false`: the very first batch stalled, so we can't tell a transient model/device
     ///   error (a retry recovers) from residue. Bounded-retry before trusting it.
     Stalled { progressed: bool },
+    /// Stopped at a batch boundary because an incremental asked for the write path
+    /// (D1). Learned nothing about embeddability: the floor stays.
+    Yielded,
 }
 /// Decide the periodic backfill driver's next `(floor, stall_retries)` from one
 /// drain attempt's [`BackfillOutcome`] and the freshly re-measured unembedded count.
@@ -59,7 +62,7 @@ pub(super) fn apply_backfill_outcome(
     match outcome {
         // Learned nothing — leave the floor low so the very next tick re-attempts;
         // the drain fires for real the moment the model finishes downloading.
-        BackfillOutcome::NoModel => (floor, stall_retries),
+        BackfillOutcome::NoModel | BackfillOutcome::Yielded => (floor, stall_retries),
         // Embeddable set emptied. Reset to 0: any count observed later is fresh work
         // that must be picked up, not residue to skip. Clears the retry budget too.
         BackfillOutcome::Drained => (0, 0),
@@ -120,6 +123,7 @@ impl McpServer {
             None => return,
         };
         let flag = Arc::clone(&self.indexing.embedding_in_progress);
+        let yield_flag = Arc::clone(&self.indexing.embedding_yield);
         std::thread::spawn(move || {
             // `floor` = unembedded count left after the last drain (the un-embeddable
             // residue). Start at 0 so the first non-empty observation — including nodes
@@ -148,7 +152,7 @@ impl McpServer {
                 // no-ops (None) if a tool-call/startup backfill is already draining — leave
                 // the floor untouched and retry next tick rather than trusting that other
                 // run's mid-drain count.
-                let Some(outcome) = Self::run_guarded_backfill(&db_path, &flag) else {
+                let Some(outcome) = Self::run_guarded_backfill(&db_path, &flag, &yield_flag) else {
                     continue;
                 };
                 // Re-measure the residue for the floor decision. `apply_backfill_outcome`
@@ -191,6 +195,7 @@ impl McpServer {
     pub(super) fn run_guarded_backfill(
         db_path: &Path,
         in_progress: &AtomicBool,
+        yield_requested: &AtomicBool,
     ) -> Option<BackfillOutcome> {
         if in_progress.swap(true, Ordering::AcqRel) {
             return None; // a backfill is already running
@@ -203,7 +208,7 @@ impl McpServer {
             }
         }
         let _guard = FlagGuard(in_progress);
-        match Self::run_unembedded_backfill(db_path) {
+        match Self::run_unembedded_backfill(db_path, yield_requested) {
             Ok(outcome) => Some(outcome),
             Err(e) => {
                 // A hard error (DB open / count query failed) embedded nothing — a
@@ -219,7 +224,10 @@ impl McpServer {
     /// Loads its own model + DB connection (EmbeddingModel is `!Send`, so it can't
     /// cross the thread boundary) and no-ops when no model is available locally or
     /// vec is disabled. Append-only writes — safe to run alongside a reader.
-    fn run_unembedded_backfill(db_path: &Path) -> Result<BackfillOutcome> {
+    fn run_unembedded_backfill(
+        db_path: &Path,
+        yield_requested: &AtomicBool,
+    ) -> Result<BackfillOutcome> {
         let model = match EmbeddingModel::load()? {
             Some(m) => m,
             // Model not on disk yet (download in flight). Report NoModel so the periodic
@@ -262,6 +270,16 @@ impl McpServer {
         // Ranked once, not once per batch — see `UnembeddedQueue` (CORE-13).
         let mut queue = queries::UnembeddedQueue::new(db.conn())?;
         loop {
+            // An incremental wants the write path (D1): stop between batches. The
+            // queue was ranked at the start, so a respawned backfill ranks afresh
+            // and picks up the nodes the incremental rewrote.
+            if yield_requested.load(Ordering::Acquire) {
+                tracing::info!(
+                    "[embed-bg] Yielding to a structural re-index after {} node(s)",
+                    total_embedded
+                );
+                return Ok(BackfillOutcome::Yielded);
+            }
             let chunk = queue.next_chunk(db.conn(), EMBED_BATCH, &failed)?;
             if chunk.is_empty() {
                 break;

@@ -214,6 +214,13 @@ fn build_stats_json(
         .map(|(k, v)| (k.clone(), serde_json::json!(v)))
         .collect::<serde_json::Map<String, serde_json::Value>>()
         .into();
+    // D#163: the Stop check's reports, their follow-ups and how many saw a
+    // listed caller file edited; SubagentStart deliveries.
+    let r = &mut stats_json["recommendations"];
+    r["stop_checks"] = serde_json::json!(recs.stop_checks);
+    r["stop_followups"] = serde_json::json!(recs.stop_followups);
+    r["stop_adopted"] = serde_json::json!(recs.stop_adopted);
+    r["subagent_contexts"] = serde_json::json!(recs.subagent_contexts);
     stats_json
 }
 
@@ -514,6 +521,21 @@ fn render_stats_text(
         sout!(
             "Live-context: {} recent-change blast-radius injection(s) at SessionStart",
             recs.live_impact
+        );
+    }
+    // D#163 — the two P1 #3 hooks. Printed only once either has fired.
+    if recs.stop_checks > 0 || recs.stop_followups > 0 {
+        sout!(
+            "Stop check: {} report(s) of callers left behind; {} of {} followed by a change to a listed caller file",
+            recs.stop_checks,
+            recs.stop_adopted,
+            recs.stop_followups
+        );
+    }
+    if recs.subagent_contexts > 0 {
+        sout!(
+            "Subagent context: index facts handed to {} subagent(s) at SubagentStart",
+            recs.subagent_contexts
         );
     }
     // Per-session funnel: of sessions that saw a deny/hint, how many also called

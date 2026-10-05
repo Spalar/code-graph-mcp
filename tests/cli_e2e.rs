@@ -3058,6 +3058,41 @@ fn test_cli_search_resyncs_after_edit() {
     );
 }
 
+/// C5 (2026-09-28 usage evaluation): outside Rust, 0–25% of the dead-code
+/// candidates on the evaluation corpora were really unused (Go `init`,
+/// interface and override methods, `__init__.py` re-exports). The text report
+/// says so when a candidate is outside Rust, and only then.
+#[test]
+fn test_cli_dead_code_marks_non_rust_candidates_experimental() {
+    for (file, body, experimental) in [
+        (
+            "lib.py",
+            "def unused_helper(x):\n    y = x + 1\n    return y\n",
+            true,
+        ),
+        (
+            "lib.rs",
+            "fn unused_helper(x: u8) -> u8 {\n    let y = x + 1;\n    y\n}\n",
+            false,
+        ),
+    ] {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join(file), body).unwrap();
+        let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+        code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+        let (stdout, stderr, code) = run_cli(&project, &["dead-code", "--min-lines", "1"]);
+        assert_eq!(code, 0, "{file}: {stderr}");
+        assert!(stdout.contains("unused_helper"), "{file}: {stdout}");
+        assert_eq!(
+            stdout.contains("experimental"),
+            experimental,
+            "{file}: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn test_cli_dead_code_resyncs_after_edit() {
     let project = setup_indexed_project();
@@ -4025,6 +4060,33 @@ pub fn make_them() {
     project
 }
 
+/// C4 (2026-09-28 usage evaluation): Python `@overload` stubs type the one
+/// implementation after them. Indexed as definitions they made callgraph,
+/// impact and refs refuse every overloaded name (flask: `stream_with_context`,
+/// `locate_app`); the implementation now answers for it.
+#[test]
+fn test_cli_python_overloads_answer_as_their_implementation() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("lib.py"),
+        "import typing as t\n\n\
+         @t.overload\ndef wrap(g: int) -> int: ...\n\n\
+         @t.overload\ndef wrap(g: str) -> str: ...\n\n\
+         def wrap(g):\n    return g\n\n\
+         def use_it():\n    return wrap(1)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    for cmd in ["callgraph", "impact", "refs"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "wrap"]);
+        assert_eq!(code, 0, "{cmd} must answer; stderr={stderr:?}");
+        assert!(stdout.contains("use_it"), "{cmd}: {stdout}");
+    }
+}
+
 /// Seven non-test definitions of one name in one file — two more than an
 /// ambiguity envelope will list (`resolve::SUGGESTION_CAP`).
 fn setup_overflowing_overload_project() -> TempDir {
@@ -4223,6 +4285,37 @@ fn test_cli_impact_same_file_overload_is_ambiguous() {
         stderr.contains("Ambiguous symbol 'new'"),
         "should report ambiguity; got: {stderr:?}"
     );
+}
+
+// C4 (2026-09-28 usage evaluation): the same two `new` under `--file lib.rs`.
+// A file selector cannot split same-file definitions, yet callgraph and impact
+// skipped the ambiguity gate whenever it was given and merged both graphs
+// (flask: `callgraph pop --file src/flask/ctx.py` answered for
+// `_AppCtxGlobals.pop` and `AppContext.pop` at once) while refs refused the
+// identical input (SURF-17). The selector now gets the same verdict.
+#[test]
+fn test_cli_same_file_overload_is_ambiguous_under_a_file_selector() {
+    let project = setup_same_file_overload_project();
+    for cmd in ["callgraph", "impact"] {
+        let (_, stderr, code) = run_cli(&project, &[cmd, "new", "--file", "lib.rs"]);
+        assert_eq!(code, 1, "{cmd} --file must not merge; stderr={stderr:?}");
+        assert!(
+            stderr.contains("Ambiguous symbol 'new'") && stderr.contains("same file"),
+            "{cmd}: {stderr:?}"
+        );
+        let (stdout, _, code) = run_cli(&project, &[cmd, "new", "--file", "lib.rs", "--json"]);
+        assert_eq!(code, 1, "{cmd} --json too; stdout={stdout:?}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(
+            v["suggestions"].as_array().map(Vec::len),
+            Some(2),
+            "{cmd}: {stdout}"
+        );
+    }
+    // A name defined once in the named file still answers.
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "make_them", "--file", "lib.rs"]);
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert!(stdout.contains("make_them"), "{stdout}");
 }
 
 #[test]
@@ -4822,6 +4915,65 @@ fn test_cli_stats_recommendations_dark_when_absent() {
 }
 
 #[test]
+fn test_cli_stats_reports_the_stop_and_subagent_hook_records() {
+    // D#163: the two P1 #3 hooks' records reach both outputs, adoption is
+    // counted only from an explicit `adopted: true`, and neither kind is a
+    // recommendation.
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::write(
+        cg.join("usage.jsonl"),
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cg.join("recommendations.jsonl"),
+        "{\"hook\":\"stop\",\"action\":\"stop_check\",\"symbols\":1,\"callers\":2}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_followup\",\"adopted\":true,\"listed\":2,\"edited\":1}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_check\",\"symbols\":1,\"callers\":1}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_followup\",\"adopted\":false,\"listed\":1,\"edited\":0}\n\
+         {\"hook\":\"stop\",\"action\":\"stop_followup\",\"listed\":1}\n\
+         {\"hook\":\"subagent\",\"action\":\"subagent_context\",\"agent\":\"Explore\"}\n",
+    )
+    .unwrap();
+    let (stdout, _, code) = run_cli(&project, &["stats"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains(
+            "Stop check: 2 report(s) of callers left behind; 1 of 3 followed by a change to a listed caller file"
+        ),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Subagent context: index facts handed to 1 subagent(s) at SubagentStart"),
+        "got: {stdout}"
+    );
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    let r = &v["recommendations"];
+    assert_eq!(
+        (
+            &r["stop_checks"],
+            &r["stop_followups"],
+            &r["stop_adopted"],
+            &r["subagent_contexts"]
+        ),
+        (
+            &serde_json::json!(2),
+            &serde_json::json!(3),
+            &serde_json::json!(1),
+            &serde_json::json!(1)
+        ),
+        "got: {jstdout}"
+    );
+    assert_eq!(
+        r["total"], 0,
+        "none of these is a recommendation: {jstdout}"
+    );
+}
+
+#[test]
 fn test_cli_stats_recommendations_empty_distinct_from_absent() {
     let project = setup_indexed_project();
     let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -5144,13 +5296,10 @@ fn test_cli_similar_no_embeddings_remedy_matches_binary_features() {
 // empty-result branch, and a reindex hint there would be chasing a non-problem.
 #[test]
 fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
+    // A name no file holds. (One in a file added since the last index is now
+    // found: test_cli_a_symbol_in_a_new_file_is_found_by_every_lookup.)
     let project = setup_indexed_project();
-    std::fs::write(
-        project.path().join("src").join("fresh2.ts"),
-        "export function brandNewCgFn() { return 1; }\n",
-    )
-    .unwrap();
-    let (_, stderr, code) = run_cli(&project, &["callgraph", "brandNewCgFn"]);
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "noSuchCgFnAnywhere"]);
     assert_ne!(code, 0);
     assert!(
         stderr.contains("incremental-index"),
@@ -5177,19 +5326,70 @@ fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
     );
 }
 
-// A symbol ADDED after the last index has no indexed file for query-time
-// freshness to refresh, so `show` misses it — the miss must at least tell the
-// user the index may be stale instead of a bare "Symbol not found" that reads
-// as "doesn't exist" (a fresh `incremental-index` then makes it visible).
+// A symbol ADDED after the last index lives in a file the index does not hold,
+// which no result-set refresh reaches: every lookup missed it until a manual
+// `incremental-index` (2026-09-28 usage evaluation D2; the hook audit reproduced
+// it 4/4). On a name miss the lookups now index the unindexed files that mention
+// the name, within the resync budget, and look again.
 #[test]
-fn test_cli_show_miss_hints_stale_index_for_new_symbol() {
-    let project = setup_indexed_project();
-    std::fs::write(
-        project.path().join("src").join("fresh.ts"),
-        "export function brandNewFn() { return 1; }\n",
+fn test_cli_a_symbol_in_a_new_file_is_found_by_every_lookup() {
+    // A project of its own per command: the first lookup indexes the file, so a
+    // shared one would let the others pass on its work.
+    let fresh_project = || {
+        let project = setup_indexed_project();
+        std::fs::write(
+            project.path().join("src").join("fresh.ts"),
+            "import { validateToken } from './auth';\n\
+             export function brandNewFn(t: string) { return validateToken(t); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("src").join("unrelated.ts"),
+            "export function somethingElse() { return 2; }\n",
+        )
+        .unwrap();
+        project
+    };
+    for args in [
+        &["show", "brandNewFn"][..],
+        &["impact", "brandNewFn"][..],
+        &["refs", "brandNewFn"][..],
+        &["callgraph", "brandNewFn"][..],
+    ] {
+        let project = fresh_project();
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_eq!(code, 0, "{args:?}: stdout={stdout} stderr={stderr}");
+        assert!(stdout.contains("brandNewFn"), "{args:?}: {stdout}");
+        assert!(!stderr.contains("may be stale"), "{args:?}: {stderr}");
+    }
+    // Only a file that mentions the name was pulled in: a lookup does not
+    // index the rest of the working tree.
+    let project = fresh_project();
+    run_cli(&project, &["show", "brandNewFn"]);
+    let db = code_graph_mcp::storage::db::Database::open(
+        &project.path().join(".code-graph").join("index.db"),
     )
     .unwrap();
-    let (_, stderr, code) = run_cli(&project, &["show", "brandNewFn"]);
+    let indexed = |p: &str| {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", [p], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(indexed("src/fresh.ts"), 1);
+    assert_eq!(
+        indexed("src/unrelated.ts"),
+        0,
+        "a file that does not name the symbol stays out"
+    );
+}
+
+// A name nothing defines still misses, and the miss still says how to refresh.
+#[test]
+fn test_cli_show_miss_hints_stale_index_for_an_absent_symbol() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["show", "noSuchFunctionAnywhere"]);
     assert_ne!(code, 0);
     assert!(
         stderr.contains("incremental-index"),
@@ -6992,12 +7192,15 @@ fn test_cli_incremental_index() {
 // process-global `set_var` there races the four sibling tests that call the same
 // entry point), so the VARIABLE NAME and its `"1"` value are pinned only here —
 // a subprocess has its own environment, so this cannot race anything.
-// `setup_indexed_project` indexes through the library, which does not touch
-// `.gitignore`, so the file is absent until the CLI writes it.
+// `setup_indexed_project` indexes through the library, which writes no ignore
+// rule, so `.git/info/exclude` is absent until the CLI writes it.
 #[test]
 fn test_cli_incremental_index_gitignore_opt_out() {
     let project = setup_indexed_project();
-    let gitignore = project.path().join(".gitignore");
+    // A git work tree: the rule goes to `.git/info/exclude` (decision D3), so
+    // without a `.git` the control below would have nowhere to write.
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    let gitignore = project.path().join(".git/info/exclude");
 
     let (_, stderr, code) = run_cli_env(
         &project,
@@ -7007,8 +7210,9 @@ fn test_cli_incremental_index_gitignore_opt_out() {
     assert_eq!(code, 0, "indexing must still succeed; stderr={stderr}");
     assert!(
         !gitignore.exists(),
-        "the switch must suppress the .gitignore write entirely"
+        "the switch must suppress the ignore-rule write entirely"
     );
+    assert!(!project.path().join(".gitignore").exists());
 
     // Positive control: the same command with the switch OFF still writes, so the
     // assertion above is not green because indexing silently did nothing. Set the
@@ -7021,7 +7225,8 @@ fn test_cli_incremental_index_gitignore_opt_out() {
         &[("CODE_GRAPH_NO_GITIGNORE", "0")],
     );
     assert_eq!(code, 0, "control run must succeed; stderr={stderr}");
-    let content = std::fs::read_to_string(&gitignore).expect("control run must create .gitignore");
+    let content =
+        std::fs::read_to_string(&gitignore).expect("control run must write .git/info/exclude");
     assert!(
         content.contains(".code-graph/"),
         "control run should add the entry; got: {content:?}"
@@ -9569,9 +9774,10 @@ fn test_cli_report_refreshes_dead_code_line_numbers_after_an_edit() {
     );
 }
 
-/// DB-4: writing `.code-graph/` to `.gitignore` lived only in the MCP server's
+/// DB-4: writing the ignore rule lived only in the MCP server's
 /// `from_project_root`, so a pure-CLI user (hook-driven indexing, server never
 /// started) got an untracked 100 MB index that `git add -A` would commit.
+/// Since decision D3 the rule goes to `.git/info/exclude`, never `.gitignore`.
 #[test]
 fn test_cli_incremental_index_gitignores_the_index_dir() {
     let project = TempDir::new().unwrap();
@@ -9583,9 +9789,13 @@ fn test_cli_incremental_index_gitignores_the_index_dir() {
 
     let (_o, err, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
     assert_eq!(code, 0, "stderr: {err}");
-    let gitignore = project.path().join(".gitignore");
+    assert!(
+        !project.path().join(".gitignore").exists(),
+        "the tracked .gitignore must not be created"
+    );
+    let gitignore = project.path().join(".git/info/exclude");
     let content = std::fs::read_to_string(&gitignore)
-        .unwrap_or_else(|e| panic!("CLI indexing must create .gitignore: {e}"));
+        .unwrap_or_else(|e| panic!("CLI indexing must write .git/info/exclude: {e}"));
     assert!(
         content
             .lines()
@@ -11767,8 +11977,10 @@ fn the_qualified_path_still_discloses_the_callers_it_excluded() {
         "class Base:\n    def helper(self):\n        return 1\n",
     )
     .unwrap();
-    // A same-named method on an unrelated class, so `self.helper()` below is
-    // resolved by bare name and lands in the `ambiguous` tier.
+    // A same-named method on an unrelated class, so `obj.helper()` below (an
+    // untyped receiver) is resolved by bare name and lands in the `ambiguous`
+    // tier. (`self.helper()` in a `Base` subclass no longer would: it binds the
+    // inherited `Base.helper`, decided.)
     std::fs::write(
         project.path().join("other.py"),
         "class Other:\n    def helper(self):\n        return 2\n",
@@ -11776,7 +11988,7 @@ fn the_qualified_path_still_discloses_the_callers_it_excluded() {
     .unwrap();
     std::fs::write(
         project.path().join("child.py"),
-        "from base import Base\n\n\nclass Child(Base):\n    def run(self):\n        return self.helper()\n",
+        "def run(obj):\n    return obj.helper()\n",
     )
     .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -11970,4 +12182,494 @@ fn a_markdown_heading_does_not_shadow_the_method_it_documents() {
         "a heading is not a definition: it must be excluded from the no---file \
          result, not merely joined to it; got {files:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Q4 (2026-09-29 usage evaluation): `impact` / `callgraph --node-id`.
+//
+// Since 174f9b6 a file selector no longer merges same-file definitions: both
+// commands refuse and list each definition's `node_id`, but neither could
+// answer for one. The edit hook went silent on every signature edit of a
+// same-file same-name method (Python `__init__`, Rust `new`). `--node-id`
+// answers for exactly that definition, like `show` and `refs`.
+// ---------------------------------------------------------------------------
+
+/// Two `new` in one file, each with its own caller, so an answer that merged
+/// them (or took the other one) is visible in the caller list.
+fn setup_node_id_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct Foo;\npub struct Bar;\n\nimpl Foo {\n    pub fn new() -> Self { Foo }\n}\n\nimpl Bar {\n    pub fn new() -> Self { Bar }\n}\n\npub fn only_foo() -> Foo { Foo::new() }\n\npub fn only_bar() -> Bar { Bar::new() }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// (Foo::new id, Bar::new id), read off the same-file refusal the edit hook sees.
+fn foo_bar_new_ids(project: &TempDir) -> (i64, i64) {
+    let (out, _e, code) = run_cli(
+        project,
+        &["impact", "new", "--file", "src/lib.rs", "--json"],
+    );
+    assert_eq!(code, 1, "precondition: the file selector refuses: {out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let mut s: Vec<(i64, i64)> = v["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no suggestions: {out}"))
+        .iter()
+        .map(|c| {
+            (
+                c["start_line"].as_i64().unwrap(),
+                c["node_id"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    s.sort_unstable();
+    assert_eq!(s.len(), 2, "{out}");
+    (s[0].1, s[1].1)
+}
+
+fn impact_caller_names(out: &str) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+    let mut names: Vec<String> = v["callers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no callers: {out}"))
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn callgraph_names(out: &str) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+    let mut names: Vec<String> = v["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no results: {out}"))
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_answer_for_that_definition_only() {
+    let project = setup_node_id_project();
+    // The refusal points at the flag that now answers it.
+    for cmd in ["callgraph", "impact"] {
+        let (_o, stderr, code) = run_cli(&project, &[cmd, "new", "--file", "src/lib.rs"]);
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains("`--node-id <N>` (callgraph, impact, refs, show)")
+                && !stderr.contains("can't split"),
+            "{cmd}: {stderr}"
+        );
+    }
+    let (foo, bar) = foo_bar_new_ids(&project);
+    for (id, want) in [(foo, "only_foo"), (bar, "only_bar")] {
+        let id = id.to_string();
+        let (out, stderr, code) = run_cli(&project, &["impact", "--node-id", &id, "--json"]);
+        assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["symbol"].as_str(), Some("new"), "{out}");
+        assert_eq!(impact_caller_names(&out), vec![want.to_string()], "{out}");
+
+        let (text, stderr, code) = run_cli(&project, &["impact", "--node-id", &id]);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert!(
+            text.contains(want)
+                && !text.contains(if want == "only_foo" {
+                    "only_bar"
+                } else {
+                    "only_foo"
+                }),
+            "{text}"
+        );
+
+        let (out, stderr, code) = run_cli(
+            &project,
+            &[
+                "callgraph",
+                "--node-id",
+                &id,
+                "--direction",
+                "callers",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+        assert_eq!(callgraph_names(&out), vec![want.to_string()], "{out}");
+    }
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_refuse_an_unknown_id() {
+    let project = setup_node_id_project();
+    for cmd in ["impact", "callgraph"] {
+        let (out, _e, code) = run_cli(&project, &[cmd, "--node-id", "999999", "--json"]);
+        assert_eq!(code, 1, "{cmd}: {out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["node_id"].as_i64(), Some(999999), "{cmd}: {out}");
+        assert!(
+            v["error"].as_str().is_some_and(|e| e.contains("not found")),
+            "{cmd}: {out}"
+        );
+        let (_o, stderr, code) = run_cli(&project, &[cmd]);
+        assert_ne!(
+            code, 0,
+            "{cmd} with neither a symbol nor --node-id: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_ignore_the_file_selector_and_say_so() {
+    let project = setup_node_id_project();
+    let (foo, _bar) = foo_bar_new_ids(&project);
+    let id = foo.to_string();
+    for cmd in ["impact", "callgraph"] {
+        let (_out, stderr, code) =
+            run_cli(&project, &[cmd, "--node-id", &id, "--file", "src/other.rs"]);
+        assert_eq!(code, 0, "{cmd}: {stderr}");
+        assert!(
+            stderr.contains("--file is ignored when --node-id is given"),
+            "{cmd}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn impact_and_callgraph_by_node_id_answer_the_symbol_the_id_named_before_the_refresh() {
+    for cmd in ["impact", "callgraph"] {
+        let project = setup_refs_renumber_project();
+        let (out, stderr, code) = run_cli(&project, &["show", "helper", "--json"]);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let helper_id = v[0]["node_id"].as_i64().unwrap().to_string();
+
+        insert_zeta_pair(&project);
+
+        // First command after the edit: THIS run performs the refresh.
+        let args: Vec<&str> = if cmd == "impact" {
+            vec![cmd, "--node-id", &helper_id, "--json"]
+        } else {
+            vec![
+                cmd,
+                "--node-id",
+                &helper_id,
+                "--direction",
+                "callers",
+                "--json",
+            ]
+        };
+        let (out, stderr, code) = run_cli(&project, &args);
+        assert_eq!(code, 0, "{cmd} stderr:\n{stderr}\nstdout:\n{out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["symbol"].as_str(), Some("helper"), "{cmd}: {out}");
+        let names = if cmd == "impact" {
+            impact_caller_names(&out)
+        } else {
+            callgraph_names(&out)
+        };
+        assert_eq!(
+            names,
+            vec!["main_entry".to_string()],
+            "{cmd}: `helper` is called only by `main_entry`; anything else is the answer for \
+             whatever reused the id after the refresh: {out}"
+        );
+
+        // Anti-vacuity, read after the assertion so this probe is not the run
+        // that refreshes: the id really was reused by another symbol.
+        let (shown, _e, c) = run_cli(&project, &["show", "--node-id", &helper_id, "--json"]);
+        assert_eq!(c, 0, "{shown}");
+        let sv: serde_json::Value = serde_json::from_str(shown.trim()).unwrap();
+        assert_ne!(
+            sv[0]["name"].as_str(),
+            Some("helper"),
+            "fixture precondition: {shown}"
+        );
+    }
+}
+
+/// With no edges in the asked direction, a name takes callgraph's fuzzy "did
+/// you mean" path, which refuses a name defined twice. Named by node_id the
+/// definition is already exact: `Foo::new` has no callees, and the answer is
+/// that empty graph, not a refusal over the two `new`.
+#[test]
+fn callgraph_by_node_id_never_fuzzy_resolves_an_edgeless_direction() {
+    let project = setup_node_id_project();
+    let (foo, _bar) = foo_bar_new_ids(&project);
+    let id = foo.to_string();
+    let (out, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "--node-id",
+            &id,
+            "--direction",
+            "callees",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["symbol"].as_str(), Some("new"), "{out}");
+    assert_eq!(callgraph_names(&out), Vec::<String>::new(), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Pre-tag review of 0.164.0 (2026-09-29): the same-file gate and `--node-id`.
+// ---------------------------------------------------------------------------
+
+fn index_project(files: &[(&str, &str)]) -> TempDir {
+    let project = TempDir::new().unwrap();
+    for (rel, body) in files {
+        let p = project.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// Node ids of `name` in `file`, in source order, read from the index.
+fn node_ids_in_file(project: &TempDir, file: &str, name: &str) -> Vec<i64> {
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE f.path = ?1 AND n.name = ?2 ORDER BY n.start_line",
+        )
+        .unwrap();
+    stmt.query_map([file, name], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn append(project: &TempDir, rel: &str, text: &str) {
+    let p = project.path().join(rel);
+    let mut s = std::fs::read_to_string(&p).unwrap();
+    s.push_str(text);
+    std::fs::write(p, s).unwrap();
+}
+
+const CFG_TWINS: &str = "#[cfg(unix)]\npub fn connect() { unix_helper() }\n\n\
+    #[cfg(windows)]\npub fn connect() { win_helper() }\n\n\
+    pub fn unix_helper() {}\n\npub fn win_helper() {}\n";
+const CFG_CALLER: &str = "pub fn run() { crate::a::connect() }\n";
+
+// Definitions that share one qualified name in one file — `#[cfg]` twins, a
+// property's getter and setter — are one symbol to every caller. 0.163.0
+// answered for them under `--file`; 174f9b6's gate refused them, and MCP
+// `get_call_graph` has no node_id to get past that. Only definitions with
+// DIFFERENT qualified names (two classes' `run`) need splitting.
+#[test]
+fn same_file_definitions_sharing_a_qualified_name_answer_under_a_file_selector() {
+    let rs = index_project(&[("src/a.rs", CFG_TWINS), ("src/b.rs", CFG_CALLER)]);
+    for cmd in ["callgraph", "impact"] {
+        let (out, stderr, code) = run_cli(&rs, &[cmd, "connect", "--file", "src/a.rs", "--json"]);
+        assert_eq!(
+            code, 0,
+            "{cmd}: cfg twins must answer; stderr={stderr:?} stdout={out}"
+        );
+        assert!(
+            out.contains("run"),
+            "{cmd}: the caller must be listed: {out}"
+        );
+    }
+    let py = index_project(&[(
+        "app.py",
+        "class App:\n    @property\n    def debug(self):\n        return self._d\n\n    \
+         @debug.setter\n    def debug(self, v):\n        self._d = v\n\n\
+         def show(a):\n    return a.debug()\n",
+    )]);
+    let (out, stderr, code) = run_cli(&py, &["callgraph", "debug", "--file", "app.py", "--json"]);
+    assert_eq!(
+        code, 0,
+        "getter+setter must answer; stderr={stderr:?} stdout={out}"
+    );
+    // Control: different qualified names in one file still refuse.
+    let two = index_project(&[(
+        "app.py",
+        "class A:\n    def run(self):\n        return 1\n\n\
+         class B:\n    def run(self):\n        return 2\n",
+    )]);
+    let (out, _e, code) = run_cli(&two, &["callgraph", "run", "--file", "app.py", "--json"]);
+    assert_eq!(code, 1, "A.run and B.run must still refuse: {out}");
+}
+
+// H1: `--node-id` re-found its target after ANY refresh by (file, name,
+// qualified name, type) and took the first match — the other twin — even when
+// the target's own file was never re-indexed and its id was still valid.
+#[test]
+fn node_id_keeps_its_definition_across_a_refresh() {
+    let project = index_project(&[("src/a.rs", CFG_TWINS), ("src/b.rs", CFG_CALLER)]);
+    let ids = node_ids_in_file(&project, "src/a.rs", "connect");
+    assert_eq!(ids.len(), 2, "fixture: two connect twins: {ids:?}");
+    let second = ids[1].to_string();
+    let callees = |project: &TempDir| {
+        let (out, stderr, code) = run_cli(
+            project,
+            &[
+                "callgraph",
+                "--node-id",
+                &second,
+                "--direction",
+                "callees",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "stderr={stderr:?} stdout={out}");
+        callgraph_names(&out)
+    };
+    assert!(
+        callees(&project).contains(&"win_helper".to_string()),
+        "precondition"
+    );
+    // A caller file changes: the target's own file is untouched.
+    append(&project, "src/b.rs", "// edited\n");
+    let after = callees(&project);
+    assert!(after.contains(&"win_helper".to_string()), "{after:?}");
+    assert!(
+        !after.contains(&"unix_helper".to_string()),
+        "swapped twin: {after:?}"
+    );
+    // The target's own file changes below both twins: re-indexed, same order.
+    append(&project, "src/a.rs", "// edited\n");
+    let after = callees(&project);
+    assert!(after.contains(&"win_helper".to_string()), "{after:?}");
+    assert!(
+        !after.contains(&"unix_helper".to_string()),
+        "swapped twin: {after:?}"
+    );
+}
+
+const TWO_RUNS_WITH_FILLER: &str = "class A:\n    def run(self):\n        return 1\n\
+    # filler\n# filler\n# filler\n# filler\n# filler\n# filler\n# filler\n# filler\n\n\
+    class B:\n    def run(self):\n        return 2\n\n\
+    def go_a():\n    return A().run()\n\ndef go_b():\n    return B().run()\n";
+
+// H3: the same-file refusal listed node_ids and start lines from the index as
+// it was before this command refreshed anything, and the edit hook picks a
+// definition by the line on disk — after an unindexed edit had shifted lines,
+// it picked the neighbour.
+#[test]
+fn same_file_refusal_lists_the_lines_on_disk() {
+    // One project per command: the first command's refresh would otherwise
+    // hand the second a fresh index and leave its own refresh untested.
+    for cmd in ["callgraph", "impact"] {
+        let project = index_project(&[("app.py", TWO_RUNS_WITH_FILLER)]);
+        std::fs::write(
+            project.path().join("app.py"),
+            TWO_RUNS_WITH_FILLER.replace("# filler\n", ""),
+        )
+        .unwrap();
+        let on_disk: Vec<i64> = std::fs::read_to_string(project.path().join("app.py"))
+            .unwrap()
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("def run"))
+            .map(|(i, _)| i as i64 + 1)
+            .collect();
+        let (out, _e, code) = run_cli(&project, &[cmd, "run", "--file", "app.py", "--json"]);
+        assert_eq!(code, 1, "{cmd}: refuses: {out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let mut lines: Vec<i64> = v["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["start_line"].as_i64().unwrap())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, on_disk, "{cmd}: stale start lines: {out}");
+    }
+}
+
+// H2: the refusal lists at most `SUGGESTION_CAP` definitions; `total` says how
+// many there are, so a consumer picking one by line knows when the one it
+// needs may be past the list.
+#[test]
+fn same_file_refusal_json_carries_the_total() {
+    let mut src = String::new();
+    for i in 1..=7 {
+        src.push_str(&format!(
+            "class C{i}:\n    def run(self):\n        return {i}\n\n"
+        ));
+    }
+    let project = index_project(&[("views.py", &src)]);
+    let (out, _e, code) = run_cli(&project, &["impact", "run", "--file", "views.py", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["suggestions"].as_array().map(Vec::len), Some(5), "{out}");
+    assert_eq!(v["total"].as_u64(), Some(7), "{out}");
+}
+
+// Second review round: a class and its own constructor have different
+// qualified names (`Widget`, `Widget.Widget`) but are one symbol to a caller;
+// 0.163.0 answered `callgraph Widget --file …`, and the gate refused it.
+#[test]
+fn a_class_and_its_constructor_answer_under_a_file_selector() {
+    let project = index_project(&[
+        (
+            "src/Widget.java",
+            "public class Widget {\n    public Widget() { init(); }\n    void init() {}\n}\n",
+        ),
+        (
+            "src/Use.java",
+            "public class Use {\n    Widget make() { return new Widget(); }\n}\n",
+        ),
+    ]);
+    let (out, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "Widget", "--file", "src/Widget.java", "--json"],
+    );
+    assert_eq!(code, 0, "stderr={stderr:?} stdout={out}");
+}
+
+// Second review round: when the definitions sharing a node's identity change
+// in number, no position is the one the caller meant — the deleted twin must
+// not be answered for by the one that is left.
+#[test]
+fn node_id_refuses_when_its_twin_group_changes_size() {
+    let project = index_project(&[("src/a.rs", CFG_TWINS), ("src/b.rs", CFG_CALLER)]);
+    let ids = node_ids_in_file(&project, "src/a.rs", "connect");
+    assert_eq!(ids.len(), 2, "fixture: {ids:?}");
+    let second = ids[1].to_string();
+    std::fs::write(
+        project.path().join("src/a.rs"),
+        CFG_TWINS.replace("#[cfg(windows)]\npub fn connect() { win_helper() }\n\n", ""),
+    )
+    .unwrap();
+    let (out, _e, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "--node-id",
+            &second,
+            "--direction",
+            "callees",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "the deleted twin must not be answered for: {out}");
+    assert!(!out.contains("unix_helper"), "{out}");
 }

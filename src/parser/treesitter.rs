@@ -44,7 +44,19 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             .get_mut(language)
             .ok_or_else(|| anyhow!("parser cache inconsistency for {}", language))?;
         let timeout = std::time::Duration::from_millis(parse_timeout_ms());
-        match parse_with_deadline(parser, source, timeout) {
+        // The tree's byte ranges index the ORIGINAL source: blanking keeps every
+        // offset, so callers slice node text from `source`, macro included.
+        let parsed = if matches!(language, "c" | "cpp") {
+            let classes = blank_class_decl_macros(source);
+            let annotated = match blank_thread_annotations(&classes) {
+                Cow::Owned(s) => Some(s),
+                Cow::Borrowed(_) => None,
+            };
+            annotated.map(Cow::Owned).unwrap_or(classes)
+        } else {
+            Cow::Borrowed(source)
+        };
+        match parse_with_deadline(parser, &parsed, timeout) {
             Some(tree) => Ok(tree),
             None => {
                 parser.reset();
@@ -52,6 +64,362 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             }
         }
     })
+}
+
+/// Name suffixes of the Clang thread-safety annotation macros (`GUARDED_BY`,
+/// `ABSL_GUARDED_BY`, `EXCLUSIVE_LOCKS_REQUIRED`, …).
+const THREAD_ANNOTATION_SUFFIXES: &[&str] = &[
+    "GUARDED_BY",
+    "LOCKS_REQUIRED",
+    "LOCKS_EXCLUDED",
+    "LOCK_RETURNED",
+    "ACQUIRED_AFTER",
+    "ACQUIRED_BEFORE",
+    "LOCK_FUNCTION",
+    "TRYLOCK_FUNCTION",
+    "EXCLUDES",
+    "REQUIRES",
+    "REQUIRES_SHARED",
+    "ACQUIRE",
+    "ACQUIRE_SHARED",
+    "RELEASE",
+    "RELEASE_SHARED",
+    "TRY_ACQUIRE",
+    "ASSERT_CAPABILITY",
+    "RETURN_CAPABILITY",
+    "NO_THREAD_SAFETY_ANALYSIS",
+];
+
+/// Blank (with spaces, same byte length) Clang thread-safety annotations after a
+/// declarator: `SnapshotList snapshots_ GUARDED_BY(mutex_);`, `void f()
+/// EXCLUSIVE_LOCKS_REQUIRED(mutex_);`. tree-sitter reads `snapshots_
+/// GUARDED_BY(mutex_)` as an ERROR followed by a function `GUARDED_BY`, so the
+/// field's name is lost. An annotation here is an all-caps macro whose name is
+/// or ends in `_` + one of [`THREAD_ANNOTATION_SUFFIXES`], with its argument
+/// list (`NO_THREAD_SAFETY_ANALYSIS` may have none), right after a declarator
+/// (a non-keyword identifier, `)` or `]`, or another annotation) and before
+/// `;`, `{`, `=`, `,`, another annotation, or `const`/`override`/`final`/
+/// `noexcept`. `return REQUIRES(x);`, `#define GUARDED_BY(x) …` and a call's
+/// argument are left alone.
+fn blank_thread_annotations(source: &str) -> Cow<'_, str> {
+    const KEYWORDS: &[&str] = &[
+        "return",
+        "throw",
+        "case",
+        "else",
+        "do",
+        "co_return",
+        "co_yield",
+        "sizeof",
+        "new",
+        "delete",
+        "define",
+        "typedef",
+        "using",
+        "goto",
+        "if",
+        "while",
+        "for",
+        "switch",
+    ];
+    // A return type, never a declarator's name: `static void OBJ_RELEASE(…)`.
+    const BUILTIN_TYPES: &[&str] = &[
+        "void", "bool", "char", "short", "int", "long", "float", "double", "signed", "unsigned",
+        "auto",
+    ];
+    let b = source.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let skip_ws_back = |mut p: usize| {
+        while p > 0 && b[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        p
+    };
+    // The start of the word ending at `e`.
+    let ident_start = |e: usize| {
+        let mut s = e;
+        while s > 0 && ident(b[s - 1]) {
+            s -= 1;
+        }
+        s
+    };
+    // A word that can name a declarator or a function: no keyword, number or
+    // preprocessor directive.
+    let plain_word = |s: usize, e: usize| {
+        let w = &source[s..e];
+        !w.is_empty()
+            && !KEYWORDS.contains(&w)
+            && !b[s].is_ascii_digit()
+            && (s == 0 || b[s - 1] != b'#')
+    };
+    // Whether `operator<sym>` ends at `q` (`operator<<`, `operator=`, `operator()`).
+    let after_operator = |q: usize| {
+        let mut k = q;
+        while k > 0 && b"<>=!+-*/%^&|~[]()".contains(&b[k - 1]) {
+            k -= 1;
+        }
+        let k = skip_ws_back(k);
+        k < q && &source[ident_start(k)..k] == "operator"
+    };
+    // The `(` matching the `)` at `close`, within one statement and 4 KiB (so
+    // deeply nested input stays linear), or None.
+    let parens_start = |close: usize| {
+        let mut depth = 0usize;
+        let mut i = close + 1;
+        while i > 0 && close + 1 - i < 4096 {
+            i -= 1;
+            match b[i] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b';' | b'{' | b'}' => return None,
+                _ => {}
+            }
+        }
+        None
+    };
+    let is_annotation = |w: &str| {
+        w.bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+            && THREAD_ANNOTATION_SUFFIXES
+                .iter()
+                .any(|s| w == *s || (w.ends_with(s) && w[..w.len() - s.len()].ends_with('_')))
+    };
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let word_at = |i: usize| {
+        let mut e = i;
+        while e < b.len() && ident(b[e]) {
+            e += 1;
+        }
+        &source[i..e]
+    };
+    // The byte just past a balanced `( ... )` starting at `i`, within 4 KiB (an
+    // unclosed `REQUIRES(` repeated would rescan to EOF each time), or None.
+    let parens_end = |mut i: usize| {
+        let mut depth = 0usize;
+        let stop = b.len().min(i + 4096);
+        while i < stop {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                b';' | b'{' | b'}' => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !ident(b[i]) || (i > 0 && ident(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let word = word_at(i);
+        let end = i + word.len();
+        if !is_annotation(word) {
+            i = end;
+            continue;
+        }
+        let open = skip_ws(end);
+        let macro_end = if b.get(open) == Some(&b'(') {
+            parens_end(open)
+        } else if word.ends_with("NO_THREAD_SAFETY_ANALYSIS") {
+            Some(end)
+        } else {
+            None
+        };
+        let Some(macro_end) = macro_end else {
+            i = end;
+            continue;
+        };
+        // What precedes: a declarator's end, or an annotation already taken.
+        // A `)` must close a parameter list (the word before its `(` names a
+        // function or an annotation), not `if (…)`, `while (…)` or a cast; a
+        // word must be a declarator's name, itself after a type or a
+        // qualifier, not the return type before a function's own name.
+        let p = skip_ws_back(i);
+        let after_declarator = p > 0
+            && match b[p - 1] {
+                b']' => true,
+                b')' => parens_start(p - 1).is_some_and(|open| {
+                    let q = skip_ws_back(open);
+                    q > 0
+                        && (b[q - 1] == b']' // a lambda's `[captures](params)`
+                            || ident(b[q - 1]) && plain_word(ident_start(q), q)
+                            || after_operator(q))
+                }),
+                c if ident(c) => {
+                    let s = ident_start(p);
+                    let q = skip_ws_back(s);
+                    plain_word(s, p)
+                        && !BUILTIN_TYPES.contains(&&source[s..p])
+                        && q > 0
+                        && (ident(b[q - 1]) || matches!(b[q - 1], b'*' | b'&' | b'>' | b')' | b','))
+                }
+                _ => false,
+            };
+        let next = skip_ws(macro_end);
+        let before_end = match b.get(next) {
+            Some(b';' | b'{' | b'=' | b',') => true,
+            Some(&c) if ident(c) => {
+                let w = word_at(next);
+                is_annotation(w) || matches!(w, "const" | "override" | "final" | "noexcept")
+            }
+            _ => false,
+        };
+        if after_declarator && before_end {
+            spans.push((i, macro_end));
+        }
+        i = macro_end.max(end);
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut out = b.to_vec();
+    for (s, e) in spans {
+        for c in &mut out[s..e] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    }
+    // Only ASCII bytes were replaced by ASCII spaces, so this stays valid UTF-8.
+    Cow::Owned(String::from_utf8(out).expect("blanking ASCII keeps UTF-8 valid"))
+}
+
+/// Blank (with spaces, same byte length) the attribute macros between `class` /
+/// `struct` and the type name: `class LEVELDB_EXPORT Slice {`, `struct
+/// SCOPED_LOCKABLE MutexLock : Base {`, `class __declspec(dllexport) W {`.
+/// tree-sitter cannot expand a macro, so it reads that line as a function
+/// `Slice` returning `class LEVELDB_EXPORT`, the class body as the function's
+/// body, and every member as a statement or an ERROR. A macro here is an
+/// all-caps identifier (or `__declspec(...)` / `__attribute__((...))`) followed
+/// by another identifier and then `{`, `:` or `final` — no other C/C++ construct
+/// has two identifiers after `class`/`struct` before a body.
+fn blank_class_decl_macros(source: &str) -> Cow<'_, str> {
+    let b = source.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let word_end = |mut i: usize| {
+        while i < b.len() && ident(b[i]) {
+            i += 1;
+        }
+        i
+    };
+    // The byte just past a balanced `( ... )` starting at `i`, or None.
+    let parens_end = |mut i: usize| {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                b';' | b'{' | b'}' => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let is_kw = |kw: &[u8]| {
+            b[i..].starts_with(kw)
+                && (i == 0 || !ident(b[i - 1]))
+                && b.get(i + kw.len()).is_some_and(|c| c.is_ascii_whitespace())
+        };
+        let kw_len = if is_kw(b"class") {
+            5
+        } else if is_kw(b"struct") {
+            6
+        } else {
+            i += 1;
+            continue;
+        };
+        let mut j = skip_ws(i + kw_len);
+        let mut macros = Vec::new();
+        let matched = loop {
+            let start = j;
+            let end = word_end(j);
+            if end == start {
+                break false;
+            }
+            let word = &source[start..end];
+            let after = skip_ws(end);
+            let is_macro_word = word.len() >= 2
+                && word.bytes().any(|c| c.is_ascii_uppercase())
+                && word
+                    .bytes()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_');
+            let (macro_end, next) = if word.starts_with("__") && b.get(after) == Some(&b'(') {
+                match parens_end(after) {
+                    Some(e) => (e, skip_ws(e)),
+                    None => break false,
+                }
+            } else {
+                (end, after)
+            };
+            // `word` is the type name once a macro was seen and a body or base
+            // clause follows (`::` would be a qualified name, not a base). Checked
+            // before the macro test: an all-caps name (`class LEVELDB_EXPORT DB {`)
+            // is shaped like a macro too.
+            let tail = &b[after..];
+            let body = tail.first() == Some(&b'{')
+                || (tail.first() == Some(&b':') && tail.get(1) != Some(&b':'))
+                || (tail.starts_with(b"final") && !tail.get(5).is_some_and(|&c| ident(c)));
+            if macro_end == end && !macros.is_empty() && body {
+                break true;
+            }
+            if !(is_macro_word || macro_end != end) || next >= b.len() || !ident(b[next]) {
+                break false;
+            }
+            macros.push((start, macro_end));
+            j = next;
+        };
+        if matched {
+            spans.extend(macros);
+        }
+        i += kw_len;
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut out = b.to_vec();
+    for (s, e) in spans {
+        for c in &mut out[s..e] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    }
+    // Only ASCII bytes were replaced by ASCII spaces, so this stays valid UTF-8.
+    Cow::Owned(String::from_utf8(out).expect("blanking ASCII keeps UTF-8 valid"))
 }
 
 /// Parse `source`, giving up once `timeout` has elapsed — `None` then, as for any
@@ -222,6 +590,11 @@ fn extract_nodes(
             if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
             {
                 parsed.is_test = node_is_test;
+                if matches!(config.name, "javascript" | "typescript" | "tsx") {
+                    if let Some(q) = js_returned_member(&node, &parsed.name, source) {
+                        parsed.qualified_name = Some(q);
+                    }
+                }
                 results.push(parsed);
             } else if let Some(name) = super::route_handler_name(&node, source) {
                 // Anonymous `function (req, res) { ... }` used as an inline route
@@ -238,6 +611,9 @@ fn extract_nodes(
         }
         // Python async functions
         "async_function_definition" => {
+            if python_overload_stub(&node, source) {
+                return;
+            }
             let nt = if parent_class.is_some() {
                 "method"
             } else {
@@ -293,6 +669,9 @@ fn extract_nodes(
                     }
                 }
             } else {
+                if python_overload_stub(&node, source) {
+                    return;
+                }
                 // Python and others: name is in "name" field
                 let nt = if parent_class.is_some() {
                     "method"
@@ -319,13 +698,19 @@ fn extract_nodes(
         "lexical_declaration" | "variable_declaration" => {
             for mut parsed in extract_named_arrows(&node, source) {
                 parsed.is_test = node_is_test;
+                if parsed.node_type == "function" {
+                    if let Some(q) = js_returned_member(&node, &parsed.name, source) {
+                        parsed.qualified_name = Some(q);
+                    }
+                }
                 results.push(parsed);
             }
         }
 
-        // Classes: shared across TS/JS/Java (class_declaration), Python (class_definition)
+        // Classes: shared across TS/JS/Java (class_declaration), Python (class_definition),
+        // TS `abstract class` (abstract_class_declaration).
         // Kotlin: both classes and interfaces use class_declaration — distinguish by first child kind
-        "class_declaration" | "class" | "class_definition" => {
+        "class_declaration" | "abstract_class_declaration" | "class" | "class_definition" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 // Kotlin interfaces are class_declaration with first child kind "interface"
                 // Swift reuses class_declaration for class/struct/enum — first child is the keyword
@@ -659,7 +1044,10 @@ fn extract_nodes(
             }
         }
 
-        // C++ class/struct
+        // C++ class/struct. Only a definition: without a body the specifier is a
+        // forward declaration (`class Cache;`) or a C type use (`struct stat *st`),
+        // naming a type defined elsewhere, and a node here would be a phantom twin.
+        "class_specifier" | "struct_specifier" if node.child_by_field_name("body").is_none() => {}
         "class_specifier" | "struct_specifier" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 let nt = if kind == "class_specifier" {
@@ -742,31 +1130,24 @@ fn extract_nodes(
         }
         "impl_item" => {
             if let Some(type_node) = node.child_by_field_name("type") {
-                let impl_name_full = node_text(&type_node, source);
-                // Strip path prefix so `impl crate::db_a::Db` is captured as
-                // "Db" (matching what callers use as `Self`/`self` payload).
-                // Mirrors the strip in relations/mod.rs walk_for_relations
-                // for impl_item — keeps qualified_name consistent across the
-                // two parser walks (treesitter.rs builds nodes; relations/mod.rs
-                // builds edges).
-                let impl_name = impl_name_full.rsplit("::").next().unwrap_or(impl_name_full);
-                // Strip generic parameters so `impl<T> Foo<T>` produces method
-                // qualified_names like "Foo.method" not "Foo<T>.method". The
-                // self_filter_candidates resolver and impl_method metadata
-                // both encode the bare type name (see relations/rust.rs);
-                // keeping the impl name bare avoids a LIKE mismatch that would
-                // drop every method-level implements edge.
-                let impl_name = impl_name.split('<').next().unwrap_or(impl_name).trim();
+                // `impl<T> crate::db_a::Db<T>` is captured as "Db": the name
+                // the relation walk puts in `self`/`Self` payloads and
+                // trait-impl heritage (see `rust_impl_type_name`).
+                let impl_name = super::rust_impl_type_name(node_text(&type_node, source));
+                let first_child = results.len();
                 extract_children(
                     node,
                     source,
                     language,
                     config,
-                    Some(impl_name),
+                    Some(&impl_name),
                     results,
                     depth,
                     node_is_test,
                 );
+                if let Some(param) = rust_blanket_impl_param(&node, &type_node, source) {
+                    mark_rust_blanket_methods(&node, source, param, &mut results[first_child..]);
+                }
                 return;
             }
         }
@@ -889,6 +1270,43 @@ fn extract_nodes(
                     source,
                     node_is_test,
                 ));
+            } else if let chain @ [_, ..] =
+                super::js_member_assignment_chain(&node, source).as_slice()
+            {
+                // D7: `res.send = function send() {}` — spans the assignment; its
+                // doc comment sits above the statement that holds it. A chained
+                // `res.set = res.header = function () {}` is a node per member.
+                for (name, qualified, kind, assign) in chain {
+                    let doc_anchor = assign
+                        .parent()
+                        .filter(|p| p.kind() == "expression_statement")
+                        .unwrap_or(*assign);
+                    results.push(assigned_function_node(
+                        kind,
+                        name.clone(),
+                        qualified.clone(),
+                        &node,
+                        assign,
+                        get_preceding_comment(&doc_anchor, source),
+                        source,
+                        node_is_test,
+                    ));
+                }
+            } else if let (Some(cls), Some(field)) =
+                (parent_class, super::js_class_field_function(&node, source))
+            {
+                // D7: a class field holding a function is that class's method.
+                let decl = node.parent().unwrap_or(node);
+                results.push(assigned_function_node(
+                    "method",
+                    field.clone(),
+                    format!("{cls}.{field}"),
+                    &node,
+                    &decl,
+                    get_preceding_comment(&decl, source),
+                    source,
+                    node_is_test,
+                ));
             }
             // fall through to extract_children below so nested fns still extract
         }
@@ -980,6 +1398,36 @@ fn strip_nul_field(s: Option<String>) -> Option<String> {
     })
 }
 
+/// A function node whose name comes from what holds the function — an assigned
+/// member or a class field (D7). `span` is that holder: its lines and text are
+/// the node's; the signature is the function's own.
+#[allow(clippy::too_many_arguments)]
+fn assigned_function_node(
+    node_type: &str,
+    name: String,
+    qualified_name: String,
+    function: &tree_sitter::Node,
+    span: &tree_sitter::Node,
+    doc_comment: Option<String>,
+    source: &str,
+    is_test: bool,
+) -> ParsedNode {
+    let sig_info = extract_signature_info(function, source);
+    ParsedNode {
+        node_type: node_type.into(),
+        name,
+        qualified_name: Some(qualified_name),
+        start_line: span.start_position().row as u32 + 1,
+        end_line: span.end_position().row as u32 + 1,
+        code_content: truncate_code_content(node_text(span, source)).into_owned(),
+        signature: sig_info.signature,
+        doc_comment,
+        return_type: sig_info.return_type,
+        param_types: sig_info.param_types,
+        is_test,
+    }
+}
+
 fn make_simple_node(
     node_type: &str,
     name: String,
@@ -1019,6 +1467,66 @@ fn python_decorated_extent<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Nod
     }
 }
 
+/// A Python `@overload` stub with its implementation after it in the same
+/// block (`@t.overload def f(x: int) -> int: ...` then `def f(x): ...`). The
+/// stubs type the one runtime function that follows; as nodes they gave every
+/// overloaded name several same-file definitions, and callgraph/impact/refs
+/// refuse those (C4, 2026-09-28 usage evaluation: flask's
+/// `stream_with_context`, `locate_app`, `ConfigAttribute.__get__`). A stub with
+/// no implementation after it (a `.pyi` file, a Protocol) is all there is and
+/// stays. A decorator is `@overload` when its expression is `overload` or ends
+/// in `.overload` (`typing.`, `t.`, `typing_extensions.`).
+fn python_overload_stub(node: &tree_sitter::Node, source: &str) -> bool {
+    let Some(wrapper) = node.parent().filter(|p| p.kind() == "decorated_definition") else {
+        return false;
+    };
+    if !python_overload_decorated(&wrapper, source) {
+        return false;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let name = node_text(&name, source);
+    let mut next = wrapper.next_named_sibling();
+    while let Some(sibling) = next {
+        let (def, decorated) = if sibling.kind() == "decorated_definition" {
+            (sibling.child_by_field_name("definition"), true)
+        } else {
+            (Some(sibling), false)
+        };
+        let same_name = def
+            .filter(|d| {
+                matches!(
+                    d.kind(),
+                    "function_definition" | "async_function_definition"
+                )
+            })
+            .and_then(|d| d.child_by_field_name("name"))
+            .is_some_and(|n| node_text(&n, source) == name);
+        if same_name && !(decorated && python_overload_decorated(&sibling, source)) {
+            return true;
+        }
+        next = sibling.next_named_sibling();
+    }
+    false
+}
+
+/// Whether a `decorated_definition` carries `@overload` (see
+/// [`python_overload_stub`]).
+fn python_overload_decorated(wrapper: &tree_sitter::Node, source: &str) -> bool {
+    let mut cursor = wrapper.walk();
+    let found = wrapper
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "decorator")
+        .any(|d| {
+            d.named_child(0).is_some_and(|e| {
+                let text = node_text(&e, source);
+                text == "overload" || text.ends_with(".overload")
+            })
+        });
+    found
+}
+
 /// The owner type of a Go method, from its receiver: `func (s *Server) Start()`
 /// → `Server`. `None` for any node without a `receiver` field, which is every
 /// non-Go `method_declaration` (Java nests its methods in a class body instead)
@@ -1046,6 +1554,63 @@ fn go_receiver_type(node: &tree_sitter::Node, source: &str) -> Option<String> {
         None
     } else {
         Some(base)
+    }
+}
+
+/// The type parameter a Rust `impl` is a blanket impl over: its self type is,
+/// after any `&`/`&'a`/`&mut`, a bare name that the impl's own `<…>` list
+/// declares (`impl<T: Display> Shout for T`, `impl<W: Wait> Wait for &mut W`).
+/// Decided from the impl's header alone, so a `struct T` anywhere else changes
+/// nothing (batch-1 review round 2). `impl<T> Tr for Box<T>`, `for [T]`, `for
+/// (T,)` and `for *const T` are impls on that type constructor, not on every
+/// type: no (their text is never a bare parameter name).
+fn rust_blanket_impl_param<'s>(
+    impl_node: &tree_sitter::Node,
+    type_node: &tree_sitter::Node,
+    source: &'s str,
+) -> Option<&'s str> {
+    let mut ty = *type_node;
+    while ty.kind() == "reference_type" {
+        ty = ty.child_by_field_name("type")?;
+    }
+    let name = node_text(&ty, source);
+    let params = impl_node.child_by_field_name("type_parameters")?;
+    // tree-sitter-rust 0.24: a type parameter, bounded or not, is a
+    // `type_parameter` with a `name` field; a lifetime has none.
+    (0..params.named_child_count())
+        .filter_map(|i| params.named_child(i))
+        .filter_map(|p| p.child_by_field_name("name"))
+        .any(|d| node_text(&d, source) == name)
+        .then_some(name)
+}
+
+/// Mark the methods of a blanket impl ([`rust_blanket_impl_param`]): their
+/// signature opens with the type parameter, `<T> (&self) -> String`, which the
+/// resolver reads (`resolve::rust_fn_shape`) to let them run on any receiver
+/// type. Only the impl's own items (a signature is a function's): a function
+/// nested in a method body keeps its signature.
+fn mark_rust_blanket_methods(
+    impl_node: &tree_sitter::Node,
+    source: &str,
+    param: &str,
+    nodes: &mut [ParsedNode],
+) {
+    let Some(body) = impl_node.child_by_field_name("body") else {
+        return;
+    };
+    let items: Vec<(u32, &str)> = (0..body.named_child_count())
+        .filter_map(|i| body.named_child(i))
+        .filter_map(|c| {
+            let name = c.child_by_field_name("name")?;
+            Some((c.start_position().row as u32 + 1, node_text(&name, source)))
+        })
+        .collect();
+    for n in nodes {
+        if items.contains(&(n.start_line, n.name.as_str())) {
+            if let Some(sig) = n.signature.as_mut() {
+                *sig = format!("<{param}> {sig}");
+            }
+        }
     }
 }
 
@@ -1129,6 +1694,76 @@ fn collect_binding_names(pattern: &tree_sitter::Node, source: &str, out: &mut Ve
         }
         _ => {}
     }
+}
+
+/// JS/TS function kinds that open a scope.
+const JS_FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "function",
+    "generator_function_declaration",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+];
+
+/// `outer.name` when the function `name`, declared at `decl` inside the
+/// function `outer`, is returned by `outer` in an object literal
+/// (`return { attemptUpgrade, reset: reset }`): a member of the object a
+/// factory returns, which a member call (`stub.attemptUpgrade()`) reaches. The
+/// dotted qualified name is what lets the resolver keep it for such a call
+/// (`filter_out_function_ids`).
+fn js_returned_member(decl: &tree_sitter::Node, name: &str, source: &str) -> Option<String> {
+    let mut cur = decl.parent();
+    let outer = loop {
+        let n = cur?;
+        if JS_FUNCTION_KINDS.contains(&n.kind()) {
+            break n;
+        }
+        cur = n.parent();
+    };
+    fn returns(node: tree_sitter::Node, name: &str, source: &str, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        if node.kind() == "return_statement" {
+            let mut value = node.named_child(0);
+            while let Some(v) = value.filter(|v| v.kind() == "parenthesized_expression") {
+                value = v.named_child(0);
+            }
+            if let Some(obj) = value.filter(|v| v.kind() == "object") {
+                return (0..obj.named_child_count())
+                    .filter_map(|i| obj.named_child(i))
+                    .any(|p| match p.kind() {
+                        "shorthand_property_identifier" => node_text(&p, source) == name,
+                        // `{ run: run }`; under another key (`{ again: run }`) a
+                        // member call names the key, which is no node's name.
+                        "pair" => {
+                            p.child_by_field_name("key")
+                                .is_some_and(|k| node_text(&k, source) == name)
+                                && p.child_by_field_name("value").is_some_and(|v| {
+                                    v.kind() == "identifier" && node_text(&v, source) == name
+                                })
+                        }
+                        _ => false,
+                    });
+            }
+        }
+        (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .filter(|c| !JS_FUNCTION_KINDS.contains(&c.kind()))
+            .any(|c| returns(c, name, source, depth + 1))
+    }
+    if !returns(outer.child_by_field_name("body")?, name, source, 0) {
+        return None;
+    }
+    let outer_name = outer.child_by_field_name("name").or_else(|| {
+        outer
+            .parent()
+            .filter(|p| p.kind() == "variable_declarator")
+            .and_then(|p| p.child_by_field_name("name"))
+    })?;
+    Some(format!("{}.{name}", node_text(&outer_name, source)))
 }
 
 fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNode> {
@@ -1318,7 +1953,10 @@ fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<Str
 /// `TEST(Suite, Name) { ... }` has a function_declarator whose inner
 /// declarator is `TEST` and parameters are two type_identifiers.
 /// Returns `Some("Suite.Name")` when the macro matches; None otherwise.
-fn extract_gtest_test_name(declarator: &tree_sitter::Node, source: &str) -> Option<String> {
+pub(crate) fn extract_gtest_test_name(
+    declarator: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
     if declarator.kind() != "function_declarator" {
         return None;
     }
@@ -2173,6 +2811,236 @@ describe('Widget', () => {
     }
 
     #[test]
+    fn test_parse_cpp_class_with_export_macro_keeps_its_name() {
+        // `class LEVELDB_EXPORT Slice {` — an export/annotation macro between the
+        // keyword and the name is how most C++ libraries declare public classes.
+        // The class must be `Slice`, and its members its methods.
+        let code = "class LEVELDB_EXPORT Slice {\n public:\n  Slice() {}\n  size_t size() const { return n_; }\n};\nstruct SCOPED_LOCKABLE MutexLock : public Base {\n  void Unlock() {}\n};\n";
+        let nodes = parse_code(code, "cpp").unwrap();
+        let dump: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.node_type.as_str(),
+                    n.name.as_str(),
+                    n.qualified_name.as_deref(),
+                    n.start_line,
+                    n.end_line,
+                )
+            })
+            .collect();
+        let tree = parse_tree(code, "cpp").unwrap();
+        let sexp = tree.root_node().to_sexp();
+        for (ty, name, lines) in [("class", "Slice", (1, 5)), ("struct", "MutexLock", (6, 8))] {
+            assert!(
+                dump.iter()
+                    .any(|d| d.0 == ty && d.1 == name && (d.3, d.4) == lines),
+                "expected {ty} {name} spanning {lines:?}; got {dump:?}\n{sexp}"
+            );
+        }
+        for (method, qual) in [("size", "Slice.size"), ("Unlock", "MutexLock.Unlock")] {
+            assert!(
+                dump.iter()
+                    .any(|d| d.0 == "method" && d.1 == method && d.2 == Some(qual)),
+                "expected method {qual}; got {dump:?}"
+            );
+        }
+        assert!(
+            !dump
+                .iter()
+                .any(|d| matches!(d.1, "LEVELDB_EXPORT" | "SCOPED_LOCKABLE")),
+            "a macro must not become a node; got {dump:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_c_cpp_type_without_a_body_is_not_a_node() {
+        // Only a definition (`{ ... }`) defines a class or struct. A forward
+        // declaration (`class Plain;`, `class LEVELDB_EXPORT Cache;`) and every
+        // elaborated type use in C (`struct stat *st`) name one defined elsewhere
+        // (or nowhere, in a system header); each made a phantom same-named node.
+        for (lang, code, real) in [
+            (
+                "cpp",
+                "class LEVELDB_EXPORT Cache;\nclass Plain;\nstruct Pt;\nclass Real { public: int f(); };\n",
+                ("class", "Real"),
+            ),
+            (
+                "c",
+                "struct stat;\nvoid f(struct stat *st) { struct stat x; }\nstruct node { int v; };\nstatic struct node *g(struct node *n) { return n; }\n",
+                ("struct", "node"),
+            ),
+        ] {
+            let nodes = parse_code(code, lang).unwrap();
+            let types: Vec<_> = nodes
+                .iter()
+                .filter(|n| matches!(n.node_type.as_str(), "class" | "struct"))
+                .map(|n| (n.node_type.as_str(), n.name.as_str(), n.start_line))
+                .collect();
+            assert_eq!(types.len(), 1, "{lang}: only the definition; got {types:?}");
+            assert_eq!((types[0].0, types[0].1), real, "{lang}: got {types:?}");
+            let fns: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.node_type == "function")
+                .map(|n| n.name.as_str())
+                .collect();
+            if lang == "c" {
+                assert_eq!(fns, ["f", "g"], "functions must stay; got {fns:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn blank_thread_annotations_only_blanks_an_annotation_after_a_declarator() {
+        let blanked: [(&str, &[&str]); 17] = [
+            (
+                "  SnapshotList snapshots_ GUARDED_BY(mutex_);",
+                &["GUARDED_BY(mutex_)"],
+            ),
+            (
+                "  MemTable* imm_ GUARDED_BY(mutex_);  // c",
+                &["GUARDED_BY(mutex_)"],
+            ),
+            (
+                "  VersionSet* const versions_ PT_GUARDED_BY(mu);",
+                &["PT_GUARDED_BY(mu)"],
+            ),
+            (
+                "  int n_ ABSL_GUARDED_BY(mu_) = 0;",
+                &["ABSL_GUARDED_BY(mu_)"],
+            ),
+            (
+                "  void F() EXCLUSIVE_LOCKS_REQUIRED(mutex_);",
+                &["EXCLUSIVE_LOCKS_REQUIRED(mutex_)"],
+            ),
+            (
+                "  void F() LOCKS_EXCLUDED(a) EXCLUSIVE_LOCKS_REQUIRED(b);",
+                &["LOCKS_EXCLUDED(a)", "EXCLUSIVE_LOCKS_REQUIRED(b)"],
+            ),
+            (
+                "  void G() const SHARED_LOCKS_REQUIRED(m) {",
+                &["SHARED_LOCKS_REQUIRED(m)"],
+            ),
+            (
+                "  void H() NO_THREAD_SAFETY_ANALYSIS {",
+                &["NO_THREAD_SAFETY_ANALYSIS"],
+            ),
+            (
+                "  Mutex mu_ ACQUIRED_AFTER(a,\n    b);",
+                &["ACQUIRED_AFTER(a,", "b)"],
+            ),
+            ("  void F() REQUIRES(mu) override;", &["REQUIRES(mu)"]),
+            ("  void F() REQUIRES(mu) final {", &["REQUIRES(mu)"]),
+            ("  void F() REQUIRES(mu) noexcept;", &["REQUIRES(mu)"]),
+            (
+                "  bool changed = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(&Lb::mu_) {",
+                &["ABSL_EXCLUSIVE_LOCKS_REQUIRED(&Lb::mu_)"],
+            ),
+            (
+                "  friend std::ostream& operator<<(std::ostream& o, const X& x) REQUIRES(mu);",
+                &["REQUIRES(mu)"],
+            ),
+            ("  void operator()() REQUIRES(mu);", &["REQUIRES(mu)"]),
+            (
+                "  X& operator=(const X& o) REQUIRES(mu);",
+                &["REQUIRES(mu)"],
+            ),
+            (
+                "  int a_ GUARDED_BY(mu), b_ GUARDED_BY(mu);",
+                &["GUARDED_BY(mu)", "GUARDED_BY(mu)"],
+            ),
+        ];
+        for (src, macros) in blanked {
+            let want = macros.iter().fold(src.to_string(), |s, m| {
+                s.replacen(m, &" ".repeat(m.len()), 1)
+            });
+            let got = blank_thread_annotations(src);
+            assert_eq!(got, want, "for {src:?}");
+            assert_eq!(got.len(), src.len());
+        }
+        for src in [
+            "  return REQUIRES(x);",
+            "#define GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(guarded_by(x))",
+            "#define EXCLUDES(...)",
+            "  f(GUARDED_BY(x));",
+            "  x = 1; REQUIRES(mu);",
+            "  ASSERT_OK(Put(k));",
+            "  int n_ GUARDED_BY_X(mu);",
+            "  Foo foo_ GUARDED_BY(mu) + 1;",
+            "  void Release() { mu_.Unlock(); }",
+            // A function or call whose own name ends like an annotation.
+            "void OBJ_RELEASE(void* p) {}",
+            "  if (p) OBJ_RELEASE(p);",
+            "  while (*l) SPIN_ACQUIRE(l);",
+            "  return (PyDictObject *)FT_ATOMIC_LOAD_PTR_ACQUIRE(d->dict);",
+            "  x = (T*)FT_ATOMIC_LOAD_PTR_ACQUIRE(p);",
+            "static void OBJ_RELEASE(void* p) {}",
+            "static inline int SPIN_ACQUIRE(int* l);",
+            "  virtual void DO_RELEASE();",
+            "extern void FOO_RELEASE(void* p);",
+            "unsigned long BAR_ACQUIRE(void);",
+        ] {
+            assert!(
+                matches!(blank_thread_annotations(src), Cow::Borrowed(_)),
+                "must not touch {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_class_decl_macros_only_blanks_a_macro_before_a_type_name() {
+        let blanked: [(&str, &[&str]); 8] = [
+            ("class LEVELDB_EXPORT Slice {", &["LEVELDB_EXPORT"]),
+            ("class LEVELDB_EXPORT DB {", &["LEVELDB_EXPORT"]),
+            ("class EXPORT IO : public Base {", &["EXPORT"]),
+            (
+                "struct SCOPED_LOCKABLE M : public B {",
+                &["SCOPED_LOCKABLE"],
+            ),
+            (
+                "class A_API B_DEPRECATED W final {",
+                &["A_API", "B_DEPRECATED"],
+            ),
+            (
+                "class __declspec(dllexport) W {",
+                &["__declspec(dllexport)"],
+            ),
+            (
+                "struct __attribute__((packed)) P {",
+                &["__attribute__((packed))"],
+            ),
+            ("x; class\tFOO_EXPORT\nW\n{", &["FOO_EXPORT"]),
+        ];
+        for (src, macros) in blanked {
+            let want = macros.iter().fold(src.to_string(), |s, m| {
+                s.replacen(m, &" ".repeat(m.len()), 1)
+            });
+            let got = blank_class_decl_macros(src);
+            assert_eq!(got, want, "for {src:?}");
+            assert_eq!(got.len(), src.len());
+        }
+        for src in [
+            "class Slice {",
+            "struct FOO;",
+            "class ABC {",
+            "template <class T, class U> struct Pair {",
+            "struct POINT make_point(int x) {",
+            "struct foo bar;",
+            "class EXPORT ns::Widget {",
+            "class EXPORT Foo<T> {",
+            "subclass FOO_API W {",
+            "struct S x : 3;",
+            "class LEVELDB_EXPORT Cache;",
+            "class DB {",
+        ] {
+            assert!(
+                matches!(blank_class_decl_macros(src), Cow::Borrowed(_)),
+                "must not touch {src:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_cpp_method_scope_qualified() {
         // C++ method scope: in-class methods and out-of-class `Type::method`
         // definitions should carry node_type "method" + qualified_name
@@ -2275,6 +3143,81 @@ describe('Widget', () => {
             2,
             "both methods keep the bare name `Start`; got: {dump:?}"
         );
+    }
+
+    /// Batch-1 review round 2: a blanket impl's methods (the impl's self type,
+    /// after `&`/`&mut`, is a parameter of the impl's own `<…>` list) carry
+    /// that parameter before their signature, which the resolver reads. Every
+    /// other function's signature is the parameter list and return type, as
+    /// before: `show`, `overview` and `search` print it unchanged.
+    #[test]
+    fn test_rust_blanket_impl_methods_carry_their_type_parameter() {
+        let code = "\
+use crate::tt::T;
+pub trait Tr { fn m(&self) -> u8; }
+impl<T: std::fmt::Display> Tr for T {
+    fn m(&self) -> u8 {
+        fn nested(x: u8) -> u8 { x }
+        nested(1)
+    }
+    fn two(&self, a: u8) {}
+}
+impl<'a, W: Tr + ?Sized> Tr for &'a mut W { fn m(&self) -> u8 { 0 } }
+impl<St> Tr for &St { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for Box<T> { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for [T] { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for (T,) { fn m(&self) -> u8 { 0 } }
+impl<T> Tr for Vec<T> { fn m(&self) -> u8 { 0 } }
+impl Tr for T { fn m(&self) -> u8 { 0 } }
+impl<U> Tr for T { fn m(&self) -> u8 { 0 } }
+impl<T> Wrapper<T> { pub fn get(&self) -> &T { &self.0 } }
+impl Tr for String { fn m(&self) -> u8 { 0 } }
+pub fn free<T>(t: T) -> T { t }
+";
+        let nodes = parse_code(code, "rust").unwrap();
+        let sigs: Vec<(u32, &str, &str)> = nodes
+            .iter()
+            .filter(|n| n.node_type == "function")
+            .map(|n| {
+                (
+                    n.start_line,
+                    n.name.as_str(),
+                    n.signature.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        let blanket = [
+            (4, "m", "<T> (&self) -> u8"),
+            (8, "two", "<T> (&self, a: u8)"),
+            (10, "m", "<W> (&self) -> u8"),
+            (11, "m", "<St> (&self) -> u8"),
+        ];
+        for want in blanket {
+            assert!(sigs.contains(&want), "missing {want:?} in {sigs:#?}");
+        }
+        for n in nodes.iter().filter(|n| n.node_type == "function") {
+            if blanket
+                .iter()
+                .any(|(l, name, _)| *l == n.start_line && *name == n.name)
+            {
+                continue;
+            }
+            // HEAD's shape, byte for byte: `(params)` then ` -> ret` if any.
+            let head = match (&n.param_types, &n.return_type) {
+                (Some(p), Some(r)) => format!("{p} -> {r}"),
+                (Some(p), None) => p.clone(),
+                _ => panic!("{} at {}: no parameters", n.name, n.start_line),
+            };
+            assert_eq!(
+                n.signature.as_deref(),
+                Some(head.as_str()),
+                "{} at {}",
+                n.name,
+                n.start_line
+            );
+        }
+        // Every function of the corpus was seen: 4 blanket, 10 others.
+        assert_eq!(sigs.len(), 14, "{sigs:#?}");
     }
 
     #[test]
@@ -2449,6 +3392,19 @@ function Container() {
     }
 
     #[test]
+    fn test_parse_ts_abstract_class_is_a_class() {
+        let code =
+            "export abstract class Base {\n  run(): void {}\n  protected abstract go(): void\n}\n";
+        let nodes = parse_code(code, "typescript").unwrap();
+        let got: Vec<_> = nodes
+            .iter()
+            .map(|n| (n.node_type.as_str(), n.qualified_name.as_deref()))
+            .collect();
+        assert!(got.contains(&("class", Some("Base"))), "got {got:?}");
+        assert!(got.contains(&("method", Some("Base.run"))), "got {got:?}");
+    }
+
+    #[test]
     fn test_parse_ts_type_alias() {
         let code = "type UserId = string;\ntype Config = { name: string; port: number };\n";
         let nodes = parse_code(code, "typescript").unwrap();
@@ -2501,6 +3457,75 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"fetch_data"), "got: {:?}", names);
         assert!(names.contains(&"get"), "got: {:?}", names);
+    }
+
+    /// C4 (2026-09-28 usage evaluation): `@overload` stubs are type declarations
+    /// of the one runtime function that follows them, not definitions. As nodes
+    /// they gave flask's `stream_with_context`, `locate_app` and
+    /// `ConfigAttribute.__get__` three same-file definitions each, and
+    /// callgraph/impact/refs refuse those. A stub with no implementation after
+    /// it in its block (a `.pyi` file, a Protocol) is all there is: it stays.
+    #[test]
+    fn test_python_overload_stubs_before_an_implementation_are_no_nodes() {
+        let code = r#"import typing as t
+from typing import overload
+
+
+@t.overload
+def stream(g: int) -> int: ...
+
+
+@overload
+def stream(g: str) -> str: ...
+
+
+def stream(g):
+    return g
+
+
+class Attr:
+    @t.overload
+    def __get__(self, obj: None) -> "Attr": ...
+
+    @typing.overload
+    async def __get__(self, obj: int) -> int: ...
+
+    def __get__(self, obj):
+        return obj
+
+
+@overload
+def stub_only(x: int) -> int: ...
+
+
+@overload
+def stub_only(x: str) -> str: ...
+
+
+@t.overload
+def with_decorated_impl(x: int) -> int: ...
+
+
+@functools.cache
+def with_decorated_impl(x):
+    return x
+"#;
+        let nodes = parse_code(code, "python").unwrap();
+        let all: Vec<(&str, u32)> = nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.start_line))
+            .collect();
+        let lines = |name: &str| -> Vec<u32> {
+            nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .map(|n| n.start_line)
+                .collect()
+        };
+        assert_eq!(lines("stream"), vec![13], "{all:?}");
+        assert_eq!(lines("__get__"), vec![24], "{all:?}");
+        assert_eq!(lines("stub_only"), vec![28, 32], "{all:?}");
+        assert_eq!(lines("with_decorated_impl"), vec![40], "{all:?}");
     }
 
     /// Issue #31: `get_ast_node` stripped every decorator because the symbol was
@@ -3565,5 +4590,196 @@ def undocumented():
             .expect("add must carry its doc comment");
         // Byte-identical to the pre-cap behavior, trailing newline included.
         assert_eq!(doc, "/// Adds two numbers.\n");
+    }
+
+    // ── D7 (tasks/specs/js-ts-assigned-functions.md): functions assigned to a
+    // member, and class fields holding a function, are nodes. express 4.21.2
+    // defines 70 of its 107 `lib/` functions this way; hono's `Context` has 15
+    // arrow fields. None was indexed, so `show send` found nothing.
+
+    fn triples(code: &str, lang: &str) -> Vec<(String, String, String)> {
+        parse_code(code, lang)
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.qualified_name.unwrap_or_default(), n.node_type))
+            .collect()
+    }
+
+    #[test]
+    fn js_function_assigned_to_a_member_is_a_node() {
+        let code = r#"
+res.send = function send(body) { return body; };
+res.json = function (obj) { return this.send(obj); };
+View.prototype.lookup = function lookup(name) { return name; };
+exports.normalizeType = function (type) { return type; };
+module.exports.f = () => 1;
+x.y.z = function () {};
+obj[k] = function () {};
+a.b = someVar;
+a.c = require('x');
+app.get('/users', function handler(req, res) { res.send(1); });
+"#;
+        for lang in ["javascript", "typescript"] {
+            let got = triples(code, lang);
+            let want = [
+                ("send", "res.send", "function"),
+                ("json", "res.json", "function"),
+                ("lookup", "View.lookup", "method"),
+                ("normalizeType", "exports.normalizeType", "function"),
+                ("f", "exports.f", "function"),
+                ("z", "x.y.z", "function"),
+            ];
+            for (n, q, t) in want {
+                assert!(
+                    got.iter().any(|(gn, gq, gt)| gn == n && gq == q && gt == t),
+                    "{lang}: missing ({n}, {q}, {t}) in {got:?}"
+                );
+            }
+            // Not a member name (computed), not a function literal, and the route
+            // handler keeps its synthetic name.
+            for absent in ["k", "b", "c", "handler"] {
+                assert!(
+                    !got.iter().any(|(gn, _, _)| gn == absent),
+                    "{lang}: {absent} in {got:?}"
+                );
+            }
+            assert!(
+                got.iter().any(|(gn, _, _)| gn.starts_with("GET /users#L")),
+                "{lang}: {got:?}"
+            );
+        }
+    }
+
+    /// `res.set = res.header = function header() {}` gives one function two
+    /// member names (express: `req.get`/`req.header`, `res.type`/`res.contentType`);
+    /// a call through either must find it.
+    #[test]
+    fn a_chained_member_assignment_names_the_function_under_each_member() {
+        let code = "res.set = res.header = function header(field, val) { return this; };\n";
+        let got = triples(code, "javascript");
+        for q in ["res.header", "res.set"] {
+            assert!(
+                got.iter().any(|(_, gq, gt)| gq == q && gt == "function"),
+                "missing {q}: {got:?}"
+            );
+        }
+    }
+
+    /// `this.match = (m, p) => …` inside a class method replaces the method at
+    /// run time (hono's RegExpRouter); as a node named `this.match` it drew the
+    /// class's own `match` calls (2 wrong edges on hono). A `this`-rooted member
+    /// names no stable place, in a class or in a constructor function.
+    #[test]
+    fn a_this_rooted_member_assignment_is_no_node() {
+        let code = "class R {\n  match(m, p) {\n    this.match = (m2, p2) => m2;\n    return this.match(m, p);\n  }\n}\n\
+                    function Legacy() {\n  this.handle = function handle() {};\n}\n";
+        for lang in ["javascript", "typescript"] {
+            let got = triples(code, lang);
+            let matches: Vec<_> = got.iter().filter(|(n, _, _)| n == "match").collect();
+            assert_eq!(matches.len(), 1, "{lang}: only the method: {got:?}");
+            assert_eq!(matches[0].1, "R.match");
+            assert!(
+                !got.iter().any(|(n, _, _)| n == "handle"),
+                "{lang}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_assigned_function_node_spans_the_assignment() {
+        let code = "// Send a body.\nres.send = function send(body) {\n  return body;\n};\n";
+        let nodes = parse_code(code, "javascript").unwrap();
+        let n = nodes.iter().find(|n| n.name == "send").expect("send node");
+        assert_eq!((n.start_line, n.end_line), (2, 4));
+        assert!(
+            n.code_content.starts_with("res.send = function send(body)"),
+            "{}",
+            n.code_content
+        );
+        assert_eq!(n.signature.as_deref(), Some("(body)"));
+        assert_eq!(n.doc_comment.as_deref(), Some("// Send a body."));
+    }
+
+    // A member-assigned function is a node only when a module can hand it out:
+    // not on a parameter, a function's local or a host global. A test's mocks
+    // became nodes and drew production calls by name (pre-tag review
+    // 2026-09-29). A global another script defines (`jQuery`) still counts.
+    #[test]
+    fn member_assigned_function_needs_an_api_root() {
+        let js = r#"
+jQuery.fn.plugin = function () {};
+global.fetch = async () => 1;
+console.log = function () {};
+var res = {};
+res.send = function send() {};
+exports.helper = function () {};
+module.exports.other = function () {};
+Widget.prototype.draw = function () {};
+function setup(req) {
+  req.end = () => {};
+  const fake = {};
+  fake.destroy = function () {};
+  res.status = function () {};
+}
+(function () {
+  function View() {}
+  View.prototype.paint = function () {};
+})();
+it('x', () => { const s = {}; s.close = () => {}; });
+"#;
+        let names: Vec<String> = parse_code(js, "javascript")
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        for kept in [
+            "send", "helper", "other", "draw", "status", "plugin", "paint",
+        ] {
+            assert!(names.iter().any(|n| n == kept), "{kept} missing: {names:?}");
+        }
+        for gone in ["fetch", "log", "end", "destroy", "close"] {
+            assert!(
+                !names.iter().any(|n| n == gone),
+                "{gone} is a node: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_field_holding_a_function_is_a_method_node() {
+        let ts = r#"
+class Context {
+  json = (obj: unknown) => { return this.text(String(obj)); };
+  private readonly f = function () { return 1; };
+  count = 0;
+  text(s: string) { return s; }
+}
+"#;
+        let got = triples(ts, "typescript");
+        for (n, q) in [
+            ("json", "Context.json"),
+            ("f", "Context.f"),
+            ("text", "Context.text"),
+        ] {
+            assert!(
+                got.iter()
+                    .any(|(gn, gq, gt)| gn == n && gq == q && gt == "method"),
+                "missing ({n}, {q}, method) in {got:?}"
+            );
+        }
+        assert!(
+            !got.iter().any(|(gn, _, _)| gn == "count"),
+            "a plain value field is no node: {got:?}"
+        );
+
+        let js = "class A {\n  handler = () => { go(); };\n  static make = function () {};\n}\n";
+        let got = triples(js, "javascript");
+        for (n, q) in [("handler", "A.handler"), ("make", "A.make")] {
+            assert!(
+                got.iter()
+                    .any(|(gn, gq, gt)| gn == n && gq == q && gt == "method"),
+                "missing ({n}, {q}, method) in {got:?}"
+            );
+        }
     }
 }

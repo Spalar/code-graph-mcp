@@ -130,6 +130,33 @@ pub fn reresolve_node_by_identity(
         }))
 }
 
+/// Every node carrying one identity (see [`reresolve_node_by_identity`]), as
+/// ids in source order. Identity is not unique for `#[cfg]` twins, C++
+/// overloads or a property's getter and setter, so a caller that must survive
+/// a refresh with the RIGHT one of them records its position in this group
+/// before the refresh and takes the same position after (pre-tag review
+/// 2026-09-29: `--node-id` took the first twin).
+pub fn identity_group_ids(
+    conn: &Connection,
+    file_path: &str,
+    name: &str,
+    qualified_name: Option<&str>,
+    node_type: &str,
+) -> Result<Vec<i64>> {
+    let wanted = qualified_name.unwrap_or(name);
+    let mut group: Vec<(i64, i64)> = queries::get_nodes_with_files_by_name(conn, name)?
+        .into_iter()
+        .filter(|c| {
+            c.file_path == file_path
+                && c.node.node_type == node_type
+                && c.node.qualified_name.as_deref().unwrap_or(&c.node.name) == wanted
+        })
+        .map(|c| (c.node.start_line, c.node.id))
+        .collect();
+    group.sort_unstable();
+    Ok(group.into_iter().map(|(_, id)| id).collect())
+}
+
 /// Detect whether a bare symbol `name` resolves to ≥2 non-test definitions.
 /// Returns the candidate definitions when ambiguous (same-file OR cross-file),
 /// `None` when unique or not found.
@@ -165,6 +192,61 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
     } else {
         Ok(None)
     }
+}
+
+/// [`detect_ambiguity`] under a file selector: the definitions of bare `name`
+/// in `file_path` when there are ≥2. A file cannot split same-file
+/// definitions, yet callgraph, impact and `get_call_graph` skipped the gate
+/// whenever one was given and merged both into one answer (flask:
+/// `callgraph pop --file src/flask/ctx.py` answered for `_AppCtxGlobals.pop`
+/// and `AppContext.pop` at once), while refs, `find_references` and
+/// `get_ast_node` refused the identical input (SURF-17; C4, 2026-09-28 usage
+/// evaluation). Test definitions count: the selector named their file.
+///
+/// It refuses only where the callable definitions (functions and methods) in
+/// the file have different qualified names — two classes' `run` — and answers
+/// every other group merged, as 0.163.0 answered all of them: `#[cfg]` twins,
+/// C++ overloads, a getter and setter, a class beside its constructor, and
+/// also a type beside another owner's same-named method (gin's `Negotiate`).
+/// Refusing those left MCP `get_call_graph`, which takes no node_id, with no
+/// way to answer (pre-tag review 2026-09-29). `refs` stays stricter.
+pub fn detect_same_file_ambiguity(
+    conn: &Connection,
+    name: &str,
+    file_path: &str,
+) -> Result<Option<Vec<NameCandidate>>> {
+    let nodes: Vec<_> = queries::get_nodes_by_file_path(conn, file_path)?
+        .into_iter()
+        .filter(|n| n.name == name)
+        .collect();
+    // Counted over the callable definitions when there are any: a class and
+    // its own constructor (`Widget`, `Widget.Widget` in Java, C#, Dart, C++)
+    // or a function and a same-named constant are one symbol to a caller, and
+    // 0.163.0 answered them (second review round).
+    let callable = |n: &&queries::NodeResult| matches!(n.node_type.as_str(), "function" | "method");
+    let pool: Vec<&queries::NodeResult> = if nodes.iter().any(|n| callable(&n)) {
+        nodes.iter().filter(callable).collect()
+    } else {
+        nodes.iter().collect()
+    };
+    let identities: std::collections::HashSet<&str> = pool
+        .iter()
+        .map(|n| n.qualified_name.as_deref().unwrap_or(&n.name))
+        .collect();
+    if identities.len() < 2 {
+        return Ok(None);
+    }
+    let cands: Vec<NameCandidate> = nodes
+        .into_iter()
+        .map(|n| NameCandidate {
+            name: n.name,
+            file_path: file_path.to_string(),
+            node_type: n.node_type,
+            node_id: n.id,
+            start_line: n.start_line,
+        })
+        .collect();
+    Ok((cands.len() > 1).then_some(cands))
 }
 
 /// True when `file_path` names a definition the caller can actually act on.
@@ -235,9 +317,11 @@ pub fn candidates_to_json(cands: &[NameCandidate]) -> Vec<serde_json::Value> {
 /// Build the accurate ambiguity message for `name` given its candidate defs.
 ///
 /// Cross-file → advise the file selector (which works). Same-file overloads →
-/// advise the `node_id` path via the node-oriented tools, because `get_call_graph`
-/// / `impact` resolve by name and *cannot* split same-file defs; the file
-/// selector would be a dead end. `surface` only swaps flag/tool names.
+/// advise the `node_id` path, because the file selector would be a dead end:
+/// on the CLI every symbol command takes `--node-id` (callgraph/impact since
+/// Q4, 2026-09-29); MCP `get_call_graph` resolves by name and cannot split
+/// them, so the MCP wording points at the node-oriented tools. `surface` only
+/// swaps flag/tool names.
 pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) -> String {
     let n = cands.len();
     // SURF-34: `n` counts the definitions; the list under this message carries at
@@ -264,8 +348,8 @@ pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) 
         match surface {
             Surface::Cli => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \
-                 callgraph/impact resolve by name and can't split same-file overloads — \
-                 inspect a specific one with `show --node-id <N>` (node_ids below).{capped}"
+                 A file selector cannot split them — pass one of the node_ids below as \
+                 `--node-id <N>` (callgraph, impact, refs, show).{capped}"
             ),
             Surface::Mcp => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \

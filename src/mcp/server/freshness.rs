@@ -154,7 +154,7 @@ impl McpServer {
     /// re-resolve by identity, and it can only know to do that if the refresh
     /// says whether it fired.
     pub(super) fn ensure_file_fresh_reported(&self, path: Option<&str>) -> Result<bool> {
-        if !self.is_primary() {
+        if !self.may_write_index() {
             return Ok(false);
         }
         let Some(rel_path) = path else {
@@ -247,6 +247,31 @@ impl McpServer {
         }
         // Secondaries hold a read-only DB; nothing to refresh with.
         if !self.is_primary() {
+            return value;
+        }
+        // An index a newer binary built is not ours to write either. Say so rather
+        // than attempt the refresh: `index_files` would refuse it, and the failure
+        // would be disclosed below as a budget or busy-database problem, which
+        // points the caller at the wrong remedy.
+        let newer = self.write_db().newer_index_version();
+        if let Some(newer) = newer {
+            let mut value = value;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "freshness".to_string(),
+                    json!({
+                        "refreshed": 0,
+                        "note": format!(
+                            "This index was built by a newer code-graph (index v{} > this \
+                             server v{}), so this server no longer updates it: results may \
+                             predate recent edits. Restart the Claude Code session to run one \
+                             version.",
+                            newer,
+                            crate::domain::INDEX_VERSION
+                        ),
+                    }),
+                );
+            }
             return value;
         }
         let Some(root) = self.project_root.clone() else {
@@ -387,18 +412,42 @@ impl McpServer {
             }
         }
 
-        let stale_kept = outcome.failed + outcome.skipped_over_budget + unchecked;
-        if stale_kept > 0 {
+        // Changed-and-kept and never-checked are different facts. Files past the
+        // scan cap were not compared with the disk at all, so counting them as
+        // "changed on disk" reported 8 changed files for 40 untouched ones (B7,
+        // 2026-09-29 usage evaluation).
+        let stale_kept = outcome.failed + outcome.skipped_over_budget;
+        if stale_kept > 0 || unchecked > 0 {
+            let note = match (stale_kept > 0, unchecked > 0) {
+                (true, false) => {
+                    "Some files in this result changed on disk and were not re-indexed \
+                                  (per-call budget or a busy database). Their line numbers and \
+                                  snippets may predate your last edit — re-run the query, or pass \
+                                  an explicit file_path tool for those files."
+                        .to_string()
+                }
+                (false, _) => format!(
+                    "{unchecked} file(s) in this result were not checked against the disk (only \
+                     the first {RESULT_REFRESH_SCAN_CAP} are, per call). If you edited any of \
+                     them, their line numbers and snippets may predate the edit — narrow the \
+                     query to re-check them."
+                ),
+                (true, true) => format!(
+                    "Some files in this result changed on disk and were not re-indexed \
+                     (per-call budget or a busy database), and {unchecked} more were not \
+                     checked (only the first {RESULT_REFRESH_SCAN_CAP} are, per call). Line \
+                     numbers and snippets from those files may predate your last edit — re-run \
+                     or narrow the query."
+                ),
+            };
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "freshness".to_string(),
                     json!({
                         "refreshed": outcome.refreshed,
                         "stale_kept": stale_kept,
-                        "note": "Some files in this result changed on disk and were not re-indexed \
-                                 (per-call budget or a busy database). Their line numbers and \
-                                 snippets may predate your last edit — re-run the query, or pass \
-                                 an explicit file_path tool for those files.",
+                        "unchecked": unchecked,
+                        "note": note,
                     }),
                 );
             }

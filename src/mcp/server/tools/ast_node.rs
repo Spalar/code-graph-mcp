@@ -121,6 +121,20 @@ impl McpServer {
         let include_similar = arg_bool(args, "include_similar", false)?;
         let similar_top_k = arg_clamped(args, "similar_top_k", "get_ast_node", 5)? as i64;
         let compact = arg_bool(args, "compact", false)?;
+        // P1 #2: absent = the unbudgeted answer. With a budget, `compact` is
+        // inert (reported in `ignored_arguments`): the budget decides what
+        // stays, starting from the full node.
+        let max_tokens = match &args["max_tokens"] {
+            serde_json::Value::Null => None,
+            _ => Some(arg_clamped(args, "max_tokens", "get_ast_node", 0)? as usize),
+        };
+        let compact = compact && max_tokens.is_none();
+        let budgeted = |out: serde_json::Value| -> serde_json::Value {
+            match max_tokens {
+                Some(tokens) => ast_node_budgeted(out, tokens, args),
+                None => out,
+            }
+        };
 
         if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
@@ -188,7 +202,7 @@ impl McpServer {
                      The node_id you passed is no longer valid; use the node_id in this response."
                 );
             }
-            return Ok(out);
+            return Ok(budgeted(out));
         }
 
         let context_lines = arg_clamped(args, "context_lines", "get_ast_node", 0)? as usize;
@@ -230,7 +244,7 @@ impl McpServer {
                     if include_similar {
                         self.attach_similar(&mut out, nid, similar_top_k)?;
                     }
-                    Ok(out)
+                    Ok(budgeted(out))
                 }
             };
         }
@@ -380,6 +394,10 @@ impl McpServer {
                     return Ok(result);
                 }
 
+                if max_tokens.is_some() {
+                    return Ok(budgeted(result));
+                }
+
                 // Compress if result exceeds token threshold: drop code_content but keep references/impact
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
                 if tokens > COMPRESSION_TOKEN_THRESHOLD {
@@ -390,6 +408,10 @@ impl McpServer {
                         "Code content omitted ({} lines, ~{} tokens). Use Read tool on {}:{}-{} to view source.",
                         n.end_line.saturating_sub(n.start_line) + 1, tokens, file_path, n.start_line, n.end_line
                     ));
+                    // The same node through the CLI, source included (P1 #2).
+                    if let Some(next) = cli_next_command("get_ast_node", args, &result) {
+                        result["next"] = json!(next.to_string());
+                    }
                     result["summary"] = json!(format!(
                         "{} {} in {} (lines {}-{}){}",
                         n.node_type,
@@ -652,6 +674,13 @@ impl McpServer {
                 ambiguous_callers_excluded
             ));
         }
+        // No production caller: disclose where the name is dispatched
+        // dynamically (P1 #4), inside `impact` like the CLI's top-level field.
+        if cls.prod_callers.is_empty() {
+            if let Some(b) = self.empty_result_boundaries(symbol_name)? {
+                impact["boundaries"] = b;
+            }
+        }
         result["impact"] = impact;
         Ok(())
     }
@@ -763,6 +792,108 @@ impl McpServer {
         let last = start as i64 + collected.len() as i64;
         Some((collected.join("\n"), first, last))
     }
+}
+
+/// `get_ast_node` with `max_tokens`: one node fitted to the budget.
+///
+/// Units: the source (`code_content`; its shorter form is the node without
+/// it — signature and `file_path:start_line-end_line` stay) and each
+/// `called_by` / `calls` entry (from the end of each list; `called_by` is
+/// sorted production-first). The source goes first — it is never cut part-way
+/// — then references. Impact and similar-node sections are kept whole.
+fn ast_node_budgeted(
+    full: serde_json::Value,
+    tokens: usize,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    // An ambiguity or error envelope has no node to fit.
+    if full.get("code_content").is_none() && full.get("called_by").is_none() {
+        return full;
+    }
+    let next = cli_next_command("get_ast_node", args, &full)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    let list = |k: &str| full[k].as_array().cloned().unwrap_or_default();
+    let (callers, calls) = (list("called_by"), list("calls"));
+    let (nb, ncb, nc) = (1usize, callers.len(), calls.len());
+    let has_code = full.get("code_content").is_some_and(|c| !c.is_null());
+    let n = nb + ncb + nc;
+    let mut order: Vec<usize> = Vec::new();
+    // Least important first: calls (tail first), called_by (tail first), source.
+    order.extend(
+        budget::order_by_importance(nc, Reverse)
+            .into_iter()
+            .map(|i| nb + ncb + i),
+    );
+    order.extend(
+        budget::order_by_importance(ncb, Reverse)
+            .into_iter()
+            .map(|i| nb + i),
+    );
+    order.push(0);
+    let steps: Vec<budget::Step> = budget::standard_steps(&order, |u| u == 0 && has_code)
+        .into_iter()
+        .filter(|&(u, _)| u != 0 || has_code)
+        .filter(|&(u, l)| !(u == 0 && l == Level::Dropped))
+        .collect();
+    let render = |levels: &[Level]| -> serde_json::Value {
+        let mut out = full.clone();
+        if levels[0] != Level::Full {
+            if let Some(o) = out.as_object_mut() {
+                o.remove("code_content");
+            }
+            drop_content_range(&mut out);
+        }
+        let keep = |items: &[serde_json::Value], off: usize| -> Vec<serde_json::Value> {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| levels[off + i] == Level::Full)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        if full.get("called_by").is_some() {
+            out["called_by"] = json!(keep(&callers, nb));
+        }
+        if full.get("calls").is_some() {
+            out["calls"] = json!(keep(&calls, nb + ncb));
+        }
+        let cut = |r: std::ops::Range<usize>| r.filter(|&i| levels[i] != Level::Full).count();
+        let (a, b) = (cut(nb..nb + ncb), cut(nb + ncb..n));
+        let code_cut = has_code && levels[0] != Level::Full;
+        if a + b > 0 || code_cut {
+            let mut bud = json!({ "max_tokens": tokens });
+            if code_cut {
+                bud["code_omitted"] = json!(true);
+            }
+            let mut omitted = serde_json::Map::new();
+            if a > 0 {
+                omitted.insert("called_by".into(), json!(a));
+            }
+            if b > 0 {
+                omitted.insert("calls".into(), json!(b));
+            }
+            if !omitted.is_empty() {
+                bud["omitted"] = serde_json::Value::Object(omitted);
+            }
+            bud["next"] = json!(next);
+            out["budget"] = bud;
+        }
+        out
+    };
+    budget::fit(
+        &vec![Level::Full; n],
+        &steps,
+        budget::budget_bytes(tokens),
+        |levels| {
+            let v = render(levels);
+            let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+            (v, len)
+        },
+    )
+    .output
 }
 
 #[cfg(test)]

@@ -9,17 +9,20 @@
 if (require.main === module) require('./hook-fail-open').installHookFailOpen('PreToolUse:Edit');
 
 // PreToolUse(Edit) hook: auto-inject impact analysis when editing function definitions.
-// Only fires when:
-//   1. The old_string contains a function/method definition (signature being modified)
-//   2. The symbol has 2+ production callers (high impact)
-//   3. Same symbol not queried in last 2 minutes
-// Silently exits otherwise — zero noise for normal edits.
+// Write reaches it too (Q1): only logged for the Stop check, never answered. For Edit, it only fires when:
+//   1. The old_string contains a function/method definition AND the edit changes
+//      that definition's header (a body-only edit cannot break a caller)
+//   2. The edited file is inside the project
+//   3. The symbol has 1+ production callers
+//   4. Same symbol not queried in last 2 minutes
+// Silently exits otherwise — zero noise for normal edits. CODE_GRAPH_QUIET_HOOKS=1
+// silences it like the other injecting hooks.
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
 const { cgTmpDir, cwdHash } = require('./tmp-dir');
-const { resolveProjectRoot } = require('./project-root');
+const { resolveProjectRoot, indexBuildInProgress } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
@@ -49,7 +52,44 @@ try {
   input = JSON.parse(fs.readFileSync(0, 'utf8'));
 } catch { process.exit(0); }
 
-const oldStr = (input.tool_input && input.tool_input.old_string) || '';
+// P1 #3 — the Stop hook (stop-impact.js) checks, at the end of the turn, which
+// edited symbols changed signature and which of their callers were left alone.
+// It needs to know what was edited in THIS session, so every Edit is logged
+// here — first file-only (so "files touched this turn" is complete even for
+// edits the signature extraction below gives up on), then again with the
+// symbol once one is known. Append-only, best-effort: it cannot fail the Edit.
+const sessionEdits = require('./session-edits');
+const toolInput = input.tool_input || {};
+const editedAbs = toolInput.file_path || '';
+const editedRel = editedAbs ? path.relative(cwd, path.resolve(cwd, editedAbs)) : '';
+const insideProject = editedRel && !editedRel.startsWith('..') && !path.isAbsolute(editedRel);
+const editedKey = insideProject ? editedRel.split(path.sep).join('/') : '';
+
+// Q1 — a Write (matcher `Edit|Write`) is logged for the Stop check and never
+// answered: it carries the whole file, and the pick below would name
+// whichever definition its first matching pattern finds, not the one that
+// changed. A Write over
+// an existing file records a baseline for each definition whose header its
+// content changes.
+if (input.tool_name === 'Write') {
+  if (editedKey) {
+    const newText = typeof toolInput.content === 'string' ? toolInput.content : null;
+    sessionEdits.recordFileEdit(cwd, input.session_id, editedKey, { newText });
+  }
+  process.exit(0);
+}
+
+const logEdit = (symbol) => {
+  if (editedKey) sessionEdits.recordEdit(cwd, input.session_id, { file: editedKey, symbol });
+};
+logEdit(null);
+
+// An edit outside the project cannot be about this project's symbols; asking
+// the index anyway injected a same-named project function's callers.
+if (!insideProject) process.exit(0);
+
+const oldStr = toolInput.old_string || '';
+const newStr = toolInput.new_string || '';
 if (!oldStr || oldStr.length < 10) process.exit(0);
 
 // --- Extract function/method signature from the edited text ---
@@ -91,63 +131,27 @@ const fnPatterns = [
 // future author adds to the array without reading the note above.
 const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 
+// Which definition the hunk names: the first pattern, in array order, that
+// matches — 0.163.0's rule. Three replacements (the earliest match, then an
+// allow-list of what may precede a method name, then keyword-anchored arms
+// first) each fixed shapes and broke others, and three review rounds found a
+// regression in each (pre-tag review 2026-09-29), so the released rule stays
+// until a per-language design with a corpus for each language replaces it.
+//
+// Where the definition starts is its name's line: `// TODO: make this
+// async\nfn f(` matches from the comment line, and the same-file pick below
+// counts lines from here. That moves no name, only the line.
 let symbol = null;
+let symbolAt = -1;
 for (const pat of fnPatterns) {
-  const m = scanned.match(pat);
+  const m = scanned.match(new RegExp(pat.source, `${pat.flags}d`));
   if (m) {
-    // Find the first captured group
     symbol = m[1] || m[2];
+    const nameAt = (m.indices[1] || m.indices[2])[0];
+    symbolAt = Math.max(m.index, scanned.lastIndexOf('\n', nameAt - 1) + 1);
     break;
   }
 }
-
-// Fallback: if old_string is inside a function body (not a definition),
-// extract a unique identifier from the code and grep for it to find the containing function
-if (!symbol || symbol.length < 3) {
-  const filePath = (input.tool_input && input.tool_input.file_path) || '';
-  if (filePath && oldStr.length >= 10) {
-    try {
-      // Extract identifiers from old_string, try the most specific one first
-      const identifiers = (oldStr.match(/\b([a-z]\w*(?:_\w+)+|[a-z]\w*(?:[A-Z]\w*)+|[A-Z]\w+\.\w+|[A-Z]\w+::\w+)\b/g) || [])
-        .filter(id => id.length >= 6);
-      const skipWords = new Set(['return', 'function', 'default', 'require', 'module', 'exports', 'import', 'console']);
-      // Sort by length descending (longer = more specific = fewer matches)
-      const candidates = [...new Set(identifiers)]
-        .filter(id => !skipWords.has(id.toLowerCase()))
-        .sort((a, b) => b.length - a.length);
-      // Two candidates, not five. They are sorted most-specific-first, so the
-      // 3rd–5th were the least likely to resolve AND the ones that pushed this
-      // loop past the hook's whole 4 s budget (5 × 2000 ms here + 2500 ms of
-      // impact below); the impact query they starve is the hook's actual output
-      // (audit 2026-09-05 JS-03).
-      for (const candidate of candidates.slice(0, 2)) {
-        const budget = remainingMs(2000);
-        if (budget === null) break;
-        try {
-          const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], hidden({
-            cwd, timeout: budget, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-            env: internalEnv,
-          }));
-          const grepResult = JSON.parse(raw);
-          // Pick this candidate if it has few matches (precise location)
-          const withContainer = (grepResult || []).filter(m => m.container && m.container.name);
-          if (withContainer.length > 0 && withContainer.length <= 5) {
-            // If multiple containers, vote for the most common one
-            const votes = {};
-            for (const m of withContainer) {
-              const cn = m.container.name;
-              votes[cn] = (votes[cn] || 0) + 1;
-            }
-            const best = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
-            symbol = best.includes('.') ? best.split('.').pop() : best.includes('::') ? best.split('::').pop() : best;
-            break;
-          }
-        } catch { /* try next candidate */ }
-      }
-    } catch { /* grep failed or no match — fall through */ }
-  }
-}
-
 if (!symbol || symbol.length < 3) process.exit(0);
 
 // Skip common patterns that aren't real function names
@@ -159,6 +163,26 @@ function isCommonKeyword(s) {
   return /^(if|for|while|switch|catch|else|return|new|get|set|try)$/i.test(s);
 }
 
+// Before the cooldown: the cooldown throttles the impact PUSH, not the record
+// of what was edited — a second signature edit inside two minutes is exactly
+// the one the Stop check must still see.
+logEdit(symbol);
+
+// The definition's header, from where it starts to where its body opens. An
+// edit that leaves it verbatim changes only the body, which no caller can see.
+// (A body-only hunk with no definition in it exited above: the grep fallback
+// that used to guess its enclosing function named a wrong one for 108 of 608
+// TypeScript definitions, 2026-09-28 hook audit.)
+function headerAt(text, at) {
+  const rest = text.slice(at, at + 400);
+  const ends = [rest.indexOf('{'), rest.indexOf('=>'), rest.search(/:\s*(?:\n|$)/)]
+    .filter((i) => i >= 0);
+  return ends.length ? rest.slice(0, Math.min(...ends)) : rest.split('\n', 1)[0];
+}
+if (newStr.includes(headerAt(scanned, symbolAt))) process.exit(0);
+
+if (process.env.CODE_GRAPH_QUIET_HOOKS === '1') process.exit(0);
+
 // --- Per-symbol cooldown: 2 minutes ---
 // Project-scoped (see cwdHash in tmp-dir.js). A symbol name is the LEAST
 // project-unique key there is — `main`, `run`, `new`, `parse` collide across
@@ -169,6 +193,10 @@ try {
   if (Date.now() - fs.statSync(cooldownFile).mtimeMs < 120000) process.exit(0);
 } catch { /* first time for this symbol */ }
 
+// A half-built index gives a wrong caller count and risk, not a short one (D5).
+// The edit itself is already logged above for the Stop hook.
+if (indexBuildInProgress(cwd)) process.exit(0);
+
 // --- Run impact analysis (JSON mode for programmatic parsing) ---
 // Disambiguate via --file: file_path from tool_input is absolute, but the
 // indexer stores files as repo-relative paths — converting here is what makes
@@ -177,33 +205,65 @@ try {
 // path, which previously caused silent exits for the most common edit cases.
 const editedFile = (input.tool_input && input.tool_input.file_path) || '';
 const relFile = editedFile ? path.relative(cwd, editedFile) : '';
-let jsonResult;
 // Whatever is left of the registered 4 s, capped at this call's own 2500 ms.
 // `null` = the candidate loop above already spent the budget; running anyway is
 // what got the hook killed by Claude Code mid-Edit (audit 2026-09-05 JS-03).
-const impactBudget = remainingMs(2500);
-if (impactBudget === null) process.exit(0);
-try {
-  const args = ['impact', symbol, '--json'];
-  if (relFile && !relFile.startsWith('..')) args.push('--file', relFile);
-  // v0.49 — use the resolved binary (bare 'code-graph-mcp' was PATH-dependent,
-  // diverging from the findBinary() result the rest of the hook trusts).
-  const raw = execFileSync(binary, args, hidden({
-    cwd,
-    timeout: impactBudget,
-    encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: internalEnv,
-  }));
-  jsonResult = JSON.parse(raw);
-} catch {
-  // Symbol not found, timeout, or parse error — exit silently
-  process.exit(0);
+// A refusal exits 1 with its JSON on stdout, which is read too.
+function runImpact(args) {
+  const budget = remainingMs(2500);
+  if (budget === null) return null;
+  let raw;
+  try {
+    // v0.49 — use the resolved binary (bare 'code-graph-mcp' was PATH-dependent,
+    // diverging from the findBinary() result the rest of the hook trusts).
+    raw = execFileSync(binary, args, hidden({
+      cwd,
+      timeout: budget,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: internalEnv,
+    }));
+  } catch (e) {
+    raw = e && typeof e.stdout === 'string' ? e.stdout : '';
+  }
+  try { return JSON.parse(raw); } catch { return null; }
 }
 
-// CLI returns {"error": "..."} on ambiguous / not-found instead of throwing.
-// Treat as silent skip — direct_callers will be undefined.
-if (jsonResult && jsonResult.error) process.exit(0);
+// Q4 — the definition this edit changes, among same-file same-name ones: the
+// last candidate starting at or before the edited header's line. null when
+// the old_string is not in the file (the Edit will fail) or no candidate fits.
+// The CLI lists at most five, in source order, and says how many exist in
+// `total`: past the last listed one an unlisted definition may start, so an
+// edit there is not guessed at (pre-tag review 2026-09-29).
+function editedNodeId(suggestions, fileKey, total) {
+  let text;
+  try { text = fs.readFileSync(path.join(cwd, fileKey), 'utf8'); } catch { return null; }
+  const at = text.indexOf(oldStr);
+  if (at === -1) return null;
+  const line = text.slice(0, at + symbolAt).split('\n').length;
+  let best = null;
+  for (const c of suggestions) {
+    if (!c || c.file_path !== fileKey || !Number.isInteger(c.node_id) || !Number.isInteger(c.start_line)) continue;
+    if (c.start_line <= line && (best === null || c.start_line > best.start_line)) best = c;
+  }
+  const lastListed = Math.max(...suggestions.map((c) => (c && Number.isInteger(c.start_line) ? c.start_line : -Infinity)));
+  if (Number.isInteger(total) && total > suggestions.length && line > lastListed) return null;
+  return best ? best.node_id : null;
+}
+
+const impactArgs = ['impact', symbol, '--json'];
+if (relFile && !relFile.startsWith('..')) impactArgs.push('--file', relFile);
+let jsonResult = runImpact(impactArgs);
+// A file that defines the name more than once (two classes' `get`) makes
+// `--file` refuse and list each definition's node_id (174f9b6). Ask again for
+// the one being edited.
+if (jsonResult && jsonResult.error && Array.isArray(jsonResult.suggestions)) {
+  const nodeId = editedNodeId(jsonResult.suggestions, editedKey, jsonResult.total);
+  jsonResult = nodeId === null ? null : runImpact(['impact', '--node-id', String(nodeId), '--json']);
+}
+
+// Symbol not found, another refusal, timeout, or unparsable output — silent.
+if (!jsonResult || jsonResult.error) process.exit(0);
 
 // --- Inject when the symbol has any caller (1+) ---
 // Earlier gate was 2+ direct callers; reality is that editing a function with

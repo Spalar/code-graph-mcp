@@ -99,6 +99,41 @@ pub fn get_call_graph(
     get_call_graph_filtered(conn, function_name, direction, max_depth, file_path, 0)
 }
 
+/// Where a traversal starts: every definition matching a name (optionally in
+/// one file), or exactly one node — `impact` / `callgraph --node-id` (Q4), the
+/// one way to split same-file definitions of one name.
+#[derive(Debug, Clone, Copy)]
+pub enum CallGraphSeed<'a> {
+    Name {
+        name: &'a str,
+        file_path: Option<&'a str>,
+    },
+    Node(i64),
+}
+
+impl CallGraphSeed<'_> {
+    /// The predicate over `nodes n` / `files f` that selects the seed rows,
+    /// and its two parameters (`?1`, `?2`). Neither arm seeds on an
+    /// `<external>` sentinel; the name arm also skips `<module>` rows (see
+    /// [`query_direction_seeded`]).
+    fn predicate(&self) -> (&'static str, rusqlite::types::Value, Option<String>) {
+        match *self {
+            CallGraphSeed::Name { name, file_path } => (
+                "(n.name = ?1 OR (n.qualified_name = ?1 AND n.type <> 'module'))
+                 AND f.path <> '<external>'
+                 AND (?2 IS NULL OR f.path = ?2)",
+                rusqlite::types::Value::Text(name.to_string()),
+                file_path.map(str::to_string),
+            ),
+            CallGraphSeed::Node(id) => (
+                "n.id = ?1 AND f.path <> '<external>' AND ?2 IS NULL",
+                rusqlite::types::Value::Integer(id),
+                None,
+            ),
+        }
+    }
+}
+
 /// Traverse the call graph, following only edges whose resolution confidence
 /// ranks at or above `min_confidence_rank` (per `domain::confidence_rank`:
 /// extracted=2, inferred=1, ambiguous=0). The filter is applied INSIDE the
@@ -115,41 +150,57 @@ pub fn get_call_graph_filtered(
     file_path: Option<&str>,
     min_confidence_rank: u8,
 ) -> Result<CallGraphResult> {
+    get_call_graph_seeded(
+        conn,
+        CallGraphSeed::Name {
+            name: function_name,
+            file_path,
+        },
+        direction,
+        max_depth,
+        min_confidence_rank,
+    )
+}
+
+/// [`get_call_graph_filtered`] from any [`CallGraphSeed`].
+pub fn get_call_graph_seeded(
+    conn: &Connection,
+    seed: CallGraphSeed<'_>,
+    direction: &str,
+    max_depth: i32,
+    min_confidence_rank: u8,
+) -> Result<CallGraphResult> {
     let requested_max_depth = max_depth;
     let effective_max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH);
     let depth_capped = max_depth > CALL_GRAPH_MAX_DEPTH;
 
     let (nodes, limit_hit) = match direction {
-        "callees" => query_direction(
+        "callees" => query_direction_seeded(
             conn,
-            function_name,
+            seed,
             effective_max_depth,
-            file_path,
             Direction::Callees,
             min_confidence_rank,
         )?,
-        "callers" => query_direction(
+        "callers" => query_direction_seeded(
             conn,
-            function_name,
+            seed,
             effective_max_depth,
-            file_path,
             Direction::Callers,
             min_confidence_rank,
         )?,
         "both" => {
-            let (callees, c1) = query_direction(
+            let (callees, c1) = query_direction_seeded(
                 conn,
-                function_name,
+                seed,
                 effective_max_depth,
-                file_path,
                 Direction::Callees,
                 min_confidence_rank,
             )?;
-            let (callers, c2) = query_direction(
+            let (callers, c2) = query_direction_seeded(
                 conn,
-                function_name,
+                seed,
                 effective_max_depth,
-                file_path,
                 Direction::Callers,
                 min_confidence_rank,
             )?;
@@ -166,34 +217,20 @@ pub fn get_call_graph_filtered(
     // Disclose, rather than silently drop, the pruned fan-out: count the seed's
     // direct sub-threshold edges in the queried direction(s).
     let suppressed_ambiguous = match direction {
-        "callees" => count_suppressed_seed_edges(
-            conn,
-            function_name,
-            file_path,
-            Direction::Callees,
-            min_confidence_rank,
-        )?,
-        "callers" => count_suppressed_seed_edges(
-            conn,
-            function_name,
-            file_path,
-            Direction::Callers,
-            min_confidence_rank,
-        )?,
+        "callees" => {
+            count_suppressed_seed_edges_seeded(conn, seed, Direction::Callees, min_confidence_rank)?
+        }
+        "callers" => {
+            count_suppressed_seed_edges_seeded(conn, seed, Direction::Callers, min_confidence_rank)?
+        }
         "both" => {
-            count_suppressed_seed_edges(
-                conn,
-                function_name,
-                file_path,
-                Direction::Callees,
-                min_confidence_rank,
-            )? + count_suppressed_seed_edges(
-                conn,
-                function_name,
-                file_path,
-                Direction::Callers,
-                min_confidence_rank,
-            )?
+            count_suppressed_seed_edges_seeded(conn, seed, Direction::Callees, min_confidence_rank)?
+                + count_suppressed_seed_edges_seeded(
+                    conn,
+                    seed,
+                    Direction::Callers,
+                    min_confidence_rank,
+                )?
         }
         _ => 0,
     };
@@ -238,6 +275,9 @@ const FRONTIER_CHUNK: usize = 400;
 /// parent discovered first, with the frontier held in discovery order and each
 /// level's children ordered by `(parent discovery rank, node id)`. Same class of
 /// answer, now pinned by the code rather than by the query plan.
+// The by-name form the traversal tests drive; production goes through
+// `get_call_graph_seeded`.
+#[cfg(test)]
 fn query_direction(
     conn: &Connection,
     function_name: &str,
@@ -246,9 +286,26 @@ fn query_direction(
     direction: Direction,
     min_confidence_rank: u8,
 ) -> Result<(Vec<CallGraphNode>, bool)> {
+    query_direction_seeded(
+        conn,
+        CallGraphSeed::Name {
+            name: function_name,
+            file_path,
+        },
+        max_depth,
+        direction,
+        min_confidence_rank,
+    )
+}
+
+fn query_direction_seeded(
+    conn: &Connection,
+    seed: CallGraphSeed<'_>,
+    max_depth: i32,
+    direction: Direction,
+    min_confidence_rank: u8,
+) -> Result<(Vec<CallGraphNode>, bool)> {
     let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap on traversal depth
-                                                         // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
-    let file_path_param: Option<&str> = file_path;
 
     // Seed. Never SEED on an `<external>` sentinel: it has no outgoing calls, so
     // the traversal returns a one-node graph whose root prints as
@@ -267,17 +324,14 @@ fn query_direction(
     // `find_references` and `get_ast_node` refused the same input. Three seed
     // predicates in this file need it; all three have it.
     let mut frontier: Vec<i64> = {
-        let mut stmt = conn.prepare(
+        let (predicate, p1, p2) = seed.predicate();
+        let mut stmt = conn.prepare(&format!(
             "SELECT n.id FROM nodes n
              JOIN files f ON f.id = n.file_id
-             WHERE (n.name = ?1 OR (n.qualified_name = ?1 AND n.type <> 'module'))
-               AND f.path <> '<external>'
-               AND (?2 IS NULL OR f.path = ?2)
-             ORDER BY n.id",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![function_name, file_path_param], |row| {
-            row.get::<_, i64>(0)
-        })?;
+             WHERE {predicate}
+             ORDER BY n.id"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![p1, p2], |row| row.get::<_, i64>(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     if frontier.is_empty() {
@@ -485,6 +539,24 @@ pub fn count_suppressed_seed_edges(
     direction: Direction,
     min_confidence_rank: u8,
 ) -> Result<usize> {
+    count_suppressed_seed_edges_seeded(
+        conn,
+        CallGraphSeed::Name {
+            name: function_name,
+            file_path,
+        },
+        direction,
+        min_confidence_rank,
+    )
+}
+
+/// [`count_suppressed_seed_edges`] from any [`CallGraphSeed`].
+pub fn count_suppressed_seed_edges_seeded(
+    conn: &Connection,
+    seed: CallGraphSeed<'_>,
+    direction: Direction,
+    min_confidence_rank: u8,
+) -> Result<usize> {
     if min_confidence_rank == 0 {
         return Ok(0);
     }
@@ -494,23 +566,17 @@ pub fn count_suppressed_seed_edges(
         Direction::Callees => "source_id",
         Direction::Callers => "target_id",
     };
+    let (predicate, p1, p2) = seed.predicate();
     let sql = format!(
         "SELECT COUNT(*) FROM edges e
          JOIN nodes n ON n.id = e.{seed_col}
          JOIN files f ON f.id = n.file_id
-         WHERE (n.name = ?1 OR (n.qualified_name = ?1 AND n.type <> 'module'))
-               AND f.path <> '<external>'
-           AND (?2 IS NULL OR f.path = ?2) AND e.relation = ?3
+         WHERE {predicate} AND e.relation = ?3
            AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) < ?4"
     );
     let count: i64 = conn.query_row(
         &sql,
-        rusqlite::params![
-            function_name,
-            file_path,
-            REL_CALLS,
-            min_confidence_rank as i64
-        ],
+        rusqlite::params![p1, p2, REL_CALLS, min_confidence_rank as i64],
         |row| row.get(0),
     )?;
     Ok(count as usize)

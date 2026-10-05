@@ -124,4 +124,26 @@ function resolveProjectRoot(startDir, opts = {}) {
   return null;
 }
 
-module.exports = { resolveProjectRoot };
+// True while the MCP server's startup index is still being written for `root`.
+// The server writes `.code-graph/indexing-status.json` ({s, d, t}) and heartbeats
+// it per batch and per finalize phase, then removes it. Until then the index is
+// partial, and a structural answer from it is wrong, not just short: 0.3 s into
+// a cold networkx build `impact edge_betweenness_centrality` said "0 callers,
+// Risk UNKNOWN"; the finished index has 4 callers, MEDIUM (2026-09-29, D5).
+// Same test as statusline.js, whose INDEXING_STALE_MS mirrors the Rust
+// INDEXING_STATUS_STALE_SECS: an older file was left by a killed server.
+const INDEXING_STALE_MS = 120000;
+
+function indexBuildInProgress(root, now = Date.now()) {
+  if (!root) return false;
+  const file = path.join(root, '.code-graph', 'indexing-status.json');
+  try {
+    if (now - fs.statSync(file).mtimeMs >= INDEXING_STALE_MS) return false;
+    const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return (p.s === 'indexing' || p.s === 'finalizing') && p.t > 0;
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { resolveProjectRoot, indexBuildInProgress, INDEXING_STALE_MS };

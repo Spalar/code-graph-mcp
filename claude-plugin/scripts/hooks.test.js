@@ -138,16 +138,36 @@ test('hooks.json: matchers avoid banned expression-DSL tokens', () => {
     'hooks.json matcher syntax regression — see v0.31.1 CHANGELOG:\n  ' + offenders.join('\n  '));
 });
 
-// v0.32.0 architecture: plugin-cache hooks.json ONLY carries SessionStart.
-// PreToolUse / PostToolUse / UserPromptSubmit are registered into
-// ~/.claude/settings.json by lifecycle.js (current Claude Code silently
-// ignores plugin-cache hooks.json entries for those events — confirmed
-// 2026-05-24 via session jsonl, see feedback_pretooluse_dark_under_green_health.md).
-test('hooks.json: contains SessionStart only (v0.32.0)', () => {
-  const cfg = loadHooks();
-  assert.deepEqual(Object.keys(cfg.hooks || {}), ['SessionStart'],
-    'plugin-cache hooks.json must contain only SessionStart; other events go via settings.json. ' +
-    'Adding entries here for PreToolUse/PostToolUse/UserPromptSubmit would be dead config — CC does not load them.');
+// Decision D2 (2026-09-28 usage evaluation): every hook lives in hooks.json
+// again. Current Claude Code loads a plugin's hooks.json for every event —
+// verified on 2.1.284: PreToolUse / PostToolUse / UserPromptSubmit / Stop
+// entries in a plugin's hooks.json all fired, and the marketplace-installed
+// claude-mem-lite runs every hook it has that way. The 2026-05-24 observation
+// behind the v0.32.0 settings.json re-route no longer holds.
+// buildSettingsHookEntries stays the one list (it still feeds settings.json for
+// an install that has no plugin), and this test holds hooks.json to it: same
+// events, matchers, scripts and timeouts, nothing more, nothing less.
+test('hooks.json declares every hook the plugin runs, matching the settings.json list', () => {
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const script = (cmd) => {
+    const m = (cmd || '').match(/([\w-]+\.js)"/);
+    return m ? m[1] : `unparsed(${cmd})`;
+  };
+  const want = [];
+  for (const [event, entries] of Object.entries(buildSettingsHookEntries())) {
+    for (const e of entries) {
+      for (const h of e.hooks) want.push(`${event}|${e.matcher || ''}|${script(h.command)}|${h.timeout}`);
+    }
+  }
+  const got = [];
+  for (const [event, entries] of Object.entries(loadHooks().hooks || {})) {
+    if (event === 'SessionStart') continue;
+    for (const e of entries) {
+      for (const h of e.hooks) got.push(`${event}|${e.matcher || ''}|${script(h.command)}|${h.timeout}`);
+    }
+  }
+  assert.ok(want.length >= 7, `the settings.json list must not be empty (${want.length})`);
+  assert.deepEqual(got.sort(), want.sort());
 });
 
 // v0.145.1: Claude Code validates this file against a closed key set and warns
@@ -282,7 +302,7 @@ test('lifecycle.buildSettingsHookEntries covers PreToolUse Edit/Bash/Read', () =
   const { buildSettingsHookEntries } = require('./lifecycle');
   const desired = buildSettingsHookEntries();
   const ptu = (desired.PreToolUse || []).map(e => e.matcher);
-  for (const tool of ['Edit', 'Bash', 'Read']) {
+  for (const tool of ['Edit|Write', 'Bash', 'Read']) {
     assert.ok(ptu.includes(tool), `lifecycle.js PreToolUse missing matcher: ${tool}; got ${JSON.stringify(ptu)}`);
   }
 });
@@ -322,7 +342,7 @@ test('registered PreToolUse/PostToolUse/UserPromptSubmit timeouts come from HOOK
       }
     }
   }
-  assert.equal(checked, 6, `expected all six settings.json hooks; checked ${checked}`);
+  assert.equal(checked, 8, `expected all eight settings.json hooks; checked ${checked}`);
 });
 
 // The coupling the whole deadline mechanism rests on, and the one that can
@@ -357,7 +377,7 @@ function registeredHookScripts() {
 test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a deadline', () => {
   const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
   const registered = registeredHookScripts();
-  assert.ok(registered.size >= 7, `only ${registered.size} hook scripts found: ${[...registered]}`);
+  assert.ok(registered.size >= 9, `only ${registered.size} hook scripts found: ${[...registered]}`);
 
   for (const script of registered) {
     assert.ok(
@@ -453,13 +473,14 @@ test('a registered hook that spawns a child must spend the budget, not a literal
 
   // Anti-vacuity floor, absolute rather than derived from the set it guards: if
   // every registered hook stopped spawning directly, the loop above would assert
-  // nothing at all and stay green. Four is exactly today's count
-  // (incremental-index, pre-edit-guide, session-init, user-prompt-context), so
-  // this catches a total collapse of the detector, NOT four-of-eight going dark
-  // — raise it alongside any hook that starts spawning.
+  // nothing at all and stay green. Six is exactly today's count
+  // (incremental-index, pre-edit-guide, session-init, user-prompt-context,
+  // subagent-start, stop-impact), so this catches a total collapse of the
+  // detector, NOT six-of-ten going dark — raise it alongside any hook that
+  // starts spawning.
   assert.ok(
-    spawners >= 4,
-    `expected at least 4 registered hooks to start a child directly; saw ${spawners}. ` +
+    spawners >= 6,
+    `expected at least 6 registered hooks to start a child directly; saw ${spawners}. ` +
     `Either the corpus shrank or the spawn detector stopped matching — both make this guard vacuous`
   );
 });
@@ -554,8 +575,9 @@ function allRegisteredHookCommands() {
 
 test('every registered hook script exists on disk', () => {
   const commands = allRegisteredHookCommands();
-  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit + 1 SessionStart = 7
-  assert.ok(commands.length >= 7, `expected >=7 registered hook commands, got ${commands.length}`);
+  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit
+  // + 1 SubagentStart + 1 Stop + 1 SessionStart = 9
+  assert.ok(commands.length >= 9, `expected >=9 registered hook commands, got ${commands.length}`);
   for (const cmd of commands) {
     const p = resolveHookScript(cmd);
     assert.ok(p, `could not extract a .js path from hook command: ${JSON.stringify(cmd)}`);
@@ -586,18 +608,28 @@ test('every registered hook script parses (node --check)', () => {
 //     support in the parser / supported-language set), so both pre-edit-guide
 //     (needs graph symbols) and incremental-index (needs to re-index the file)
 //     would no-op on a notebook. Prerequisite is .ipynb PARSING support (a parser
-//     feature); add the matcher as PART of that work, never before it.
+//     feature); add the matcher as PART of that work, never before it. Q1
+//     (2026-09-29) re-checked this for the Stop check's edit log: a notebook has
+//     no signature reading, and "touched this turn" already comes from mtime.
+// Write joined Edit in Q1: pre-edit-guide logs it (baselines of the definitions
+// whose header the new content changes) for the Stop check, and answers nothing.
 test('buildSettingsHookEntries: matcher surface is exactly the intended set', () => {
   const { buildSettingsHookEntries } = require('./lifecycle');
   const desired = buildSettingsHookEntries();
   const setOf = (event) => (desired[event] || []).map(e => e.matcher).sort();
-  assert.deepEqual(setOf('PreToolUse'), ['Bash', 'Edit', 'Read'],
+  assert.deepEqual(setOf('PreToolUse'), ['Bash', 'Edit|Write', 'Read'],
     'PreToolUse matcher set changed — update this gate intentionally (does the new tool need a guide hook?)');
   assert.deepEqual(setOf('PostToolUse'), ['Bash', 'Write|Edit'],
     'PostToolUse matcher set changed — incremental-index (Write|Edit) + compound-grep inject (Bash) trigger surface must be deliberate');
   assert.deepEqual(setOf('UserPromptSubmit'), [''],
     'UserPromptSubmit matcher set changed unexpectedly');
-  assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'UserPromptSubmit'],
+  // P1 #3: SubagentStart matches on agent TYPE — the built-in names that do
+  // not load CLAUDE.md (Explore, Plan) plus the default Agent type. Stop has
+  // no matcher.
+  assert.deepEqual(setOf('SubagentStart'), ['Explore|Plan|general-purpose'],
+    'SubagentStart matcher changed — which agent types receive the index facts must be deliberate');
+  assert.deepEqual(setOf('Stop'), [''], 'Stop takes no matcher');
+  assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'Stop', 'SubagentStart', 'UserPromptSubmit'],
     'a new top-level hook event is registered into settings.json — confirm it is intended (SessionStart belongs in hooks.json)');
 });
 
@@ -628,4 +660,13 @@ test('settings hook commands are existence-guarded on POSIX (dead path silent-0,
   const guarded = `if [ -f "${script}" ]; then node "${script}"; fi`;
   const r2 = spawnSync('sh', ['-c', guarded], { encoding: 'utf8' });
   assert.equal(r2.status, 2, 'live script exit code passes through the guard');
+});
+
+// Q1 (2026-09-29): Write reaches the edit hook, which logs it for the Stop
+// check and answers nothing; before, only Edit did, and a signature changed by
+// a Write was never checked. (NotebookEdit: see the matcher-surface gate.)
+test('hooks.json: the edit hook also fires for Write', () => {
+  const pre = loadHooks().hooks.PreToolUse.filter((e) => e.hooks.some((h) => h.command.includes('pre-edit-guide.js')));
+  assert.equal(pre.length, 1);
+  assert.deepEqual(pre[0].matcher.split('|').sort(), ['Edit', 'Write']);
 });

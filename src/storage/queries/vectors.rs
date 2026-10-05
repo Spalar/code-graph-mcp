@@ -469,6 +469,19 @@ pub fn get_unembedded_nodes_excluding(
         .collect())
 }
 
+/// Whether the vector table holds any row (B7, 2026-09-29 usage evaluation):
+/// with none, a semantic search's KNN half returns nothing and the answer is
+/// FTS5's alone, whatever model is loaded. One row read, so it is cheap enough
+/// for every search. Orphans (a vector whose node is gone) count; the backfill
+/// reaps them.
+pub fn any_node_vector(conn: &Connection) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row("SELECT 1 FROM node_vectors LIMIT 1", [], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Count nodes with embeddings vs total embeddable nodes.
 /// Returns (with_vectors, total_embeddable).
 pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
@@ -794,6 +807,18 @@ mod tests {
             Some(ids[7]),
             "KNN search must still find the nearest vector after the rewrite"
         );
+    }
+
+    /// B7: whether the vector channel has anything to search at all.
+    #[test]
+    fn any_node_vector_is_false_on_an_empty_table_and_true_after_one_insert() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        assert!(!any_node_vector(conn).unwrap());
+        seed_vectors(conn, "a.ts", 1);
+        assert!(any_node_vector(conn).unwrap());
     }
 
     /// The rewrite drops vectors whose node is gone — the rows `reap_orphan_vectors`

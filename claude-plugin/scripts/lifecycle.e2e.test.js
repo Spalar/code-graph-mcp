@@ -1357,3 +1357,58 @@ test('a binary lookup does not re-create the cache dir a teardown just removed',
   assert.equal(control.cacheDir, true,
     'control: with no teardown standing the same lookup DOES cache — the guard is what stopped it');
 });
+
+// ── P1 #3: every writer knows the two new events ──
+//
+// SubagentStart and Stop are registered the same way as the other six — by
+// lifecycle.js into settings.json — so every path that writes or strips our
+// entries must handle them: install and update add them, uninstall removes
+// them, doctor's repair puts back a missing one (and, per the tombstone test
+// above, not after a teardown). Enumerated here because a new event that only
+// `install` knew about is the "one writer fixed, the others not" shape
+// (memory: feedback_a_repair_default_diagnostic_can_undo_the_teardown).
+test('SubagentStart and Stop: install/update add them, doctor restores one, uninstall strips both', (t) => {
+  const homeDir = mkHome(t);
+  const tmp = path.join(homeDir, 'tmp');
+  fs.mkdirSync(tmp, { recursive: true });
+  const env = { TMPDIR: tmp, TMP: tmp, TEMP: tmp };
+  const settings = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settings, {});
+  const ours = (s, event) => ((s.hooks || {})[event] || [])
+    .filter((e) => (e.description || '').startsWith('[code-graph-mcp'));
+
+  runScriptCaptured(homeDir, lifecycleCli, ['install'], { env });
+  let s = readJson(settings);
+  assert.equal(ours(s, 'SubagentStart').length, 1, 'install registers SubagentStart once');
+  assert.equal(ours(s, 'SubagentStart')[0].matcher, 'Explore|Plan|general-purpose');
+  assert.match(ours(s, 'SubagentStart')[0].hooks[0].command, /subagent-start\.js/);
+  assert.equal(ours(s, 'Stop').length, 1, 'install registers Stop once');
+  assert.match(ours(s, 'Stop')[0].hooks[0].command, /stop-impact\.js/);
+
+  // A user's own Stop hook sits beside ours and survives every step below.
+  s.hooks.Stop.push({ hooks: [{ type: 'command', command: 'echo users-own-stop' }] });
+  // Drop OUR SubagentStart: doctor's repair arm must notice and restore it.
+  delete s.hooks.SubagentStart;
+  writeJson(settings, s);
+  const repaired = JSON.parse(execFileSync(process.execPath, ['-e', `
+    const { runRepairs } = require(${JSON.stringify(path.join(__dirname, 'doctor.js'))});
+    console.log('@@' + JSON.stringify({ fixed: runRepairs([{ name: 'Hook coverage', status: 'warn', fixId: 'missing-hooks-in-settings' }]) }));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, ...env }, cwd: repoRoot })
+    .toString().split('@@').pop().trim());
+  assert.equal(repaired.fixed, 1);
+  s = readJson(settings);
+  assert.equal(ours(s, 'SubagentStart').length, 1, 'doctor restored the missing SubagentStart');
+  assert.equal(ours(s, 'Stop').length, 1, 'and did not duplicate Stop');
+
+  runScriptCaptured(homeDir, lifecycleCli, ['update'], { env });
+  s = readJson(settings);
+  assert.equal(ours(s, 'SubagentStart').length, 1, 'update keeps exactly one');
+  assert.equal(ours(s, 'Stop').length, 1, 'update keeps exactly one');
+
+  runScriptCaptured(homeDir, lifecycleCli, ['uninstall'], { env });
+  s = readJson(settings);
+  assert.equal(ours(s, 'SubagentStart').length, 0, 'uninstall strips SubagentStart');
+  assert.equal(ours(s, 'Stop').length, 0, 'uninstall strips Stop');
+  assert.deepEqual((s.hooks || {}).Stop, [{ hooks: [{ type: 'command', command: 'echo users-own-stop' }] }],
+    "the user's own Stop hook is left exactly as it was");
+});

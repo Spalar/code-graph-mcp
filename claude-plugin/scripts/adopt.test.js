@@ -117,12 +117,12 @@ test('memoryDir honors CLAUDE_CONFIG_DIR override (multi-account isolation)', ()
 
 // ── buildBlock — the managed CLAUDE.md block ────────────────────────────────
 
-test('buildBlock generic: v2 sentinel + 6 base rows + pointer', () => {
+test('buildBlock generic: v2 sentinel + 8 base rows + pointer', () => {
   const block = buildBlock('generic');
   assert.ok(block.startsWith(SENTINEL_BEGIN), 'opens with v2 BEGIN');
   assert.ok(block.endsWith(SENTINEL_END), 'closes with END');
   assert.ok(block.includes('| Who calls X / what X calls | `code-graph-mcp callgraph X` |'));
-  assert.ok(block.includes('| Impact before editing a fn | `code-graph-mcp impact X` |'));
+  assert.ok(block.includes('| Impact before changing a signature | `code-graph-mcp impact X` |'));
   assert.ok(block.includes('Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`'));
   assert.ok(!block.includes('trace'), 'generic has no HTTP-trace row');
 });
@@ -133,10 +133,22 @@ test('buildBlock web-rs inserts the HTTP-route → handler row', () => {
   assert.ok(block.includes('`code-graph-mcp trace "GET /api/x"`'));
 });
 
-test('buildBlock frontend surfaces a find-references audit row', () => {
-  const block = buildBlock('frontend');
-  assert.ok(block.includes('Rename / refactor audit (refs)'));
-  assert.ok(block.includes('`code-graph-mcp refs X`'));
+// Rename / remove audits are not a frontend concern only: `refs` is the one
+// command that lists every use, and `grep -w` covers what the graph misses.
+test('every project type carries the rename / remove audit row', () => {
+  for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
+    const block = buildBlock(type);
+    assert.ok(block.includes('| Rename / remove audit | `code-graph-mcp refs X`, then `grep -w X` |'), type);
+  }
+});
+
+// Q3 (2026-09-29): "which tests does this change touch" is asked after every
+// edit, and `affected` answers it; the resident guidance never named it.
+test('every project type carries the tests-to-re-run row', () => {
+  for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
+    const block = buildBlock(type);
+    assert.ok(block.includes('| Tests to re-run after changing files | `code-graph-mcp affected <files>` |'), type);
+  }
 });
 
 test('buildBlock is deterministic (byte-identical across calls)', () => {
@@ -144,17 +156,16 @@ test('buildBlock is deterministic (byte-identical across calls)', () => {
   assert.strictEqual(buildBlock('generic'), buildBlock(undefined));
 });
 
-// issue #41: a plugin-only install never puts `code-graph-mcp` on PATH. The
-// binary the plugin manages for itself lands in ~/.cache/code-graph/bin
-// (auto-update.js `BINARY_CACHE_DIR` + `cachedBinaryPath`), and every row of
-// this block spends the bare name. The reporter's session therefore read a
-// table of commands their shell answers with "command not found".
-test('every project type tells a plugin-only install where the binary is', () => {
+// issue #41 was a plugin-only install whose shell answered the bare
+// `code-graph-mcp` with "command not found". Claude Code now puts the plugin's
+// `bin/` launcher on the Bash PATH, so the block spends the bare name only; the
+// `~/.cache/code-graph/bin` fallback it used to carry also could not run the
+// JS-dispatched `adopt`/`doctor` (2026-09-28 steering audit F5).
+test('the block spends only the bare name — no cache-path fallback', () => {
   for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
     const block = buildBlock(type);
-    assert.ok(block.includes('~/.cache/code-graph/bin/code-graph-mcp'),
-      `${type}: the block spends bare \`code-graph-mcp\` but never says where it is ` +
-      'for an install that has it nowhere on PATH');
+    assert.ok(block.includes('`code-graph-mcp callgraph X`'), type);
+    assert.ok(!block.includes('.cache/code-graph/bin'), `${type}: stale fallback path`);
   }
 });
 
@@ -482,14 +493,20 @@ test('maybeAutoAdopt skips when not plugin-mode (npm install path)', () => {
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt installs when plugin-mode + not-yet-adopted', () => {
+// Decision D4 (2026-09-28 usage evaluation): SessionStart no longer writes a
+// project's CLAUDE.md. Creating CLAUDE.md and .claude/ in the user's tree made
+// Claude stop and explain those changes to the user in 12 of 15 coding runs
+// (0 of 15 without the plugin), and the MCP instructions already carry 10 of
+// the block's 11 guidance points. `code-graph-mcp adopt` still writes it.
+test('maybeAutoAdopt never adopts a project on its own', () => {
   const sb = makeSandbox();
   try {
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: PLUGIN_SCRIPTS, env: {} });
-    assert.strictEqual(res.attempted, true);
-    assert.strictEqual(res.reason, 'adopted');
-    assert.strictEqual(res.result.ok, true);
-    assert.strictEqual(isAdopted({ cwd: sb.cwd }), true);
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'not-adopted');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), false);
+    assert.strictEqual(fs.existsSync(sb.claudeMd), false, 'no CLAUDE.md created');
+    assert.strictEqual(fs.existsSync(sb.detail), false, 'no detail doc created');
   } finally { sb.cleanup(); }
 });
 
@@ -504,17 +521,17 @@ test('maybeAutoAdopt is already-adopted when in sync (no gratuitous write)', () 
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt refreshes a drifted detail doc (reason=refreshed)', () => {
+test('maybeAutoAdopt reports a drifted block as stale and rewrites nothing', () => {
   const sb = makeSandbox();
   try {
     adopt({ cwd: sb.cwd });
     fs.writeFileSync(sb.detail, `${MANAGED_BY}\n# stale\n`);
+    const claudeMdBefore = fs.readFileSync(sb.claudeMd, 'utf8');
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: PLUGIN_SCRIPTS, env: {} });
-    assert.strictEqual(res.reason, 'refreshed');
-    const shipped = fs.readFileSync(TEMPLATE_PATH);
-    const cur = fs.readFileSync(sb.detail);
-    const nl = cur.indexOf(0x0a);
-    assert.ok(shipped.equals(cur.subarray(nl + 1)), 'detail re-synced to shipped template');
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'stale');
+    assert.strictEqual(fs.readFileSync(sb.detail, 'utf8'), `${MANAGED_BY}\n# stale\n`, 'detail left as it was');
+    assert.strictEqual(fs.readFileSync(sb.claudeMd, 'utf8'), claudeMdBefore, 'CLAUDE.md left as it was');
   } finally { sb.cleanup(); }
 });
 
@@ -530,13 +547,14 @@ test('maybeAutoAdopt skips refresh when CODE_GRAPH_NO_TEMPLATE_REFRESH=1 (locks 
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt surfaces not-a-project for a bare cwd', () => {
+test('maybeAutoAdopt writes nothing for a bare cwd', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
   const cwd = mkBareCwd();
   try {
     const res = maybeAutoAdopt({ cwd, home, scriptPath: PLUGIN_SCRIPTS, env: {} });
-    assert.strictEqual(res.result.ok, false);
-    assert.strictEqual(res.result.reason, 'not-a-project');
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'not-adopted');
+    assert.strictEqual(fs.existsSync(path.join(cwd, 'CLAUDE.md')), false);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(cwd, { recursive: true, force: true });
@@ -589,7 +607,7 @@ test('migrate is a no-op when there is nothing to clean', () => {
   } finally { sb.cleanup(); }
 });
 
-test('maybeAutoAdopt runs the legacy migration then installs the new scheme', () => {
+test('maybeAutoAdopt runs the legacy migration and installs nothing', () => {
   const sb = makeSandbox();
   try {
     const L = seedLegacy(sb);
@@ -597,7 +615,7 @@ test('maybeAutoAdopt runs the legacy migration then installs the new scheme', ()
     assert.ok(res.migrated.memoryIndexPruned && res.migrated.legacyDetailRemoved, 'legacy cleaned');
     assert.ok(!fs.existsSync(L.legacyDetail), 'legacy detail gone');
     assert.ok(!fs.readFileSync(L.memIndex, 'utf8').includes(SENTINEL_BEGIN_V1), 'v1 block gone');
-    assert.strictEqual(isAdopted({ cwd: sb.cwd }), true, 'new CLAUDE.md scheme installed');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), false, 'no CLAUDE.md block written');
   } finally { sb.cleanup(); }
 });
 
@@ -867,6 +885,54 @@ test('adopt records the project in the registry; unadopt removes it', () => {
   } finally { sb.cleanup(); }
 });
 
+// A8 (2026-09-29 usage evaluation): the registry only grew — 7 of 16 entries
+// on the evaluation machine named deleted temp dirs. A directory that no
+// longer exists holds no managed block, so every write drops such entries;
+// one that exists (or cannot be checked) stays.
+test('registry writes drop projects whose directory is gone (A8)', () => {
+  const sb = makeSandbox();
+  try {
+    const { readAdoptedProjects, adoptedRegistryFile } = require('./adopt');
+    const file = adoptedRegistryFile(sb.home);
+    const kept = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-kept-'));
+    const gone = path.join(os.tmpdir(), `cg-adopt-gone-${process.pid}-${Date.now()}`);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify([gone, kept]));
+      assert.strictEqual(adopt({ cwd: sb.cwd, home: sb.home }).ok, true);
+      assert.deepStrictEqual(readAdoptedProjects(sb.home), [kept, path.resolve(sb.cwd)],
+        'adopt drops the gone entry and appends this project');
+
+      fs.writeFileSync(file, JSON.stringify([gone, kept, path.resolve(sb.cwd)]));
+      unadopt({ cwd: sb.cwd, home: sb.home });
+      assert.deepStrictEqual(readAdoptedProjects(sb.home), [kept],
+        'unadopt drops the gone entry along with this project');
+
+      // Already registered: the write that re-adopting skips still prunes.
+      fs.writeFileSync(file, JSON.stringify([gone, path.resolve(sb.cwd)]));
+      adopt({ cwd: sb.cwd, home: sb.home });
+      assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)]);
+
+      // Unverifiable is not gone: behind a directory we may not search, the
+      // project (and its block) may well still exist.
+      if (process.platform !== 'win32' && process.getuid && process.getuid() !== 0) {
+        const hidden = path.join(kept, 'proj');
+        fs.mkdirSync(hidden);
+        fs.chmodSync(kept, 0o000);
+        try {
+          fs.writeFileSync(file, JSON.stringify([hidden, gone]));
+          adopt({ cwd: sb.cwd, home: sb.home });
+          assert.deepStrictEqual(readAdoptedProjects(sb.home), [hidden, path.resolve(sb.cwd)]);
+        } finally {
+          fs.chmodSync(kept, 0o700);
+        }
+      }
+    } finally {
+      fs.rmSync(kept, { recursive: true, force: true });
+    }
+  } finally { sb.cleanup(); }
+});
+
 test('unadopt KEEPS the registry entry when it could not strip the block', () => {
   // The registry is the only record of which repos carry a managed block, and
   // `uninstall --unadopt-all` is driven entirely by it. Deregistering a project
@@ -1101,7 +1167,7 @@ test('isAdopted / needsRefresh return false (never throw) on an unreadable CLAUD
   }
 });
 
-test('maybeAutoAdopt surfaces the unreadable CLAUDE.md instead of throwing', () => {
+test('maybeAutoAdopt does not throw on an unreadable CLAUDE.md', () => {
   const sb = makeSandbox();
   try {
     fs.writeFileSync(sb.claudeMd, '# mine\n');
@@ -1110,9 +1176,8 @@ test('maybeAutoAdopt surfaces the unreadable CLAUDE.md instead of throwing', () 
       cwd: sb.cwd, home: sb.home, env: {},
       scriptPath: path.join(os.homedir(), '.claude', 'plugins', 'cache', 'x', 'scripts'),
     });
-    assert.strictEqual(r.attempted, true);
-    assert.strictEqual(r.result.ok, false);
-    assert.strictEqual(r.result.reason, 'claude-md-unreadable');
+    assert.strictEqual(r.attempted, false);
+    assert.strictEqual(r.reason, 'not-adopted');
   } finally {
     try { fs.chmodSync(sb.claudeMd, 0o600); } catch { /* ok */ }
     sb.cleanup();

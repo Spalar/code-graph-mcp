@@ -347,10 +347,45 @@ function runGrepAnswer(opts = {}) {
  *   `no-binary` distinguishes a missing/unlocatable binary from a runtime
  *   `unavailable`, so the deny funnel can see a dark flagship answer-in-deny.
  */
+/**
+ * The files of the definitions a `show` printed: each definition opens with an
+ * unindented header `<kind> <name>  <path>:<start>-<end>  <signature>`, its body
+ * indented below. null when an unindented line is not such a header, so a
+ * caller that must account for every definition can refuse.
+ */
+function showDefinitionFiles(out) {
+  const defs = [];
+  for (const line of out.split('\n')) {
+    if (line === '' || /^\s/.test(line)) continue;
+    const m = /^(\S+) \S+ {2}(\S+):\d+-\d+(?: |$)/.exec(line);
+    if (!m) return null;
+    defs.push({ kind: m[1], file: m[2] });
+  }
+  return defs.length ? defs : null;
+}
+
+/** Whether a root-relative file lies under a grep path ('' = the whole root). */
+function pathWithin(file, within) {
+  const w = within.replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+  return w === '' || w === '.' || file === w || file.startsWith(w + '/');
+}
+
 function runShowAnswer(opts = {}) {
   const {
     cwd,
     symbols,
+    // A grep path the answer must stay inside (D#125 #2): `show` prints every
+    // same-named definition in the project. With `within`, a symbol is answered
+    // only when EVERY definition `show` prints lies inside the path and is one
+    // the grep's declaration keyword matches (`kinds`: symbol → the label and
+    // file-extension shapes it matches); a symbol with no definition inside is
+    // skipped (the grep finds none either), and any other mix refuses the whole
+    // answer. Narrowing with `show --file` was tried and removed: the label is
+    // coarser than the keyword, so a narrowed answer dropped real matches, and
+    // the inject printed the unnarrowed text (review of D#125, round 2).
+    // undefined: unscoped, as before.
+    within,
+    kinds,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxBytes = DEFAULT_MAX_BYTES,
   } = opts;
@@ -365,6 +400,8 @@ function runShowAnswer(opts = {}) {
     // Which symbols actually resolved — the rewrite re-runs exactly these, so a
     // symbol that printed nothing here cannot turn into an exit-1 in the Bash call.
     const resolved = [];
+    // The argv that re-runs each resolved symbol, scoped when `within` is set.
+    const argvs = [];
     for (const sym of symbols.slice(0, 3)) {
       if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
       const res = runCg(binary, ['show', sym], { cwd, timeoutMs });
@@ -383,12 +420,24 @@ function runShowAnswer(opts = {}) {
       if (classifyRun(res, { exitOneIsNoHits: false }) !== 'ok') continue;
       const out = (res.stdout || '').trim();
       if (isEmptyAnswer(out)) continue;
-      parts.push(`$ code-graph-mcp show ${sym}\n${out}`);
+      const argv = ['show', sym];
+      if (within !== undefined) {
+        const defs = showDefinitionFiles(out);
+        if (!defs) return { status: 'unavailable', reason: 'scope' };
+        if (!defs.some((d) => pathWithin(d.file, within))) continue;
+        const shapes = (kinds && kinds[sym]) || [];
+        const ext = (f) => (f.match(/\.([A-Za-z0-9]+)$/) || [])[1];
+        const matches = (d) => pathWithin(d.file, within)
+          && shapes.some((k) => k.labels.includes(d.kind) && k.exts.includes(ext(d.file)));
+        if (!defs.every(matches)) return { status: 'unavailable', reason: 'scope' };
+      }
+      parts.push(`$ code-graph-mcp ${argv.join(' ')}\n${out}`);
       resolved.push(sym);
+      argvs.push(argv);
     }
     if (parts.length === 0) return { status: 'no-hits' };
     const { text, truncated } = truncateAtLine(parts.join('\n\n'), maxBytes);
-    return { status: 'hits', text, truncated, symbols: resolved };
+    return { status: 'hits', text, truncated, symbols: resolved, argvs };
   } catch {
     return { status: 'unavailable' };
   }
@@ -494,6 +543,13 @@ function runCallgraphAnswer(opts = {}) {
     // Only an edge-bearing tree is marginal over the grep the model already ran.
     if (isEmptyAnswer(out) ||
         !(out.includes('← called by') || out.includes('→ calls'))) {
+      return { status: 'no-hits' };
+    }
+    // `callgraph` promotes a unique fuzzy match when the name has no edges of
+    // its own (`task` → `run_startup_tasks`) and says so only on stderr, which
+    // this run discards. A tree rooted at another symbol is not an answer about
+    // the grepped one: real sessions got up to 27 of 98 injections this way.
+    if (out.split('\n', 1)[0].split(' ', 1)[0] !== symbol) {
       return { status: 'no-hits' };
     }
     const { text, truncated } = truncateAtLine(out, maxBytes);

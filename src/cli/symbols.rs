@@ -41,6 +41,10 @@ pub(crate) fn emit_exact_ambiguity(
             serde_json::json!({
                 "error": message,
                 "suggestions": sugg,
+                // How many definitions there are: `suggestions` stops at
+                // SUGGESTION_CAP, and a consumer picking one by line must know
+                // when the one it needs may be past the list.
+                "total": cands.len(),
             })
         );
     } else {
@@ -126,6 +130,143 @@ pub(crate) fn emit_fuzzy_ambiguity(
         }
     }
     std::process::exit(1);
+}
+
+/// `--node-id` on `impact` / `callgraph` (Q4): the one definition to answer
+/// for, and the identity it is re-found by after the command's own query-time
+/// refresh. `nodes.id` is a rowid alias with no AUTOINCREMENT, so a re-index
+/// reuses freed ids and the id alone can name another symbol afterwards
+/// (SURF-16); the identity is `resolve::reresolve_node_by_identity`'s, shared
+/// with `refs --node-id`, `show --node-id` and MCP `get_ast_node`.
+///
+/// An identity can be carried by several nodes (`#[cfg]` twins, overloads), so
+/// the target also records its position among them, in source order, before
+/// the refresh, and is re-found at the same position after it.
+pub(crate) struct CliNodeTarget {
+    pub(crate) id: i64,
+    /// The id the caller passed, for messages after a re-resolution moved `id`.
+    requested: i64,
+    pub(crate) name: String,
+    file_path: String,
+    qualified_name: Option<String>,
+    node_type: String,
+    /// (position, size) of this node's identity group before any refresh.
+    ordinal: (usize, usize),
+}
+
+impl CliNodeTarget {
+    /// The node `nid` names, or exit 1: `{"error", "node_id"}` plus
+    /// `extra_json` (a command's own envelope keys, e.g. `results: []`).
+    pub(crate) fn lookup(
+        conn: &rusqlite::Connection,
+        nid: i64,
+        json_mode: bool,
+        extra_json: &serde_json::Value,
+    ) -> Result<Self> {
+        match queries::get_node_with_file_by_id(conn, nid)? {
+            Some(nwf) => {
+                let group = crate::resolve::identity_group_ids(
+                    conn,
+                    &nwf.file_path,
+                    &nwf.node.name,
+                    nwf.node.qualified_name.as_deref(),
+                    &nwf.node.node_type,
+                )?;
+                let at = group.iter().position(|&id| id == nid).unwrap_or(0);
+                Ok(Self {
+                    id: nid,
+                    requested: nid,
+                    name: nwf.node.name,
+                    file_path: nwf.file_path,
+                    qualified_name: nwf.node.qualified_name,
+                    node_type: nwf.node.node_type,
+                    ordinal: (at, group.len()),
+                })
+            }
+            None => Self::exit_missing(
+                nid,
+                "Node ID not found",
+                &format!("node_id {nid} not found in index"),
+                json_mode,
+                extra_json,
+            ),
+        }
+    }
+
+    /// Re-find the node after a refresh re-indexed its file. Exits 1 when the
+    /// definition is gone from the re-indexed source; the caller discloses the
+    /// refresh first (`on_gone`), since this exits.
+    pub(crate) fn reresolve(
+        &mut self,
+        conn: &rusqlite::Connection,
+        json_mode: bool,
+        extra_json: &serde_json::Value,
+        on_gone: impl FnOnce(),
+    ) -> Result<()> {
+        let group = crate::resolve::identity_group_ids(
+            conn,
+            &self.file_path,
+            &self.name,
+            self.qualified_name.as_deref(),
+            &self.node_type,
+        )?;
+        let (at, len) = self.ordinal;
+        let found = match group.len() {
+            0 => None,
+            n if n == len => Some(group[at]),
+            _ => {
+                // The definitions sharing this identity were added or removed:
+                // no position is the one the caller meant. Refuse, never guess.
+                on_gone();
+                Self::exit_missing(
+                    self.requested,
+                    "Node identity changed in the re-indexed source",
+                    &format!(
+                        "node_id {} ('{}' in {}) shares its name with {} definition(s) there now, {} before the re-index — look the node_id up again.",
+                        self.requested, self.name, self.file_path, group.len(), len
+                    ),
+                    json_mode,
+                    extra_json,
+                )
+            }
+        };
+        match found {
+            Some(id) => {
+                self.id = id;
+                Ok(())
+            }
+            None => {
+                on_gone();
+                Self::exit_missing(
+                    self.requested,
+                    "Node no longer in the re-indexed source",
+                    &format!(
+                        "node_id {} ('{}' in {}) is no longer in the re-indexed source — nothing to report.",
+                        self.requested, self.name, self.file_path
+                    ),
+                    json_mode,
+                    extra_json,
+                )
+            }
+        }
+    }
+
+    fn exit_missing(
+        nid: i64,
+        error: &str,
+        message: &str,
+        json_mode: bool,
+        extra_json: &serde_json::Value,
+    ) -> ! {
+        if json_mode {
+            let mut out = extra_json.clone();
+            out["error"] = serde_json::json!(error);
+            out["node_id"] = serde_json::json!(nid);
+            println!("{}", out);
+        }
+        eprintln!("[code-graph] {}", message);
+        std::process::exit(1);
+    }
 }
 
 /// The lookup chosen for a CLI symbol after qualified-name selection.

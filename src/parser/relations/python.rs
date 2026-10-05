@@ -125,6 +125,7 @@ pub(super) fn extract_python_type_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -136,6 +137,7 @@ pub(super) fn extract_python_type_reference(
 ///   - keyword-argument value (`sorted(xs, key=my_key)`);
 ///   - assignment RHS (`cb = handler`) — the `right` field;
 ///   - `return handler`;
+///   - a decorator named bare (`@setupmethod`);
 ///   - dict value (`{ "k": handler }`).
 ///
 /// Self-exclusion is structural: a call's callee is the `function` field of `call`
@@ -160,6 +162,10 @@ pub(super) fn extract_python_value_reference(
         }
         "assignment" => parent.child_by_field_name("right").map(|v| v.id()) == Some(node.id()),
         "return_statement" => true,
+        // `@setupmethod` names the function it applies (C4, 2026-09-28 usage
+        // evaluation: flask's 44 uses made `refs setupmethod` report none). A
+        // decorator spelled as a call (`@app.route("/")`) is a call edge already.
+        "decorator" => true,
         "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
         // Phase 3b: tuple return (`return f, g`) / tuple RHS (`a, b = f, g`) wrap the
         // values in an `expression_list` under the return / assignment-right.
@@ -185,12 +191,41 @@ pub(super) fn extract_python_value_reference(
     if py_enclosing_fn_local_names(node, source).contains(name) {
         return None;
     }
+    // A decorator sits before its `def`, where the walk's scope is still the
+    // class body or module: attribute it to the decorated function instead,
+    // named as the walk names a method (`Class.method`).
+    let decorated = (parent.kind() == "decorator")
+        .then(|| decorated_function_scope(&parent, source))
+        .flatten();
     Some(ParsedRelation {
-        source_name: scope.unwrap_or("<module>").to_string(),
+        source_name: decorated.unwrap_or_else(|| scope.unwrap_or("<module>").to_string()),
         target_name: name.to_string(),
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
+    })
+}
+
+/// `Class.method` or `function` for the definition a `decorator` applies to:
+/// the scope name the relations walk gives that definition, so the edge's
+/// source is its node.
+fn decorated_function_scope(decorator: &tree_sitter::Node, source: &str) -> Option<String> {
+    let decorated = decorator
+        .parent()
+        .filter(|p| p.kind() == "decorated_definition")?;
+    let definition = decorated.child_by_field_name("definition")?;
+    let name = node_text(&definition.child_by_field_name("name")?, source).to_string();
+    let class = decorated
+        .parent()
+        .filter(|b| b.kind() == "block")
+        .and_then(|b| b.parent())
+        .filter(|c| c.kind() == "class_definition")
+        .and_then(|c| c.child_by_field_name("name"))
+        .map(|n| node_text(&n, source).to_string());
+    Some(match class {
+        Some(class) if definition.kind() == "function_definition" => format!("{class}.{name}"),
+        _ => name,
     })
 }
 
@@ -302,10 +337,15 @@ pub(super) fn infer_python_call_receiver_type(
         return None;
     }
     let recv = node_text(&object, source);
-    // `self`/`cls` are not local-variable receivers; leave them to bare
-    // resolution (Python does not currently emit a Self qualifier).
-    if recv.is_empty() || recv == "self" || recv == "cls" {
+    if recv.is_empty() {
         return None;
+    }
+    // `self.f()` / `cls.f()`: the class whose method's first parameter it is.
+    if recv == "self" || recv == "cls" {
+        let (_, class) = py_method_class(call_node, Some(recv), source)?;
+        return class
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, source).to_string());
     }
 
     let scope = nearest_py_scope(call_node)?;
@@ -328,6 +368,111 @@ pub(super) fn infer_python_call_receiver_type(
         // >1 assignment → possibly reassigned to different types → unknown.
         _ => None,
     }
+}
+
+/// `super().f()` / `super(C, self).f()`: the first base class of the class
+/// whose method holds the call, when it is a plain name (`class A(Base)`).
+pub(super) fn infer_python_super_type(
+    call_node: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    let function = call_node.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    let is_super = object.kind() == "call"
+        && object
+            .child_by_field_name("function")
+            .is_some_and(|f| node_text(&f, source) == "super");
+    if !is_super {
+        return None;
+    }
+    let (_, class) = py_method_class(call_node, None, source)?;
+    // `super(B, self)` starts after `B`, which need not be this class: only the
+    // two-argument form naming the enclosing class is the plain `super()`.
+    let class_name = class
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, source));
+    let args = object.child_by_field_name("arguments")?;
+    if let Some(named) = args.named_child(0) {
+        if Some(node_text(&named, source)) != class_name {
+            return None;
+        }
+    }
+    let bases = class.child_by_field_name("superclasses")?;
+    let first = bases.named_child(0)?;
+    (first.kind() == "identifier").then(|| node_text(&first, source).to_string())
+}
+
+/// The method enclosing `node` and its class: the nearest `def` directly in a
+/// class body, reached through nested `def`s only when none of them rebinds
+/// `receiver` as a parameter. With `Some(receiver)`, the method's first parameter
+/// must be that name (`self` / `cls`), so a `@staticmethod` does not qualify.
+fn py_method_class<'a>(
+    node: &tree_sitter::Node<'a>,
+    receiver: Option<&str>,
+    source: &str,
+) -> Option<(tree_sitter::Node<'a>, tree_sitter::Node<'a>)> {
+    let mut cur = node.parent();
+    let mut depth = 0;
+    while let Some(n) = cur {
+        if depth > MAX_SUBTREE_DEPTH {
+            return None;
+        }
+        if n.kind() == "class_definition" {
+            return None; // class body code, not inside a method
+        }
+        // `lambda self: self.f()` binds its own `self`.
+        if n.kind() == "lambda" {
+            if let (Some(r), Some(params)) = (receiver, n.child_by_field_name("parameters")) {
+                let mut ids = std::collections::HashSet::new();
+                collect_py_idents(&params, source, &mut ids, 0);
+                if ids.contains(r) {
+                    return None;
+                }
+            }
+        }
+        if n.kind() == "function_definition" {
+            let first_param = n
+                .child_by_field_name("parameters")
+                .and_then(|p| p.named_child(0))
+                .map(|p| match p.kind() {
+                    "identifier" => node_text(&p, source),
+                    _ => p
+                        .child_by_field_name("name")
+                        .or_else(|| p.named_child(0))
+                        .map(|c| node_text(&c, source))
+                        .unwrap_or(""),
+                });
+            let mut holder = n.parent();
+            if holder.is_some_and(|h| h.kind() == "decorated_definition") {
+                holder = holder.and_then(|h| h.parent());
+            }
+            let class = holder
+                .filter(|b| b.kind() == "block")
+                .and_then(|b| b.parent())
+                .filter(|c| c.kind() == "class_definition");
+            if let Some(class) = class {
+                return match receiver {
+                    Some(r) if first_param != Some(r) => None,
+                    _ => Some((n, class)),
+                };
+            }
+            if let Some(r) = receiver {
+                let mut ids = std::collections::HashSet::new();
+                if let Some(params) = n.child_by_field_name("parameters") {
+                    collect_py_idents(&params, source, &mut ids, 0);
+                }
+                if ids.contains(r) {
+                    return None; // a nested function's own `self` parameter
+                }
+            }
+        }
+        cur = n.parent();
+        depth += 1;
+    }
+    None
 }
 
 /// Nearest enclosing scope node — a `function_definition` or the `module` root.

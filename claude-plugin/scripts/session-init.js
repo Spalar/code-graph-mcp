@@ -10,7 +10,8 @@ const {
 } = require('./lifecycle');
 const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
-const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand } = require('./adopt');
+const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand, adoptCommand } = require('./adopt');
+const { capContext } = require('./hook-emit');
 const { isNonProjectCwd } = require('./project-detect');
 const { hidden } = require('./proc-opts');
 const { installHookFailOpen, remainingMs } = require('./hook-fail-open');
@@ -48,6 +49,30 @@ const { resolveProjectRoot } = require('./project-root');
 // being quieter than usual.
 let budgetSkips = [];
 
+// What this run has to say, delivered as ONE JSON envelope when the hook exits
+// (sessionStartOutput): `notices` become the user-facing `systemMessage`,
+// `contextParts` the model-facing `additionalContext`. Claude Code never shows
+// a SessionStart hook's stderr when it exits 0, so the fifteen notices this
+// hook used to write there — "CLAUDE.md was modified", "hooks look dark",
+// "binary missing" — reached no one (decision D5, 2026-09-28 usage
+// evaluation). Only notices a user must act on are kept. Module state, reset
+// per run like budgetSkips.
+let notices = [];
+let contextParts = [];
+
+function sessionStartOutput() {
+  if (notices.length === 0 && contextParts.length === 0) return '';
+  const out = {};
+  if (notices.length > 0) out.systemMessage = notices.join('\n');
+  if (contextParts.length > 0) {
+    out.hookSpecificOutput = {
+      hookEventName: 'SessionStart',
+      additionalContext: capContext(contextParts.join('\n')),
+    };
+  }
+  return JSON.stringify(out) + '\n';
+}
+
 function budgetFor(label, defaultMs) {
   const ms = remainingMs(defaultMs);
   if (ms === null) budgetSkips.push(label);
@@ -80,132 +105,6 @@ function computeQuietHooks({ env = {} } = {}) {
 // get no map even under CODE_GRAPH_VERBOSE_HOOKS / legacy QUIET_HOOKS=0.
 function shouldInjectMap({ available, quietHooks, adopted } = {}) {
   return !!(available && !quietHooks && adopted);
-}
-
-// v0.63 — SessionStart "live context": the recent-change blast radius from the
-// AST index. UNLIKE injectProjectMap (default-OFF because the static module map
-// duplicates the CLAUDE.md block + the on-demand project_map tool), this is git-delta-
-// derived — it changes every session and the static CLAUDE.md block cannot carry it, so it earns
-// being ON by default for adopted projects. It is the graph-unique, actionable
-// counterpart to mem's SessionStart dashboard (which pushes recent activity to
-// create engagement). Selectivity is automatic: a session with no recently
-// changed *source* files (a deps-only or release commit, a clean checkout off a
-// non-code commit) injects nothing — zero standing-context cost when idle.
-//
-// Gating differs from the static map on purpose: it respects only the hard
-// kill-switch (CODE_GRAPH_QUIET_HOOKS=1) and a dedicated opt-out, NOT the
-// default-quiet flag that suppresses the duplicative map.
-function shouldInjectRecentImpact({ available, adopted, env = {} } = {}) {
-  if (!available || !adopted) return false;
-  if (env.CODE_GRAPH_QUIET_HOOKS === '1') return false;
-  if (env.CODE_GRAPH_NO_RECENT_IMPACT === '1') return false;
-  return true;
-}
-
-// Pure: given whether there are uncommitted (WIP) source changes and the
-// SessionStart `source`, decide if the recent-impact injection is worth its
-// standing-context cost. Marginal-information argument, not measured:
-//   - WIP present → active work; the blast radius of what you're editing is the
-//     highest-value case → always show.
-//   - clean tree → we fall back to the LAST COMMIT. On a cold `startup` that's
-//     low value (you just made it, or you're starting on something unrelated),
-//     and the project's own evidence is that SessionStart dumps tend to go
-//     unreferenced ([[project_cross_project_interference]]) → suppress. On a
-//     resume (`clear`/`compact`/`resume`) the same last-commit reminder helps
-//     re-establish context → show.
-// Unknown source (direct calls / tests) defaults to showing — only an explicit
-// cold `startup` with no WIP is suppressed.
-function recentImpactWorthShowing({ isWip, source } = {}) {
-  if (isWip) return true;
-  return source !== 'startup';
-}
-
-// Source-file extensions the indexer extracts symbols from (AST-bearing). Config
-// /lockfile/doc changes have no graph blast radius, so they're filtered out
-// before the `affected` call — keeps the "Changed:" line free of Cargo.lock noise
-// and avoids spending the CLI call on a commit that only bumped versions.
-const RECENT_SRC_EXT =
-  /\.(rs|ts|tsx|js|jsx|mjs|cjs|py|go|java|rb|php|swift|kt|kts|dart|c|h|cc|cpp|hpp|cs|sh|bash)$/i;
-
-// Pure: filter file paths to indexed source files, capped. Accepts EITHER a raw
-// `git diff --name-only` blob (string, split on newline) OR an already-parsed
-// path array (from parseGitStatusPaths) — the array form is essential: passing
-// the parser's array output to a string-only signature silently returned [] and
-// broke WIP detection (caught by the composing test). Cap guards message length
-// and the affected call's argv on a sweeping refactor.
-function filterSourceFiles(input, cap = 25) {
-  const lines = Array.isArray(input)
-    ? input
-    : (typeof input === 'string' ? input.split('\n') : []);
-  return lines
-    .map(s => s.trim())
-    .filter(Boolean)
-    .filter(f => RECENT_SRC_EXT.test(f))
-    .slice(0, cap);
-}
-
-// Pure: extract file paths from `git status --porcelain` output. One call covers
-// tracked changes (staged + unstaged) AND untracked files — the diff-only path
-// MISSED untracked new source files you're actively editing (finding #3). Format
-// is `XY␣PATH`, or `XY␣ORIG -> PATH` for renames (take the new path). Git quotes
-// paths with special chars; best-effort unquote.
-function parseGitStatusPaths(statusOutput) {
-  if (!statusOutput || typeof statusOutput !== 'string') return [];
-  const paths = [];
-  for (const line of statusOutput.split('\n')) {
-    if (line.length < 4) continue;        // need 2 status chars + space + ≥1 path char
-    let rest = line.slice(3);             // skip the XY status columns + separator space
-    const arrow = rest.indexOf(' -> ');   // rename/copy → the path after the arrow is current
-    if (arrow >= 0) rest = rest.slice(arrow + 4);
-    rest = rest.trim();
-    if (rest.startsWith('"') && rest.endsWith('"')) rest = rest.slice(1, -1);
-    if (rest) paths.push(rest);
-  }
-  return paths;
-}
-
-// Above ~15 direct dependents the per-name list is noise, not signal:
-// information scales INVERSELY with blast size. A high-fanout node (a constants
-// module, a shared util) "touches everything", so its actionable content
-// collapses to "this is high-risk — run the full suite"; the arbitrary first-N
-// dependent names add nothing. Below the threshold the specific dependents ARE
-// the signal (edit one fn → these 3 callers). So scale detail to actionability.
-const FANOUT_LIST_MAX = 15;
-
-// Pure: render the injected text from the parsed `affected --json` payload.
-// Returns null when there's nothing graph-relevant to say (no indexed dependents),
-// so the caller injects nothing rather than an empty banner.
-function formatRecentImpact(changed, affected, dependentCap = 6) {
-  if (!Array.isArray(changed) || changed.length === 0) return null;
-  const all = (affected && Array.isArray(affected.affected_files)) ? affected.affected_files : [];
-  if (all.length === 0) return null;
-  const direct = all.filter(a => a.depth === 1 && !a.is_test).map(a => a.path);
-  const testCount = Array.isArray(affected.tests) ? affected.tests.length : all.filter(a => a.is_test).length;
-
-  const changedShown = changed.slice(0, 8).join(', ') + (changed.length > 8 ? `, +${changed.length - 8}` : '');
-  const lines = [
-    '[code-graph] Recent changes — blast radius from the AST index (graph-only; not in MEMORY.md):',
-    `  Changed: ${changedShown}`,
-  ];
-  if (direct.length > FANOUT_LIST_MAX) {
-    // High fanout: the name list is noise; surface risk + test scope only.
-    lines.push(`  High-fanout change — ${all.length} file(s) impacted (${direct.length} direct); run the full suite (${testCount} test file(s)).`);
-  } else {
-    lines.push(`  Impacts ${all.length} file(s) (${direct.length} direct dependent(s)), ${testCount} test file(s) to re-run.`);
-    if (direct.length > 0) {
-      const shown = direct.slice(0, dependentCap).join(', ');
-      const more = direct.length > dependentCap ? `, +${direct.length - dependentCap} more` : '';
-      lines.push(`  Direct dependents: ${shown}${more}`);
-    }
-  }
-  // Runnable verbatim when ≤4 changed; above that, show 4 + an explicit count
-  // rather than a bare "…" — a pasted "…" command yields a SMALLER blast than the
-  // numbers above (the computation used all changed files, up to the cap) — finding #4.
-  const runCmd = changed.length <= 4
-    ? `code-graph-mcp affected ${changed.join(' ')}`
-    : `code-graph-mcp affected ${changed.slice(0, 4).join(' ')}  (+${changed.length - 4} more changed file(s) — pass all for the full blast)`;
-  lines.push(`  Re-run impacted tests: ${runCmd}`);
-  return lines.join('\n');
 }
 
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env, { force = false } = {}) {
@@ -251,10 +150,10 @@ function isHighIntentSource(source) {
 // Claude Code surfaces (same one injectProjectMap uses).
 function reportRebuild(r) {
   if (r && r.settingsRebuiltFrom) {
-    process.stdout.write(
+    notices.push(
       `[code-graph] ${settingsPath()} could not be parsed and has been REBUILT. ` +
       `Your original is saved at ${r.settingsRebuiltFrom} — merge anything you ` +
-      `still need (model / env / permissions / your own hooks) back by hand.\n`
+      `still need (model / env / permissions / your own hooks) back by hand.`
     );
   }
   // install()/update() have reported `manifestUnwritable` since they learned not
@@ -265,11 +164,11 @@ function reportRebuild(r) {
   // re-run install() and re-report 'installed', forever, with nothing to show
   // for it (audit 2026-08-16 review Minor tail).
   if (r && r.manifestUnwritable) {
-    process.stdout.write(
+    notices.push(
       `[code-graph] The plugin manifest could not be written (${r.manifestUnwritable}). ` +
       'Hooks are registered but the install will not be remembered, so this runs again ' +
       'every session. Check permissions on ~/.claude/plugins/, then run ' +
-      '`code-graph-mcp doctor`.\n'
+      '`code-graph-mcp doctor`.'
     );
   }
   return r;
@@ -360,8 +259,19 @@ function syncLifecycleConfig() {
   // exists) also heals. Previously only doctor checked staleness, so if the
   // auto-update re-register step failed silently, users kept running old hook
   // code indefinitely — the settings.json sibling of the binary-pin bug.
-  const { surveyHookCoverage } = require('./lifecycle');
+  const { surveyHookCoverage, hooksFromPluginManifest } = require('./lifecycle');
   const cov = surveyHookCoverage(settings);
+  // Decision D2: a plugin session gets every hook from the plugin's hooks.json,
+  // so "missing from settings.json" is the healthy state there, and an entry
+  // still in settings.json (written by a pre-0.164 install, or re-added by
+  // hand) fires its hook a second time. install() removes ours on this path.
+  if (hooksFromPluginManifest(settings)) {
+    if (cov.present.length > 0) {
+      installReporting();
+      return 'removed-settings-hooks';
+    }
+    return 'noop';
+  }
   if (cov.missing.length > 0) {
     installReporting();
     return 'self-healed-missing-settings-hook';
@@ -382,9 +292,10 @@ function syncLifecycleConfig() {
  * health-check carries the verdict in `index_version_stale`. Best-effort: any
  * failure → false (never force work off a bad probe).
  *
- * Returns true | false | null, where null means the SessionStart budget ran out
- * before the probe could run. `false` says "asked, not stale"; conflating the
- * two would let the caller report a freshness it never established.
+ * Returns true | false | null | 'corrupt', where null means the SessionStart
+ * budget ran out before the probe could run. `false` says "asked, not stale";
+ * conflating the two would let the caller report a freshness it never
+ * established. 'corrupt' is health-check's `reason:"corrupt"` verdict.
  */
 function indexNeedsRevalidation(bin, cwd) {
   const budget = budgetFor('health-check', 3000);
@@ -398,7 +309,13 @@ function indexNeedsRevalidation(bin, cwd) {
       // health-check exits non-zero on an unhealthy index but still writes JSON.
       out = ((e && e.stdout) || '').toString();
     }
-    return JSON.parse(out).index_version_stale === true;
+    const report = JSON.parse(out);
+    // A corrupt index answers every hook with nothing, and a reader never
+    // rebuilds it (it reports and preserves). Only an indexer does, so the
+    // caller must start one — before this it read as "not stale" and every
+    // hook stayed dark with no word to the user (hook audit 2026-09-28 P1-7).
+    if (report.reason === 'corrupt') return 'corrupt';
+    return report.index_version_stale === true;
   } catch {
     return false;
   }
@@ -434,6 +351,7 @@ function ensureIndexFresh() {
 
   let needsRefresh = false;
   let unprobed = false;
+  let corrupt = false;
   // Trigger 1: git HEAD newer than index mtime.
   const gitBudget = budgetFor('git-log', 2000);
   if (gitBudget === null) {
@@ -451,7 +369,8 @@ function ensureIndexFresh() {
   // Trigger 2: INDEX_VERSION mismatch (only probe when mtime looked fresh).
   if (!needsRefresh) {
     const stale = indexNeedsRevalidation(bin, cwd);
-    if (stale === true) needsRefresh = true;
+    if (stale === 'corrupt') corrupt = needsRefresh = true;
+    else if (stale === true) needsRefresh = true;
     else if (stale === null) unprobed = true;
   }
 
@@ -467,6 +386,14 @@ function ensureIndexFresh() {
     stdio: 'ignore',
   }));
   if (child && typeof child.unref === 'function') child.unref();
+  if (corrupt) {
+    notices.push(
+      '[code-graph] The index at .code-graph/index.db was corrupt, so every hook had nothing to say.\n' +
+      '            Rebuilding it in the background; hooks resume when it finishes.\n' +
+      '            If this repeats: code-graph-mcp rebuild-index --confirm'
+    );
+    return 'rebuilding-corrupt';
+  }
   return 'refreshing';
 }
 
@@ -503,7 +430,7 @@ function verifyBinary() {
   const { findBinary } = require('./find-binary');
   const binary = findBinary();
   if (!binary) {
-    process.stderr.write(missingBinaryMessage());
+    notices.push(missingBinaryMessage().trimEnd());
     return { available: false, binary: null };
   }
 
@@ -511,13 +438,11 @@ function verifyBinary() {
   try {
     fs.accessSync(binary, fs.constants.X_OK);
   } catch {
-    process.stderr.write(
+    notices.push(
       `[code-graph] Binary not executable: ${binary}\n` +
-      `Fix: chmod +x "${binary}"\n`
+      `Fix: chmod +x "${binary}"` +
+      (process.platform === 'darwin' ? `\nAlso try: xattr -d com.apple.quarantine "${binary}"` : '')
     );
-    if (process.platform === 'darwin') {
-      process.stderr.write(`Also try: xattr -d com.apple.quarantine "${binary}"\n`);
-    }
     return { available: false, binary, issue: 'not-executable' };
   }
 
@@ -538,17 +463,17 @@ function verifyBinary() {
       const msg = (err.message || '') + (err.stderr ? err.stderr.toString() : '');
       if (msg.includes('quarantine') || msg.includes('not permitted') ||
           msg.includes('killed') || err.status === 137 || err.signal === 'SIGKILL') {
-        process.stderr.write(
+        notices.push(
           `[code-graph] macOS Gatekeeper is blocking the binary: ${binary}\n` +
           `Fix: xattr -d com.apple.quarantine "${binary}"\n` +
-          `Then restart Claude Code to reconnect the MCP server.\n`
+          'Then restart Claude Code to reconnect the MCP server.'
         );
         return { available: false, binary, issue: 'quarantine' };
       }
       // Other errors (e.g., missing libs) — still report
-      process.stderr.write(
+      notices.push(
         `[code-graph] Binary found but failed to run: ${binary}\n` +
-        `Error: ${msg.slice(0, 200)}\n`
+        `Error: ${msg.slice(0, 200)}`
       );
       return { available: false, binary, issue: 'runtime-error' };
     }
@@ -623,16 +548,8 @@ function consistencyCheck(binary) {
     }
   } catch { /* skip check on error */ }
 
-  // Output warnings to stderr
-  if (issues.length > 0) {
-    const lines = [`[code-graph] ${issues.length} consistency issue(s):`];
-    issues.forEach((issue, i) => {
-      lines.push(`  ${i + 1}. ${issue.msg}`);
-      lines.push(`     → ${issue.fix}`);
-    });
-    process.stderr.write(lines.join('\n') + '\n');
-  }
-
+  // Returned, not printed: stderr never reaches the user, and a version skew
+  // self-heals through the background auto-update (decision D5).
   return issues;
 }
 
@@ -653,6 +570,8 @@ function runSessionInit({ source } = {}) {
   // many times in one process. A carried-over array would report last run's
   // skips as this one's.
   budgetSkips = [];
+  notices = [];
+  contextParts = [];
   // GC the shared tmp dir before anything else, so it happens even on the
   // inactive / non-project early returns below — those sessions still wrote
   // cooldown flags on the way in. Cheap (one readdir + a stat per entry) and
@@ -742,13 +661,9 @@ function runSessionInit({ source } = {}) {
     return { inactive: false, nonProject: true, lifecycle, autoUpdateLaunched: false };
   }
 
-  const conflict = checkScopeConflict();
-  if (conflict) {
-    process.stderr.write(
-      `[code-graph] Warning: conflicting install detected — ${conflict.existingId} (${conflict.scope || 'unknown'} scope). ` +
-      `Use /plugin to remove one to avoid config conflicts.\n`
-    );
-  }
+  // `doctor` reports a conflicting install; a SessionStart line about it went
+  // to stderr, which no one sees (decision D5).
+  checkScopeConflict();
 
   // Verify binary availability — catch issues early with actionable diagnostics
   const binaryCheck = verifyBinary();
@@ -756,80 +671,26 @@ function runSessionInit({ source } = {}) {
   const autoUpdateLaunched = launchBackgroundAutoUpdate(spawn, process.env, { force: isHighIntentSource(source) });
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
 
-  // 上下文感知默认：插件模式下首次 SessionStart 自动安装（创建/注入 CLAUDE.md 块 +
-  // .claude/ detail 文件），并清理旧 memory-dir 制品（升级自动迁移）。shipped 漂移
-  // 时刷新。三种情况发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
-  // Adoption is OPTIONAL; the rest of this hook is not. It touches files the
-  // user owns (CLAUDE.md, .claude/) which can be unreadable, a directory, or on
-  // a read-only mount — and a throw here used to abort every remaining step
-  // (map injection, recent impact, consistency check, both hook canaries) with a
-  // raw stack trace (audit 2026-08-16 P1-16). adopt() now returns reasons rather
-  // than throwing; this is the belt to that suspenders, so a future unguarded
-  // read inside it cannot take the session down again.
-  let autoAdopt = { attempted: false, result: null };
+  // SessionStart no longer writes CLAUDE.md (decision D4); maybeAutoAdopt only
+  // cleans this plugin's legacy memory-dir artifacts and reports the project's
+  // adoption state. A block that has drifted from the shipped template is the
+  // one case worth a notice: its guidance is out of date and only the user can
+  // decide to refresh or remove it. Never throws out of this hook (P1-16).
+  let autoAdopt = { attempted: false, reason: null };
   if (!isRelic) {
     try {
       autoAdopt = maybeAutoAdopt({ scriptPath: __dirname });
     } catch (e) {
-      autoAdopt = { attempted: true, reason: 'threw', result: null, error: (e && e.message) || String(e) };
-      process.stderr.write(
-        `[code-graph] Skipped CLAUDE.md adoption for this project (${(e && e.code) || (e && e.message) || 'unknown error'}).\n` +
-        '            Everything else in this session start continues normally.\n'
-      );
+      autoAdopt = { attempted: false, reason: 'threw', error: (e && e.message) || String(e) };
     }
   }
-  if (autoAdopt.result && autoAdopt.result.ok === false &&
-      (autoAdopt.result.reason === 'claude-md-unreadable' || autoAdopt.result.reason === 'claude-md-unwritable' ||
-       autoAdopt.result.reason === 'detail-unwritable')) {
-    // A refusal is not a silent no-op: the user's steering block is NOT
-    // installed/refreshed, and only this line says so.
-    process.stderr.write(
-      `[code-graph] Could not install the CLAUDE.md steering block (${autoAdopt.result.reason}: ` +
-      `${autoAdopt.result.error || 'unknown'}). Nothing was changed.\n` +
-      '            Opt out permanently: CODE_GRAPH_NO_AUTO_ADOPT=1\n'
+  if (autoAdopt.reason === 'stale') {
+    notices.push(
+      "[code-graph] This project's CLAUDE.md carries an out-of-date code-graph block.\n" +
+      `            Refresh it: ${adoptCommand()}\n` +
+      `            Remove it:  ${unadoptCommand()}\n` +
+      '            (SessionStart no longer edits CLAUDE.md itself; CODE_GRAPH_NO_TEMPLATE_REFRESH=1 silences this.)'
     );
-  }
-  const migrated = autoAdopt.migrated || {};
-  if (migrated.memoryIndexPruned || migrated.legacyDetailRemoved) {
-    process.stderr.write(
-      '[code-graph] Migrated to CLAUDE.md steering — cleaned legacy memory-dir artifacts\n' +
-      '            (MEMORY.md sentinel + detail file). Your other memories are untouched.\n'
-    );
-  }
-  if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
-    if (autoAdopt.reason === 'refreshed') {
-      // Name BOTH refreshed surfaces: the drift-refresh fully overwrites the
-      // generated detail doc, so a user who hand-edited it must learn why
-      // their edits vanished and how to lock the file.
-      const detailNote = autoAdopt.result.detailWritten
-        ? ' + .claude/plugin_code_graph_mcp.md (manual edits to that generated file are overwritten)'
-        : '';
-      process.stderr.write(
-        `[code-graph] Refreshed CLAUDE.md decision block to latest shipped version${detailNote}.\n` +
-        '            Lock files: CODE_GRAPH_NO_TEMPLATE_REFRESH=1 in ~/.claude/settings.json env\n'
-      );
-    } else {
-      process.stderr.write(
-        '[code-graph] Installed code-graph block into project CLAUDE.md (plugin install → knowing consent).\n' +
-        '            Detail table: .claude/plugin_code_graph_mcp.md (generated; safe to gitignore)\n' +
-        '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
-        `            Reverse:    ${unadoptCommand()}\n`
-      );
-    }
-    // `adopt()` has returned `registryRecorded` since it stopped throwing on a
-    // broken registry, and nothing read it. The consequence is not cosmetic:
-    // `uninstall()` walks that registry to strip our managed block from every
-    // adopted project's CLAUDE.md, so an unrecorded project keeps the block
-    // FOREVER after uninstall, with no plugin code left to remove it — the
-    // teardown-asymmetry class this repo has already been bitten by (audit
-    // 2026-08-16 review Minor tail).
-    if (autoAdopt.result.registryRecorded === false) {
-      process.stderr.write(
-        '[code-graph] Note: this project could not be recorded in the adopted-projects registry,\n' +
-        '            so `/plugin uninstall` will NOT strip the block from this CLAUDE.md.\n' +
-        `            Remove it by hand with \`${unadoptCommand()}\` before uninstalling.\n`
-      );
-    }
   }
 
   // quietHooks: default quiet (project_map injection duplicates MEMORY.md +
@@ -842,12 +703,6 @@ function runSessionInit({ source } = {}) {
   const mapInjected = shouldInjectMap({ available: binaryCheck.available, quietHooks, adopted })
     ? injectProjectMap()
     : false;
-  // v0.63 — live context: recent-change blast radius. Default-ON for adopted
-  // projects (separate gate from the duplicative static map); self-selecting
-  // (nothing injected when no source files changed recently).
-  const recentImpactInjected = shouldInjectRecentImpact({ available: binaryCheck.available, adopted, env: process.env })
-    ? injectRecentImpact({ source })
-    : false;
   const consistencyIssues = binaryCheck.available
     ? consistencyCheck(binaryCheck.binary)
     : [];
@@ -855,18 +710,19 @@ function runSessionInit({ source } = {}) {
   // FAILED firing self-test result (and refreshes it in the background, off the
   // 5s budget); Layer B is the runtime dispatch-dark canary. Both best-effort.
   const hookFireWarn = checkHookFiring();
-  if (hookFireWarn) process.stderr.write(hookFireWarn);
+  if (hookFireWarn) notices.push(hookFireWarn.trimEnd());
   const hookDarkWarn = detectHookDark();
-  if (hookDarkWarn) process.stderr.write(hookDarkWarn);
+  if (hookDarkWarn) notices.push(hookDarkWarn.trimEnd());
   return {
     inactive: false, lifecycle,
-    autoUpdateLaunched, indexFreshness, mapInjected, recentImpactInjected, binaryCheck, consistencyIssues,
+    autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues,
     quietHooks, adopted, autoAdopted: autoAdopt.attempted,
     hookFireWarn: !!hookFireWarn, hookDarkWarn: !!hookDarkWarn,
     // Which children the 5s budget cut, in the order they were reached. Empty
     // on every healthy run; non-empty is the only signal that this SessionStart
     // did less than it looks like it did.
     budgetSkipped: budgetSkips.slice(),
+    notices: notices.slice(),
   };
 }
 
@@ -883,8 +739,7 @@ function injectProjectMap() {
 
     // findBinary, not bare 'code-graph-mcp' on PATH (finding #8): a stale/global
     // PATH binary reads a different/older index and returns "(empty project)"
-    // even when the local index is populated — the sibling bug injectRecentImpact
-    // already avoided via findBinary().
+    // even when the local index is populated.
     const { findBinary } = require('./find-binary');
     const bin = findBinary();
     if (!bin) return false;
@@ -901,116 +756,18 @@ function injectProjectMap() {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       // Hook-internal delivery, not a model conversion — keep record_cli_use from
-      // logging this `map` run as a phantom `use` (mirror injectRecentImpact's affected call).
+      // logging this `map` run as a phantom `use`.
       env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
     }));
 
     if (output && output.trim()) {
-      process.stdout.write(
-        '[code-graph] Project map (indexed):\n' + output.trim() + '\n'
-      );
+      contextParts.push('[code-graph] Project map (indexed):\n' + output.trim());
       return true;
     }
   } catch {
     // Index not ready or binary not found — skip silently
   }
   return false;
-}
-
-/**
- * v0.63 — inject the recent-change blast radius (graph-unique "live" context).
- * Changed source files = working-tree changes vs HEAD (WIP), else the last commit.
- * The last-commit fallback is suppressed on a cold `startup` (low marginal value)
- * via recentImpactWorthShowing. One bounded `affected --json` call; degrades to
- * silent no-op on any error. Records a `live_impact` event so `stats` can see the
- * feature fire (else it's a dark metric). Returns true iff something was injected.
- */
-function injectRecentImpact({ source } = {}) {
-  try {
-    // Index + telemetry live at the canonical root (worktree → main checkout,
-    // subdir → project root); git WIP detection stays in the SESSION dir — the
-    // worktree's branch state is what this session edits. Repo-relative git
-    // paths translate 1:1 to root-relative index paths (a worktree mirrors the
-    // checkout layout).
-    const { resolveProjectRoot } = require('./project-root');
-    const sessionDir = process.cwd();
-    const cwd = resolveProjectRoot(sessionDir) || sessionDir;
-    const dbPath = path.join(cwd, '.code-graph', 'index.db');
-    if (!fs.existsSync(dbPath)) return false;
-
-    // WIP = ALL working-tree changes (staged + unstaged + UNTRACKED) in one
-    // `git status` call — the old diff-only path missed untracked new source
-    // files you're actively editing (finding #3). Clean tree → fall back to the
-    // last commit. Timeouts tightened (finding #1): worst-case cap sum is now
-    // status(1s) + HEAD~1(1s) + affected(1.5s) = 3.5s, comfortably under the 5s
-    // SessionStart hook budget; the old 2+2+3=7s could get the whole hook killed.
-    // Each git call re-reads the budget and builds its own opts rather than
-    // sharing one object: the fallback `git diff` runs AFTER `git status` has
-    // already spent wall clock, so a timeout computed once would let the pair
-    // overshoot by up to its own value. `hidden(...)` stays inline at both call
-    // sites — windows-hide.test.js follows a `const x = hidden(...)` binding but
-    // not one returned from a helper, and that guard is right to be that strict.
-    let changed = [];
-    let isWip = false;
-    try {
-      const statusMs = budgetFor('git-status', 1000);
-      if (statusMs === null) return false;
-      changed = filterSourceFiles(parseGitStatusPaths(
-        execSync('git status --porcelain --untracked-files=all',
-          hidden({ cwd: sessionDir, timeout: statusMs, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }))));
-      isWip = changed.length > 0;
-      // Clean tree → fall back to what the last commit touched.
-      if (!isWip) {
-        const diffMs = budgetFor('git-diff', 1000);
-        if (diffMs === null) return false;
-        changed = filterSourceFiles(
-          execSync('git diff --name-only HEAD~1 HEAD',
-            hidden({ cwd: sessionDir, timeout: diffMs, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })));
-      }
-    } catch {
-      return false; // not a git repo / no commits — nothing to diff
-    }
-    if (changed.length === 0) return false;
-
-    // Marginal-value gate: cold startup + clean tree (last-commit fallback) → skip,
-    // before spending the affected CLI call.
-    if (!recentImpactWorthShowing({ isWip, source })) return false;
-
-    const { findBinary } = require('./find-binary');
-    const bin = findBinary();
-    if (!bin) return false;
-
-    const affectedBudget = budgetFor('affected', 1500);
-    if (affectedBudget === null) return false;
-
-    let affected;
-    try {
-      const raw = execFileSync(bin, ['affected', ...changed, '--json'], hidden({
-        cwd, timeout: affectedBudget, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-      }));
-      affected = JSON.parse(raw);
-    } catch {
-      return false;
-    }
-
-    const text = formatRecentImpact(changed, affected);
-    if (!text) return false;
-    process.stdout.write(text + '\n');
-
-    // Instrumentation (step 3a): record that the injection fired so `stats`
-    // surfaces it instead of the feature being dark. Carries the blast/direct
-    // counts + WIP flag for later reference-rate / A-B analysis. Best-effort.
-    try {
-      const all = Array.isArray(affected.affected_files) ? affected.affected_files : [];
-      const direct = all.filter(a => a.depth === 1 && !a.is_test).length;
-      const { recordRecommendation } = require('./recommendation-log');
-      recordRecommendation(cwd, { hook: 'session', action: 'live_impact', blast: all.length, direct, wip: isWip });
-    } catch { /* telemetry must never break the injection */ }
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ── v0.67.0 hook-reliability surfaces ─────────────────────────────────
@@ -1096,17 +853,11 @@ module.exports = {
   ensureIndexFresh,
   indexNeedsRevalidation,
   injectProjectMap,
-  injectRecentImpact,
   verifyBinary, missingBinaryMessage, unadoptCommand,
   consistencyCheck,
   runSessionInit,
   computeQuietHooks,
   shouldInjectMap,
-  shouldInjectRecentImpact,
-  recentImpactWorthShowing,
-  filterSourceFiles,
-  parseGitStatusPaths,
-  formatRecentImpact,
   hookFireWarning, checkHookFiring, analyzeHookDark, detectHookDark, // v0.67.0
 };
 
@@ -1132,6 +883,8 @@ if (require.main === module) {
   // housekeeping (audit 2026-08-16 P1-16). One `[code-graph]` line, exit 0.
   try {
     runSessionInit({ source });
+    const out = sessionStartOutput();
+    if (out) process.stdout.write(out);
   } catch (e) {
     process.stderr.write(
       `[code-graph] SessionStart hook error (${(e && e.code) || (e && e.name) || 'Error'}): ` +

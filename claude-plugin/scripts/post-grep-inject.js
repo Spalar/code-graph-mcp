@@ -36,7 +36,7 @@ const { recordRecommendation } = require('./recommendation-log');
 // `sanitizeSearchPath` is deliberately NOT imported any more: this hook passes
 // the RAW path so buildGrepArgs can split a glob into scope + `-g` instead of
 // widening it away. Leaving the require behind would read as "still used".
-const { runGrepAnswer, runShowAnswer, runCallgraphAnswer } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, shellQuoteArg, formatCgCommand } = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
 const {
   splitTopLevelSegments,
@@ -46,10 +46,26 @@ const {
   extractCgFlags,
   cgFlagSet,
   extractSearchPath,
+  bareSourceTarget,
+  segmentCwd,
+  segmentSeparators,
+  operandMatches,
+  firstShellClause,
   normalizeCommandPaths,
+  rootOnlyInSearchPath,
+  isDirectory,
+  declKindsBySymbol,
+  extractPatterns,
   rebaseRelativePaths,
   resolveProjectRoot,
+  readSourceRoots,
+  useSourceRoots,
+  grepListsBinaryMatches,
+  rewritePlan,
+  showAnswersPattern,
+  searchesSameFiles,
 } = require('./pre-grep-guide');
+const { indexBuildInProgress } = require('./project-root');
 
 // The command HEAD is grep/rg/ag (or git grep, or a KEY=VALUE/env prefix). Kept
 // loosely aligned with pre-grep-guide's GREP_VERB; this only gates "is this
@@ -193,6 +209,38 @@ const INJECT_HEADER = '[code-graph] AST-aware view of your grep (ran alongside):
 const CALLGRAPH_HEADER =
   '[code-graph] Cross-file call graph for the symbol you grepped (grep can\'t show this):';
 
+// B11 (2026-09-29 usage evaluation) — a call graph about a symbol defined
+// outside the path the grep searched. The grep's own scope says where the model
+// is looking; a same-named symbol's 4 KB call tree from elsewhere is not about
+// that place (a grep in tests/cli_e2e.rs got `indexed_project`'s tree from
+// src/indexer/resync.rs). Its location was the useful part, so that is what it
+// gets: one pointer line.
+
+/** The file on a `callgraph` answer's root line (`name (path)`), or null. */
+function definitionFile(text) {
+  const m = /^\S+ \(([^()\n]+)\)/.exec(String(text || ''));
+  return m ? m[1] : null;
+}
+
+/**
+ * Whether a grep over root-relative `searchPath` reads `file`. No path, `.`,
+ * or an unknown file count as covered (the full answer, as before); a glob
+ * counts as its directory.
+ */
+function searchCovers(searchPath, file) {
+  if (!file) return true;
+  let p = String(searchPath || '').replace(/^\.\//, '').replace(/\/+$/, '');
+  const glob = p.search(/[*?[]/);
+  if (glob !== -1) p = p.slice(0, glob).replace(/\/?[^/]*$/, '');
+  if (p === '' || p === '.') return true;
+  return file === p || file.startsWith(p + '/');
+}
+
+function buildPointerText(symbol, file, searchPath) {
+  return `[code-graph] ${symbol} is defined in ${shellQuoteArg(file)}, outside the path your grep ` +
+    `searched (${shellQuoteArg(searchPath)}). Its callers and callees: ${formatCgCommand(['callgraph', symbol])}`;
+}
+
 function buildInjectText(answer, mode) {
   if (mode === 'callgraph') {
     const lines = [CALLGRAPH_HEADER, answer.text];
@@ -239,6 +287,8 @@ function runMain() {
   const shellCwd = process.cwd();
   const root = resolveProjectRoot(shellCwd);
   if (root === null) return;  // no index anywhere up to $HOME
+  // The same source dirs the PreToolUse half recognized (F1).
+  useSourceRoots(readSourceRoots(root));
 
   let input;
   try {
@@ -263,8 +313,42 @@ function runMain() {
   markCooldown(rawCmd, root);
 
   const { segment, block } = found;
+  // D#73 — a bare dir names `<shell cwd>/src`. From a subdirectory shell (same
+  // guard as pre-grep-guide's runMain), or after anything earlier in the same
+  // command, that is not provably the root's src: round 2 found `cd x && grep`,
+  // round 3 reproduced 19 more forms that move the shell (`builtin cd`, `if cd`,
+  // `{ cd …; }`, `\cd`, `popd`, `eval`, a function). A denylist of those never
+  // closes, so a bare dir is answered only when the grep is the FIRST segment.
+  if (bareSourceTarget(firstShellClause(segment))
+      && (relPrefix || splitTopLevelSegments(cmd)[0] !== segment)) return;
+  // D#76 — the answer searches `extractSearchPath(segment)` from the root. The
+  // segment ran where the shell was by then: its own cwd, moved by any `cd`
+  // before it. Segments are read from the RAW command (normalizing strips the
+  // root from `cd <root>/x` too), which splits into the same segments.
+  const segs = splitTopLevelSegments(cmd);
+  const rawSegs = splitTopLevelSegments(rawCmd);
+  const idx = segs.indexOf(segment);
+  if (rawSegs.length !== segs.length) return;
+  const segCwd = segmentCwd(rawSegs, idx, shellCwd, { seps: segmentSeparators(rawCmd) });
+  if (segCwd === null) return;
+  if ((segCwd !== root || relPrefix)
+      && !operandMatches(firstShellClause(rawSegs[idx]), extractSearchPath(segment), root, segCwd)) return;
+  // D#125 #1 — the root strip rewrote a pattern that held the root.
+  if (!rootOnlyInSearchPath(rawSegs[idx], root, extractSearchPath(segment))) return;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
+  // D#133 — the inject had no grammar of its own: a flag it did not know was
+  // dropped, so `"-rv"` (grep reads -r -v: the shell strips the quotes), ag's
+  // `-n` (no recursion), `rg --max-depth`, an abbreviated `--inv`, or a glob
+  // the shell expands one level deep (`src/*.js`) got an answer for another
+  // search. The grep clause must now read under the rewrite's grammar, the
+  // per-verb flag allowlist included, as the same pattern and path the answer
+  // uses. One grammar for both hooks, not a list of shapes to refuse. It also
+  // declines a plain grep without -r on a directory (D#125 #3), which a
+  // separate check here used to do.
+  const plan = rewritePlan(firstShellClause(segment), { isDir: (t) => isDirectory(path.resolve(root, t)) });
+  const norm = (p) => (p === undefined ? undefined : p.replace(/^\.\//, '').replace(/\/+$/, ''));
+  if (!plan || plan.pattern !== rawPattern || norm(plan.target) !== norm(extractSearchPath(segment))) return;
   // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they
   // re-stated hits the model already had). If the command's OWN output already
   // surfaced the grepped symbol, the inject is redundant → skip it, saving the
@@ -345,11 +429,16 @@ function runMain() {
   // stopping at the first symbol with real edges. runCallgraphAnswer returns `hits`
   // ONLY when the symbol has edges → a leaf/absent symbol self-filters to the
   // show/grep echo below.
-  for (const symbol of extractCallgraphSymbols(rawPattern)) {
+  // Not while the startup index is being written: its call edges are a subset
+  // shown as the whole graph (D5). The grep echo below reads the files.
+  const callgraphSymbols = indexBuildInProgress(root) ? [] : extractCallgraphSymbols(rawPattern);
+  let answeredSymbol = null;
+  for (const symbol of callgraphSymbols) {
     const cg = runCallgraphAnswer({ cwd: root, symbol });
     if (cg.status === 'hits') {
       answer = cg;
       answeredMode = 'callgraph';
+      answeredSymbol = symbol;
       break;
     }
   }
@@ -357,7 +446,16 @@ function runMain() {
   if (answer.status !== 'hits') {
     if (block.mode === 'show') {
       answeredMode = 'show';
-      answer = runShowAnswer({ cwd: root, symbols: block.symbols });
+      // Scoped like the rewrite: the grep's path and declaration kinds; a grep
+      // with a file filter gets the grep answer, which honors it. So does a
+      // pattern `show` does not answer exactly (`fn foo` also matches
+      // `fn foobar`; D#133).
+      answer = flags.includes('-g') || flags.includes('-t') || !showAnswersPattern(rawPattern, segment)
+        ? { status: 'unavailable' }
+        : runShowAnswer({
+          cwd: root, symbols: block.symbols, within: searchPath ?? '',
+          kinds: declKindsBySymbol(extractPatterns(segment)),
+        });
       if (answer.status !== 'hits' && pattern) {
         answeredMode = 'grep';
         answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
@@ -401,12 +499,30 @@ function runMain() {
     return;
   }
 
+  // D#133 #8 — a grep or show answer must read the files the grep read
+  // (untracked hidden or ignored ones, git grep's tracked-only set). Checked
+  // only for an answer about to be injected: it runs git. The call graph does
+  // not depend on which files a grep reads. A `show` answer reads the index,
+  // which skips more (review of D#133, H-2).
+  if (answeredMode !== 'callgraph' && !searchesSameFiles({
+    root, target: searchPath, verb: plan.verb, show: answeredMode === 'show',
+    binaryCacheOk: !grepListsBinaryMatches(segment),
+  })) return;
+
+  // B11: `scope:'outside'` marks a pointer in place of the tree; `mode` stays
+  // `callgraph`, the one the funnel aggregator buckets.
+  const rootFile = answeredMode === 'callgraph' ? definitionFile(answer.text) : null;
+  const outside = answeredMode === 'callgraph' && !searchCovers(searchPath, rootFile);
   recordRecommendation(root, {
     hook: 'grep', action: 'inject', answered: true,
     ...(pattern ? { pattern } : {}),
     mode: answeredMode,
+    ...(outside ? { scope: 'outside' } : {}),
   });
-  process.stdout.write(emitPostToolContext(buildInjectText(answer, answeredMode)) + '\n');
+  const text = outside
+    ? buildPointerText(answeredSymbol, rootFile, searchPath)
+    : buildInjectText(answer, answeredMode);
+  process.stdout.write(emitPostToolContext(text) + '\n');
 }
 
 if (require.main === module) {
@@ -419,6 +535,9 @@ module.exports = {
   extractGrepOutput,
   grepFoundPattern,
   buildInjectText,
+  definitionFile,
+  searchCovers,
+  buildPointerText,
   isSilenced,
   isInjectDisabled,
   commandHash,

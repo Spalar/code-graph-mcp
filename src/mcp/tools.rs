@@ -21,6 +21,17 @@ use serde_json::json;
 /// compatibility (it was always a same-shape rename, never a hidden tool).
 pub const TOOL_COUNT: usize = 7;
 
+/// The `max_tokens` description (P1 #2), one wording for the four tools that
+/// take it. LLM-visible: keep it one short clause. The property itself is
+/// written inline as `"max_tokens": { "type": "integer", … }` at each tool, the
+/// shape `test_no_new_undeclared_mcp_args` reads declarations in.
+fn max_tokens_description(tool: &str) -> String {
+    format!(
+        "Token cap (bytes/3, {}): least-called items shrink, then drop; budget.next returns them",
+        count_range_hint(tool, "max_tokens")
+    )
+}
+
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
 }
@@ -67,7 +78,8 @@ impl ToolRegistry {
                         "include_middleware": { "type": "boolean", "description": "For route_path mode: include downstream middleware/calls (default true)" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
                         "include_tests": { "type": "boolean", "description": "Include test callers (default false)" },
-                        "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Min edge confidence to FOLLOW (default 'inferred'): hides 'ambiguous' by-name fan-out — a method name shared by many defs that resolves to all of them (e.g. `.execute()` → every execute). Pass 'ambiguous' to include every edge; 'extracted' for same-file-precise only. `ambiguous_edges_hidden` in the response counts what was suppressed." }
+                        "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Min edge confidence to FOLLOW (default 'inferred'): hides 'ambiguous' by-name fan-out — a method name shared by many defs that resolves to all of them (e.g. `.execute()` → every execute). Pass 'ambiguous' to include every edge; 'extracted' for same-file-precise only. `ambiguous_edges_hidden` in the response counts what was suppressed." },
+                        "max_tokens": { "type": "integer", "description": max_tokens_description("get_call_graph") }
                     },
                     // `callgraph.rs:95` rejects a call carrying neither
                     // `symbol_name` nor `route_path`, and the schema cannot say
@@ -77,7 +89,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "ONE named symbol: signature + source + opt impact/refs/similar. Use BEFORE editing X to see signature + blast radius. Repo-wide index (LSP only handles open files).".into(),
+                description: "ONE named symbol: signature + source + opt impact/refs/similar. Use BEFORE editing X to see signature + blast radius.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -91,7 +103,8 @@ impl ToolRegistry {
                         "include_similar": { "type": "boolean", "description": "Include embedding-similar nodes (default false; requires embed-model + indexed embeddings)" },
                         "similar_top_k": { "type": "integer", "description": format!("With include_similar: max similar results (default 5, {})", count_range_hint("get_ast_node", "similar_top_k")) },
                         "context_lines": { "type": "integer", "description": format!("Surrounding source lines to include (default 0, default 3 when using node_id; {})", count_range_hint("get_ast_node", "context_lines")) },
-                        "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" },
+                        "max_tokens": { "type": "integer", "description": max_tokens_description("get_ast_node") }
                     },
                     // `ast_node.rs:200` rejects a call carrying neither
                     // `symbol_name` nor `node_id` (a bare `file_path` is not
@@ -135,7 +148,8 @@ impl ToolRegistry {
                         // map is discoverable without a second round-trip.
                         "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves tokens)" },
                         "include_centrality": { "type": "boolean", "description": "Include architectural chokepoints (betweenness centrality — functions on the most shortest call paths; high score = structural bridge). Default false." },
-                        "centrality_limit": { "type": "integer", "description": format!("With include_centrality: max ranked results (default 10, {})", count_range_hint("project_map", "centrality_limit")) }
+                        "centrality_limit": { "type": "integer", "description": format!("With include_centrality: max ranked results (default 10, {})", count_range_hint("project_map", "centrality_limit")) },
+                        "max_tokens": { "type": "integer", "description": max_tokens_description("project_map") }
                     },
                     "required": []
                 }),
@@ -152,7 +166,8 @@ impl ToolRegistry {
                         "deps_direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "With include_deps: direction filter (default 'both')" },
                         "deps_depth": { "type": "integer", "description": format!("With include_deps: max transitive depth (default 2, {})", count_range_hint("module_overview", "deps_depth")) },
                         "include_dead": { "type": "boolean", "description": "Include unreferenced symbols (orphans + exported-unused) under this path (default false). Macro/shell-invoked entry points are pre-filtered. Results are candidates to verify: receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked, so a flagged symbol may still be used." },
-                        "dead_min_lines": { "type": "integer", "description": "With include_dead: min line count to flag (default 3)" }
+                        "dead_min_lines": { "type": "integer", "description": "With include_dead: min line count to flag (default 3)" },
+                        "max_tokens": { "type": "integer", "description": max_tokens_description("module_overview") }
                     },
                     "required": ["path"]
                 }),
@@ -182,7 +197,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Rename/remove audits — every site that imports/inherits/implements/calls a symbol. Repo-wide cross-language (LSP needs file open). Literals → Grep; 'who calls X?' → get_call_graph.".into(),
+                description: "Rename/remove audits — every site that imports/inherits/implements/calls a symbol, across languages; Grep after it for dynamic uses. Literals → Grep; 'who calls X?' → get_call_graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

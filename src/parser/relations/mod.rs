@@ -54,9 +54,16 @@ mod helpers;
 mod imports;
 mod inherits;
 mod java;
+mod member;
+pub(crate) use member::js_member_root_is_api;
 mod python;
+mod receiver;
+pub use receiver::{cpp_class_fields, CppField};
 mod routes;
 mod rust;
+mod rust_impls;
+mod rust_receiver;
+mod rust_use;
 mod typescript;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
@@ -79,6 +86,7 @@ fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
         SelfRecv(t) => Some(serde_json::json!({ "q": "self", "v": t }).to_string()),
         Receiver(r) => Some(serde_json::json!({ "q": "recv", "v": r }).to_string()),
         Chain => Some(serde_json::json!({ "q": "chain" }).to_string()),
+        Member => Some(member::MEMBER_META.to_string()),
     }
 }
 
@@ -88,6 +96,16 @@ fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
 /// inputs it actually receives. Mirrors `serialize_callee_qualifier`.
 fn serialize_rtype_metadata(ty: &str) -> String {
     serde_json::json!({ "q": "rtype", "v": ty }).to_string()
+}
+
+/// Build `{"q":"field","c":<class>,"v":<field>}` (`"a":1` through `->`): a C++
+/// member call on a field the resolver types from its class's recorded fields.
+fn serialize_field_metadata(class: &str, field: &str, arrow: bool) -> String {
+    let mut m = serde_json::json!({ "q": "field", "c": class, "v": field });
+    if arrow {
+        m["a"] = serde_json::json!(1);
+    }
+    m.to_string()
 }
 
 /// Build the `{"q":"impl_method","v":<ty>}` implements-edge metadata (Rust trait
@@ -124,6 +142,12 @@ pub struct ParsedRelation {
     /// to enforce same-language hard equality on cross-file `calls` edges
     /// (prevents false positives like Python `foo()` matching a C `foo()`).
     pub source_language: String,
+    /// 1-based start line of the definition whose scope `source_name` names, when
+    /// the relation comes from inside one. Stamped by `walk_for_relations`, so the
+    /// edge resolver can tell same-named definitions in one file apart (cfg twins,
+    /// `@overload` stubs, nested `def index()` handlers) instead of giving every
+    /// one of them this relation.
+    pub source_line: Option<u32>,
 }
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
@@ -146,11 +170,17 @@ pub fn extract_relations_from_tree(
     // Unconditional (not gated on `language == "rust"`) so a non-Rust file can
     // never carry a previous Rust file's entries into the next Rust one.
     rust::reset_fn_local_names_cache();
+    rust_use::reset();
+    rust_receiver::reset();
+    rust_impls::reset();
+    member::reset_import_bound(tree.root_node(), source, config.name);
+    receiver::reset();
     walk_for_relations(
         tree.root_node(),
         source,
         language,
         &config,
+        None,
         None,
         None,
         None,
@@ -298,6 +328,7 @@ mod ruby_bare_calls {
                             relation: REL_CALLS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -517,6 +548,23 @@ const REFERENCE_PASSES: &[ReferencePass] = &[
     },
 ];
 
+/// D7: the scope of a member-assigned (`res.send = function () {}`) or
+/// class-field (`json = () => {}`) function — the qualified name its node
+/// carries in the extractor (treesitter.rs), so the function's calls attach to
+/// it rather than to `<module>` or the enclosing class body.
+fn js_assigned_or_field_scope(
+    node: &tree_sitter::Node,
+    source: &str,
+    current_class: Option<&str>,
+) -> Option<String> {
+    super::js_member_assigned_function(node, source)
+        .map(|(_, qualified, _, _)| qualified)
+        .or_else(|| {
+            let field = super::js_class_field_function(node, source)?;
+            Some(format!("{}.{}", current_class?, field))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_for_relations(
     node: tree_sitter::Node,
@@ -524,6 +572,7 @@ fn walk_for_relations(
     language: &str,
     config: &LanguageConfig,
     current_scope: Option<&str>,
+    current_scope_line: Option<u32>,
     current_class: Option<&str>,
     current_rust_impl: Option<&str>,
     results: &mut Vec<ParsedRelation>,
@@ -552,9 +601,13 @@ fn walk_for_relations(
                     // not a `name` field (so this arm used to return None and the
                     // call's source attributed to `<module>` / got dropped). Pull
                     // the declarator name, e.g. `void Foo::bar(){}` → "Foo::bar".
+                    // A gtest case is named "Suite.Case" by the node extractor, so
+                    // its scope must be too, or no node matches the calls' source.
                     if config.name == "c" || config.name == "cpp" {
-                        node.child_by_field_name("declarator")
-                            .and_then(|d| cpp_declarator_name(&d, source, 0))
+                        node.child_by_field_name("declarator").and_then(|d| {
+                            super::treesitter::extract_gtest_test_name(&d, source)
+                                .or_else(|| cpp_declarator_name(&d, source, 0))
+                        })
                     } else {
                         None
                     }
@@ -584,24 +637,28 @@ fn walk_for_relations(
             // inherit the parent scope. (Returning `Some("<anonymous>")` would
             // emit unresolvable edges — no node is named that — silently dropping
             // callback calls and causing false-positive orphans.)
-            super::route_handler_name(&node, source).or_else(|| {
-                node.parent()
-                    .filter(|p| p.kind() == "variable_declarator")
-                    .and_then(|p| p.child_by_field_name("name"))
-                    .map(|n| {
-                        let name = node_text(&n, source).to_string();
-                        match current_class {
-                            Some(cls) => format!("{}.{}", cls, name),
-                            None => name,
-                        }
-                    })
-            })
+            super::route_handler_name(&node, source)
+                .or_else(|| {
+                    node.parent()
+                        .filter(|p| p.kind() == "variable_declarator")
+                        .and_then(|p| p.child_by_field_name("name"))
+                        .map(|n| {
+                            let name = node_text(&n, source).to_string();
+                            match current_class {
+                                Some(cls) => format!("{}.{}", cls, name),
+                                None => name,
+                            }
+                        })
+                })
+                .or_else(|| js_assigned_or_field_scope(&node, source, current_class))
         }
         "function_expression" => {
-            // Only materialized inline route handlers get a scope here; other
-            // function expressions keep inheriting the parent scope (no node is
-            // created for them, so a synthetic scope would dangle).
+            // Materialized inline route handlers and (D7) member-assigned or
+            // class-field functions get a scope here; other function expressions
+            // keep inheriting the parent scope (no node is created for them, so a
+            // synthetic scope would dangle).
             super::route_handler_name(&node, source)
+                .or_else(|| js_assigned_or_field_scope(&node, source, current_class))
         }
         // Dart: function_body is a sibling of either method_signature
         // (in class_body) or function_signature (top-level declaration).
@@ -638,6 +695,12 @@ fn walk_for_relations(
     };
 
     let active_scope = scope_name.as_deref().or(current_scope);
+    let active_scope_line = if scope_name.is_some() {
+        Some(node.start_position().row as u32 + 1)
+    } else {
+        current_scope_line
+    };
+    let first_new = results.len();
 
     // Additive `references` passes, table-driven (see `REFERENCE_PASSES`).
     // They run BEFORE the `match kind` call-dispatch below so they cannot
@@ -752,7 +815,11 @@ fn walk_for_relations(
     // Determine class context for children: when entering a class body,
     // pass the class name so methods can build qualified scope names.
     let child_class = match kind {
-        "class_declaration" | "class_definition" | "class" | "class_specifier"
+        "class_declaration"
+        | "abstract_class_declaration"
+        | "class_definition"
+        | "class"
+        | "class_specifier"
         | "struct_specifier" => node
             .child_by_field_name("name")
             .map(|n| node_text(&n, source).to_string()),
@@ -767,18 +834,23 @@ fn walk_for_relations(
     // (relations source_name="conn" matches pf.node_names "conn"; would
     // become "Database.conn" if folded into current_class).
     let child_rust_impl: Option<String> = if language == "rust" && kind == "impl_item" {
-        node.child_by_field_name("type").map(|t| {
-            let full = node_text(&t, source);
-            // Strip path prefix: `impl crate::db_a::Db` → "Db". Mirrors
-            // treesitter.rs's parent_class strip so SelfRecv payloads
-            // match qualified_name (which uses just the rightmost type
-            // segment).
-            full.rsplit("::").next().unwrap_or(full).to_string()
-        })
+        // `impl<T> crate::db_a::Db<T>` → "Db", the name its methods'
+        // qualified_names carry (see `rust_impl_type_name`).
+        node.child_by_field_name("type")
+            .map(|t| crate::parser::rust_impl_type_name(node_text(&t, source)))
     } else {
         None
     };
     let effective_rust_impl = child_rust_impl.as_deref().or(current_rust_impl);
+
+    // Where the scope these relations name begins: the resolver's tie-break
+    // between same-named definitions. Only a relation sourced FROM the active
+    // scope gets it (not `<module>` imports, not a type's heritage).
+    for r in &mut results[first_new..] {
+        if r.source_line.is_none() && Some(r.source_name.as_str()) == active_scope {
+            r.source_line = active_scope_line;
+        }
+    }
 
     // Recurse into children
     for i in 0..node.named_child_count() {
@@ -789,6 +861,7 @@ fn walk_for_relations(
                 language,
                 config,
                 active_scope,
+                active_scope_line,
                 effective_class,
                 effective_rust_impl,
                 results,

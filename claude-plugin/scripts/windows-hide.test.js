@@ -321,7 +321,9 @@ test('every child_process call site in the shipped JS dirs sets windowsHide', ()
   // seeing HALF the call sites and still pass. Counted at the time of writing;
   // -2 of slack absorbs an incidental removal without hiding a scanner that has
   // gone blind. Adding call sites raises it — update the number deliberately.
-  const EXPECTED_CALL_SITES = 50;
+  // 50 → 47 (2026-09-28): the pre-edit hook's grep fallback and the SessionStart
+  // recent-impact briefing were removed, taking their child calls with them.
+  const EXPECTED_CALL_SITES = 47;
   assert.ok(scanned >= EXPECTED_CALL_SITES - 2,
     `expected the scanner to still find ~${EXPECTED_CALL_SITES} call sites, found ${scanned} — ` +
     'a drop this large means the scanner stopped seeing code, not that the code went away');

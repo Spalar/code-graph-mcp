@@ -1,3 +1,4 @@
+pub mod boundaries;
 pub mod centrality;
 pub mod cycles;
 pub mod impact;

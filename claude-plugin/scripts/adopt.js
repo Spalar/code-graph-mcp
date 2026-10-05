@@ -69,29 +69,26 @@ function writeFileAtomic(filePath, data, { followLink = false } = {}) {
 // The managed block written into <cwd>/CLAUDE.md. Concise + always-loaded: a
 // scannable trigger table that primes the right tool, ending with a pointer to
 // the full table at .claude/plugin_code_graph_mcp.md (opened on demand, never
-// auto-loaded). Project-type tailoring swaps a couple of rows (web → HTTP-route
-// tracing; frontend → reference audits) — body of the detail doc is unchanged.
+// auto-loaded). Project-type tailoring adds a row for web projects (HTTP-route
+// tracing) — body of the detail doc is unchanged.
 //
-// Every row spends the bare name `code-graph-mcp`, and a plugin-only install has
-// it nowhere on PATH: findBinary() resolves the plugin's own download at
-// ~/.cache/code-graph/bin (auto-update.js `cachedBinaryPath`), and the global-npm
-// tiers below it exist only for users who ran `npm i -g` themselves. Issue #41 is
-// what that reads like from the other side — a table of commands the user's shell
-// answers with "command not found". Hence the fallback line below the table.
+// Every row spends the bare name `code-graph-mcp`. Issue #41 was a plugin-only
+// install whose shell answered it with "command not found"; Claude Code now puts
+// the plugin's `bin/` launcher on the Bash PATH, so the `~/.cache/code-graph/bin`
+// fallback line this block used to carry is gone (it also could not run
+// `adopt`/`doctor`, which are JS-dispatched).
 //
-// It names a path SHAPE, never a resolved one. This file goes into a git-tracked
-// CLAUDE.md (the adopt output says so two screens down), so a resolved
-// /home/<user>/… is right on one machine and wrong on every teammate's — and
-// buildBlock's byte-determinism is exactly what needsRefresh diffs, so
-// machine-varying content would rewrite the block on every clone's next
-// SessionStart. No `.exe` variant for the same reason it is safe not to have one:
-// platformGuard() refuses adopt on win32, so this block never exists there.
+// The block is byte-deterministic and machine-independent: it goes into a
+// CLAUDE.md that may be git-tracked, and needsRefresh diffs it bytewise, so a
+// resolved /home/<user>/… path would be right on one machine only.
 const BLOCK_HEADING = '## Code Graph (repo-wide AST index)';
 
 function buildTriggerRows(projectType = 'generic') {
   const base = [
     ['Who calls X / what X calls', '`code-graph-mcp callgraph X`'],
-    ['Impact before editing a fn', '`code-graph-mcp impact X`'],
+    ['Impact before changing a signature', '`code-graph-mcp impact X`'],
+    ['Tests to re-run after changing files', '`code-graph-mcp affected <files>`'],
+    ['Rename / remove audit', '`code-graph-mcp refs X`, then `grep -w X`'],
     ['Unfamiliar dir / module', '`code-graph-mcp overview <dir>`'],
     ['Symbol source / signature', '`code-graph-mcp show X`'],
     ['Concept search (no exact name)', '`code-graph-mcp search "…"` (vector: MCP `semantic_code_search`)'],
@@ -106,11 +103,6 @@ function buildTriggerRows(projectType = 'generic') {
       return [base[0], base[1],
         ['HTTP route → handler chain', '`code-graph-mcp trace "GET /api/x"`'],
         ...base.slice(2)];
-    case 'frontend':
-      // Rename/refactor audits dominate; surface find-references explicitly.
-      return [base[0],
-        ['Rename / refactor audit (refs)', '`code-graph-mcp refs X`'],
-        ...base.slice(1)];
     default:
       return base;
   }
@@ -126,14 +118,13 @@ function buildBlock(projectType = 'generic') {
   const body = [
     BLOCK_HEADING,
     '',
-    'AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for',
-    'structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:',
+    'Parsed index of the whole repo. For structural questions — who calls X, what a',
+    'change breaks, every use of a symbol — one call replaces rounds of Grep + Read:',
     '',
     table,
     '',
-    'Not on PATH? A plugin-only install keeps its own copy — same commands, run',
-    '`~/.cache/code-graph/bin/code-graph-mcp` (or `npm i -g @sdsrs/code-graph` once).',
-    '',
+    'Unresolved calls (dynamic dispatch, reflection, unresolved imports) leave no edge, so',
+    'an empty answer is not proof: confirm with grep before deleting or renaming.',
     "Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.",
     'Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`',
   ].join('\n');
@@ -491,6 +482,17 @@ function readAdoptedProjects(home) {
   return readAdoptedResult(home).list;
 }
 
+// A8 (2026-09-29 usage evaluation): the registry only ever grew — 7 of 16
+// entries on the evaluation machine named deleted temp dirs. A directory that
+// no longer exists holds no managed block, so each write drops those; an entry
+// whose check fails any other way (EACCES, a stale mount) stays, since its
+// block may still be there.
+function withoutGoneDirs(list) {
+  return list.filter((p) => {
+    try { fs.statSync(p); return true; } catch (err) { return !(err && err.code === 'ENOENT'); }
+  });
+}
+
 /** @returns {boolean} true when the project is recorded (or already was). */
 function recordAdopted(projectDir, home) {
   const res = readAdoptedResult(home);
@@ -498,9 +500,11 @@ function recordAdopted(projectDir, home) {
   try {
     const file = adoptedRegistryFile(home);
     const abs = path.resolve(projectDir);
-    if (res.list.includes(abs)) return true;
+    const kept = withoutGoneDirs(res.list);
+    const next = kept.includes(abs) ? kept : [...kept, abs];
+    if (next.length === res.list.length && next.every((p, i) => p === res.list[i])) return true;
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeFileAtomic(file, JSON.stringify([...res.list, abs], null, 2) + '\n');
+    writeFileAtomic(file, JSON.stringify(next, null, 2) + '\n');
     return true;
   } catch { return false; }        // best-effort: registry loss only degrades guidance
 }
@@ -511,7 +515,7 @@ function removeAdopted(projectDir, home) {
   if (res.unusable) return false;
   try {
     const abs = path.resolve(projectDir);
-    const next = res.list.filter((p) => p !== abs);
+    const next = withoutGoneDirs(res.list).filter((p) => p !== abs);
     if (next.length === res.list.length) return true;
     writeFileAtomic(adoptedRegistryFile(home), JSON.stringify(next, null, 2) + '\n');
     return true;
@@ -736,19 +740,27 @@ function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
   if (!isPluginModeInstall(scriptPath || __dirname)) {
     return { attempted: false, reason: 'not-plugin-mode', migrated: noMigration };
   }
-  // Clean legacy memory-dir artifacts before installing the new CLAUDE.md scheme.
+  // Clean up this plugin's own legacy memory-dir artifacts.
   const migrated = migrateLegacyMemoryDir({ cwd, home });
+  // Never writes CLAUDE.md or .claude/ (decision D4, 2026-09-28 usage
+  // evaluation). Creating them on the first session made Claude stop to
+  // explain the unexpected changes in 12 of 15 coding runs (0 of 15 without
+  // the plugin), and the MCP instructions already carry 10 of the block's 11
+  // guidance points. An adopted project keeps its block as it is; one that has
+  // drifted from the shipped template is reported as `stale`, so SessionStart
+  // can tell the user how to refresh (`adopt`) or remove (`unadopt`) it. The
+  // name is kept: SessionStart, tests and the uninstall paths all call it.
   if (isAdopted({ cwd })) {
-    // shipped template / 管理块 漂移时重跑 adopt 对齐。
-    // opt-out: CODE_GRAPH_NO_TEMPLATE_REFRESH=1（锁定手动编辑）。
     if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd })) {
-      const result = adopt({ cwd, home });
-      return { attempted: true, reason: 'refreshed', result, migrated };
+      return { attempted: false, reason: 'stale', migrated };
     }
     return { attempted: false, reason: 'already-adopted', migrated };
   }
-  const result = adopt({ cwd, home });
-  return { attempted: true, reason: 'adopted', result, migrated };
+  return { attempted: false, reason: 'not-adopted', migrated };
+}
+
+function adoptCommand() {
+  return `node ${shellQuote(__filename)} adopt`;
 }
 
 function unadopt({ cwd, home } = {}) {
@@ -978,7 +990,7 @@ if (require.main === module) {
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, unadoptCommand, shellQuote, stripSentinelBlock,
   readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot, adoptCommand,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
   claudeMdPath, detailDir, detailPath,
   extractCargoRuntimeDeps, extractPyRuntimeDeps, extractGoDirectRequires,

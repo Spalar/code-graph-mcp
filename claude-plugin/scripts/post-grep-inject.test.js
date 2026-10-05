@@ -418,14 +418,19 @@ test('e2e: the inject honours the grep\'s flags and glob, like the deny path', (
   const fixture = e2eFixture(
     `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
   // A miss, so the inject is additive and actually fires.
-  const cmd = `grep -rln "${uniq}" tests/*.mjs && echo done`;
+  const cmd = `grep -rln "${uniq}" tests/ && echo done`;
+  // The shell expands `tests/*.mjs` one level deep; `-g '*.mjs'` matches
+  // every depth, so a glob path is no longer answered at all (D#133).
+  const glob = `grep -rln "${uniq}G" tests/*.mjs && echo done`;
   try {
     const res = runHook(cmd, fixture, {}, undefined, '');
     const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
-    assert.match(ctx, new RegExp(`ARGV\\[grep -l ${uniq} tests -g \\*\\.mjs\\]`),
-      `the inject dropped -l and widened the glob while the deny path kept both: ${ctx}`);
+    assert.match(ctx, new RegExp(`ARGV\\[grep -l ${uniq} tests/\\]`),
+      `the inject dropped -l while the deny path kept it: ${ctx}`);
+    assert.equal(runHook(glob, fixture, {}, undefined, '').stdout.trim(), '', 'a glob path is not answered');
   } finally {
     cleanupFixture(fixture, cmd);
+    cleanupFixture(fixture, glob);
   }
 });
 
@@ -450,6 +455,7 @@ test('e2e: the inject\'s -F guard is not fooled by `-F` in a VALUE position', (t
     `if (process.argv[2] !== 'grep') process.exit(1);\n` +
     `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
   const cmd = `echo x && grep -rn --include -F "${uniq}\\|other_symbol" src/`;
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
   try {
     const ctx = JSON.parse(runHook(cmd, fixture, {}, undefined, '').stdout)
       .hookSpecificOutput.additionalContext;
@@ -690,6 +696,69 @@ test('e2e: alternation grep `Alpha|Beta` → callgraph mode when a symbol has ed
   }
 });
 
+test('F1: a grep into an indexed package dir is injected once the index lists it as a source root', () => {
+  const uniq = `PkgRoot${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + '\\n  \\u2190 called by: someCaller (networkx/x.py:3)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('networkx/foo.py:7  def ' + arg + '()\\n');`);
+  const cmd = `echo "x" && grep "${uniq}" networkx/`;
+  try {
+    assert.equal(runHook(cmd, fixture).stdout, '', 'no source-roots.json: not a source path, as before');
+    fs.writeFileSync(path.join(fixture.dir, '.code-graph', 'source-roots.json'),
+      JSON.stringify({ version: 1, roots: ['networkx'] }));
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /called by: someCaller/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('F1b: grep -r into a package dir holding an ignored __pycache__ still gets the grep echo', () => {
+  const uniq = `PycEcho${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2];\n` +
+    `if (sub === 'callgraph') { process.exit(1); }\n` +
+    `process.stdout.write('networkx/graph.py:1  ${uniq} = 1\\n');`);
+  const git = (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a],
+    { cwd: fixture.dir, encoding: 'utf8' });
+  const cmd = `echo "x" && grep -rn "${uniq}" networkx/`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'networkx', '__pycache__'), { recursive: true });
+    fs.writeFileSync(path.join(fixture.dir, 'networkx', 'graph.py'), `${uniq} = 1\n`);
+    fs.writeFileSync(path.join(fixture.dir, 'networkx', '__pycache__', 'graph.cpython-312.pyc'),
+      Buffer.from([0x6f, 0x0d, 0x0d, 0x0a, 0, 0, 0xff]));
+    fs.writeFileSync(path.join(fixture.dir, '.gitignore'), '.code-graph/\n__pycache__/\ncg-stub.js\n');
+    fs.writeFileSync(path.join(fixture.dir, '.code-graph', 'source-roots.json'),
+      JSON.stringify({ version: 1, roots: ['networkx'] }));
+    for (const a of [['init', '-q', '.'], ['add', '-A'], ['commit', '-qm', 'init']]) assert.equal(git(...a).status, 0);
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /AST-aware view of your grep/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('D5: while the startup index is being written, no call graph — the grep echo still answers', () => {
+  // Call edges from a partial index are a subset presented as the whole graph;
+  // the grep echo comes from the files themselves and stays correct.
+  const uniq = `AltBuild${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + '\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/foo.rs:7  fn ' + arg + '()\\n');`);
+  fs.writeFileSync(path.join(fixture.dir, '.code-graph', 'indexing-status.json'),
+    JSON.stringify({ s: 'finalizing', d: 50, t: 50 }));
+  const cmd = `echo "x" && grep "${uniq}|OtherSym" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.doesNotMatch(out.hookSpecificOutput.additionalContext, /Cross-file call graph|called by/);
+    assert.match(out.hookSpecificOutput.additionalContext, /AST-aware view of your grep/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('e2e: alternation grep, no symbol has edges → falls back to grep echo (grep mode)', () => {
   // callgraph returns exit 1 (no node) for every alternand → the grep-echo path
   // still delivers, mode:grep. Guards that widening never LOSES the echo fallback.
@@ -859,3 +928,588 @@ test('e2e: a spent hook budget records fallthrough_reason:budget, not a bare una
     cleanupFixture(fixture, cmd);
   }
 });
+
+// ── D#73: bare source dir on the inject path ────────────────────────────────
+// Commands newly recognized by D#73 reach this hook too (a bare dir with a
+// `| head` tail is never rewritten, so it lands here). Pre-ship review round 1
+// found the inject answering the wrong question on text-level matches; the
+// recognition is now the rewrite grammar's, and a subdir shell is guarded.
+
+test('e2e D#73: a bare dir with a tail gets the inject, scoped to that dir', (t) => {
+  const uniq = `InjBare${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  const cmd = `grep -rn "${uniq}" src | head -3`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+    const res = runHook(cmd, fixture, {}, undefined, '');
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, new RegExp(`ARGV\\[grep ${uniq} src\\]`), ctx);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#73: a bare dir from a subdir shell gets no inject', (t) => {
+  const uniq = `InjBareSub${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('ARGV[never]\\n');`);
+  const cmd = `grep -rn "${uniq}" src | head -3`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+    const res = runHook(cmd, fixture, {}, path.join(fixture.dir, 'xtask'), '');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout, '', `inject answered the root's src for a subdir grep: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+for (const cmd of [
+  'grep -n tasks "task_queue.py"',                   // M1: the bare word is the pattern
+  'grep -rn "widget_count" $(ls -d src tests) | wc -l', // M2
+  'ag "widget_count" --ignore tests . | wc -l',       // M3
+]) {
+  test(`e2e D#73: no inject for a non-path bare word: ${cmd}`, (t) => {
+    const fixture = e2eFixture(`process.stdout.write('ARGV[never]\\n');`);
+    try {
+      for (const d of ['src', 'tests', 'tasks']) fs.mkdirSync(path.join(fixture.dir, d), { recursive: true });
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.stdout, '', `unexpected inject: ${res.stdout}`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+}
+
+// Round 2 B3 / round 3: anything before the grep in the same command can move
+// the shell (`cd`, and 19 other forms round 3 reproduced: `builtin cd`, `if cd`,
+// `{ cd …; }`, `\\cd`, `popd`, `eval`, a function …). A denylist of those never
+// closes, so a bare dir is answered only when the grep is the FIRST segment.
+for (const prefix of [
+  'cd xtask && ', 'builtin cd xtask && ', 'if cd xtask; then ', '{ cd xtask; ',
+  '\\cd xtask && ', 'popd >/dev/null; ', 'eval "cd xtask"; ', 'echo start; ',
+]) {
+  test(`e2e D#73: no bare-dir inject when a segment precedes the grep: ${prefix}`, (t) => {
+    const uniq = `InjBarePre${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+    const fixture = e2eFixture(`process.stdout.write('ARGV[never]\\n');`);
+    const cmd = `${prefix}grep -rn "${uniq}" src`;
+    try {
+      fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+      fs.mkdirSync(path.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.stdout, '', `inject answered the root's src: ${res.stdout}`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+}
+
+// Round 2 B1, end to end: the inject must search the grammar's operand.
+test('e2e D#73: a path-shaped pattern is not taken for the inject scope', (t) => {
+  const uniq = `InjPatPath${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  const cmd = `grep -rn "./src/${uniq}" tests | head`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'tests'), { recursive: true });
+    const res = runHook(cmd, fixture, {}, undefined, '');
+    assert.equal(res.status, 0, res.stderr);
+    if (res.stdout) {
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.doesNotMatch(ctx, new RegExp(`ARGV\\[[^\\]]* \\./src/${uniq}\\]`), `pattern used as scope: ${ctx}`);
+      assert.match(ctx, /ARGV\[[^\]]* tests\]/, ctx);
+    }
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+
+// ── D#76: the inject searches where the grep searched ─────────────────────
+// The answer runs from the root with a root-relative path. A segment after a
+// `cd`, or a subdirectory shell's operand the rebase left alone, searched
+// somewhere else.
+function injectArgs(res) {
+  assert.equal(res.status, 0, res.stderr);
+  if (!res.stdout) return null;
+  const m = JSON.parse(res.stdout).hookSpecificOutput.additionalContext.match(/ARGV\[([^\]]*)\]/);
+  return m ? m[1] : 'no-argv';
+}
+const ARGV_ECHO = `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`;
+
+function withTwoSrcDirs(fn) {
+  const fixture = e2eFixture(ARGV_ECHO);
+  fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+  return fixture;
+}
+
+test('e2e D#76: `cd xtask && grep … src/` is not answered with the root\'s src', () => {
+  const uniq = `InjCd${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `cd xtask && grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), null);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: a subdir shell\'s `src/` the rebase left alone gets no inject', () => {
+  const uniq = `InjSubSlash${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `echo x; grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, path.join(fixture.dir, 'xtask'), '')), null);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: `cd <root> && grep … src/` from a subdir is the root\'s src', () => {
+  const uniq = `InjCdRoot${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const real = fs.realpathSync(fixture.dir);
+  const cmd = `cd ${real} && grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, path.join(real, 'xtask'), '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: an absolute operand after a cd is still that path', () => {
+  const uniq = `InjCdAbs${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const real = fs.realpathSync(fixture.dir);
+  const cmd = `cd xtask && grep -rn "${uniq}" ${real}/src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#76: cwd-neutral segments before the grep keep the inject', () => {
+  const uniq = `InjNeutral${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `echo "== a"; git status; grep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#66 — a grep line inside a heredoc body never ran.
+test('e2e D#66: a grep inside a heredoc body gets no inject', () => {
+  const uniq = `InjHeredoc${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `python3 - <<'PY'\nprint("x")\ngrep -rn "${uniq}" src/\nPY\necho done`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), null);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#66: a grep after a heredoc is found, whatever the body quotes', () => {
+  const uniq = `InjAfterDoc${Date.now()}`;
+  const fixture = withTwoSrcDirs();
+  const cmd = `python3 - <<'PY'\nprint('it\\'s')\nPY\ngrep -rn "${uniq}" src/ | head -3`;
+  try {
+    assert.equal(injectArgs(runHook(cmd, fixture, {}, undefined, '')), `grep ${uniq} src/`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#125 #1: the root strip rewrote a pattern holding the project root, and the
+// inject answered the stripped pattern.
+test('e2e: a pattern holding the project root is not answered', (t) => {
+  const uniq = `InjRootPat${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:1  hit\\n');`);
+  const root = fs.realpathSync(fixture.dir);
+  const cmd = `echo x && grep -rn "${root}/${uniq}" src/`;
+  const control = `echo x && grep -rn "${uniq}" "${root}/src/"`;
+  try {
+    const res = runHook(cmd, fixture, {}, root, '');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), '', `must not inject: ${res.stdout}`);
+    // Control: a quoted path under the root is still answered.
+    const ok = runHook(control, fixture, {}, root, '');
+    assert.match(JSON.parse(ok.stdout).hookSpecificOutput.additionalContext, /src\/foo\.rs/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+    cleanupFixture(fixture, control);
+  }
+});
+
+// Pre-release review of D#125, F1 and F4.
+test('e2e: the inject skips a -e pattern holding the root', (t) => {
+  const uniq = `InjRootE${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `process.stdout.write('src/foo.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  const root = fs.realpathSync(fixture.dir);
+  const cmd = `grep -rn -e "${root}/def ${uniq}" -e "BarBaz" src/; echo x`;
+  try {
+    const res = runHook(cmd, fixture, {}, root, '');
+    assert.equal(res.stdout.trim(), '', `must not inject: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the inject scopes show to the grep path and skips a non-recursive dir grep', (t) => {
+  const uniq = `InjScope${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `if (process.argv[2] === 'show') { process.stdout.write('fn ' + process.argv[3] + '  src/a/x.rs:1-3  ()\\n  body\\n'); process.exit(0); }\n` +
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  fs.mkdirSync(path.join(fixture.dir, 'lib'));
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  const scoped = `grep -rn -A3 "fn ${uniq}\\b" lib/ && echo done`;
+  const flat = `grep -n "${uniq}Bar" src/ ; echo done`;
+  try {
+    const a = runHook(scoped, fixture, {}, undefined, '').stdout.trim();
+    if (a) assert.doesNotMatch(JSON.parse(a).hookSpecificOutput.additionalContext, /src\/a\/x\.rs/,
+      'a definition outside the grep path');
+    const b = runHook(flat, fixture, {}, undefined, '');
+    assert.equal(b.stdout.trim(), '', `a grep without -r searched no directory: ${b.stdout}`);
+  } finally {
+    cleanupFixture(fixture, scoped);
+    cleanupFixture(fixture, flat);
+  }
+});
+
+// Review of D#125, round 2: F1 (a root-holding pattern spelled like a path was
+// answered) and F2 (the inject printed show output from outside the grep path).
+test('e2e: the inject answers neither a root-holding pattern nor show output outside the path', (t) => {
+  const uniq = `InjR2${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `if (process.argv[2] === 'show') { for (const f of ['lib/d.rs', 'src/a.rs']) process.stdout.write('fn ' + process.argv[3] + '  ' + f + ':1-3  ()\\n  body\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/foo_mod/m.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  fs.mkdirSync(path.join(fixture.dir, 'lib'));
+  fs.mkdirSync(path.join(fixture.dir, 'src', 'foo_mod'), { recursive: true });
+  const root = fs.realpathSync(fixture.dir);
+  const rootPat = `echo x; grep -rn "${root}/src/foo_mod" lib/`;
+  const scoped = `grep -rn -A3 "fn ${uniq}\\b" src/a.rs; echo done`;
+  try {
+    assert.equal(runHook(rootPat, fixture, {}, root, '').stdout.trim(), '', 'root-holding pattern');
+    const out = runHook(scoped, fixture, {}, root, '').stdout.trim();
+    if (out) assert.doesNotMatch(JSON.parse(out).hookSpecificOutput.additionalContext, /lib\/d\.rs/);
+  } finally {
+    cleanupFixture(fixture, rootPat);
+    cleanupFixture(fixture, scoped);
+  }
+});
+
+// ── D#133: leftovers of the 0.160.0/0.161.0 reviews ─────────────────
+// The inject had no grammar: any flag it did not know was dropped, so an
+// inverted, non-recursive or differently-filtered grep got an answer for
+// another search. It now answers only a grep clause the rewrite grammar reads
+// (the same allowlist per verb), with the same pattern and path.
+function d133Stub() {
+  return `if (process.argv[2] === 'callgraph') process.exit(1);\n` +
+    `if (process.argv[2] === 'show') { process.stdout.write('fn ' + process.argv[3] + '  src/a.rs:1-3  ()\\n  SHOWBODY\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/a.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`;
+}
+
+test('e2e D#133: the inject declines a grep whose flags or path it cannot reproduce', () => {
+  const uniq = `InjD133${Date.now()}`;
+  const fixture = e2eFixture(d133Stub());
+  fs.mkdirSync(path.join(fixture.dir, 'src', 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(fixture.dir, 'src', 'a.js'), 'x\n');
+  const declined = [
+    // #9: the shell strips the quotes; grep reads -r -v.
+    `echo start; grep "-rv" "${uniq}A" src/sub/`,
+    `echo start; grep -rn "${uniq}B" src/ "-v"`,
+    // Non-recursive: a glob the shell expands one level deep, ag -n, a depth cap.
+    `echo x; grep -n "${uniq}C" src/*.js`,
+    `echo x; grep -rn "${uniq}D" src/*.js`,
+    `echo x; ag -n "${uniq}E" src/`,
+    `echo x; rg --max-depth 1 "${uniq}F" src/`,
+    `echo x; grep -rn -d skip "${uniq}G" src/`,
+    // An abbreviated long flag GNU grep accepts (--invert-match, --include).
+    `echo x; grep -rn --inv "${uniq}H" src/`,
+    `echo x; grep -rn --inc='*.rs' "${uniq}I" src/`,
+    // #7: GNU grep matches --include against the base name.
+    `echo x; grep -rn --include='src/*.js' "${uniq}J" src/`,
+    // #5: -E / -P dialect.
+    `echo x; grep -rnE "${uniq}K\\d" src/`,
+    `echo x; grep -rnP "\\<${uniq}L" src/`,
+    // M19: an unquoted expansion joined to the quoted pattern.
+    `echo x; grep -rn "${uniq}M"$SUFFIX src/`,
+    // #10: the grep never ran.
+    `exit 0; grep -rn "${uniq}N" src/`,
+    `set -e; test -f nope.txt; grep -rn "${uniq}O" src/`,
+  ];
+  const accepted = [
+    `echo x; grep -rn "${uniq}P" src/`,
+    `echo x; grep -rnE "${uniq}Q|other_symbol" src/`,
+    `echo x; grep -rn --include='*.js' "${uniq}R" src/`,
+    `set -x; grep -rn "${uniq}S" src/`,
+  ];
+  try {
+    for (const cmd of declined) {
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.stdout.trim(), '', `must not inject: ${cmd}\n${res.stdout}`);
+    }
+    for (const cmd of accepted) {
+      const out = runHook(cmd, fixture, {}, undefined, '').stdout.trim();
+      assert.ok(out.startsWith('{'), `control must inject: ${cmd}`);
+    }
+  } finally {
+    for (const cmd of [...declined, ...accepted]) cleanupFixture(fixture, cmd);
+  }
+});
+
+// 0.161.0 Not covered: `show` answers exact names. The inject's show answer
+// now needs a pattern naming whole definitions; otherwise it answers the grep.
+test('e2e D#133: the inject answers a prefix declaration grep with grep, not show', () => {
+  const uniq = `InjShowExact${Date.now()}`;
+  const fixture = e2eFixture(d133Stub());
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  const prefix = `echo x; grep -rn -A3 "fn ${uniq}" src/`;
+  const exact = `echo x; grep -rn -A3 "fn ${uniq}B\\b" src/`;
+  try {
+    const a = JSON.parse(runHook(prefix, fixture, {}, undefined, '').stdout).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(a, /SHOWBODY/, `fn X also matches fn Xbar: ${a}`);
+    assert.match(a, /ARGV\[grep /);
+    const b = JSON.parse(runHook(exact, fixture, {}, undefined, '').stdout).hookSpecificOutput.additionalContext;
+    assert.match(b, /SHOWBODY/, `a bounded name is answered by show: ${b}`);
+  } finally {
+    cleanupFixture(fixture, prefix);
+    cleanupFixture(fixture, exact);
+  }
+});
+
+// M22 of the 0.160.0 review stayed green: post-grep-inject not passing `seps`
+// to segmentCwd. `true || cd .. && grep` runs the grep without the cd.
+test('e2e D#133: a cd after || is not followed end to end (M22)', () => {
+  const uniq = `InjSeps${Date.now()}`;
+  const fixture = e2eFixture(d133Stub());
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  fs.mkdirSync(path.join(fixture.dir, 'docs'));
+  const docs = path.join(fs.realpathSync(fixture.dir), 'docs');
+  const orCd = `true || cd .. && grep -rn "${uniq}A" src/`;
+  const andCd = `cd .. && grep -rn "${uniq}B" src/`;
+  try {
+    assert.equal(runHook(orCd, fixture, {}, docs, '').stdout.trim(), '',
+      'the grep ran in docs/, where src/ does not exist');
+    assert.ok(runHook(andCd, fixture, {}, docs, '').stdout.trim().startsWith('{'),
+      'control: a cd that must have run is followed');
+  } finally {
+    cleanupFixture(fixture, orCd);
+    cleanupFixture(fixture, andCd);
+  }
+});
+
+// Mutations of the D#133 gate that stayed green: the call graph is injected
+// before any grep answer, so a declined grep must be refused before it too; and
+// the gate's pattern and path must be the ones the answer uses.
+test('e2e D#133: the grammar gate covers the call graph, the pattern and the path', () => {
+  const uniq = `InjGate${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'callgraph') { process.stdout.write(process.argv[3] + '\\n  ← called by: caller (src/b.rs)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/a.rs:1  ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  fs.mkdirSync(path.join(fixture.dir, 'src', 'sub'), { recursive: true });
+  fs.mkdirSync(path.join(fixture.dir, 'src', 'x_y'), { recursive: true });
+  fs.mkdirSync(path.join(fixture.dir, 'tmp'));
+  const declined = [
+    // grep reads -r -v; a call graph of the symbol is no view of this grep
+    `echo start; grep -rn "${uniq}A" src/ "-v"`,
+    // the unquoted word is the pattern; the quoted path looks like one
+    `echo x; grep -rn ${uniq}_b "src/x_y/"`,
+    // the quoted pattern looks like a path; the grep searched tmp/
+    `echo x; grep -rn "src/${uniq}_c" tmp/`,
+  ];
+  const control = `echo start; grep -rn "${uniq}D" src/`;
+  try {
+    for (const cmd of declined) {
+      assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', `must not inject: ${cmd}`);
+    }
+    assert.match(JSON.parse(runHook(control, fixture, {}, undefined, '').stdout).hookSpecificOutput.additionalContext,
+      /Cross-file call graph/, 'control');
+  } finally {
+    for (const cmd of [...declined, control]) cleanupFixture(fixture, cmd);
+  }
+});
+
+// D#133 #8 on the PostToolUse side: an untracked hidden file under the path is
+// read by grep -r and not by the answer.
+test('e2e D#133: the inject declines when the grep reads files the answer does not', () => {
+  const uniq = `InjFiles${Date.now()}`;
+  const fixture = e2eFixture(d133Stub());
+  const git = (...a) => {
+    const r = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: fixture.dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  git('init', '-q', '.');
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  fs.writeFileSync(path.join(fixture.dir, 'src', 'a.rs'), 'x\n');
+  fs.writeFileSync(path.join(fixture.dir, '.gitignore'), '.code-graph/\n');
+  git('add', '-A');
+  git('commit', '-qm', 'init');
+  const control = `echo x; grep -rn "${uniq}A" src/`;
+  const cmd = `echo x; grep -rn "${uniq}B" src/`;
+  try {
+    assert.ok(runHook(control, fixture, {}, undefined, '').stdout.trim().startsWith('{'), 'control');
+    fs.writeFileSync(path.join(fixture.dir, 'src', '.local.rs'), 'x\n');
+    assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'an untracked hidden file');
+  } finally {
+    cleanupFixture(fixture, cmd);
+    cleanupFixture(fixture, control);
+  }
+});
+
+// ── D#133 review repairs on the PostToolUse side ─────────────────────
+function gitFixtureInject(stubBody) {
+  const fixture = e2eFixture(stubBody);
+  const git = (...a) => {
+    const r = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: fixture.dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  git('init', '-q', '.');
+  fs.mkdirSync(path.join(fixture.dir, 'src'));
+  fs.writeFileSync(path.join(fixture.dir, 'src', 'a.rs'), 'x\n');
+  fs.writeFileSync(path.join(fixture.dir, '.gitignore'), '.code-graph/\nsrc/gen/\n');
+  git('add', '-A');
+  git('commit', '-qm', 'init');
+  return { fixture, git };
+}
+
+// L-6 R29: the inject passed its own verb to the file check; a check run for
+// another verb (git grep reads no untracked file, ignored or not) let grep -r's
+// ignored file through.
+test('e2e review L-6 R29: the inject checks the files of the grep\'s own verb', () => {
+  const uniq = `InjVerb${Date.now()}`;
+  const { fixture } = gitFixtureInject(d133Stub());
+  const control = `echo x; grep -rn "${uniq}A" src/`;
+  const cmd = `echo x; grep -rn "${uniq}B" src/`;
+  try {
+    assert.ok(runHook(control, fixture, {}, undefined, '').stdout.trim().startsWith('{'), 'control');
+    fs.mkdirSync(path.join(fixture.dir, 'src', 'gen'));
+    fs.writeFileSync(path.join(fixture.dir, 'src', 'gen', 'g.rs'), 'x\n');
+    assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'an untracked ignored file grep -r reads');
+  } finally {
+    cleanupFixture(fixture, cmd);
+    cleanupFixture(fixture, control);
+  }
+});
+
+// Review H-1 and H-2 on the inject: a `.ignore` hides files from cg's walk, and
+// a show answer reads the index, which skips vendor/.
+test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and on a file the index skips', () => {
+  const uniq = `InjIdx${Date.now()}`;
+  const cmds = [];
+  try {
+    {
+      const { fixture } = gitFixtureInject(d133Stub());
+      const control = `echo x; grep -rn -A2 "fn ${uniq}A\\b" src/`;
+      const cmd = `echo x; grep -rn -A2 "fn ${uniq}B\\b" src/`;
+      cmds.push([fixture, control], [fixture, cmd]);
+      assert.match(JSON.parse(runHook(control, fixture, {}, undefined, '').stdout).hookSpecificOutput.additionalContext,
+        /SHOWBODY/, 'control answers with show');
+      fs.mkdirSync(path.join(fixture.dir, 'src', 'vendor'));
+      fs.writeFileSync(path.join(fixture.dir, 'src', 'vendor', 'b.rs'), `fn ${uniq}B() {}\n`);
+      assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'src/vendor/ is not indexed');
+    }
+    {
+      const { fixture } = gitFixtureInject(d133Stub());
+      const control = `echo x; grep -rn "${uniq}C" src/`;
+      const cmd = `echo x; grep -rn "${uniq}D" src/`;
+      cmds.push([fixture, control], [fixture, cmd]);
+      assert.ok(runHook(control, fixture, {}, undefined, '').stdout.trim().startsWith('{'), 'control');
+      fs.writeFileSync(path.join(fixture.dir, 'src', '.ignore'), 'u.rs\n');
+      fs.writeFileSync(path.join(fixture.dir, 'src', 'u.rs'), 'x\n');
+      assert.equal(runHook(cmd, fixture, {}, undefined, '').stdout.trim(), '', 'src/.ignore');
+    }
+  } finally {
+    for (const [fixture, cmd] of cmds) cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── B11 (2026-09-29 usage evaluation): a symbol defined outside the grep's path ──
+// A grep scoped to one file found nothing, and the hook injected 4 KB of the
+// call tree of a same-named symbol defined elsewhere (`indexed_project` in
+// src/indexer/resync.rs for a grep in tests/cli_e2e.rs). Only its location
+// was useful: that is now all it gets, as one pointer line.
+{
+  const { definitionFile, searchCovers, buildPointerText } = require('./post-grep-inject');
+
+  test('definitionFile: the file on the callgraph root line, or null', () => {
+    assert.equal(definitionFile('indexed_project (src/indexer/resync.rs)\n  ← called by: x (a.rs)'), 'src/indexer/resync.rs');
+    assert.equal(definitionFile('indexed_project\n  ← called by: x (a.rs)'), null, 'no file on the root line');
+    assert.equal(definitionFile(''), null);
+    assert.equal(definitionFile(undefined), null);
+  });
+
+  test('searchCovers: a path covers itself and what is under it; a glob counts as its directory', () => {
+    const cases = [
+      [null, 'src/a.rs', true], ['', 'src/a.rs', true], ['.', 'src/a.rs', true], ['./', 'src/a.rs', true],
+      ['src', 'src/a.rs', true], ['src/', 'src/deep/a.rs', true], ['./src', 'src/a.rs', true],
+      ['src/a.rs', 'src/a.rs', true], ['tests/cli_e2e.rs', 'src/indexer/resync.rs', false],
+      ['tests', 'src/a.rs', false], ['src/a', 'src/ab.rs', false],
+      ['tests/*.rs', 'tests/x.rs', true], ['tests/*.rs', 'src/x.rs', false], ['*.py', 'src/x.py', true],
+      ['src/**/x.rs', 'src/deep/x.rs', true],
+      ['tests', null, true],
+    ];
+    for (const [p, f, want] of cases) assert.equal(searchCovers(p, f), want, `${p} covers ${f}`);
+  });
+
+  test('buildPointerText: location and the command, repo tokens shell-quoted', () => {
+    const t = buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs');
+    assert.match(t, /indexed_project is defined in src\/indexer\/resync\.rs, outside the path your grep searched \(tests\/cli_e2e\.rs\)/);
+    assert.match(t, /code-graph-mcp callgraph indexed_project/);
+    assert.ok(t.split('\n').length <= 2, t);
+    assert.match(buildPointerText('f', "src/a b'.rs", 'x'), /'src\/a b'\\''\.rs'/);
+  });
+
+  const STUB_ROOTED = (file) =>
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + ' (${file})\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    `process.exit(1);`;
+
+  test('e2e B11: a symbol defined outside the grep path gets a pointer, not its call graph', () => {
+    const uniq = `Outside${Date.now()}`;
+    const fixture = e2eFixture(STUB_ROOTED('src/indexer/resync.rs'));
+    const cmd = `echo "x" && grep "${uniq}" tests/cli_e2e.rs`;
+    try {
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.match(ctx, new RegExp(`${uniq} is defined in src/indexer/resync\\.rs, outside the path your grep searched`));
+      assert.doesNotMatch(ctx, /called by/);
+      const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+      const rec = JSON.parse(recs.trim().split('\n').pop());
+      assert.equal(rec.mode, 'callgraph');
+      assert.equal(rec.scope, 'outside');
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+
+  test('e2e B11: a symbol defined inside the grep path keeps its call graph', () => {
+    const uniq = `Inside${Date.now()}`;
+    const fixture = e2eFixture(STUB_ROOTED('src/lib.rs'));
+    const cmd = `echo "x" && grep "${uniq}" src/`;
+    try {
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.match(ctx, /Cross-file call graph/);
+      assert.match(ctx, /called by: someCaller/);
+      const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+      assert.equal(JSON.parse(recs.trim().split('\n').pop()).scope, undefined);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+}

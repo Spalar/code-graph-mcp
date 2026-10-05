@@ -7,8 +7,12 @@ use super::*;
     about = "Show call graph (callers/callees)"
 )]
 pub struct CallgraphArgs {
-    /// Symbol name to analyze
-    pub symbol: String,
+    /// Symbol name to analyze (required unless --node-id is given)
+    pub symbol: Option<String>,
+    /// Graph exactly this definition: a node_id from a same-file ambiguity
+    /// answer or `show --json` (authoritative over --file)
+    #[arg(long = "node-id")]
+    pub node_id: Option<i64>,
     // --direction stays an in-handler String (NOT a clap ValueEnum) so the exact
     // "must be one of: callers, callees, both" exit-1 message is preserved.
     /// Direction: callers, callees, or both
@@ -37,6 +41,11 @@ pub struct CallgraphArgs {
     /// 'ambiguous' to show every edge.
     #[arg(long = "min-confidence")]
     pub min_confidence: Option<String>,
+    /// Token budget for the text answer (bytes/3, 100-100000): the deepest
+    /// nodes with the fewest callers are shortened, then left out (a node goes
+    /// before its parent); ends with a command that prints them
+    #[arg(long, conflicts_with_all = ["json", "compact"])]
+    pub budget: Option<u64>,
 }
 
 /// Call graph display.
@@ -49,9 +58,9 @@ pub struct CallgraphArgs {
 /// ```
 pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // clap accepts an empty-string positional; preserve the non-empty guard.
-    let raw_symbol = args.symbol.as_str();
-    if raw_symbol.is_empty() {
-        anyhow::bail!("Usage: code-graph-mcp callgraph <symbol> [--direction callers|callees|both] [--depth N] [--file <path>] [--json]");
+    let raw_symbol = args.symbol.as_deref().unwrap_or("");
+    if raw_symbol.is_empty() && args.node_id.is_none() {
+        anyhow::bail!("Usage: code-graph-mcp callgraph <symbol> [--node-id N] [--direction callers|callees|both] [--depth N] [--file <path>] [--json]");
     }
 
     let direction = crate::domain::normalize_call_direction(args.direction.as_str())
@@ -67,6 +76,12 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         Some(f) => Some(normalize_user_path(project_root, f)?),
         None => None,
     };
+    // `--node-id` names one definition, so a file selector has nothing left to
+    // choose (same rule as `refs --node-id`).
+    if args.node_id.is_some() && explicit_file_owned.is_some() {
+        eprintln!("[code-graph] Note: --file is ignored when --node-id is given (node_id is authoritative).");
+    }
+    // Read only on the by-name paths below; a node target never consults it.
     let explicit_file = explicit_file_owned.as_deref();
 
     // Confidence floor: default 'inferred' hides the ambiguous by-name fan-out
@@ -79,8 +94,35 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
+    // callgraph's in-band error envelope carries `results: []` (see the
+    // not-found branch below).
+    let not_found_extra = serde_json::json!({ "results": [] });
+    let mut node_target = match args.node_id {
+        Some(nid) => Some(CliNodeTarget::lookup(
+            conn,
+            nid,
+            json_mode,
+            &not_found_extra,
+        )?),
+        None => None,
+    };
+    // A symbol in a file added since the last index (D2).
+    if node_target.is_none() {
+        crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
+    }
+    let target_name: Option<String> = node_target.as_ref().map(|target| target.name.clone());
+    let raw_symbol = target_name.as_deref().unwrap_or(raw_symbol);
 
-    let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+    let selected = match &node_target {
+        Some(target) => Ok(CliSymbolSelection {
+            lookup_name: target.name.clone(),
+            bare_name: target.name.clone(),
+            file_filter: None,
+            lookup: CliSymbolLookup::Bare,
+        }),
+        None => select_cli_symbol(conn, raw_symbol, explicit_file)?,
+    };
+    let selection = match selected {
         Ok(selection) => selection,
         Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
             emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
@@ -103,41 +145,55 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
     let symbol = selection.lookup_name.as_str();
     let file_filter = selection.file_filter.as_deref();
+    // Refresh the selector's own file before the gate reads it: its node_ids
+    // and start lines are what a caller picks a definition by (see `impact`).
+    if let Some(fp) = file_filter {
+        refresh_files_if_stale(&ctx.db, &ctx.project_root, &[fp.to_string()]).disclose();
+    }
 
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge call graphs.
     // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
-    if file_filter.is_none() && !is_exact_qualified {
-        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+    // A file selector cannot split same-file definitions either; a node_id can.
+    if !is_exact_qualified && node_target.is_none() {
+        let cands = match file_filter {
+            None => crate::resolve::detect_ambiguity(conn, symbol)?,
+            Some(fp) => crate::resolve::detect_same_file_ambiguity(conn, symbol, fp)?,
+        };
+        if let Some(cands) = cands {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }
 
     // Wrapped so a query-time freshness resync below can re-run it against the
     // refreshed index (parity with refs/show/… via refresh_files_if_stale).
-    let run_query = |sym: &str| {
-        crate::graph::query::get_call_graph_filtered(
-            conn,
-            sym,
-            direction,
-            depth,
-            file_filter,
-            min_conf_rank,
-        )
+    let run_query = |sym: &str, target: &Option<CliNodeTarget>| {
+        let seed = match target {
+            Some(target) => crate::graph::query::CallGraphSeed::Node(target.id),
+            None => crate::graph::query::CallGraphSeed::Name {
+                name: sym,
+                file_path: file_filter,
+            },
+        };
+        crate::graph::query::get_call_graph_seeded(conn, seed, direction, depth, min_conf_rank)
     };
 
-    let mut result = run_query(symbol)?;
+    let mut result = run_query(symbol, &node_target)?;
     // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
     // node with no edges) and no --file was specified, promote a unique fuzzy
     // match. Matches MCP get_call_graph behavior.
     let has_edges = result.nodes.iter().any(|n| n.depth > 0);
     let has_seed = result.nodes.iter().any(|n| n.depth == 0);
     let mut resolved_symbol: String = symbol.to_string();
-    if !(is_exact_qualified || has_edges || has_seed && file_filter.is_some()) {
+    if !(is_exact_qualified
+        || node_target.is_some()
+        || has_edges
+        || has_seed && file_filter.is_some())
+    {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
-                    result = run_query(&resolved)?;
+                    result = run_query(&resolved, &node_target)?;
                     eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
@@ -179,7 +235,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let files: Vec<String> = result.nodes.iter().map(|n| n.file_path.clone()).collect();
     let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
-        if is_exact_qualified {
+        // The re-index reused ids: re-find the node before re-running anything
+        // with its id (SURF-16).
+        if let Some(target) = node_target.as_mut() {
+            target.reresolve(conn, json_mode, &not_found_extra, || outcome.disclose())?;
+        } else if is_exact_qualified {
             match select_cli_symbol(conn, raw_symbol, explicit_file)? {
                 Ok(refreshed) if refreshed.lookup == CliSymbolLookup::ExactQualified => {}
                 Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
@@ -192,7 +252,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 }
             }
         }
-        result = run_query(symbol)?;
+        result = run_query(symbol, &node_target)?;
     }
     outcome.disclose();
 
@@ -269,6 +329,20 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         (display, tests, test_callees)
     };
 
+    // An empty caller side cannot tell "nobody calls it" from "called through a
+    // string key / reflection / function value". Disclose the dynamic-dispatch
+    // sites that name it — never as edges, and only when the caller list shown
+    // is empty, so a non-empty answer is byte-identical (P1 #4).
+    let boundaries = if direction != "callees"
+        && !display_nodes
+            .iter()
+            .any(|n| n.depth > 0 && matches!(n.direction, crate::graph::query::Direction::Callers))
+    {
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+    } else {
+        None
+    };
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
@@ -315,6 +389,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         // The stderr note above is invisible under `--json 2>/dev/null`, and
         // this envelope is object-shaped, so it can carry the marker (parity
         // with ast-search/refs/trace/impact/report).
+        if let Some(b) = &boundaries {
+            output["boundaries"] = b.to_json();
+        }
         outcome.attach_partial(&mut output);
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
@@ -390,9 +467,66 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         Ok(())
     }
 
+    // Footers are collected first so a budgeted answer can count them; the
+    // unbudgeted answer writes the same bytes after the tree.
+    let mut footer: Vec<u8> = Vec::new();
+    write_callgraph_footer(
+        &mut footer,
+        test_count,
+        test_callee_count,
+        &result,
+        boundaries.as_ref(),
+    )?;
+
+    if let Some(requested) = args.budget {
+        let tokens = clamp_arg(
+            "--budget",
+            requested,
+            crate::budget::MIN_BUDGET_TOKENS,
+            crate::budget::MAX_BUDGET_TOKENS,
+        ) as usize;
+        let next = crate::budget::NextCommand::new("callgraph")
+            .arg(raw_symbol)
+            .opt_path("--file", args.file.clone())
+            .opt(
+                "--direction",
+                (args.direction != "both").then(|| args.direction.clone()),
+            )
+            .opt("--depth", (args.depth != 3).then(|| args.depth.to_string()))
+            .flag_if(include_tests, "--include-tests")
+            .opt("--min-confidence", args.min_confidence.clone());
+        let root = root.unwrap();
+        let head = format!("{} ({})\n", root.name, root.file_path);
+        let text = callgraph_budget_text(
+            conn,
+            &head,
+            &children,
+            root_id,
+            &String::from_utf8_lossy(&footer),
+            tokens,
+            &next,
+        )?;
+        // The head line was already written above.
+        write!(stdout, "{}", &text[head.len()..])?;
+        return Ok(());
+    }
+
     render_subtree(&mut stdout, &children, root_id, "callers", compact)?;
     render_subtree(&mut stdout, &children, root_id, "callees", compact)?;
+    stdout.write_all(&footer)?;
 
+    Ok(())
+}
+
+/// The lines after the tree: hidden-test counts, traversal limits, hidden
+/// ambiguous edges, dynamic-dispatch boundaries.
+fn write_callgraph_footer<W: std::io::Write>(
+    stdout: &mut W,
+    test_count: usize,
+    test_callee_count: usize,
+    result: &crate::graph::query::CallGraphResult,
+    boundaries: Option<&crate::graph::boundaries::Boundaries>,
+) -> Result<()> {
     if test_count > 0 || test_callee_count > 0 {
         let mut parts: Vec<String> = Vec::new();
         if test_count > 0 {
@@ -428,8 +562,135 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             result.suppressed_ambiguous,
         )?;
     }
-
+    if let Some(b) = boundaries {
+        b.render_text(stdout, "  ")?;
+    }
     Ok(())
+}
+
+/// One rendered tree line of `callgraph` (depth, parent and whether it was
+/// deduplicated are already settled by the unbudgeted renderer's rules).
+struct TreeLine<'a> {
+    node: &'a crate::graph::query::CallGraphNode,
+    direction: &'static str,
+    /// Index of the parent line, `None` under the root.
+    parent: Option<usize>,
+}
+
+/// `callgraph --budget`: the tree fitted to `tokens`.
+///
+/// One unit per tree line. Least important first: deepest, then fewest
+/// callers (call-edge in-degree), then latest in the listing — so a node is
+/// always shortened or left out before its parent. The shorter form is the
+/// `--compact` line (`← name (file)`).
+fn callgraph_budget_text(
+    conn: &rusqlite::Connection,
+    head: &str,
+    children: &std::collections::HashMap<
+        (i64, &'static str),
+        Vec<&crate::graph::query::CallGraphNode>,
+    >,
+    root_id: i64,
+    footer: &str,
+    tokens: usize,
+    next: &crate::budget::NextCommand,
+) -> Result<String> {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    fn collect<'a>(
+        children: &std::collections::HashMap<
+            (i64, &'static str),
+            Vec<&'a crate::graph::query::CallGraphNode>,
+        >,
+        parent_id: i64,
+        parent: Option<usize>,
+        direction: &'static str,
+        out: &mut Vec<TreeLine<'a>>,
+    ) {
+        if let Some(kids) = children.get(&(parent_id, direction)) {
+            for n in kids {
+                out.push(TreeLine {
+                    node: n,
+                    direction,
+                    parent,
+                });
+                let me = out.len() - 1;
+                collect(children, n.node_id, Some(me), direction, out);
+            }
+        }
+    }
+    let mut lines: Vec<TreeLine> = Vec::new();
+    collect(children, root_id, None, "callers", &mut lines);
+    collect(children, root_id, None, "callees", &mut lines);
+    let ids: Vec<i64> = lines.iter().map(|l| l.node.node_id).collect();
+    let in_degree = budget::caller_counts(conn, &ids)?;
+    let n = lines.len();
+    let order = budget::order_by_importance(n, |i| {
+        (
+            Reverse(lines[i].node.depth),
+            in_degree.get(&lines[i].node.node_id).copied().unwrap_or(0),
+            Reverse(i),
+        )
+    });
+    let steps = budget::standard_steps(&order, |_| true);
+    let line_text = |l: &TreeLine, level: Level| -> String {
+        let indent = "  ".repeat(l.node.depth as usize);
+        let label = crate::domain::display_node_name(&l.node.name);
+        let (arrow, arrow_text) = match l.direction {
+            "callers" => ("←", "← called by"),
+            _ => ("→", "→ calls"),
+        };
+        if level == Level::Skeleton {
+            format!("{indent}{arrow} {label} ({})\n", l.node.file_path)
+        } else {
+            format!(
+                "{indent}{arrow_text}: {label} ({}) [{}]\n",
+                l.node.file_path, l.node.node_type
+            )
+        }
+    };
+    let render = |levels: &[Level]| -> String {
+        let mut out = String::from(head);
+        let mut shown = vec![false; n];
+        for (i, l) in lines.iter().enumerate() {
+            // A line whose parent is not shown is not shown either: the order
+            // above already guarantees it, this keeps the tree well-formed if
+            // the fill pass brings a child back without its parent.
+            let parent_shown = l.parent.is_none_or(|p| shown[p]);
+            if levels[i] == Level::Dropped || !parent_shown {
+                continue;
+            }
+            shown[i] = true;
+            out.push_str(&line_text(l, levels[i]));
+        }
+        out.push_str(footer);
+        let omitted = shown.iter().filter(|s| !**s).count();
+        let short = (0..n)
+            .filter(|&i| shown[i] && levels[i] == Level::Skeleton)
+            .count();
+        if let Some(line) = budget::notice(
+            "  ",
+            tokens,
+            &[
+                (omitted, "node omitted", "nodes omitted"),
+                (short, "node without its type", "nodes without their type"),
+            ],
+        ) {
+            out.push_str(&format!("{line}\n  next: {next}\n"));
+        }
+        out
+    };
+    Ok(budget::fit(
+        &vec![Level::Full; n],
+        &steps,
+        budget::budget_bytes(tokens),
+        |l| {
+            let s = render(l);
+            let len = s.len();
+            (s, len)
+        },
+    )
+    .output)
 }
 
 // --- impact subcommand ---

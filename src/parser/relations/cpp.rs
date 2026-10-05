@@ -49,15 +49,22 @@ pub(super) fn extract_cpp_inheritance(
             Some(b) => b,
             None => continue,
         };
-        let name = match base.kind() {
-            "type_identifier" => Some(node_text(&base, source)),
-            // ns::Base → the `name` tail; Tmpl<int> → the template `name`.
-            "qualified_identifier" | "template_type" => base
-                .child_by_field_name("name")
-                .map(|n| node_text(&n, source)),
-            // access_specifier / virtual / anything else: not a base type name.
-            _ => None,
-        };
+        // ns::Base → the `name` tail, `log::Reader::Reporter` → `Reporter` (the
+        // tail of a nested scope is itself qualified); Tmpl<int> → the template
+        // `name`. access_specifier / virtual / anything else: not a base type.
+        let mut name = None;
+        let mut cur = Some(base);
+        for _ in 0..8 {
+            let Some(n) = cur else { break };
+            match n.kind() {
+                "type_identifier" => {
+                    name = Some(node_text(&n, source));
+                    break;
+                }
+                "qualified_identifier" | "template_type" => cur = n.child_by_field_name("name"),
+                _ => break,
+            }
+        }
         if let Some(name) = name {
             if !name.is_empty() {
                 out.push(ParsedRelation {
@@ -66,6 +73,7 @@ pub(super) fn extract_cpp_inheritance(
                     relation: REL_INHERITS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -132,6 +140,7 @@ pub(super) fn extract_cpp_value_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 

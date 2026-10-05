@@ -36,6 +36,36 @@ pub const META_KEY_INDEX_RUN_IN_FLIGHT: &str = "index_run_in_flight";
 /// [`META_KEY_INDEX_RUN_IN_FLIGHT`] above).
 pub const META_KEY_PARSE_ERROR_FILES: &str = "parse_error_files";
 
+/// The subset of [`META_KEY_PARSE_ERROR_FILES`] whose "damaged parse" verdict
+/// this `INDEX_VERSION` produced, each with the content hash it was about:
+/// `{"v": INDEX_VERSION, "files": {path: blake3}}`. Bounded by the main set on
+/// every fold.
+///
+/// The main set is also written by OTHER binaries sharing the index: a server
+/// started before an upgrade keeps running, and before 0.157.0 it went on
+/// storing its older grammar's parse of any file it touched. Those files look
+/// damaged, hash as unchanged, and were never re-parsed. A listed path whose
+/// entry here is missing, carries another version's stamp, or names a hash the
+/// `files` row no longer has, is re-parsed by the next incremental run (see
+/// `Database::unverified_parse_error_files`).
+///
+/// No SCHEMA_VERSION bump: absent or unreadable reads as empty, so on an index
+/// from before this key every listed file is re-examined once, which is what
+/// repairs the indexes already written that way.
+pub const META_KEY_PARSE_ERROR_FILES_VERIFIED: &str = "parse_error_files_verified";
+
+/// JSON object: for each Rust package with both `src/lib.rs` and `src/main.rs`,
+/// the top-level modules each root declared when the index last covered them
+/// (`indexer::pipeline::resolve::RustCrates::root_mods_json`, D#136). Which of
+/// the two crates a file is compiled into decides what its `crate::` names, and
+/// that is read from the root files' `mod` items, not from the file itself: an
+/// incremental run compares this record with the tree to find the files a
+/// root's `mod` edit moved, which the diff alone never names.
+///
+/// No SCHEMA_VERSION bump: absent or unreadable reads as "no package recorded",
+/// so the next incremental re-extracts every file of each such package once.
+pub const META_KEY_RUST_ROOT_MODS: &str = "rust_root_mods";
+
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
 const FTS5_TRIGGERS: &str = "
@@ -169,6 +199,21 @@ CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
 CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
 CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);
+
+-- C++ class fields and the class a call through each names (`dot` for `x.f()`,
+-- `arrow` for `x->f()`), recorded from the class body's own file. A member
+-- function defined outside its class (`DBImpl::Get` in db_impl.cc, the fields in
+-- db_impl.h) or a gtest `TEST_F` body calls through fields its own file never
+-- declares; the resolver types those calls from here. Keyed on the class node,
+-- so re-indexing or deleting the class's file clears its rows. Additive: created
+-- IF NOT EXISTS on an older database, and filled by the INDEX_VERSION rebuild.
+CREATE TABLE IF NOT EXISTS cpp_fields (
+    class_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    field      TEXT NOT NULL,
+    dot_type   TEXT,
+    arrow_type TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cpp_fields_class ON cpp_fields(class_id);
 "#
     )
 }

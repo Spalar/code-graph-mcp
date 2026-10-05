@@ -384,6 +384,20 @@ impl McpServer {
             .iter()
             .any(|t| type_kinds.contains(&t.as_str()));
 
+        // Nothing lists as a reference: disclose the dynamic-dispatch sites
+        // that name it (P1 #4) — same relation gate as the CLI twin. Hidden
+        // test references still leave the visible list empty; that is the
+        // answer the caller sees, so it carries the disclosure too.
+        let boundaries = if all_refs.is_empty()
+            && matches!(
+                relation_filter,
+                None | Some(crate::domain::REL_CALLS) | Some(crate::domain::REL_REFERENCES)
+            ) {
+            self.empty_result_boundaries(&symbol_name)?
+        } else {
+            None
+        };
+
         let mut out = json!({
             "symbol": symbol_name,
             "total_references": all_refs.len(),
@@ -420,6 +434,9 @@ impl McpServer {
                      this type (see module_overview for method list) and grep for the bare name."
                 ));
             }
+        }
+        if let Some(b) = boundaries {
+            out["boundaries"] = b;
         }
         Ok(out)
     }

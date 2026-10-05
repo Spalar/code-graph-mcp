@@ -52,6 +52,11 @@ impl McpServer {
         // `centrality_limit` sent without the flag was still swallowed, which is
         // precisely what the sibling comment says must not happen.
         let centrality_limit = arg_clamped(args, "centrality_limit", "project_map", 10)? as usize;
+        // P1 #2: absent = the unbudgeted answer. Read at entry for the same reason.
+        let max_tokens = match &args["max_tokens"] {
+            serde_json::Value::Null => None,
+            _ => Some(arg_clamped(args, "max_tokens", "project_map", 0)? as usize),
+        };
 
         if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
@@ -194,6 +199,10 @@ impl McpServer {
             result["centrality"] = json!(centrality_json);
         }
 
+        if let Some(tokens) = max_tokens {
+            return Ok(project_map_budgeted(&result, tokens, centrality_limit));
+        }
+
         if compact {
             let compact_modules: Vec<serde_json::Value> = result["modules"]
                 .as_array()
@@ -287,6 +296,8 @@ impl McpServer {
             if hot_total > COMPACT_HOT_FUNCTIONS {
                 compact_result["hot_functions_truncated"] = json!(true);
                 compact_result["hot_functions_total"] = json!(hot_total);
+                // The non-compact text map lists every hot function.
+                compact_result["next"] = json!("code-graph-mcp map");
             }
             // Compact is a WHITELIST rebuild (feedback_compact_field_allowlist —
             // v0.90/v0.97.1 both dropped new fields here): forward centrality
@@ -309,6 +320,176 @@ impl McpServer {
 
         Ok(result)
     }
+}
+
+/// `project_map` with `max_tokens`: the full envelope fitted to the budget.
+///
+/// Same units and ranking as CLI `map --budget`: modules by incoming imports
+/// (shorter form: path + counts, no `key_symbols` / `languages`), dependencies
+/// by import count, hot functions by caller count, entry points by order,
+/// `centrality` (when asked for) by score; sections lose units in proportion
+/// to their length. When anything was shortened or left out, `budget` says
+/// how much and names the command per section that returns it;
+/// `over_budget` says the fixed part alone did not fit.
+fn project_map_budgeted(
+    full: &serde_json::Value,
+    tokens: usize,
+    centrality_limit: usize,
+) -> serde_json::Value {
+    use crate::budget::{self, Level};
+    use std::cmp::Reverse;
+    let arr = |k: &str| full[k].as_array().cloned().unwrap_or_default();
+    let (eps, mods, deps, hot, cent) = (
+        arr("entry_points"),
+        arr("modules"),
+        arr("module_dependencies"),
+        arr("hot_functions"),
+        arr("centrality"),
+    );
+    let (ne, nm, nd, nh) = (eps.len(), mods.len(), deps.len(), hot.len());
+    let (om, od, oh, oc) = (ne, ne + nm, ne + nm + nd, ne + nm + nd + nh);
+    let n = oc + cent.len();
+    let u = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap_or(0);
+    let mut in_imports: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for d in &deps {
+        *in_imports
+            .entry(d["to"].as_str().unwrap_or(""))
+            .or_default() += u(d, "imports");
+    }
+    let symbols = |m: &serde_json::Value| {
+        [
+            "functions",
+            "classes",
+            "interfaces_traits",
+            "constants",
+            "other",
+        ]
+        .iter()
+        .map(|k| u(m, k))
+        .sum::<u64>()
+    };
+    let shift = |v: Vec<usize>, by: usize| v.into_iter().map(|x| x + by).collect::<Vec<_>>();
+    let order = budget::interleave(&[
+        budget::order_by_importance(ne, Reverse),
+        shift(
+            budget::order_by_importance(nm, |i| {
+                let path = mods[i]["path"].as_str().unwrap_or("");
+                (
+                    in_imports.get(path).copied().unwrap_or(0),
+                    symbols(&mods[i]),
+                    Reverse(i),
+                )
+            }),
+            om,
+        ),
+        shift(
+            budget::order_by_importance(nd, |i| (u(&deps[i], "imports"), Reverse(i))),
+            od,
+        ),
+        shift(
+            budget::order_by_importance(nh, |i| (u(&hot[i], "caller_count"), Reverse(i))),
+            oh,
+        ),
+        // Listed highest score first.
+        shift(budget::order_by_importance(cent.len(), Reverse), oc),
+    ]);
+    let steps = budget::standard_steps(&order, |x| (om..od).contains(&x));
+    let skeleton_module = |m: &serde_json::Value| {
+        let mut s = compact_project_module(m);
+        if let Some(o) = s.as_object_mut() {
+            o.remove("key_symbols");
+        }
+        s
+    };
+    let render = |levels: &[Level], over_budget: bool| -> serde_json::Value {
+        let keep = |items: &[serde_json::Value], off: usize| -> Vec<serde_json::Value> {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| levels[off + i] != Level::Dropped)
+                .map(|(i, v)| {
+                    if levels[off + i] == Level::Skeleton {
+                        skeleton_module(v)
+                    } else {
+                        v.clone()
+                    }
+                })
+                .collect()
+        };
+        let mut out = full.clone();
+        out["entry_points"] = json!(keep(&eps, 0));
+        out["modules"] = json!(keep(&mods, om));
+        out["module_dependencies"] = json!(keep(&deps, od));
+        out["hot_functions"] = json!(keep(&hot, oh));
+        if full.get("centrality").is_some() {
+            out["centrality"] = json!(keep(&cent, oc));
+        }
+        let dropped =
+            |r: std::ops::Range<usize>| r.filter(|&x| levels[x] == Level::Dropped).count();
+        let mut omitted = serde_json::Map::new();
+        for (k, c) in [
+            ("entry_points", dropped(0..ne)),
+            ("modules", dropped(om..od)),
+            ("module_dependencies", dropped(od..oh)),
+            ("hot_functions", dropped(oh..oc)),
+            ("centrality", dropped(oc..n)),
+        ] {
+            if c > 0 {
+                omitted.insert(k.to_string(), json!(c));
+            }
+        }
+        let skel = (om..od).filter(|&x| levels[x] == Level::Skeleton).count();
+        let map_cut = skel > 0 || dropped(0..oc) > 0;
+        let cent_cut = dropped(oc..n) > 0;
+        if !omitted.is_empty() || skel > 0 || over_budget {
+            let mut b = json!({ "max_tokens": tokens });
+            if !omitted.is_empty() {
+                b["omitted"] = serde_json::Value::Object(omitted);
+            }
+            if skel > 0 {
+                b["modules_without_key_symbols"] = json!(skel);
+            }
+            if over_budget {
+                b["over_budget"] = json!(true);
+            }
+            let mut cmds = Vec::new();
+            if map_cut || !cent_cut {
+                // The text map caps dependencies at 30; everything else it lists.
+                let past_cap = (30..nd).any(|i| levels[od + i] == Level::Dropped);
+                cmds.push(if past_cap {
+                    "code-graph-mcp map --json".to_string()
+                } else {
+                    "code-graph-mcp map".to_string()
+                });
+            }
+            if cent_cut {
+                cmds.push(
+                    crate::budget::NextCommand::new("centrality")
+                        .arg("--limit")
+                        .arg(centrality_limit.to_string())
+                        .to_string(),
+                );
+            }
+            b["next"] = json!(cmds.join("; "));
+            out["budget"] = b;
+        }
+        out
+    };
+    let fitted = budget::fit(
+        &vec![Level::Full; n],
+        &steps,
+        budget::budget_bytes(tokens),
+        |levels| {
+            let v = render(levels, false);
+            let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+            (v, len)
+        },
+    );
+    if fitted.over_budget {
+        // Even with every unit left out the fixed part is larger than asked.
+        return render(&fitted.levels, true);
+    }
+    fitted.output
 }
 
 #[cfg(test)]
@@ -380,5 +561,31 @@ mod tests {
             "`languages` is the one field compact deliberately drops, got {compact}"
         );
         assert_eq!(compact["functions"], json!(9));
+    }
+
+    /// A budgeted answer whose fixed part alone is larger than the budget
+    /// says so (`over_budget`) instead of passing as sized; one that fits
+    /// does not.
+    #[test]
+    fn budgeted_map_marks_a_fixed_part_over_the_budget() {
+        let module = json!({"path": "m", "files": 1, "functions": 1, "classes": 0});
+        let full = json!({
+            "modules": [module],
+            "module_dependencies": [],
+            "entry_points": [],
+            "hot_functions": [],
+            "note": "x".repeat(400),
+        });
+        let out = project_map_budgeted(&full, 100, 10);
+        assert_eq!(out["budget"]["over_budget"], json!(true), "{out}");
+        assert_eq!(out["budget"]["omitted"]["modules"], json!(1), "{out}");
+        let small = json!({
+            "modules": [module],
+            "module_dependencies": [],
+            "entry_points": [],
+            "hot_functions": [],
+        });
+        let out = project_map_budgeted(&small, 100, 10);
+        assert!(out.get("budget").is_none(), "{out}");
     }
 }

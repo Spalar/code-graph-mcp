@@ -74,6 +74,66 @@ pub type ProgressFn<'a> = &'a dyn Fn(IndexPhase, usize, usize);
 /// server's startup indexing thread and read by the plugin statusline.
 pub const INDEXING_STATUS_FILE: &str = "indexing-status.json";
 
+/// Top-level project dirs that hold indexed code, written beside `index.db` at the
+/// end of every full and incremental index for the plugin's grep hook, which
+/// reads it instead of spawning a query per Bash call. The hook's fixed list of
+/// source-dir names (`src`, `lib`, …) misses the dir a Python package lives in
+/// (`networkx/`): in the 2026-09-28 coding eval not one grep in 15 runs reached
+/// the hook (tasks/specs/grep-hook-source-roots.md).
+pub const SOURCE_ROOTS_FILE: &str = "source-roots.json";
+
+/// Languages whose files do not make their dir a source root: prose and data. A
+/// `doc/` of markdown is not where a code grep goes.
+const NON_CODE_LANGUAGES: &[&str] = &["markdown", "json", "html", "css"];
+
+/// Write [`SOURCE_ROOTS_FILE`] from the files table. Only beside an index that
+/// lives in a `.code-graph` dir — a snapshot's staging DB or a test DB elsewhere
+/// gets none. Best-effort: indexing never fails over it, and an unchanged list is
+/// not rewritten. Atomic (temp file + rename) because hooks read it at any time.
+fn write_source_roots(db: &Database) {
+    if let Err(e) = try_write_source_roots(db) {
+        tracing::warn!("could not write {}: {}", SOURCE_ROOTS_FILE, e);
+    }
+}
+
+fn try_write_source_roots(db: &Database) -> Result<()> {
+    let conn = db.conn();
+    let db_file: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |r| r.get(0),
+    )?;
+    let Some(dir) = Path::new(&db_file).parent() else {
+        return Ok(());
+    };
+    if db_file.is_empty()
+        || dir.file_name() != Some(std::ffi::OsStr::new(crate::domain::CODE_GRAPH_DIR))
+    {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; NON_CODE_LANGUAGES.len()].join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT substr(path, 1, instr(path, '/') - 1) AS root FROM files \
+         WHERE instr(path, '/') > 1 AND language IS NOT NULL \
+         AND language NOT IN ({placeholders}) ORDER BY root"
+    ))?;
+    let roots: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(NON_CODE_LANGUAGES), |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let body = serde_json::json!({ "version": 1, "roots": roots }).to_string() + "\n";
+    let target = dir.join(SOURCE_ROOTS_FILE);
+    if std::fs::read_to_string(&target).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    let tmp = dir.join(format!("{SOURCE_ROOTS_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Age past which `indexing-status.json` is a leftover from a killed process, not
 /// a live indexer: live runs heartbeat at least once per batch / finalize phase,
 /// orders of magnitude more often than this. The statusline applies the same
@@ -129,7 +189,8 @@ pub fn run_full_index(
         .into_iter()
         .map(|(rel, _abs)| rel)
         .collect();
-    index_files(
+    let root_mods = resolve::collect_rust_crates(project_root).root_mods_json();
+    let result = index_files(
         db,
         project_root,
         &files,
@@ -137,7 +198,14 @@ pub fn run_full_index(
         model,
         &[],
         progress,
-    )
+    )?;
+    crate::storage::queries::set_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+        &root_mods,
+    )?;
+    write_source_roots(db);
+    Ok(result)
 }
 
 /// True when `rel_path` is a safe project-relative path: no absolute root and no
@@ -369,8 +437,26 @@ pub fn apply_file_refreshes(
         return Ok(());
     }
 
-    let files: Vec<String> = reindex.iter().map(|(p, _)| p.clone()).collect();
+    let mut files: Vec<String> = reindex.iter().map(|(p, _)| p.clone()).collect();
     let hashes: HashMap<String, String> = reindex.iter().cloned().collect();
+
+    // D#136, as the incremental run applies it (batch-1 review B1): a refresh
+    // of main.rs that adds `mod engine;` moves `engine.rs` into main.rs's crate
+    // without touching it. Left to the next incremental run, the root's hash
+    // was already current, the run saw an empty diff and never compared the
+    // record, and `engine.rs` stayed bound to the library for good. The files
+    // the index will hold: its rows, less the ones dropped, plus the new ones.
+    let root_mods = {
+        let dropped: HashSet<&String> = drop_rows.iter().collect();
+        let mut held: HashSet<String> = get_all_file_hashes(db.conn())?
+            .into_keys()
+            .filter(|p| !dropped.contains(p))
+            .collect();
+        held.extend(files.iter().cloned());
+        let (moved, record) = rust_root_mod_moves_of_run(db, project_root, &files, held.iter())?;
+        files.extend(moved);
+        record
+    };
 
     // Cross-file edges into these files' nodes need their context strings rebuilt
     // *after* the node IDs are replaced — capture the dirty set BEFORE re-indexing.
@@ -412,6 +498,13 @@ pub fn apply_file_refreshes(
     // never happens. The alternative destroys the marker outright, so this is
     // the lesser of the two; it is not nothing.
     fan_out_to_new_duplicate_definitions(db, project_root, &hashes, model)?;
+    if let Some(root_mods) = root_mods {
+        crate::storage::queries::set_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+            &root_mods,
+        )?;
+    }
     if was_interrupted {
         crate::storage::queries::set_meta(
             db.conn(),
@@ -489,11 +582,23 @@ pub fn run_incremental_index_cached(
     // Same interrupted-run escalation as `run_incremental_index`. `current_hashes`
     // is complete here too — the merge above carries forward the stored hash of
     // every file in a directory the cache let us skip walking.
-    let to_index = to_index_after_interrupt_check(
-        db,
-        [diff.new_files, diff.changed_files].concat(),
-        &current_hashes,
-    )?;
+    // D#136: a root's `mod` edit moves files to the other crate of a lib.rs +
+    // main.rs package, and changes what their `crate::` names, without touching
+    // them. Only a run whose diff has a file can have edited a root.
+    //
+    // Every other path that indexes a file (`apply_file_refreshes`) applies the
+    // same check, so a root it re-indexed never reaches here as an empty diff
+    // with a stale record (batch-1 review B1).
+    let mut diff_files = [diff.new_files, diff.changed_files].concat();
+    let root_mods = if diff_files.is_empty() && deleted_files.is_empty() {
+        None
+    } else {
+        let (moved, record) =
+            rust_root_mod_moves_of_run(db, project_root, &diff_files, current_hashes.keys())?;
+        diff_files.extend(moved);
+        record
+    };
+    let to_index = to_index_after_interrupt_check(db, diff_files, &current_hashes)?;
 
     // CORE-12: deletions are dirty too. A file's removal cascade-deletes the
     // edges INTO it, but the callers live in files nobody touched, so their
@@ -541,6 +646,13 @@ pub fn run_incremental_index_cached(
     if fanout_possible {
         fan_out_to_new_duplicate_definitions(db, project_root, &current_hashes, model)?;
     }
+    if let Some(root_mods) = root_mods {
+        crate::storage::queries::set_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+            &root_mods,
+        )?;
+    }
 
     if !dirty_node_ids.is_empty() {
         // Heartbeat: context-string regeneration for dirty dependents runs after
@@ -562,11 +674,48 @@ pub fn run_incremental_index_cached(
         );
     }
 
+    write_source_roots(db);
     Ok((result, new_cache))
 }
 
+/// D#136 for one run over `run_files`: the Rust files, outside `run_files`,
+/// that a crate root's `mod` edit moved between the stored record of the roots'
+/// `mod` items and the tree now, and the record to store once the run has
+/// indexed them (None when it did not change). `held` is every file the index
+/// will hold after the run. Shared by every path that indexes a file, so none
+/// can leave the record behind the roots it indexed.
+fn rust_root_mod_moves_of_run<'a>(
+    db: &Database,
+    project_root: &Path,
+    run_files: &[String],
+    held: impl Iterator<Item = &'a String>,
+) -> Result<(Vec<String>, Option<String>)> {
+    let crates = resolve::collect_rust_crates(project_root);
+    let stored = crate::storage::queries::get_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_RUST_ROOT_MODS,
+    )?;
+    let known: HashSet<&String> = run_files.iter().collect();
+    let moved: Vec<String> = resolve::rust_root_mod_moves(stored.as_deref(), &crates, held)
+        .into_iter()
+        .filter(|p| !known.contains(p))
+        .collect();
+    if !moved.is_empty() {
+        tracing::info!(
+            "[index] re-extracting {} Rust file(s) a crate root's `mod` edit moved",
+            moved.len()
+        );
+    }
+    let record = Some(crates.root_mods_json()).filter(|now| stored.as_ref() != Some(now));
+    Ok((moved, record))
+}
+
 /// D#24's second extraction round: re-extract the bare-name callers that a run
-/// just gave a new same-name definition to.
+/// just gave a new same-name definition to — and, since D#97, the typed callers
+/// (`rtype` / `super`) whose answer the run's change to the class structure
+/// moved (`resolve::typed_callers_of_class_drift`). Both are callers in files the
+/// run never opened that a rebuild would bind differently; re-extracting them is
+/// the rebuild's own resolution, not a second copy of it.
 ///
 /// A bare call fans out to EVERY same-name candidate, so a rebuild of a tree
 /// where `c.py` defines a second `helper` carries both `b.py:caller ->
@@ -642,14 +791,28 @@ fn fan_out_to_new_duplicate_definitions(
     hashes: &HashMap<String, String>,
     model: Option<&EmbeddingModel>,
 ) -> Result<usize> {
-    let callers = resolve::bare_name_callers_of_new_duplicates(db.conn())?;
+    // Typed callers first: the bare-name half drops the snapshot both read.
+    let typed = resolve::typed_callers_of_class_drift(db.conn())?;
+    let bare = resolve::bare_name_callers_of_new_duplicates(
+        db.conn(),
+        &resolve::collect_rust_crates(project_root),
+    )?;
+    let callers: Vec<String> = typed
+        .iter()
+        .chain(bare.iter())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     if callers.is_empty() {
         return Ok(0);
     }
     tracing::info!(
-        "[index] fan-out round: re-extracting {} bare-name caller file(s) reached by a new \
-         same-name definition",
-        callers.len()
+        "[index] fan-out round: re-extracting {} caller file(s): {} bare-name caller(s) reached \
+         by a new same-name definition, {} typed caller(s) of a changed class structure",
+        callers.len(),
+        bare.len(),
+        typed.len()
     );
     // Same reason round one captures it: re-indexing these files replaces their
     // node ids, so the context strings of nodes in OTHER files that point at
@@ -682,12 +845,29 @@ fn index_run_was_interrupted(db: &Database) -> Result<bool> {
 /// The file set an incremental run should process: its diff normally, or the
 /// whole tree when the previous run was interrupted. `index_files` re-sets and
 /// clears the marker itself, so the escalated run needs no extra bookkeeping.
+///
+/// A normal run also re-parses every still-present file whose damaged-parse
+/// verdict another binary wrote. Such a file hashes as unchanged, so the diff
+/// alone would keep that binary's parse forever. `index_files` dedups, and its
+/// verdict fold marks each one verified, so this costs one parse per file once.
 fn to_index_after_interrupt_check(
     db: &Database,
-    diff_files: Vec<String>,
+    mut diff_files: Vec<String>,
     current_hashes: &HashMap<String, String>,
 ) -> Result<Vec<String>> {
     if !index_run_was_interrupted(db)? {
+        let unverified: Vec<String> = db
+            .unverified_parse_error_files()?
+            .into_iter()
+            .filter(|p| current_hashes.contains_key(p))
+            .collect();
+        if !unverified.is_empty() {
+            tracing::info!(
+                "[incremental] re-parsing {} file(s) whose damaged-parse verdict this binary did not produce",
+                unverified.len()
+            );
+            diff_files.extend(unverified);
+        }
         return Ok(diff_files);
     }
     tracing::warn!(

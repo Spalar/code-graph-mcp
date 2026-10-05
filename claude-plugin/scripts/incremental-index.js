@@ -60,8 +60,11 @@ function runMain() {
   const budget = childBudgetMs();
   if (budget === null) return; // exhausted — the index waits for the next edit
 
+  // --no-embed: structure is what the next query needs, and the vector
+  // backfill made every edit wait out the whole budget (8,048 ms per edit,
+  // hook audit 2026-09-28). Vectors are filled in by the MCP server.
   try {
-    execFileSync(bin, ['incremental-index', '--quiet'], hidden({
+    execFileSync(bin, ['incremental-index', '--quiet', '--no-embed'], hidden({
       timeout: budget,
       stdio: ['pipe', 'pipe', 'pipe']
     }));

@@ -582,6 +582,381 @@ void run() { Engine::ignite(); }
 }
 
 #[test]
+fn test_cpp_gtest_body_calls_are_sourced_from_the_gtest_node() {
+    // The node extractor names `TEST_F(Suite, Case) {...}` "Suite.Case"; a call's
+    // source must carry the same name, or the pipeline's by-name source lookup
+    // finds no node and every call in a gtest body is dropped (leveldb: 1 of 229
+    // TEST nodes had any call edge).
+    let code = r#"
+TEST_F(DBTest, GetFromImmutableLayer) {
+  Reopen();
+}
+TEST(Coding, Fixed32) { EncodeFixed32(); }
+"#;
+    let nodes = crate::parser::treesitter::parse_code(code, "cpp").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    let relations = extract_relations(code, "cpp").unwrap();
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    for (case, callee) in [
+        ("DBTest.GetFromImmutableLayer", "Reopen"),
+        ("Coding.Fixed32", "EncodeFixed32"),
+    ] {
+        assert!(
+            names.contains(&case),
+            "node extractor should name the case {case}; got {names:?}"
+        );
+        assert!(
+            calls.contains(&(case, callee)),
+            "a call in {case} must be sourced from {case}; got {calls:?}"
+        );
+    }
+}
+
+/// (target, metadata) of every call in `code`.
+fn call_meta(code: &str, lang: &str) -> Vec<(String, Option<String>)> {
+    extract_relations(code, lang)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.target_name, r.metadata))
+        .collect()
+}
+
+fn meta_of<'a>(calls: &'a [(String, Option<String>)], target: &str) -> Option<&'a str> {
+    calls
+        .iter()
+        .find(|(t, _)| t == target)
+        .unwrap_or_else(|| panic!("no call to {target}: {calls:?}"))
+        .1
+        .as_deref()
+}
+
+const MEMBER: &str = r#"{"q":"member"}"#;
+
+#[test]
+fn test_receiver_type_is_not_claimed_where_the_source_rebinds_it() {
+    const RTYPE: &str = r#""q":"rtype""#;
+    let untyped = |code: &str, lang: &str, callee: &str| {
+        let calls = call_meta(code, lang);
+        let m = meta_of(&calls, callee).map(str::to_string);
+        assert!(
+            !m.as_deref()
+                .is_some_and(|m| m.contains(RTYPE) || m.contains(r#""q":"super""#)),
+            "{lang}: {callee} must stay untyped in {code:?}; got {m:?}"
+        );
+    };
+    // A template parameter named like a class.
+    untyped(
+        "template <typename Iterator> void Advance(Iterator it) { it.Next(); }",
+        "cpp",
+        "Next",
+    );
+    // A closure reassigns the captured variable; a destructuring assignment.
+    untyped(
+        "function f() { let q = new Q(); const swap = () => { q = new R(); }; swap(); q.run(); }",
+        "javascript",
+        "run",
+    );
+    untyped(
+        "function f(other) { let q = new Q(); [q] = [other]; q.run(); }",
+        "javascript",
+        "run",
+    );
+    // `super(B, self)` from another class starts past B; a lambda's own `self`.
+    untyped(
+        "class C(A):\n    def f(self):\n        super(B, self).go()\n",
+        "python",
+        "go",
+    );
+    untyped(
+        "class C:\n    def f(self):\n        g = lambda self: self.go()\n",
+        "python",
+        "go",
+    );
+    // A nested function re-creating the same class keeps it.
+    let calls = call_meta(
+        "function f() { let ws: W; const setup = () => { ws = new W(); }; setup(); ws.close(); }",
+        "typescript",
+    );
+    assert_eq!(meta_of(&calls, "close"), Some(r#"{"q":"rtype","v":"W"}"#));
+    // A property assignment does not rebind; a wrapper type is its argument.
+    let calls = call_meta(
+        "function f() { const q = new Q(); q.x = 1; q.run(); }\nfunction g(r: Readonly<Impl>) { r.go(); }",
+        "typescript",
+    );
+    assert_eq!(meta_of(&calls, "run"), Some(r#"{"q":"rtype","v":"Q"}"#));
+    assert_eq!(meta_of(&calls, "go"), Some(r#"{"q":"rtype","v":"Impl"}"#));
+    // `super(C, self)` naming the enclosing class is plain `super()`.
+    let calls = call_meta(
+        "class C(A):\n    def f(self):\n        super(C, self).go()\n",
+        "python",
+    );
+    assert_eq!(meta_of(&calls, "go"), Some(r#"{"q":"super","v":"A"}"#));
+}
+
+#[test]
+fn test_member_call_on_an_object_is_marked_member() {
+    // D#86: `x.f()` on an object can only run a method, never a free function —
+    // the resolver needs to know the call was a member call. A receiver that is
+    // `this`/`self`/`super`, or a module/import binding, is not marked: those
+    // calls resolve as before.
+    let cpp = call_meta(
+        "void A::run() { snapshots_.Delete(s); p->clear(); this->Put(); Helper(); }",
+        "cpp",
+    );
+    // Undeclared in an out-of-line member: a field of `A`, typed at resolution.
+    assert_eq!(
+        meta_of(&cpp, "Delete"),
+        Some(r#"{"c":"A","q":"field","v":"snapshots_"}"#)
+    );
+    assert_eq!(
+        meta_of(&cpp, "clear"),
+        Some(r#"{"a":1,"c":"A","q":"field","v":"p"}"#)
+    );
+    // `this` names its class (D#89).
+    assert_eq!(meta_of(&cpp, "Put"), Some(r#"{"q":"rtype","v":"A"}"#));
+    assert_eq!(meta_of(&cpp, "Helper"), None);
+
+    let py = call_meta(
+        "import helpers\nimport pkg.mod as m\nfrom x import util\n\
+         def f(self, ctx):\n    ctx.get(1)\n    self.push()\n    helpers.run()\n    m.go()\n    \
+         util.parse()\n    super().close()\n    cls.make()\n    local()\n",
+        "python",
+    );
+    assert_eq!(meta_of(&py, "get"), Some(MEMBER));
+    // `self` / `super()` / `cls` outside a class body name no class.
+    for t in ["push", "close", "make", "local"] {
+        assert_eq!(meta_of(&py, t), None, "{t} must resolve as before: {py:?}");
+    }
+    // A call through an absolute import names its module (dropped when that
+    // module is not the project's).
+    for (t, module) in [("run", "helpers"), ("go", "pkg.mod"), ("parse", "x")] {
+        let want = format!(r#"{{"q":"module","v":"{module}"}}"#);
+        assert_eq!(meta_of(&py, t), Some(want.as_str()), "{t}: {py:?}");
+    }
+
+    let js = call_meta(
+        "import * as ns from './ns';\nimport def, { named as alias } from './d';\n\
+         const m = require('./m');\nconst { a } = require('./a');\n\
+         function f(words, res) {\n  words.push(1);\n  res.send();\n  obj.a.b.run();\n  getApp().start();\n\
+           this.own();\n  super.base();\n  m.fromM();\n  ns.fromNs();\n  def.fromDef();\n  alias.fromAlias();\n\
+           require('./x').fromX();\n  a.fromA();\n  bare();\n}\n",
+        "javascript",
+    );
+    for t in ["push", "send", "run", "start"] {
+        assert_eq!(meta_of(&js, t), Some(MEMBER), "{t}: {js:?}");
+    }
+    for t in ["own", "base", "fromX", "bare"] {
+        assert_eq!(meta_of(&js, t), None, "{t} must resolve as before: {js:?}");
+    }
+    // An import-bound receiver keeps the qualifier its module binding needs.
+    for (t, recv) in [
+        ("fromM", "m"),
+        ("fromNs", "ns"),
+        ("fromDef", "def"),
+        ("fromAlias", "alias"),
+        ("fromA", "a"),
+    ] {
+        let want = format!(r#"{{"q":"recv","v":"{recv}"}}"#);
+        assert_eq!(meta_of(&js, t), Some(want.as_str()), "{t}: {js:?}");
+    }
+
+    // C and Rust are untouched: a C struct's function-pointer field is commonly
+    // named like the free function it holds, and Rust has its own qualifiers.
+    let c = call_meta("void f(struct ops *o) { o->read(); }", "c");
+    assert_eq!(meta_of(&c, "read"), None);
+}
+
+#[test]
+fn test_python_call_on_an_untyped_receiver_is_marked() {
+    // D10B: `self.serializer.tag()` is not a call on the instance, and
+    // `_cv_app.get()` goes through another module's object, so neither names a
+    // class — yet both reached the resolver bare and bound the caller's own
+    // file's `tag` / `get` at `extracted`. They are marked for the confidence
+    // pass, which labels such a bind by its name count; nothing else reads the
+    // mark, so they resolve as before.
+    let py = call_meta(
+        "from .globals import _cv_app\nfrom . import helpers\nimport os\n\
+         class C:\n    def f(self):\n        self.serializer.tag(1)\n        cls.x.y.make()\n        \
+         _cv_app.get()\n        helpers.load()\n        helpers.sub.deep()\n        self.own()\n        \
+         os.getcwd()\n        ctx.push()\n        local()\n",
+        "python",
+    );
+    for t in ["tag", "make"] {
+        assert_eq!(meta_of(&py, t), Some(r#"{"ur":"attr"}"#), "{t}: {py:?}");
+    }
+    for t in ["get", "load", "deep"] {
+        assert_eq!(meta_of(&py, t), Some(r#"{"ur":"rel"}"#), "{t}: {py:?}");
+    }
+    // Receivers that already say what they are keep their qualifier.
+    assert_eq!(meta_of(&py, "own"), Some(r#"{"q":"rtype","v":"C"}"#));
+    assert_eq!(meta_of(&py, "getcwd"), Some(r#"{"q":"module","v":"os"}"#));
+    assert_eq!(meta_of(&py, "push"), Some(MEMBER));
+    assert_eq!(meta_of(&py, "local"), None);
+
+    // Python only: JS measured 3 such edges over three corpora, too few to act on.
+    let js = call_meta("function f() { this.a.b(); }", "javascript");
+    assert_eq!(meta_of(&js, "b"), None);
+}
+
+#[test]
+fn test_cpp_nested_qualified_base_names_its_last_segment() {
+    // `log::Reader::Reporter`: the scope's tail is itself qualified. A local
+    // struct in a function body inherits like any other.
+    let code = "void Recover() {\n  struct LogReporter : public log::Reader::Reporter {};\n}\n\
+                class A : public ns::Tmpl<int>, private Plain {};\n";
+    let got: Vec<(String, String)> = extract_relations(code, "cpp")
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| (r.source_name, r.target_name))
+        .collect();
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(
+        got,
+        vec![
+            pair("LogReporter", "Reporter"),
+            pair("A", "Tmpl"),
+            pair("A", "Plain")
+        ]
+    );
+}
+
+#[test]
+fn test_cpp_field_receiver_outside_its_class_body_is_marked_field() {
+    let cpp = call_meta(
+        "Status DBImpl::Get() { versions_->Current(); Slice k; k.size(); \
+         auto it = Make(); it->Next(); }\n\
+         TEST_F(DBTest, Get) { db_->Put(1); }\n\
+         TEST(Plain, Case) { g_env->Run(); }\n\
+         void Free() { global_.Reset(); }\n",
+        "cpp",
+    );
+    assert_eq!(
+        meta_of(&cpp, "Current"),
+        Some(r#"{"a":1,"c":"DBImpl","q":"field","v":"versions_"}"#)
+    );
+    // A local, typed or not, is no field.
+    assert_eq!(meta_of(&cpp, "size"), Some(r#"{"q":"rtype","v":"Slice"}"#));
+    assert_eq!(meta_of(&cpp, "Next"), Some(MEMBER));
+    // gtest: the fixture is the suite.
+    assert_eq!(
+        meta_of(&cpp, "Put"),
+        Some(r#"{"a":1,"c":"DBTest","q":"field","v":"db_"}"#)
+    );
+    assert_eq!(
+        meta_of(&cpp, "Run"),
+        Some(r#"{"a":1,"c":"Plain","q":"field","v":"g_env"}"#)
+    );
+    // No class at all: a free function's global.
+    assert_eq!(meta_of(&cpp, "Reset"), Some(MEMBER));
+}
+
+#[test]
+fn test_cpp_chained_receiver_is_marked_via() {
+    let cpp = call_meta(
+        "Status TableBuilder::Finish() {\n  Rep* r = rep_;\n  r->index_block.Add(k);\n  \
+         versions_->current()->Ref();\n  this->opts_.env->NowMicros();\n  \
+         m[0].Clear();\n  Make().Reset();\n}\n",
+        "cpp",
+    );
+    assert_eq!(
+        meta_of(&cpp, "Add"),
+        Some(r#"{"b":{"t":"Rep"},"ba":1,"q":"via","s":[["f","index_block",0]]}"#)
+    );
+    assert_eq!(
+        meta_of(&cpp, "Ref"),
+        Some(
+            r#"{"b":{"c":"TableBuilder","v":"versions_"},"ba":1,"q":"via","s":[["m","current",1]]}"#
+        )
+    );
+    assert_eq!(
+        meta_of(&cpp, "NowMicros"),
+        Some(r#"{"b":{"t":"TableBuilder"},"ba":1,"q":"via","s":[["f","opts_",0],["f","env",1]]}"#)
+    );
+    // A subscript or a free function's result: not a chain of names.
+    assert_eq!(meta_of(&cpp, "Clear"), Some(MEMBER));
+    assert_eq!(meta_of(&cpp, "Reset"), Some(MEMBER));
+}
+
+#[test]
+fn test_cpp_class_fields_records_each_typed_field() {
+    let code = "class DBImpl : public DB {\n private:\n  SnapshotList snapshots_;\n  \
+                VersionSet* const versions_;\n  std::unique_ptr<Logger> log_;\n  \
+                int n_, *m_;\n  Status Get();\n};\n\
+                template <typename Key> class SkipList {\n  Key head_;\n  Arena* arena_;\n};\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(code, None).unwrap();
+    let got: Vec<(String, String, Option<String>, Option<String>)> =
+        crate::parser::relations::cpp_class_fields(&tree, code)
+            .into_iter()
+            .map(|f| (f.class_name, f.field, f.dot, f.arrow))
+            .collect();
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        got,
+        vec![
+            (
+                "DBImpl".into(),
+                "snapshots_".into(),
+                s("SnapshotList"),
+                None
+            ),
+            ("DBImpl".into(), "versions_".into(), None, s("VersionSet")),
+            (
+                "DBImpl".into(),
+                "log_".into(),
+                s("std::unique_ptr<Logger>"),
+                s("Logger")
+            ),
+            ("DBImpl".into(), "n_".into(), None, None),
+            ("DBImpl".into(), "m_".into(), None, None),
+            ("SkipList".into(), "arena_".into(), None, s("Arena")),
+        ]
+    );
+}
+
+#[test]
+fn test_cpp_direct_initialized_local_is_typed() {
+    // `ModelDB model(CurrentOptions());` and `Block block(contents);` parse as a
+    // function declarator (C++'s most vexing parse), yet inside a function body
+    // they declare a variable of that type: leveldb had 10 wrong edges from them.
+    let cpp = call_meta(
+        "void F() {\n  ModelDB model(CurrentOptions());\n  Block block(contents);\n  \
+         Slice s(\"x\");\n  Arena* a(NewArena());\n  \
+         model.Put(1);\n  block.NewIterator();\n  s.size();\n  a->Allocate(1);\n}\n",
+        "cpp",
+    );
+    assert_eq!(meta_of(&cpp, "Put"), Some(r#"{"q":"rtype","v":"ModelDB"}"#));
+    assert_eq!(
+        meta_of(&cpp, "NewIterator"),
+        Some(r#"{"q":"rtype","v":"Block"}"#)
+    );
+    assert_eq!(meta_of(&cpp, "size"), Some(r#"{"q":"rtype","v":"Slice"}"#));
+    assert_eq!(
+        meta_of(&cpp, "Allocate"),
+        Some(r#"{"q":"rtype","v":"Arena"}"#)
+    );
+    // In a class body the same shape is a method, not a field: no type here,
+    // and the resolver finds no field `block` in `A` (an untyped member call).
+    let cpp = call_meta(
+        "class A {\n  Block block(int n);\n  void f() { block.NewIterator(); }\n};\n",
+        "cpp",
+    );
+    assert_eq!(
+        meta_of(&cpp, "NewIterator"),
+        Some(r#"{"c":"A","q":"field","v":"block"}"#)
+    );
+}
+
+#[test]
 fn test_extract_bash_source_imports() {
     let code = r#"#!/usr/bin/env bash
 source ./lib/utils.sh
@@ -1148,6 +1523,72 @@ fn main() {}
             rel.metadata
         );
     }
+}
+
+/// D#71: a project `use` carries the module its item lives in, relative to the
+/// crate root (`crate::`) or to the file's module (`self::` / `super::`, net of
+/// the inline `mod` blocks around the `use`). Other roots carry nothing.
+#[test]
+fn test_rust_use_records_the_module_path() {
+    let source = r#"
+use crate::a::b::f1;
+use crate::f2;
+use crate::c::{d::f3, f4, self};
+use crate::e::f5 as renamed;
+use {crate::g::f6, std::io::Write};
+use super::f7;
+use super::super::h::f8;
+use self::i::f9;
+use somecrate::j::f10;
+use crate::k::*;
+mod tests {
+    use super::f11;
+    use super::super::f12;
+    mod inner {
+        use super::l::f13;
+    }
+}
+"#;
+    let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let meta = |n: &str| {
+        relations
+            .iter()
+            .find(|r| r.relation == REL_IMPORTS && r.target_name == n)
+            .unwrap_or_else(|| panic!("no import of {n}"))
+            .metadata
+            .clone()
+    };
+    let expect = [
+        ("f1", Some(r#"{"m":["a","b"],"ru":"crate"}"#)),
+        ("f2", Some(r#"{"m":[],"ru":"crate"}"#)),
+        ("f3", Some(r#"{"m":["c","d"],"ru":"crate"}"#)),
+        ("f4", Some(r#"{"m":["c"],"ru":"crate"}"#)),
+        ("f5", Some(r#"{"m":["e"],"ru":"crate"}"#)),
+        ("f6", Some(r#"{"m":["g"],"ru":"crate"}"#)),
+        ("Write", Some(crate::domain::IMPORT_EXTERNAL_META)),
+        ("f7", Some(r#"{"m":[],"ru":"file","up":1}"#)),
+        ("f8", Some(r#"{"m":["h"],"ru":"file","up":2}"#)),
+        ("f9", Some(r#"{"m":["i"],"ru":"file"}"#)),
+        // A crate name's path (D#132): the resolver names the file when the
+        // crate is a package of this project.
+        ("f10", Some(r#"{"c":"somecrate","m":["j"],"ru":"ext"}"#)),
+        ("f11", Some(r#"{"m":[],"ru":"file"}"#)),
+        ("f12", Some(r#"{"m":[],"ru":"file","up":1}"#)),
+        ("f13", Some(r#"{"m":["tests","l"],"ru":"file"}"#)),
+    ];
+    let wrong: Vec<String> = expect
+        .iter()
+        .filter(|(n, want)| meta(n).as_deref() != *want)
+        .map(|(n, want)| format!("{n}: want {want:?}, got {:?}", meta(n)))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(
+        !relations
+            .iter()
+            .any(|r| r.relation == REL_IMPORTS && r.target_name == "renamed"),
+        "an alias is not the imported item's name"
+    );
 }
 
 #[test]
@@ -3297,7 +3738,7 @@ fn test_rust_callee_path_qualifier_strips_crate() {
         .expect("missing call to create");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"snapshot"}"#),
+        Some(r#"{"n":0,"q":"path","v":"snapshot"}"#),
         "metadata should encode Path qualifier with crate stripped"
     );
 }
@@ -3313,7 +3754,7 @@ fn test_rust_callee_type_method_call_path() {
         .expect("missing call to create");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"File"}"#),
+        Some(r#"{"n":1,"q":"path","v":"File"}"#),
         "single-segment Path with non-reserved name should be preserved"
     );
 }
@@ -3345,7 +3786,7 @@ fn test_rust_callee_super_prefix_stripped() {
         .expect("missing call to foo");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"sibling"}"#),
+        Some(r#"{"n":0,"q":"path","v":"sibling"}"#),
     );
 }
 
@@ -3359,7 +3800,7 @@ fn test_rust_callee_multi_segment_path_preserved() {
         .expect("missing call to deep");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"a::b::c"}"#),
+        Some(r#"{"n":0,"q":"path","v":"a::b::c"}"#),
     );
 }
 
@@ -3389,7 +3830,8 @@ fn test_rust_callee_obj_method_receiver_qualifier() {
         .expect("missing call to exists");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"recv","v":"p"}"#),
+        // `p`'s declared type rides along (D#112, `rust_receiver.rs`).
+        Some(r#"{"n":0,"q":"recv","rk":"f","rt":"Path","v":"p"}"#),
         "obj.method() where obj is a plain identifier emits Receiver qualifier"
     );
 }
@@ -3408,7 +3850,7 @@ fn test_rust_callee_builder_chain_qualifier() {
         .expect("missing call to new");
     assert_eq!(
         new_call.metadata.as_deref(),
-        Some(r#"{"q":"path","v":"OpenOptions"}"#),
+        Some(r#"{"n":0,"q":"path","v":"OpenOptions"}"#),
     );
 
     // .create(true) — receiver is call_expression → Chain
@@ -3416,14 +3858,138 @@ fn test_rust_callee_builder_chain_qualifier() {
         .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "create")
         .expect("missing call to create");
-    assert_eq!(create_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
+    // `T::new()` types its value (D#112); an unimported name is taken as the
+    // project's.
+    assert_eq!(
+        create_call.metadata.as_deref(),
+        Some(r#"{"n":1,"q":"chain","rk":"p","rt":"OpenOptions"}"#),
+    );
 
     // .open(...) — receiver is also call_expression → Chain
     let open_call = relations
         .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "open")
         .expect("missing call to open");
-    assert_eq!(open_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
+    assert_eq!(
+        open_call.metadata.as_deref(),
+        Some(r#"{"n":1,"q":"chain"}"#),
+    );
+}
+
+/// D#71: a method call whose receiver is a field, an index or a literal is a
+/// member call (its callee takes `self`), not a bare call.
+#[test]
+fn test_rust_callee_member_receiver_qualifier() {
+    let code = r#"fn caller(ctx: &Ctx, v: &[S]) {
+        ctx.db.conn();
+        v[0].len();
+        "x".to_string();
+        drop(ctx);
+    }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let meta = |name: &str| {
+        relations
+            .iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == name)
+            .unwrap_or_else(|| panic!("missing call to {name}"))
+            .metadata
+            .clone()
+    };
+    assert_eq!(meta("conn").as_deref(), Some(r#"{"n":0,"q":"member"}"#));
+    assert_eq!(meta("len").as_deref(), Some(r#"{"n":0,"q":"member"}"#));
+    assert_eq!(
+        meta("to_string").as_deref(),
+        Some(r#"{"n":0,"q":"member","rk":"f","rt":"str"}"#)
+    );
+    assert_eq!(meta("drop"), None);
+}
+
+/// D#112: a qualified Rust call records how many arguments it passes; comments
+/// and attributes in the argument list are not arguments. A bare call keeps no
+/// metadata.
+#[test]
+fn test_rust_call_records_its_argument_count() {
+    let code = r#"fn caller(flag: &AtomicBool, c: &mut Classes) {
+        flag.load(Ordering::Acquire);
+        c.fill(1, /* two */ &[], #[allow(unused)] 3,);
+        super::resolve::pick(None, vec![], 1);
+        self_less();
+    }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let meta = |name: &str| {
+        relations
+            .iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == name)
+            .unwrap_or_else(|| panic!("missing call to {name}"))
+            .metadata
+            .clone()
+    };
+    assert_eq!(
+        meta("load").as_deref(),
+        Some(r#"{"n":1,"q":"recv","rk":"p","rt":"AtomicBool","v":"flag"}"#)
+    );
+    assert_eq!(
+        meta("fill").as_deref(),
+        Some(r#"{"n":3,"q":"recv","rk":"p","rt":"Classes","v":"c"}"#)
+    );
+    assert_eq!(
+        meta("pick").as_deref(),
+        Some(r#"{"n":3,"q":"path","v":"resolve"}"#)
+    );
+    assert_eq!(meta("self_less"), None);
+}
+
+/// Batch-1 review M1: each pattern that rebinds a typed local leaves the
+/// receiver untyped (the `for`, `match` and `while let` guards of
+/// `binding_type`), and an impl-level type parameter used inside a generic
+/// method is no type named `T` (`is_generic_param` walks past the method's own
+/// generics). Each row's control is the same source without the rebinding,
+/// which is typed, so no row passes for want of a receiver type.
+#[test]
+fn test_rust_receiver_rebinding_patterns_leave_it_untyped() {
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "for",
+            "fn f(v: Vec<G>) { let w = Widget::new(); for w in v { w.spin(); } }",
+            "fn f(v: Vec<G>) { let w = Widget::new(); for x in v { w.spin(); } }",
+        ),
+        (
+            "match",
+            "fn f(g: G) { let w = Widget::new(); match g { w => w.spin() } }",
+            "fn f(g: G) { let w = Widget::new(); match g { x => w.spin() } }",
+        ),
+        (
+            "while let",
+            "fn f(mut it: I) { let w = Widget::new(); while let Some(w) = it.next() { w.spin(); } }",
+            "fn f(mut it: I) { let w = Widget::new(); while let Some(x) = it.next() { w.spin(); } }",
+        ),
+        (
+            "impl-level generic",
+            "struct S<T>(T);\nimpl<T> S<T> {\n    fn f<U>(&self, w: T, u: U) { w.spin(); }\n}",
+            "struct S<T>(T);\nimpl<T> S<T> {\n    fn f<U>(&self, w: Widget, u: U) { w.spin(); }\n}",
+        ),
+    ];
+    let spin_meta = |code: &str| {
+        extract_relations(code, "rust")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == "spin")
+            .expect("missing call to spin")
+            .metadata
+            .unwrap_or_default()
+    };
+    let mut bad = Vec::new();
+    for (shape, rebound, control) in rows {
+        let got = spin_meta(rebound);
+        if got.contains(r#""rt":"#) {
+            bad.push(format!("{shape}: typed {got}"));
+        }
+        let ctl = spin_meta(control);
+        if !ctl.contains(r#""rt":"Widget""#) {
+            bad.push(format!("{shape} control: untyped {ctl}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 #[test]
@@ -3442,8 +4008,9 @@ fn test_rust_callee_self_recv_within_impl() {
         .expect("missing call to helper");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"self","v":"Db"}"#),
-        "self.method() inside impl Db emits SelfRecv with type name"
+        Some(r#"{"inh":1,"n":0,"q":"self","v":"Db"}"#),
+        "self.method() inside impl Db emits SelfRecv with type name, marked as \
+         an inherent impl's (\"inh\"), whose calls stay in the crate"
     );
 }
 
@@ -3465,7 +4032,9 @@ fn test_rust_callee_self_type_within_impl() {
         .expect("missing call to default from make");
     assert_eq!(
         call.metadata.as_deref(),
-        Some(r#"{"q":"stype","v":"Db"}"#),
+        // `"inh"`: an inherent impl's call; `"wide"`: the file defines `Db`'s
+        // `default` only in a trait impl, which an inherent one would outrank.
+        Some(r#"{"inh":1,"n":0,"q":"stype","v":"Db","wide":1}"#),
         "Self::method() inside impl Db emits SelfType with type name"
     );
 }
@@ -3476,8 +4045,10 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
     // so the indexer can bind them to a require-namespace module
     // (`const foo = require('./x')`); see Cycle 4. Bare calls (`baz()`) keep
     // metadata=None — the guard the previous test_non_rust_callee_metadata_
-    // unchanged enforced, preserved here for the non-receiver shapes.
-    let code = "function caller() { foo.bar(); baz(); }";
+    // unchanged enforced, preserved here for the non-receiver shapes. The
+    // receiver is an import binding here; one that is not (`obj.qux()`) is a
+    // member call on an object (`relations/member.rs`, D#86).
+    let code = "const foo = require('./x');\nfunction caller() { foo.bar(); baz(); obj.qux(); }";
     let relations = extract_relations(code, "javascript").unwrap();
     let bar = relations
         .iter()
@@ -3493,6 +4064,280 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
         .find(|r| r.relation == REL_CALLS && r.target_name == "baz")
         .expect("missing call baz");
     assert_eq!(baz.metadata, None, "bare baz() must keep metadata=None");
+    let qux = relations
+        .iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "qux")
+        .expect("missing call qux");
+    assert_eq!(qux.metadata.as_deref(), Some(r#"{"q":"member"}"#));
+}
+
+/// D#120: the accepted-shape table for a JS/TS call through a renamed import.
+/// A bare call whose name the NEAREST enclosing binding makes a renamed import
+/// (`import { a as b }`, `const { a: b } = require()`, `const b =
+/// require().a`) is recorded as a call of the export `a`, stamped with the
+/// specifier and the export. Every other binding of the name — a parameter, a
+/// local, a function or class, a catch or loop variable, a hoisted `var`, the
+/// same rename in a sibling function — leaves the call bare, as does every
+/// shape deliberately not taken (default and dynamic imports, nested or
+/// defaulted patterns, a re-export, which binds no local name).
+#[test]
+fn test_js_renamed_import_call_shapes() {
+    let imp = |spec: &str, export: &str| {
+        Some(format!(
+            r#"{{"js_module":"{spec}","q":"imp","v":"{export}"}}"#
+        ))
+    };
+    #[allow(clippy::type_complexity)]
+    let table: &[(&str, &str, &str, Vec<(&str, &str, Option<String>)>)] = &[
+        (
+            "esm named as",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "cjs destructuring rename",
+            "javascript",
+            "const { load: m } = require('./x');\nfunction go() { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "require().prop",
+            "javascript",
+            "var m = require(\"./x\").load;\nfunction go() { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "function-local require rename",
+            "javascript",
+            "function go() { const { load: m } = require('./x'); m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "package specifier (resolver binds nothing)",
+            "javascript",
+            "import { resolve as r } from 'path';\nfunction go() { r(); }",
+            vec![("go", "resolve", imp("path", "resolve"))],
+        ),
+        (
+            "typescript named as",
+            "typescript",
+            "import { load as m } from './x';\nfunction go(): void { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "a method named like the alias binds no lexical name",
+            "javascript",
+            "import { load as m } from './x';\nclass C { m() {} go() { m(); } }",
+            vec![("C.go", "load", imp("./x", "load"))],
+        ),
+        (
+            "outer rename seen from a nested function",
+            "javascript",
+            "const { load: m } = require('./x');\nfunction go() { function inner() { m(); } }",
+            vec![("inner", "load", imp("./x", "load"))],
+        ),
+        (
+            "inner rename wins over outer one",
+            "javascript",
+            "import { load as m } from './x';\n\
+             function go() { { const { save: m } = require('./y'); m(); } m(); }",
+            vec![
+                ("go", "save", imp("./y", "save")),
+                ("go", "load", imp("./x", "load")),
+            ],
+        ),
+        (
+            "plain named import stays bare",
+            "javascript",
+            "import { load } from './x';\nfunction go() { load(); }",
+            vec![("go", "load", None)],
+        ),
+        (
+            "require().prop of the same name stays bare",
+            "javascript",
+            "var load = require('./x').load;\nfunction go() { load(); }",
+            vec![("go", "load", None)],
+        ),
+        (
+            "default import (not taken)",
+            "javascript",
+            "import m from './x';\nfunction go() { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "namespace import keeps its receiver",
+            "javascript",
+            "import * as ns from './x';\nfunction go() { ns.load(); }",
+            vec![("go", "load", Some(r#"{"q":"recv","v":"ns"}"#.to_string()))],
+        ),
+        (
+            "F5: a sibling function's own m()",
+            "javascript",
+            "function f() { const { load: m } = require('./x'); m(); }\nfunction go() { m(); }",
+            vec![("f", "load", imp("./x", "load")), ("go", "m", None)],
+        ),
+        (
+            "F5: parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(m) { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: destructured parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go({ m }) { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: arrow parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(a) { return [a].map(m => m()); }",
+            vec![
+                ("go", "map", Some(r#"{"q":"member"}"#.to_string())),
+                ("go", "m", None),
+            ],
+        ),
+        (
+            "F5: local const shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { const m = () => 1; m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: block function declaration shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(a) { if (a) { function m() {} m(); } }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: hoisted var shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(a) { if (a) { var m = 1; } m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: catch parameter shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { try {} catch (m) { m(); } }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: loop variable shadows",
+            "javascript",
+            "import { load as m } from './x';\nfunction go(xs) { for (const m of xs) m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "F5: named function expression shadows inside itself",
+            "javascript",
+            "import { load as m } from './x';\nconst go = function m() { m(); };",
+            vec![("<module>", "m", None)],
+        ),
+        (
+            "dynamic import (not taken)",
+            "javascript",
+            "async function go() { const { load: m } = await import('./x'); m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "nested pattern (not taken)",
+            "javascript",
+            "const { a: { load: m } } = require('./x');\nfunction go() { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "defaulted pattern (not taken)",
+            "javascript",
+            "const { load: m = f } = require('./x');\nfunction go() { m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "re-export binds no local name",
+            "javascript",
+            "export { load as l } from './x';\nfunction go() { l(); }",
+            vec![("go", "l", None)],
+        ),
+        (
+            "type-only import",
+            "typescript",
+            "import type { Load as L } from './x';\nfunction go() { L(); }",
+            vec![("go", "L", None)],
+        ),
+        // Review MEDIUM-2: one row per guard no other row pinned (M9-M13).
+        (
+            "specifier-level type-only import (M9)",
+            "typescript",
+            "import { type other as TO } from './y';\nfunction go() { TO(); }",
+            vec![("go", "TO", None)],
+        ),
+        (
+            "a var in a nested function does not hoist out of it (M10)",
+            "javascript",
+            "import { load as m } from './x';\n\
+             function go() { function inner() { var m = 1; } m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "a var in a class static block does not hoist out of it (M10)",
+            "javascript",
+            "import { load as m } from './x';\n\
+             function go() { class K { static { var m = 1; } } m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+        (
+            "local class shadows (M11)",
+            "javascript",
+            "import { load as m } from './x';\nfunction go() { class m {} m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "local abstract class shadows (M11)",
+            "typescript",
+            "import { load as m } from './x';\nfunction go() { abstract class m {} m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "local enum shadows (M11)",
+            "typescript",
+            "import { load as m } from './x';\nfunction go() { enum m { A } m(); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "local overloads shadow through their implementation (M16)",
+            "typescript",
+            "import { load as m } from './x';\n\
+             function go(): void { function m(a: string): void; function m(a: any) {} m(1); }",
+            vec![("go", "m", None)],
+        ),
+        (
+            "a parameter's type annotation binds nothing (M13)",
+            "typescript",
+            "import { load as m } from './x';\nfunction go(a: typeof m): void { m(); }",
+            vec![("go", "load", imp("./x", "load"))],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, language, code, want) in table {
+        let relations = extract_relations(code, language).unwrap();
+        let got: Vec<(&str, &str, Option<String>)> = relations
+            .iter()
+            .filter(|r| {
+                r.relation == REL_CALLS && !matches!(r.target_name.as_str(), "require" | "import")
+            })
+            .map(|r| {
+                (
+                    r.source_name.as_str(),
+                    r.target_name.as_str(),
+                    r.metadata.clone(),
+                )
+            })
+            .collect();
+        if &got != want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -3573,11 +4418,21 @@ class Holder:
         !runs.is_empty(),
         "expected some run() calls to be extracted"
     );
+    // No receiver TYPE may be claimed (no rtype). `w.run()` is a member call on
+    // an object (D#86: `{"q":"member"}`, which names no type); `self.run()`
+    // names its own class (D#89), which is no guess.
     for r in &runs {
+        let want = if r.source_name.starts_with("Holder.") {
+            Some(r#"{"q":"rtype","v":"Holder"}"#)
+        } else {
+            Some(r#"{"q":"member"}"#)
+        };
         assert_eq!(
-            r.metadata, None,
-            "ambiguous/unknown receiver must stay bare (source={}); got {:?}",
-            r.source_name, r.metadata
+            r.metadata.as_deref(),
+            want,
+            "ambiguous/unknown receiver must not get a type (source={}); got {:?}",
+            r.source_name,
+            r.metadata
         );
     }
 }
@@ -3660,10 +4515,13 @@ def reassigned(w: A):
                 "local reassignment `w = B()` overrides the param annotation"
             );
         } else {
+            // No type claimed: only the D#86 member-call marker.
             assert_eq!(
-                r.metadata, None,
-                "un-annotated / builtin-annotated receiver must stay bare (source={}); got {:?}",
-                r.source_name, r.metadata
+                r.metadata.as_deref(),
+                Some(r#"{"q":"member"}"#),
+                "un-annotated / builtin-annotated receiver must not get a type (source={}); got {:?}",
+                r.source_name,
+                r.metadata
             );
         }
     }
@@ -3843,6 +4701,33 @@ fn test_ts_extends_clause_does_not_emit_references_edge() {
         rels.iter()
             .map(|r| (r.relation.as_str(), r.target_name.as_str()))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_ts_abstract_class_is_a_class() {
+    // `abstract class` is its own node kind in tree-sitter-typescript, and it was
+    // missing from every class list: its methods' calls came from an unqualified
+    // `run`, and its `extends` made no inherits edge.
+    let src = "abstract class Base extends Root {\n  run() { this.go(); }\n  protected abstract go(): void\n}\n";
+    let rels = extract_relations(src, "typescript").unwrap();
+    let got: Vec<_> = rels
+        .iter()
+        .map(|r| {
+            (
+                r.source_name.as_str(),
+                r.relation.as_str(),
+                r.target_name.as_str(),
+            )
+        })
+        .collect();
+    assert!(
+        got.contains(&("Base", REL_INHERITS, "Root")),
+        "abstract class must inherit; got {got:?}"
+    );
+    assert!(
+        got.contains(&("Base.run", REL_CALLS, "go")),
+        "a method call must come from Base.run; got {got:?}"
     );
 }
 
@@ -6438,6 +7323,15 @@ fn heritage_cases() -> Vec<(
                 ("Admin", "Auditable", REL_INHERITS),
             ],
         ),
+        // TypeScript: `abstract class` is its own declaration kind.
+        (
+            "typescript",
+            "abstract class Base extends Root implements Named { }",
+            vec![
+                ("Base", "Root", REL_INHERITS),
+                ("Base", "Named", REL_IMPLEMENTS),
+            ],
+        ),
         // C# already had a `base_list` arm keyed on the node kind rather than on
         // the declaration, so every C# declaration form was covered. Kept in the
         // table as the WORKING row: it pins the `interface_by_prefix` split
@@ -6730,4 +7624,271 @@ fn calls_axis_emits_an_edge_for_every_call_bearing_language() {
         "CALLS AXIS GAPS:\n{}",
         missing.join("\n")
     );
+}
+
+/// The relation caches are thread-local and reset per file, and Phase 1a walks
+/// many files on each of its long-lived worker threads: a file's relations must
+/// not depend on which file its thread walked before it. Each pair is two files
+/// of the same shape, so a recycled tree node id meets the first file's cache
+/// entry, with different answers (the receiver's class; whether `g` names a
+/// parameter or the function it references).
+#[test]
+fn a_files_relations_do_not_depend_on_the_file_its_thread_walked_before() {
+    type Rel = (String, String, String, Option<String>);
+    fn walk(src: &str, lang: &str) -> Vec<Rel> {
+        extract_relations(src, lang)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.source_name, r.target_name, r.relation, r.metadata))
+            .collect()
+    }
+    let pairs: [(&str, &str, &str); 3] = [
+        (
+            "javascript",
+            "function f() {\n  const s = new Map();\n  s.add(1);\n}\n",
+            "function f() {\n  const s = new Set();\n  s.add(1);\n}\n",
+        ),
+        (
+            "cpp",
+            "struct M { void Put(); };\nvoid f() {\n  M x;\n  x.Put();\n}\n",
+            "struct S { void Put(); };\nvoid f() {\n  S x;\n  x.Put();\n}\n",
+        ),
+        (
+            "rust",
+            "fn f(g: i32) {\n    h(g);\n}\n",
+            "fn f(k: i32) {\n    h(g);\n}\n",
+        ),
+    ];
+    for (lang, first, second) in pairs {
+        let fresh = std::thread::spawn(move || walk(second, lang))
+            .join()
+            .unwrap();
+        let after = std::thread::spawn(move || {
+            walk(first, lang);
+            walk(second, lang)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            after, fresh,
+            "{lang}: the previous file leaked into this one"
+        );
+    }
+}
+
+/// The C++ receiver cache, which the pairs above cannot reach: its key is a
+/// function node id, and tree-sitter-cpp did not reuse one across small parses.
+#[test]
+fn a_cpp_files_walk_starts_with_an_empty_receiver_cache() {
+    std::thread::spawn(|| {
+        extract_relations(
+            "struct M { void Put(); };\nvoid f() {\n  M x;\n  x.Put();\n}\n",
+            "cpp",
+        )
+        .unwrap();
+        assert!(
+            receiver::cpp_receiver_cache_len() > 0,
+            "the walk caches the receiver"
+        );
+        extract_relations("int n;\n", "cpp").unwrap();
+        assert_eq!(
+            receiver::cpp_receiver_cache_len(),
+            0,
+            "the next file starts empty"
+        );
+    })
+    .join()
+    .unwrap();
+}
+
+/// D#119 / D#124 F8: the Rust call shapes a turbofish or a qualified self hid.
+/// `Block::<u8>::new(0)` and `<S as Tr>::go(&s, 1)` were recorded as bare calls,
+/// and a `generic_function` callee (`f::<T>()`, `m::f::<T>()`, `x.f::<T>()`)
+/// recorded no call at all. Each row: source call, callee, expected metadata.
+#[test]
+fn test_rust_callee_turbofish_and_qualified_self_shapes() {
+    let rows: &[(&str, &str, Option<&str>)] = &[
+        (
+            "Block::<u8>::new(0)",
+            "new",
+            Some(r#"{"n":1,"q":"path","v":"Block"}"#),
+        ),
+        (
+            "a::Block::<u8>::new(0)",
+            "new",
+            Some(r#"{"n":1,"q":"path","v":"a::Block"}"#),
+        ),
+        (
+            "crate::a::Block::<u8>::new()",
+            "new",
+            Some(r#"{"n":0,"q":"path","v":"a::Block"}"#),
+        ),
+        (
+            "<S as Tr>::go(&s, 1)",
+            "go",
+            Some(r#"{"n":2,"q":"path","v":"S"}"#),
+        ),
+        (
+            "<a::S as Tr>::go(&s, 1)",
+            "go",
+            Some(r#"{"n":2,"q":"path","v":"a::S"}"#),
+        ),
+        (
+            "<Vec<T> as Tr>::init(1)",
+            "init",
+            Some(r#"{"n":1,"q":"path","v":"Vec"}"#),
+        ),
+        ("<S>::mk()", "mk", Some(r#"{"n":0,"q":"path","v":"S"}"#)),
+        (
+            "<&S as Tr>::go(&s, 1)",
+            "go",
+            Some(r#"{"n":2,"q":"path","v":"Tr"}"#),
+        ),
+        ("genf::<u8>()", "genf", None),
+        (
+            "m::genf2::<u8>(1)",
+            "genf2",
+            Some(r#"{"n":1,"q":"path","v":"m"}"#),
+        ),
+        (
+            "crate::m::genf2::<i32>()",
+            "genf2",
+            Some(r#"{"n":0,"q":"path","v":"m"}"#),
+        ),
+        (
+            "x.collect::<Vec<u8>>()",
+            "collect",
+            Some(r#"{"n":0,"q":"recv","rk":"p","rt":"X","v":"x"}"#),
+        ),
+        (
+            "Vec::<u8>::with_capacity(4)",
+            "with_capacity",
+            Some(r#"{"n":1,"q":"path","v":"Vec"}"#),
+        ),
+    ];
+    for (call, callee, expected) in rows {
+        let code = format!("fn caller(s: S, x: X) {{ {call}; }}");
+        let relations = extract_relations(&code, "rust").unwrap();
+        let found: Vec<_> = relations
+            .iter()
+            .filter(|r| r.relation == REL_CALLS && r.target_name == *callee)
+            .collect();
+        let all: Vec<_> = relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name, &r.metadata))
+            .collect();
+        assert_eq!(found.len(), 1, "{call}: {all:?}");
+        assert_eq!(found[0].metadata.as_deref(), *expected, "{call}");
+    }
+}
+
+/// `Self::f()` in a trait's default method names the trait: as a bare call it
+/// could reach no associated function at all (D#119).
+#[test]
+fn test_rust_self_path_in_a_trait_default_method_names_the_trait() {
+    let code = "trait Tr {\n    fn helper() -> u8;\n    fn go(&self) { Self::helper(); }\n}\n\
+                impl S { fn f(&self) { Self::helper(); } }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let metas: Vec<_> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS && r.target_name == "helper")
+        .map(|r| r.metadata.as_deref())
+        .collect();
+    let all: Vec<_> = relations
+        .iter()
+        .map(|r| (&r.relation, &r.target_name, &r.metadata))
+        .collect();
+    assert_eq!(
+        metas,
+        vec![
+            Some(r#"{"n":0,"q":"stype","v":"Tr"}"#),
+            Some(r#"{"inh":1,"n":0,"q":"stype","v":"S"}"#)
+        ],
+        "{all:?}"
+    );
+}
+
+// D7: calls inside a member-assigned function or a function-valued class field
+// are attributed to that function's node (its qualified name), not <module>.
+#[test]
+fn calls_inside_assigned_and_field_functions_scope_to_their_node() {
+    let js = "res.json = function (obj) { helperA(obj); };\n\
+              View.prototype.render = function render() { helperB(); };\n\
+              module.exports.f = () => helperC();\n";
+    let rels = extract_relations(js, "javascript").unwrap();
+    let source_of = |rels: &[crate::parser::relations::ParsedRelation], callee: &str| {
+        rels.iter()
+            .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == callee)
+            .map(|r| r.source_name.clone())
+            .unwrap_or_else(|| panic!("no call to {callee}"))
+    };
+    assert_eq!(source_of(&rels, "helperA"), "res.json");
+    assert_eq!(source_of(&rels, "helperB"), "View.render");
+    assert_eq!(source_of(&rels, "helperC"), "exports.f");
+
+    let ts = "class Context {\n  json = (obj: unknown) => { helperD(obj); };\n  \
+              f = function () { helperE(); };\n}\n";
+    let rels = extract_relations(ts, "typescript").unwrap();
+    assert_eq!(source_of(&rels, "helperD"), "Context.json");
+    assert_eq!(source_of(&rels, "helperE"), "Context.f");
+}
+
+// D7: a member call on a JS built-in global (`Object.create(null)`) runs no
+// project code. With `exports.create = function () {}` now a node, express's
+// seven `Object.create` calls bound it by name. A local of that name shadows the
+// global and keeps its call.
+#[test]
+fn a_member_call_on_a_builtin_global_is_no_call_edge() {
+    let js = "function f() { var o = Object.create(null); JSON.parse('{}'); Math.max(1, 2); \
+              process.nextTick(g); return Promise.resolve(o); }\n\
+              function h(Object) { return Object.create(1); }\n";
+    let rels = extract_relations(js, "javascript").unwrap();
+    let calls: Vec<(&str, &str)> = rels
+        .iter()
+        .filter(|r| r.relation == crate::domain::REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    for gone in ["parse", "max", "nextTick", "resolve"] {
+        assert!(!calls.iter().any(|(_, t)| *t == gone), "{gone}: {calls:?}");
+    }
+    assert!(!calls.contains(&("f", "create")), "{calls:?}");
+    assert!(
+        calls.contains(&("h", "create")),
+        "a parameter named Object shadows the global: {calls:?}"
+    );
+}
+
+// C4 (2026-09-28 usage evaluation): `@setupmethod` applies a project function
+// to the method below it, and flask has 44 such uses; `refs setupmethod` found
+// none. A decorator spelled as a bare name is a reference to it (one spelled as
+// a call, `@app.route("/")`, is already a call edge).
+#[test]
+fn a_python_decorator_named_bare_is_a_reference() {
+    let py = "def setupmethod(f):\n    return f\n\n\
+              class Scaffold:\n    @setupmethod\n    def add_url_rule(self, rule):\n        pass\n\n\
+              @setupmethod\ndef top():\n    pass\n\n\
+              @staticmethod\ndef not_project():\n    pass\n";
+    let rels = extract_relations(py, "python").unwrap();
+    let refs: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == crate::domain::REL_REFERENCES && r.target_name == "setupmethod")
+        .map(|r| r.source_name.as_str())
+        .collect();
+    let all: Vec<(&str, &str, &str)> = rels
+        .iter()
+        .map(|r| {
+            (
+                r.source_name.as_str(),
+                r.relation.as_str(),
+                r.target_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(refs.len(), 2, "both uses: {refs:?} in {all:?}");
+    // From the function the decorator applies to, as the relations walk names
+    // it (`Class.method`), so `refs` lists each decorated function, not one
+    // `<module>` per file (flask: 44 uses read as 3 edges).
+    let mut sources = refs.clone();
+    sources.sort_unstable();
+    assert_eq!(sources, ["Scaffold.add_url_rule", "top"], "{all:?}");
 }

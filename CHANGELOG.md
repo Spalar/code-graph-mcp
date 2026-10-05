@@ -1,5 +1,2283 @@
 # Changelog
 
+## 0.164.0
+
+Most of this release comes from a 2026-09-28 evaluation of the plugin inside
+real Claude Code work: 240 recorded sessions, five coding tasks run with and
+without the plugin, and every hook and steering text driven against real
+repositories. Two findings drive it. On a coding task the plugin was not used
+at all (0 calls in 15 runs) while its first-session side effects made Claude
+stop and explain unexpected `.gitignore` / `CLAUDE.md` changes in 12 of 15
+runs; and most of what the hooks injected had no measurable effect.
+
+**Upgrading.** Nothing to run. The update (or your first session on this
+version, whichever runs first) removes the eight hook entries earlier versions
+wrote into `~/.claude/settings.json`: the plugin's `hooks/hooks.json` now
+carries them. Restart Claude Code sessions still open on an older version;
+every hook but SessionStart came from those entries. SessionStart no longer writes `CLAUDE.md`
+or `.claude/`, and a project it adopted before keeps its block (you get a
+notice with a refresh and a remove command when that block is out of date).
+**Every index rebuilds once, automatically, on first use:** `INDEX_VERSION`
+goes 103 → 113 because JavaScript/TypeScript and Python files now produce
+different nodes and edges (see below). **Two answers change by default:**
+`impact` reports `Risk: UNKNOWN` instead of `LOW` for a function with no caller
+in the graph and for a type whose callers alone would rate it `LOW`; and a
+Python call on `self.x.f()` or on a relatively imported object that bound its
+own file's method is labelled by its name's count, so `callgraph` and `impact`
+hide some of those edges by default, say how many, and show them with
+`--min-confidence ambiguous`. To pin back: `npm i -g @sdsrs/code-graph@0.163.0`,
+or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.163.0`,
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1` so the plugin's auto-update does not move
+you forward again. An older binary leaves a v113 index intact
+and warns instead of rebuilding it; delete `.code-graph/index.db*` after
+pinning back to get its graph back.
+
+### Hooks live in the plugin's hooks.json
+
+Since v0.32.0 the non-SessionStart hooks were written into the user-global
+`settings.json`, because Claude Code once loaded only SessionStart from a
+plugin's `hooks.json`. Claude Code 2.1.284 loads it for every event (verified:
+a plugin's PreToolUse, PostToolUse, UserPromptSubmit and Stop entries all
+fire). The plugin declares all of them there now; `settings.json` keeps them
+only for an npm-global or dev CLI with no plugin installed, and never both at
+once. `doctor` reports entries left in `settings.json` next to an installed
+plugin as duplicates (each hook would fire twice) and removes them.
+
+### Your repository is left alone
+
+- SessionStart no longer creates `CLAUDE.md` and `.claude/plugin_code_graph_mcp.md`.
+  The MCP `instructions` already carry the same routing. `code-graph-mcp adopt`
+  still writes the block; `CODE_GRAPH_NO_AUTO_ADOPT` / `CODE_GRAPH_NO_TEMPLATE_REFRESH`
+  now only silence the out-of-date-block notice (see README).
+- The `.code-graph/` ignore rule goes to the repository's local
+  `.git/info/exclude`, never the tracked `.gitignore`, and only when neither
+  file names it already. A worktree's rule goes to the common git dir. A
+  `.git` that is a `gitdir:` file or a symlink is followed only to what git
+  itself accepts as a repository — a `HEAD` there, and `objects/` and `refs/`
+  in its common dir — so a directory that merely holds a `HEAD` file (a
+  clone's `refs/remotes/origin/`, its `logs/`) gets nothing written into it. A `gitdir:` file can still name
+  another repository's git dir, as every linked worktree does.
+
+### SessionStart says what matters, where you can see it
+
+A SessionStart hook's stderr is never shown when it exits 0, so all fifteen of
+its notices reached no one. It now prints one JSON value: a `systemMessage`
+for a missing or unrunnable binary, dark or failing hooks, a rebuilt
+`settings.json`, an out-of-date `CLAUDE.md` block and a corrupt index; the
+opt-in project map goes to the model as `additionalContext`. A corrupt index
+is now rebuilt in the background (it used to read as fresh, leaving every
+hook dark). The "Recent changes — blast radius" section is gone: it was
+followed up 0 of 35 times, and a comment-only edit reported 291 of 366 files
+impacted.
+
+### Quieter, correct injections
+
+- **After a grep**, the call graph is injected only when it is rooted at the
+  grepped symbol. `callgraph` promotes a unique fuzzy match (`task` →
+  `run_startup_tasks`) and said so only on stderr; up to 27 of 98 injections
+  were about another symbol.
+- **Before an edit**, the impact summary appears only when the edit changes
+  the header of the definition the hunk names (named as 0.163.0 named it),
+  skips files outside the project and honours `CODE_GRAPH_QUIET_HOOKS`. Most
+  of 802 recorded injections were body-only edits, unchanged headers or
+  outside files, and the removed body-edit guess picked a wrong TypeScript
+  symbol for 108 of 608 definitions.
+- **Reading files**: the directory overview fires on the fifth distinct file,
+  once per directory, and only when an overview came back — no more advice to
+  run `overview tests/`, which answers "No symbols found".
+- **Prompts**: task notifications and teammate, agent and cross-session
+  messages no longer trigger the
+  prompt hook (24% of its injections); a named file is overviewed itself, not
+  its whole parent directory (one was 18,497 chars); `impact` gets `--file`
+  when the prompt names one; cooldowns are per symbol; output is capped at
+  4,000 bytes.
+- **Edit-time reindex** (`CODE_GRAPH_HOOK_INDEX=on`) indexes structure only;
+  it made each edit wait 8 s for embeddings.
+- **The prompt hook searches** only for identifier-shaped names, as its
+  `impact` and `callgraph` branches already did: a prompt naming only
+  `networkx` and `checkout` injected 7 unrelated search results.
+- **While the startup index is being written** (`.code-graph/indexing-status.json`
+  fresh), the prompt, pre-edit, post-grep and read-fanout hooks inject no
+  structural answer: a half-built index answered `0 callers, Risk UNKNOWN`
+  for a function the finished index gives 4 callers. The prompt hook does not
+  start its cooldown then, so a later prompt about the same name is answered.
+- **The grep hooks know the project's own source directories.** The indexer
+  writes `.code-graph/source-roots.json` (the top-level directories holding
+  indexed code) at the end of every run, and both grep hooks add them to
+  their fixed list, so a Python package directory (`networkx/`, `django/`)
+  is answered like `src/`. A `__pycache__` holding only `.pyc`/`.pyo` files
+  no longer declines the `grep -r` rewrite (`-l` without `-I` still does:
+  grep would list the `.pyc`).
+
+- **Editing one of several same-named methods in a file** (two classes'
+  `__init__`, two `impl`s' `new`) injects that method's impact again. Since a
+  file selector stopped merging such definitions (see Queries), the edit hook
+  had gone silent on them; it now asks `impact --node-id` for the definition
+  starting at or before the edited line, and stays silent when that line lies
+  past the last definition the refusal listed.
+- **After a grep**, a symbol defined outside the path the grep searched gets
+  one line saying where it is defined and the `callgraph` command for it,
+  instead of its call graph: a grep for four helpers in `tests/cli_e2e.rs`
+  got 4 KB of `indexed_project`'s tree from `src/indexer/resync.rs`. With no
+  path, `.`, or a path that holds the definition, the tree is injected as
+  before.
+
+### The Stop check sees Write, `sed -i` and `perl -pi`, and lets optional parameters pass
+
+The end-of-turn signature check compared only edits made with the Edit tool.
+A Write over an existing file now records a baseline for each definition whose
+header its content changes, and an in-place `sed -i` / `perl -pi` (read from
+the Bash command: quoted options, redirects and a leading `cd` are handled, a
+glob operand is not recorded; shapes in `tasks/specs/edit-log-coverage.md`) records one for every
+definition of each file it edits. Nothing is injected for either. In the
+coding evaluation, 3 of 3 runs of one case made their fix with `sed -i`. The
+edit hook's matcher is `Edit|Write`; NotebookEdit stays unmatched (a notebook
+has no signature reading, and "touched this turn" already comes from mtime).
+
+Optional parameters appended at the end of a parameter list (a default value,
+TS `x?:`, `*args` / `**kwargs`, a bare `*` before defaulted keywords,
+`...rest`, Go and Java varargs) are no longer a signature change: every
+existing call stays valid, so the check no longer asks for another turn over
+them. A changed last parameter, a required keyword-only parameter, a
+parameter list inside a return type, and any Rust change still count.
+
+### `impact`: no caller in the graph is `UNKNOWN`, not `LOW`
+
+A function the call graph shows no production or test caller for now reports
+`Risk: UNKNOWN` with a warning that the empty result can also mean unresolved
+callers (dynamic dispatch, reflection, an unresolved import). `LOW` read as an
+endorsement for express's main export, which every test calls through
+`require('..')`. With `--change-type remove` or `signature` such a function
+used to rate `HIGH`; it is `UNKNOWN` too. CLI `impact`, `show --impact` and MCP
+`get_ast_node include_impact` all change.
+
+### Steering text
+
+The MCP instructions, tool descriptions, the `adopt` block, the detail doc,
+the `explore` skill and the `code-explorer` agent no longer claim the index
+"sees everything" (unresolved calls leave no edge; the detail doc names the
+JS shapes that are still no node), add `refs X` then `grep -w X` for rename and
+remove audits, and drop the `~/.cache/code-graph/bin` fallback (the plugin's
+`bin/` is on the Bash PATH). The detail doc no longer recommends
+`refs --min-confidence extracted`, which drops every cross-file caller. It is
+now English and 3.3 KB instead of 12.6 KB. `code-explorer` lists only the
+plugin-hosted MCP tool names a live install exposes.
+
+The MCP instructions (both variants) and the `adopt` block name
+`code-graph-mcp affected <files>` for "tests to re-run after changing files";
+only the detail doc did before. The noisy instructions are 1,051 of their
+1,500 bytes.
+
+### JavaScript and TypeScript: functions held by members and fields are nodes
+
+express 4.21.2 defines 70 of the 107 functions in `lib/` as
+`res.send = function send() {}`, `View.prototype.lookup = function () {}` or
+`exports.f = function () {}`, and hono's `Context` holds 15 of its methods as
+arrow fields. None was a node: `show send` found nothing and their calls were
+credited to `<module>`. Now a function literal assigned to a plain member path
+is a node named by the property (`res.send`, `exports.f`; `View.lookup` as a
+method; one node per member of `res.set = res.header = …`), a class field
+holding a function is method `Class.field`, and the calls inside either are
+scoped to it. `this.x = …`, `obj[k] = …` and `f().x = …` stay none, and so
+does a member of a parameter, of a function's local or of a host global
+(`global.fetch = …`, a test mock's `fake.end = () => {}`); a prototype chain
+names a node on any root. Before the pre-release review, such mocks were nodes
+and drew production calls by name (20 wrong `inferred` edges on this repo, all
+into test stubs). A library's API assigned onto a local of its IIFE, UMD or
+factory wrapper (`lunr.tokenizer`, `jQuery.extend` inside jQuery's factory) is
+no node either, as in 0.163.0; a mock bound at a test file's top level still
+is one.
+
+The new names would draw by-name edges the language rules out, so those are
+narrowed: a call or `require` through a package binding
+(`var send = require('send')`, `var resolve = path.resolve`) binds nothing
+in its own file and such an import no project node; a call through one of
+Node's own modules (`path.resolve`) or an unshadowed built-in global
+(`Object.create`, `JSON.parse`) is no call edge.
+
+CommonJS package entry points resolve: `require('..')` / `require('.')` are
+relative, a directory specifier reaching the repository root finds its
+`index.js`, and `module.exports = require('./lib/express')` makes `./lib/express`
+the module's import. express: `deps index.js` now names `lib/express.js`,
+and `affected lib/view.js` lists 93 test files (was 1; all 74 that load the
+package plus 19 that load it through `examples/`).
+
+Measured with the SCIP oracle on hono: 1,145 gold call pairs instead of 896
+(the new definitions map), 921 correct edges at the default floor instead of
+805, inferred precision 97.1% instead of 94.3%, and no correct edge lost;
+extracted-tier wrong edges go 4 → 8, four of them an existing rule meeting the
+new `Context.set`. On express the oracle judges 50 of 995 call edges —
+scip-typescript does not map `res.send = function send() {}` to a function, so
+388 edges fall outside it — and those 50 stay correct. Calls through a
+re-export (`express()` reaching `createApplication`) still resolve by name.
+
+A member call on one of Node's own modules (`path.resolve(p)`,
+`fs.promises.readFile(p)`, `require('path').join(p)`) binds no project
+function: it bound express's `View.prototype.resolve` and, in this
+repository, a test's `fs.renameSync` mock. Member calls on npm packages
+(`mime.lookup`) still resolve by name: telling an npm package from a
+workspace package or a tsconfig alias needs a package model the indexer does
+not have.
+
+### Python: decorators, imports and `@overload`
+
+- A decorator named bare (`@setupmethod`) is a reference from the function it
+  decorates: `refs setupmethod` on flask finds its 44 uses (was none, so it
+  also read as dead code).
+- A relative import (`from .globals import x`, `from .. import m`) binds the
+  file it names in the importer's package. It took an `<external>` sentinel
+  named `.globals`, so a package's modules imported nothing of each other:
+  on flask 103 phantom externals are gone, 150 in-package imports appear, and
+  `affected src/flask/signals.py` lists 45 test files instead of none. A name
+  that is no node of the module (a variable, a submodule, `*`) binds the
+  module file rather than a same-named symbol elsewhere.
+- `from flask import url_for` never binds a method. The name fallback took
+  `Flask.url_for` beside `helpers.url_for`, and every `url_for(...)` of the
+  importer bound both; 15 wrong flask call edges are gone.
+- `@overload` stubs followed by their implementation are no nodes of their
+  own. Three same-file definitions of one name made `callgraph`, `impact` and
+  `refs` refuse flask's 9 overloaded functions (`stream_with_context`,
+  `locate_app`, `template_filter`, …); the implementation answers for them. A
+  stub with nothing after it (a `.pyi` file, a Protocol) stays.
+- A call on an attribute of `self` (`self.serializer.tag()`) or on a name a
+  relative import binds (`_cv_app.get()`) that resolves to a same-named method
+  of the caller's own file is labelled by that name's count (`inferred` or
+  `ambiguous`) instead of `extracted`. Such a call has no receiver type, and the
+  same-file method was right in 14 of 33 `self.x.f()` cases and none of 28
+  relative-import cases (flask + networkx, SCIP oracle). No edge is added or
+  removed; flask's default-visible wrong edges go 40 → 28, and 4 correct ones
+  move to `ambiguous` (hidden by default).
+
+### Queries
+
+- `show`, `impact`, `refs` and `callgraph` find a symbol added in a file the
+  index does not hold yet: on a true miss they index the unindexed files that
+  mention the name (at most 8) and resolve again. Measured on this
+  repository's 511 files, a miss costs 171 ms instead of 163 ms; a name that
+  exists costs nothing extra.
+- The MCP server no longer answers from the pre-edit graph while an embedding
+  backfill runs: a structural re-index asks the backfill to yield between
+  32-node batches, runs, and restarts it. It used to wait 2 s, skip, and stay
+  owed for the minutes a first backfill takes.
+- `callgraph X --file F`, `impact X --file F` and MCP `get_call_graph` with a
+  `file_path` refuse a name whose callable definitions (functions and
+  methods) in that file have different qualified names, instead of merging
+  them (`callgraph pop --file src/flask/ctx.py` answered for
+  `_AppCtxGlobals.pop` and `AppContext.pop` at once). Every other group is
+  answered merged, as 0.163.0 answered all of them: `#[cfg]` twins, C++
+  overloads, a property's getter and setter, same-named helpers nested in
+  different functions, a class beside its own constructor (`Widget`,
+  `Widget.Widget`), and also a type beside another owner's same-named method
+  (gin's struct `Negotiate` and `Context.Negotiate`). The `--json` graph holds
+  every definition's edges, the text tree only the first one's; `refs` keeps
+  its own, stricter rule. A qualified name
+  (`AppContext.pop`) answers, and so does `--node-id`: `impact` and
+  `callgraph` take `--node-id N` like `show` and `refs` (the symbol is then
+  optional and `--file` is ignored with a note), answering for exactly that
+  definition. The command refreshes the named file before it lists
+  candidates, so their lines are the lines on disk, and the `--json` refusal
+  carries `total` next to the at most five it lists. When the query-time
+  refresh re-indexes the node's file, the node is found again by identity and
+  by its position among definitions sharing that identity; if their number
+  changed, the command refuses rather than guess. The refusal now names
+  `--node-id <N>` for callgraph, impact, refs and show.
+- MCP answers that name more than 32 files check only the first 32 against the
+  disk. The rest were counted in `freshness.stale_kept` under "changed on
+  disk" (a 40-file answer with nothing edited reported 8 changed files); they
+  are now `freshness.unchecked`, and the note says which happened.
+- `semantic_code_search` reports `search_mode: fts_only` while no symbol is
+  embedded yet, with a note saying so. It said `hybrid` whenever the model was
+  loaded, although the vector half had nothing to search.
+- Incremental indexing matches a rebuild in two more cases. An import resolved
+  through the project-wide name pool (`from flask import url_for`, via the
+  re-export in `flask/__init__.py`) is re-resolved when a later run adds the
+  definition; the stale import used to prune the correct call edge (flask:
+  26 edges only in the rebuild, 14 only in the incremental index → 0 and 0).
+  And a route whose handler lives in another file (hono's `app.use(mw1, mw2)`
+  in `types.test.ts` → `mw2` in `hono.test.ts`) follows its route file:
+  re-indexing the handler's file dropped it, and removing the route left it
+  behind.
+- `impact` on a type, constant or trait with few callers reports
+  `Risk: UNKNOWN` and the non-function warning instead of `LOW`: its users are
+  type positions, implementers and imports, which calls do not count (hono's
+  `Router` interface read `LOW` on one caller). MEDIUM or HIGH from calls
+  stays.
+- `dead-code` (text) and MCP `find_dead_code` say a candidate list with a
+  non-Rust file in it is experimental: on the evaluation corpora 0–25% of
+  such candidates were really unused. `dead-code --json` is unchanged.
+
+### Housekeeping
+
+- `~/.cache/code-graph/adopted-projects.json` drops projects whose directory
+  no longer exists whenever it is written (7 of 16 entries on the evaluation
+  machine named deleted temp dirs). An entry that cannot be checked
+  (permission denied) stays.
+
+### Not covered
+
+Found by the pre-release review and left for a later release:
+
+- **Incremental index vs a fresh one.** When a Python file loses `def helper`
+  but keeps a method `Box.helper`, an incremental run moves another file's
+  `from pkg import helper` (and its call) onto the method; a fresh index does
+  not. A relative import written before its module exists
+  (`from . import newmod`, then `newmod.py` is created) stays on the
+  package's `__init__.py` in an incremental index, so `affected newmod.py`
+  can come back empty there.
+- **Python decorators** named bare also reference a project method of the
+  same name (`@cache` → `Store.cache`), at `inferred`. flask's 50 new
+  decorator references are all right; networkx has 1 wrong of 15.
+- **JavaScript/TypeScript indexing cost.** The built-in and package checks
+  walk the enclosing scopes once per call: a full index of hono takes 42.6%
+  more CPU (8% more wall time), this repository 21% more.
+- **CLI and MCP at once.** A CLI lookup that indexes a new file can make an
+  MCP server running on the same project read the index as interrupted and
+  re-index every file (tokio: 2 of 12 rounds, 3.9–5.1 s tool calls).
+- **Same-file definitions.** A test function sharing the name in the same
+  file (tokio's `ctrl_c`, 29 such groups) still makes `--file` refuse, and
+  MCP `get_call_graph` takes no `node_id`. `show`, `refs` and MCP
+  `get_ast_node` still re-find a node by identity alone after a refresh, so
+  on `#[cfg]` twins they can answer for the other one.
+- **Smaller gaps.** An older global npm install's `doctor` re-adds the
+  settings.json hooks next to this plugin until the next session removes
+  them; a TypeScript string-literal type containing `=`, `?:` or `...` reads
+  as an optional parameter in the Stop check; `sed -i~`, `env … sed -i`,
+  loops, `find -exec` and `xargs` edits are not recorded; the adopted-projects
+  registry drops a project on an unmounted drive or behind a dangling
+  symlink; a project adopted by 0.163 shows the out-of-date notice at every
+  session start; a grep rewrite with an unignored `__pycache__/` under
+  `grep -rln` lists one file fewer, and prints a line that is not valid UTF-8
+  as empty; `impact X --node-id N` ignores `X`; a lookup of an absent name
+  prints the symlinked-files warning.
+- **Same-file and node ids.** A `--node-id` whose same-identity twins swap
+  places, or whose twin is replaced in the same edit, answers for the other
+  one, and one whose other twin was deleted refuses though its own is intact; checking a stale `--file` and a stale
+  caller file refreshes twice (about 30% slower on that call). A `var`
+  declared inside a top-level block and a TypeScript namespace's exported
+  object are read as locals, so members assigned onto them are no nodes.
+- **The edit hook's definition pick** is 0.163.0's: the first pattern that
+  matches the hunk names it. So a JavaScript `function` word in prose (a
+  comment, a Python docstring's "The function used …") can win over the
+  definition, and so can a call ending in `{` ahead of a Go or C definition
+  (`if s.ready() {`). Three replacement rules each fixed some shapes and broke
+  others in review, so none ships; when the fifth definition a same-file
+  refusal lists is decorated, an edit of its header stays silent.
+- **An unwritable `settings.json`** keeps the hook entries an earlier version
+  wrote there, and each of those hooks then runs twice beside the plugin's
+  own; SessionStart says so only on stderr, and `code-graph-mcp doctor`
+  reports it.
+
+### Index versions
+
+`INDEX_VERSION` goes 103 → 113. Each step, as recorded on the constant:
+
+- v104 (2026-09-29, D7): a JS/TS function literal assigned to a named member (`res.send = function send() {}`, `View.prototype.lookup = …` as method `View.lookup`, `exports.f` / `module.exports.f` as `exports.f`) and a class field holding a function (`json = () => {}` as method `Class.json`) are nodes, and the calls inside them are scoped to them instead of `<module>` or the class body; a chained `res.set = res.header = function () {}` is a node per member; a `this.x = …` assignment is none; a bare call or `require` import through a package binding (`var send = require('send')`, or a member of one: `var resolve = path.resolve`) binds no node of its own file, and such an import no project node at all (`q:"pkg"`); a member call on an unshadowed built-in global (`Object.create`, `JSON.parse`), and a bare call through one of Node's own modules (`path.resolve`), is no call edge.
+- v105 (2026-09-29, D7/C3): a bare `require('.')` / `require('..')` resolves like `./` / `../`, a directory specifier that reaches the repo root finds its `index.js`, and `module.exports = require('./x')` (`exports = module.exports = …` too) binds its module to `./x` as a namespace require does, so express's tests reach `lib/` through `index.js` in deps/affected.
+- v106 (2026-09-29, C4): a Python decorator named bare (`@setupmethod`) is a `references` edge from the function it decorates (`Class.method`), so flask's 44 uses of `setupmethod` are 44 references, not none.
+- v107 (2026-09-29, C4): a Python `from m import x` never binds a method; flask's `from flask import url_for` names a re-export of `helpers.url_for` the module lookup cannot follow, and the name fallback took `Flask.url_for` too, so every `url_for(...)` of the importer bound both (the unique import now prunes the method from the calls: 15 wrong flask call edges, 0 judged edges lost).
+- v108 (2026-09-29, D10): a Python relative import (`from .signals import x`, `from .. import m`) resolves against the importer's package instead of binding the `<external>` sentinel `.signals`; a name that is no node of the module (a variable, a submodule, `*`) binds that file's `<module>`, so flask's package modules import each other (103 phantom externals gone, 150 in-package imports) and `affected src/flask/signals.py` names 45 tests instead of none.
+- v109 (2026-09-29, C4): a Python `@overload` stub followed in its block by the implementation is no node: the stubs type that one function, and as three same-file definitions they made callgraph/impact/refs refuse flask's 9 overloaded names (`stream_with_context`, `locate_app`, `template_filter`, …); a stub with no implementation after it (`.pyi`, Protocol) stays.
+- v110 (2026-09-29, D6): a `routes_to` edge whose handler the name pool found outside the route's file records that route file as `"rf"` in its metadata: the edge is the handler's self-edge, so it sat entirely in the handler's file and re-indexing that file dropped it (hono's `app.use(mw1, mw2)` in `types.test.ts` → `hono.test.ts`'s `mw2`), while a route file that stopped routing to it left it behind; an incremental run now requeues or deletes these by their route file.
+- v111 (2026-09-29, D10B): a Python call on an attribute of `self` (`self.serializer.tag()`) or on a name a relative import binds (`_cv_app.get()`) carries `{"ur":…}`, and a same-file bind of one is labelled by its name count like a cross-file guess instead of `extracted`: on flask those were 12 of the 22 wrong `extracted` edges, and 4 right ones. Resolution is unchanged.
+- v112 (2026-09-29, B9): a JS/TS member call whose receiver is one of Node's own modules (`path.resolve(p)`, `fs.promises.readFile(p)`, `require('path').join(p)`) emits no call: it bound a project function or method of that name elsewhere (express: `path.resolve` → `View.prototype.resolve`; this repo: `fs.renameSync` → a test's mock, `assert.ok` → a local `const ok`): it removes 9 edges over three corpora, all 9 wrong (8 cross-file, 1 same-file).
+- v113 (2026-09-29, pre-tag review): a JS/TS function assigned to a member is no node when the member's root is a parameter or local of an enclosing function or a host global (`global.fetch = …`, a test mock's `fake.end = () => {}`), as `this.x = …` already was; `exports` / `module`, a prototype chain, a top-level binding and a global another script defines (`jQuery.fn.x`) still name one. As nodes they drew production calls by name: 20 wrong `inferred` edges on this repo, all into test stubs.
+
+### Evals
+
+`evals/` gains five coding cases (networkx, each a reverted upstream change),
+scored by hidden tests on the workspaces `--keep-temp` leaves
+(`evals/_coding/grade.py`). See `evals/README.md` for the baseline.
+
+The SCIP oracle maps an `@overload` function to its implementation.
+scip-python 0.6.6 gives such a function one definition, on its first stub,
+enclosing only that stub, so every call in the implementation's body was
+credited to `<module>`, and an index without stub nodes lost the symbol
+(flask gold 300 → 288). On flask's pre-change index the corrected oracle
+counts 9 more correct extracted edges and the same wrong ones.
+
+## 0.163.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 99 → 103 because the Rust fixes below change which
+`calls` and `implements` edges a file produces, the names of some Rust
+methods, and the confidence label of one class of Rust call. Nothing to run.
+**`callgraph` and `impact` on Rust code show fewer callers by default:** a
+method call whose receiver the source leaves untyped is no longer labelled
+`extracted` when its name has another definition (see below). Those edges are
+still in the graph; both commands say how many they hid, and
+`--min-confidence ambiguous` (MCP `min_confidence: "ambiguous"`) shows them.
+To pin back: `npm i -g @sdsrs/code-graph@0.162.0`, or `cargo install
+code-graph-mcp --version 0.162.0`; plugin users can set the version in the
+marketplace entry. An older binary leaves a v103 index intact and warns
+instead of rebuilding it; delete `.code-graph/index.db*` after pinning back to
+get its graph back.
+
+At the default confidence floor on tokio-1.41.1, the SCIP oracle counts 4,433
+correct call edges against 0.162.0's 4,191 and 203 wrong ones against 422: no
+wrong edge is shown that 0.162.0 did not show, and 48 correct ones 0.162.0
+showed are now below the floor (listed under the label change below).
+
+The resolution fixes, measured against 0.162.0 on the same checkouts before
+the label change: on tokio-1.41.1 the SCIP
+oracle finds 290 more correct call edges and 37 fewer wrong ones, with no
+correct edge lost and no wrong edge added; the 30 new calls it cannot judge
+are each a `self.m()` / `Self::m()` written in the caller's own body, and the
+529 `implements` edges that go all pointed at another file's method, which a
+trait impl's method never is. On this repository: 43 more correct call edges,
+nothing else changed. On hono, express, flask and leveldb every node, edge and
+buffered call is identical. A full index of tokio takes 2.58 s against
+0.162.0's 2.83 s, and an edit adding a file of three methods 0.81 s against
+0.89 s (medians of five interleaved runs of this release's final build).
+
+### `self.m()` in a generic Rust impl has its edge
+
+Three places named a Rust impl block's type, each its own way. The call
+payload kept the generic arguments, so inside `impl<T> Gen<T>` every
+`self.m()` and `Self::m()` looked for methods of `Gen<T>`, found none, and
+produced no edge at all. The node walk split on `::` before dropping the
+arguments, so `impl<L: Link> List<L, L::Target>` named its methods
+`Target>.push_front`, and `impl … for RefCell<Vec<task::Notified<T>>>` named
+its methods `Notified.…`. All three now drop the generic arguments first.
+
+### A `self` call binds its own type's method
+
+With those calls resolving, a `self.m()` met every same-named type of the
+workspace. It now binds the nearest methods of that type name: the caller's
+own file, else its crate, else — only from a trait impl, whose type may be
+another crate's — all of them. An inherent impl lives in its type's crate, and
+so does every impl that crate can call on it, so a call there never leaves the
+crate (a test, bench or example target's crate includes the files under its
+directory that its `mod`s pull in, such as `tests/common/mod.rs`): tokio's `Builder::new() { Self::default() }`, whose `default` is
+derived, no longer binds tokio-util's `Builder::default`. When the caller's
+file defines the type's method only in trait impls, an inherent one in another
+file outranks it, so the crate decides; so it does when the file holds that
+name's impls in different inline `mod`s (a test module's mock type of the same
+name), unless the caller's own inherent impl defines the method. The caller
+itself counts as no candidate: a trait method calling its type's
+inherent namesake still binds it. Because the answer now depends on other
+files, a caller is re-extracted when a method of its type and name appears in
+or leaves another file (deletions included), and an incremental index matches
+a rebuild in those cases.
+
+Impls of one type that differ only in their arguments (`impl AsyncWrite for
+Cursor<&mut [u8]>`, `… for Cursor<Vec<u8>>`) all name their type `Cursor`.
+Two impls of one trait never cover one type, and two inherent impls may not
+both define a method for one type, so a `self.m()` no longer binds the `m` of
+another impl of its file that the language keeps apart from its own. The
+inherent rule holds only when the caller's own `m` exists wherever the call
+does: with a `#[cfg]` on that `m`, the other block's `m` may be the one that
+runs, and it stays. (A `#[cfg]` on the whole block gates the caller too.)
+
+`self.get_mut()` with `self: Pin<&mut Self>` is `Pin::get_mut`, and
+`self.clone()` with `self: Arc<Self>` is `Arc`'s: method lookup meets the
+receiver's own type first. Neither binds the project's method of that name.
+Only what that `Pin` has counts: `as_ref` on any, `as_mut` and `set` on a
+mutable pointer, `get_ref` on `Pin<&T>`, `get_mut` on `Pin<&mut T>`; so
+`*self.get_ref()` in a `Pin<&mut Self>` poll still binds the type's own
+`get_ref`.
+
+An impl for a type whose generic arguments hold a function type (`impl Run for
+Box<dyn Fn() -> u8>`) names its methods `Box.run` again; the `>` of `->` had
+closed the arguments early (`Box u8>.run`).
+
+### A typed receiver binds nothing its type rules out
+
+A call on a receiver whose type the source writes down fell back to every
+method of that name when the type had none of its own. Two cases now drop what
+cannot run: `arc.clone()` on an `Arc<T>` / `Rc<T>` is the pointer's `clone`,
+and a struct of the caller's own file with no such method and no `Deref`
+reaches no other type's method. Only the result loses the ruled-out methods;
+what the call is resolved from does not, so a smaller pool never turns "several
+methods, bind none" into "one method, bind it".
+
+### `impl Trait for path::Type` binds only this file's type
+
+`impl Tr for crate::Foo` and `mod imp { impl Drop for super::Counters }` bound
+no `implements` edge; they do now when the path names an item of the file.
+`impl From<Elapsed> for std::io::Error` in a file defining its own `Error`
+binds nothing, as before, and a trait is never the source of a Rust impl's
+edge (tokio's `impl Semaphore for bounded::Semaphore` beside `trait
+Semaphore`).
+
+### A Rust method call on an untyped receiver is labelled by its name's count
+
+`self.io.poll_write(cx, buf)` names only `poll_write`. When the source does not
+fix the receiver's type (a tuple field `self.0`, a field of a struct written
+inside a `cfg_*!` macro, the result of another call), the resolver binds the
+caller's own file's `poll_write` — and labelled that edge `extracted`, the
+tier meant for bindings a language rule decides. Method dispatch follows the
+receiver's type, not the caller's file, so this is a guess by name, and a
+skewed one: a wrapper type forwards `self.inner.m()` to a field of another type
+while its own file defines `m` for the wrapper. On tokio-1.41.1 the SCIP oracle
+judged 233 such edges whose name has another definition: 48 right (21%, below
+the `ambiguous` tier's 50%). These edges are now labelled like a cross-file
+call: `ambiguous` when the name has another definition, `inferred` when it has
+none (49 of 54 right). The `extracted` tier on tokio goes from 1,931 of 2,163
+right (89.3%) to 1,834 of 1,876 (97.8%); at the default floor, wrong edges go
+388 → 203 and correct ones 4,481 → 4,433 against the resolution fixes alone.
+
+The 48 correct edges now below the floor are calls on receivers the index
+does not type yet (D#150): `self.as_mut()`, `Pin::into_inner(self)`, a tuple
+field (`self.0.header()`), a pin projection, a closure parameter, another
+method's result. Nothing is deleted: `refs`, which has no floor, and dead-code
+detection see every edge as before.
+
+Rust only, and only calls on a field or a call's result: on hono, flask and
+leveldb the same class was 75%, 91% and 48% right, and relabelling it would
+have hidden about as many correct edges as wrong ones, or more; a call on a
+local variable was 53 of 76 right on tokio. On hono, express, flask and leveldb
+every node, edge, label and buffered call is identical to the previous commit's.
+A full index of tokio takes as long as before (medians of three runs, 2,547 ms
+before and 2,559 ms after), and an edit adding a file whose methods share the
+names of the most frequent of these calls (`poll_write`, `is_closed`,
+`try_io`) took 744 ms against 800 ms, one run each. The index grown by that
+edit matches a rebuild of the same tree edge for edge.
+
+### The Stop and SubagentStart hooks record what they did
+
+Both hooks added in 0.162.0 wrote nothing to `.code-graph/recommendations.jsonl`,
+so their roadmap measures had no data. The Stop check now records every report
+it shows, and, at the next Stop — the end of the continuation the report
+starts, or of the next turn — whether any caller file it found (the ones past
+the text's eight per symbol included) changed after it: an Edit logged by this
+session, or a newer modification time. Any change counts, one from a
+formatter, a checkout or another session too; a fix made elsewhere (the
+signature reverted, the caller moved to another file) does not. SubagentStart
+records each delivery, with the agent type when it is a plain name. In the
+hook section of `code-graph-mcp stats`, which needs MCP usage data, each prints
+a line once it has fired (`Stop check: …`, `Subagent context: …`); `stats
+--json` always carries `stop_checks`, `stop_followups`, `stop_adopted` and
+`subagent_contexts`. The lines leave the re-search funnel exactly as it was.
+Nothing is recorded under `CODE_GRAPH_QUIET_HOOKS=1` or with
+`.code-graph/.no-metrics`.
+
+Whether a subagent then used the index is in its transcript, not in that file:
+`scripts/subagent_share.py [PROJECT]` reads the subagent transcripts Claude
+Code keeps beside a session and prints, per agent type and by whether the hook
+delivered, the share of code-search calls (Grep, Glob, Read, and Bash `grep` /
+`rg` / `find` / `cat` / … / `git grep`) that ran `code-graph-mcp` or a
+code-graph MCP tool. A named teammate's transcript records its name, not its
+type, so those share one row. On this repository before the hook existed,
+general-purpose subagents sent 106 of 4,133 such calls to code-graph (2.6%).
+
+**Not covered:** a method whose Rust impl is written inside a macro
+(`cfg_rt! { … }`, D#149) is still no node, so a typed receiver of a type
+defined that way keeps every candidate; so does one reached through a type
+alias or a `Deref` the index cannot follow. A `Deref` written by a macro is
+invisible too, so the typed-receiver rule above can still drop a correct edge
+through one (none on tokio), and so is one a derive writes
+(`#[derive(derive_more::Deref)]`). A Rust file under `src/bin/` belongs to no
+crate the index can name, so its `self` calls still look across the whole
+workspace. A `self` call that resolved to nothing is not revisited when its
+method appears in another file (as in 0.162.0): the next edit of its own file,
+or a rebuild, binds it. Nor is a caller re-resolved when only the parameter
+count of another file's method changes (as in 0.162.0). In `claude plugin eval` runs, where the plugin registers
+its hooks during the run's own SessionStart, the SubagentStart hook reached no
+subagent in 3 of 3 runs, for a reason not yet known, so the `subagent-callers`
+eval measures the parent's prompt, not the hook.
+
+## 0.162.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 92 → 99 because the Rust and JavaScript fixes below change
+which `calls`, `imports` and `exports` edges a file produces. Nothing to run. To
+pin back: `npm i -g @sdsrs/code-graph@0.161.0`, or `cargo install
+code-graph-mcp --version 0.161.0`; plugin users can set the version in the
+marketplace entry. An older binary leaves a v99 index intact and warns instead
+of rebuilding it; delete
+`.code-graph/index.db*` after pinning back to get its graph back.
+
+**Plugin users: the update registers two new hooks** in
+`~/.claude/settings.json` (SubagentStart and Stop, see below). They add text
+to a subagent's context and after a turn that changed a signature;
+`CODE_GRAPH_QUIET_HOOKS=1` silences both, and `uninstall` removes them.
+
+### A Rust call resolves through the file's `use`
+
+Rust call resolution never read the calling file's `use` declarations, so a
+call bound whatever project item shared its name:
+`use std::sync::Mutex; Mutex::new()` bound the project's own `Mutex::new`,
+`use tokio::sync::oneshot::channel; channel()` bound broadcast's and watch's
+`channel` too, `use tempfile::tempdir; tempdir()` bound a test helper named
+`tempdir`, and `use crate::sync::batch_semaphore::Semaphore; Semaphore::new(1)`
+bound `sync/semaphore.rs`. A call whose first name a `use` binds now resolves
+through the path the `use` writes:
+
+- A path rooted at `std`, `core`, `alloc` or `proc_macro` binds no project
+  item. One rooted at a crate that is not a package of the project resolves as
+  that path written in the call does: only through a project module of the
+  crate's name, which there usually is none of. When a `Cargo.toml` names a
+  crate the scan cannot read (a top-level `lib = { … }` or `package.name`, a
+  name or a `package =` rename that is no string literal), such a path may be
+  that crate's: it resolves without its root, and a bare call by its name, as
+  before.
+- A path rooted at a package of the workspace (by its crate name, `-` read as
+  `_`: the package's name, its `[lib] name`, a dependency's `package = "…"`
+  rename of it, or an `extern crate x as y` alias) or at this crate (`crate::`,
+  `self::`, `super::`, a module the file declares) is looked for in that crate
+  only: in the module file the path names, else among the crate's items of that
+  name and owner type whose module shares the most leading path with it (a
+  `pub use` re-export). Several such items bind as `ambiguous`. None at all
+  waits in the pending-call buffer for a later run.
+- A renamed project import (`use crate::a::f as g; g()`) is a call through
+  its path (`crate::a::f`), so it binds that `f` and not every `f` another
+  `use` of the file imports.
+- The `use` counts where it stands: one inside `mod tests { … }` or a function
+  body applies there only, a file-level one does not reach into `mod tests`
+  unless it holds `use super::*`, a local item of the call's namespace wins
+  over a `use` (`use tokio::task` beside `async fn task`: `task()` is the
+  local function), and a glob between the call and the `use` stops the lookup
+  (the name may come from the glob).
+
+A path opening with a module name a `use` binds now splits onto that module's
+file and type (`use crate::runtime::task; task::Notified::<T>::from_raw`),
+which 0.161.0 left unsplit for std-named modules (the lost
+`task::Notified::<T>::from_raw` pair is back); a std module stays unsplit.
+
+A `use` rooted at another package's name (`use mycrate::a::widget`) now binds
+the item in the file its path names, as `crate::` paths did, and follows it
+when that file gains the item later; so does an import that found no item at
+all and was left on the `<external>` sentinel, whose call an incremental run
+kept pruned until a rebuild (for `crate::` paths too). Both were listed under
+0.161.0's Not covered or found while fixing it.
+
+On tokio-1.41.1 (SCIP oracle, gold 7,908 call pairs; both arms indexed the same
+corpus copy): `inferred` precision 2,461/2,889 (85.2%) → 2,551/2,788 (91.5%),
+recall at the default floor 4,072 → 4,162; wrong `extracted` edges 366 → 366,
+wrong `ambiguous` 1,626 → 1,632. Of the call pairs the oracle can judge, 129
+correct ones gained and none lost; 194 wrong ones removed and 9 added (listed
+under Not covered); 29 correct ones moved from `inferred` to `ambiguous`,
+bound together with a `#[cfg]` twin (loom's mock `Mutex` beside the std one,
+the metrics mock beside the real metrics). On this repo (a snapshot with gold
+7,177): wrong edges unchanged (16 extracted, 7 inferred, 1 ambiguous), recall
+at the default floor 6,996 → 6,998.
+
+Measured cost, 3 runs each (ms, 0.161.0 → this): full index of tokio
+2,464/2,532/2,523 → 2,534/2,471/2,498, of this repo 1,834/1,812/1,850 →
+1,931/1,915/1,857; an incremental run on tokio after adding a `Probe::new`
+to `tokio/src/sync/mod.rs` 338/349/335 → 376/404/421, and after editing its
+body 219/228/218 → 238/234/236. The re-export follow-up re-extracts a caller
+only when the new definition is one its path could reach: an earlier cut that
+re-extracted every caller of a re-exported `new` took 141 files and 1,931 ms
+for that edit. Re-indexing the edited file, then removing and restoring
+oneshot's `channel`, matched a rebuild edge for edge (32,643 edges).
+
+### A Rust method call binds what its receiver's type can run
+
+`x.f()` names only `f`, and a Rust method call resolved by that name bound a
+project method of whatever type had one: an atomic's `.load(Ordering)` bound
+this repo's `ProjectClassNames::load`, a `BytesMut`'s `.put_slice(..)` bound
+tokio's `ReadBuf::put_slice`, a `NamedTempFile`'s `.path()` bound
+`DirEntry::path`, and a `Widget`'s `.spin()` bound a `Gadget::spin` in
+another file. When the source writes the receiver's type down, the call now
+carries it:
+
+- `self` in an `impl` block; a `let` with a type, or whose value fixes one
+  (`T::new(..)`, `T::default()`, `T::from(..)`, `T::with_capacity(..)`,
+  `T { .. }`, a literal, `vec![..]`, `format!(..)`, `.to_string()`, `.clone()`
+  of a typed value, a call of a free function of the file whose return type
+  is written, a zero-argument call of a std or dependency function, and `?`,
+  `.unwrap()` or `.expect(..)` of any of them, which take a written
+  `Result<T, _>` or `Option<T>` to `T`); a parameter `x: T`, `&T` or
+  `&mut T`; a `static` or `const`; a field of a struct the same file defines
+  (`self.buf`, `self.inner.flag`). `Box<T>`, `Rc<T>` and `Arc<T>` (a
+  project's own `Arc` too) are `T`, plus impls on the pointer itself.
+- The file's `use` says whose type it is (a suffixed literal, `7u32`, is its
+  suffix's type). A std type or a dependency's (`AtomicU8`, `String`,
+  `bytes::BytesMut`, a primitive) binds only a project trait's method
+  (`impl Ext for String {}` still gives `s.helper()` its default method), a
+  project impl's on that very type (`impl Weigh for AtomicU16`,
+  `impl StrExt for &str` for a `str`) unless the impl's own file defines a
+  project type of that name (`struct File; impl File { … }` is not
+  `std::fs::File`'s), and none of another project type: a type an item macro
+  defines has no node, so "not a known struct" proves nothing. Where no impl
+  on the type itself answers, it also binds a blanket impl whether or not
+  its trait is in scope (`impl<T: Display> Shout for T`, `impl<W: Wait> Wait
+  for &mut W`: the impl's self type is a parameter of its own `<…>` list,
+  read from its header alone; `impl<T> Tr for Box<T>` is an impl on `Box`),
+  one on a slice, array or tuple for a receiver of no name
+  (`b: &[u8]`), a slice's for a `Vec` and `str`'s for a `String`, which deref
+  to them, and a primitive's for an unsuffixed literal. A project type binds its own
+  method of the name when one takes the call's arguments; else the call
+  resolves by name as before (a trait's default method or a `Deref` target may
+  run), which can bind another type's same-named method (see Not covered).
+  Of several project types of that name, the
+  one the `use` path names wins, through a re-export as a path call's does
+  (tokio's `use crate::loom::sync::Mutex` is not `tokio::sync::Mutex`).
+- A typed call the unique-method rule cannot decide (none, or several) waits
+  in the pending-call buffer, which keeps one row per caller and name, as in
+  0.161.0: of two such calls of one name in one caller, one waits (see Not
+  covered).
+
+Deliberately untyped, resolved by name as before: a closure parameter without
+a type, a pattern binding (`if let Some(x)`, `match`, `for`, a destructuring
+`let`), a generic parameter, `impl Trait`, `dyn Trait`, the return of any other
+method or function, a tuple field, and a field of a struct defined in another
+file.
+
+On tokio-1.41.1 (SCIP oracle, gold 7,908 call pairs, both arms indexed copies
+of one clone): `inferred` precision 2,551/2,788 (91.5%) → 2,550/2,725 (93.6%),
+recall at the default floor 4,162 → 4,191; wrong `extracted` edges 366 → 247,
+wrong `inferred` 237 → 175, wrong `ambiguous` 1,632 → 1,056 (`ambiguous`
+precision 658/2,290 → 1,056/2,112). Of the call pairs the oracle can judge,
+428 correct ones gained and one lost (listed under Not covered); 764 wrong
+ones removed and 7 added, all `ambiguous`. On this repo (a snapshot of the
+previous commit, gold 7,259): wrong `extracted` edges 17 → 16, `inferred` 7
+and `ambiguous` 1 unchanged, recall at the default floor 7,077 unchanged; the
+receivers behind the rest are listed under Not covered.
+
+Measured cost, 3 runs each (ms, previous commit → this): full index of tokio
+2,480/2,510/2,525 → 2,508/2,439/2,492, of this repo 1,828/1,899/1,906 →
+1,930/1,870/1,937; an incremental run on tokio after editing a line of
+`runtime/io/driver.rs` 185/176/168 → 172/167/181, and after adding a
+`Probe::new` to `tokio/src/sync/mod.rs` 367 → 398 mean over 10 alternating
+runs (+8%; both re-extract the same 3 files). tokio's pending-call buffer holds
+4,559 rows after a full index instead of 3,989. After those incremental runs,
+tokio's index matched a fresh one edge for edge (32,323 edges).
+
+### `crate::` in a package with both lib.rs and main.rs names its own crate
+
+A package with both `src/lib.rs` and `src/main.rs` builds two crates, and
+`crate::` means the root of the one the file is compiled into. The resolver
+read it as both roots: a library file's `use crate::run; run()` bound
+main.rs's `run` beside lib.rs's, a file of main.rs's module tree bound
+lib.rs's, a `use twin::serve` (the package's name) from main.rs's tree or a
+test bound main.rs's `serve`, and a `use crate::helper` that lib.rs re-exports
+(`pub use engine::helper`) bound only main.rs's `helper`, which the library
+cannot see. Now:
+
+- lib.rs and main.rs are their own roots. Any other file belongs to the root
+  that alone declares its top-level module (`mod user;`, or an inline
+  `mod deep { mod inner; }` for `deep/inner.rs`), read from the `mod` items at
+  the top of the two root files. A module both declare is compiled into both
+  crates and binds both roots, as before; so does one neither declares
+  visibly (no declaration, a `#[path]` one, or a root with a `mod` inside a
+  macro call or definition, which makes the whole package unknown).
+- A path rooted at the package's name is its library: lib.rs, never main.rs.
+- A name the root does not define (a re-export) is looked for elsewhere in the
+  crate as before, but never in the other crate's root file, for a path call
+  and for the import's own name lookup.
+- The index records each such package's root `mod` items, so any run that
+  indexes main.rs after it gains or loses `mod user;` (an incremental run, or
+  a query's refresh of the file: `show`, an MCP tool's `file_path`, a result
+  set's resync) re-extracts the files under `user` (and, when the record
+  appears, goes away, or is unknown, every file of the package), as a rebuild
+  would resolve them.
+
+On tokio-1.41.1 (no package there has both roots) and on this repo (whose
+main.rs declares only its `tests` module and defines nothing a library file
+imports through `crate::`), every edge is unchanged: 32,323 and 13,930 edges,
+identical to the previous commit's index line for line, and the SCIP oracle's
+numbers with them. The change shows on packages whose two roots define
+same-named items; the accepted shapes are pinned in
+`test_rust_crate_root_by_file_membership`.
+
+Measured cost (ms, previous commit → this): full index of tokio
+2,517/2,515/2,496 → 2,573/2,505/2,534, of this repo 1,872/1,854/1,815 →
+1,887/1,989/1,957; an incremental run on this repo after a body edit of
+`src/main.rs` 147.8 → 151.0 mean of 10 alternating runs, and of
+`src/domain.rs` 259.1 → 265.3. Adding `mod sandbox;` to this repo's main.rs
+re-extracts the 2 files under `src/sandbox/`, and the index after it, and
+after removing it again, matched a rebuild edge for edge.
+
+### Pre-release review repairs (Rust)
+
+The review of the three Rust changes above reproduced two ways an index
+stopped matching a rebuild, and two regressions; each is repaired with a test
+that fails without it:
+
+- A query's refresh of a crate root that gained `mod engine;` left
+  `engine.rs` bound to the library for good: only the incremental run checked
+  the roots, and it then saw an empty diff. Every path that indexes a file now
+  applies the same check and records the roots
+  (`test_rust_reextraction_triggers_hold_on_every_indexing_path` runs each
+  trigger through the incremental, cached, refresh and resync paths).
+- A project `struct Duration` anywhere dropped `d.ext()` on a
+  `std::time::Duration` from `impl Ext for std::time::Duration` on a rebuild,
+  while an incremental run kept it; rustc calls that impl. Only the impl's own
+  file now decides whether it is on the project's type, and a typed call is
+  re-extracted when a class of its receiver's name moves.
+- A std receiver lost the project impls that run on it: blanket impls,
+  `&str`, `[u8]` and `7u32` receivers (restored, see the D#112 section above);
+  a `[lib] name` or a dependency's `package =` rename lost every call through
+  its `use` (3 → 0 on the review's fixture; now found).
+- A renamed project import bound the original name's other imports too (see
+  the D#132 section above).
+
+On tokio-1.41.1 (SCIP oracle, gold 7,908 call pairs, both arms indexed copies
+of one clone), 9962a87 → this: correct pairs 5,247 → 5,247 (none lost or
+gained, none moved between tiers), `inferred` precision 2,550/2,725 (93.6%)
+unchanged, `extracted` 1,641/1,888 unchanged, one wrong `ambiguous` pair added
+(mio's `Waker`, see Not covered). On this repo (one snapshot for both arms,
+gold 7,471): the judged pairs are identical (7,251 correct, 24 wrong); two
+Rust edges change only their metadata (renamed imports, now path calls).
+Full index, mean of 5 alternating runs after a warm-up (ms, 9962a87 → this):
+tokio 2,594 → 2,620, this repo 2,235 → 2,112 (load average 4–9); a `show`
+that refreshes an edited tokio file 228 → 232. The review's fixture edit
+sequences, 23 runs over its lib.rs + main.rs workspace, the `Duration` crate,
+the `[lib] name` workspace and tokio (the `show`-first refresh among them),
+all match a rebuild's `calls` and `imports` edges (tokio's std-named structs
+on `calls`; their `imports` are the Not covered item below); on 9962a87, 5
+did not.
+
+### Pre-release review repairs, round 2 (Rust)
+
+The review of the repairs above found that the blanket-impl rule they added
+broke the rebuild contract and bound calls through unrelated imports. The rule
+is withdrawn to what an impl's own header says:
+
+- Whether an impl is a blanket impl was decided by whether any project type
+  bore its parameter's name, so a `pub struct T;` added anywhere dropped the
+  blanket edges (4 on the review's fixture) on a rebuild and kept them on an
+  incremental run. It is now read from the impl's header when its file is
+  parsed: the self type, after `&`/`&mut`, is a parameter of the impl's own
+  `<…>` list. `impl<St: AsRef<str>> Ext for St` counts too, and `impl Tr for
+  T` on an imported `struct T` does not.
+- Blanket-impl methods now show their impl's type parameter in the signature
+  (`<T> (&self) -> u32`). So does a function nested in such a method, named
+  like it and starting on the method's line. No other signature changes: on
+  tokio 5 of 9,575 nodes differ, all of them blanket-impl methods, and on this
+  repo none.
+- A blanket impl was admitted only when the caller's file imported some item
+  of the impl's file, so an unrelated import of that file admitted it (`use
+  crate::ext3::util; s.trim()`). That test is withdrawn, and a blanket impl
+  binds whether or not its trait is in scope (see Not covered).
+- An impl header rewritten from blanket to concrete (`impl<T: Display> Yell
+  for T` to `impl Yell for T` beside a `struct T`) kept a `String` caller's
+  edge on every incremental path and lost it on a rebuild. The edge was
+  restored by its qualified name, which had not changed. A receiver-typed call
+  into a re-indexed file is now re-resolved in the deferred pass. The deferred
+  pass is used, not the pending-call buffer: the buffer keeps one row per
+  caller and name, and there tokio's `local.spawn_local(..)` lost its edge to
+  the same caller's waiting `task::spawn_local(..)`. Cost: an incremental run
+  after editing tokio's `runtime/runtime.rs`, the file with the most such
+  calls (188 from other files), went from 186 to 201 ms and from 190 to 207 ms
+  (+7.7% and +9.1%; mean of 10 alternating runs, two rounds).
+
+Measured against the previous commit:
+
+- Edit sequences: the review's fixtures plus new ones around blanket impls
+  (`struct T` added and removed, a trait or its impl moved to another file,
+  the impl in another crate of a workspace, a header turned concrete and
+  back), 42 sequences in all. Each ran through an incremental run, a `deps`
+  refresh and, where it only edits existing files, a `show` of an item of the
+  edited file: 99 runs. `calls` edges matched a rebuild in 85 runs, against
+  65 before (all edges: 73, against 54). The blanket-impl sequences match in
+  44 of 46 runs, against 24.
+- The 14 runs that still differ:
+  - 8 are manifest-only edits (Not covered).
+  - 2 are an exact impl added and then removed beside glob-imported callers
+    (Not covered).
+  - 2 are `show` runs whose edit renamed or removed the item the query asked
+    for, so nothing was refreshed.
+  - 2 are the documented JavaScript `x.ts` case.
+  - Each of the 14 differed in the same edges before.
+- SCIP oracle on tokio-1.41.1 (gold 7,908 pairs): correct pairs 5,247 →
+  5,247, none lost or gained. `inferred` precision 2,550/2,725 and
+  `extracted` 1,641/1,888 are unchanged; `ambiguous` goes 1,056/2,113 →
+  1,056/2,118. On this repo (gold 7,824) the judged edges are identical
+  (7,585 correct).
+
+### A call through a renamed JavaScript import binds the export
+
+`import { load as loadModel } from './model'`,
+`const { clearCache: clearBinaryCache } = require('./find-binary')` and
+`const loadModel = require('./model').load` bind a local name the exporting
+file never defines, so `loadModel()` bound nothing, or another file's function
+of that name. It now binds the export in the file the specifier names:
+
+- The call is read as the export's (`load`) only when the nearest declaration
+  of `loadModel` around it is that import. A parameter, a local, a function or
+  class declaration, a catch or loop variable or a hoisted `var` of the same
+  name keeps the call bare, and a `require` rename inside one function is
+  invisible to a sibling function's own `loadModel()`.
+- It binds only a top-level function the file exports under that name: never
+  a class method or a nested function that shares the name, nor a constant,
+  nor a function the file keeps private (a `function load` beside
+  `export { realLoad as load }`, or beside a CommonJS map without a `load`
+  key). A CommonJS export map that publishes a function under another name is
+  followed (`module.exports = { load: realLoad }`, `exports.load = realLoad`
+  bind `realLoad`; those `exports` edges now record the published name), and
+  when the map publishes something else as `load`, the file's own `load` is
+  not bound.
+- A package's export (`import { resolve as r } from 'path'`) binds nothing.
+- An incremental run agrees with a rebuild: when the export is renamed away
+  the call binds nothing (it no longer binds a same-named function elsewhere);
+  when the file gains the export later, or its export map moves to another
+  function, the call binds it; when the file appears only after the caller,
+  or is deleted and comes back, it binds, for an ESM import as for a
+  `require`.
+
+This is the design of the change withdrawn before 0.160.0, redone against the
+four defects its review reproduced, each now a named test that fails on the
+withdrawn design (`test_js_renamed_import_*`).
+
+SCIP oracle, the same snapshot for both arms: this repo's JavaScript recall at
+the default floor 1,354 → 1,358 of 1,360 gold pairs (the four calls it adds
+are the four known misses, `doctor.js` ×3 and `auto-update.js`), inferred
+precision 519/519 → 523/523; hono 801 → 805 of 896, inferred precision
+492/522 → 496/526 (4 edges added, all judged correct; 9 more it adds are
+unjudged by the oracle and correct on reading); express unchanged (892 edges,
+identical line for line), and this repo's Python scores unchanged. No correct
+pair lost, no edge removed on any of the three. Full index time, median of 5
+alternating runs: this repo 2.10 s → 2.05 s, hono 0.56 s → 0.54 s, express
+0.18 s → 0.18 s; a synthetic 5,000-file tree with 999 renamed-import calls
+over 20,999 `exports` edges 1.50 s → 1.54 s. An incremental run carrying
+10,000 buffered renamed-import calls takes 78 ms → 87 ms (median of 7). Each
+file's exports are read once per pass, not once per call.
+
+### An empty caller list names the lines that dispatch by name
+
+`callgraph`, `impact` and `refs`, and MCP `get_call_graph`, `find_references`
+and `get_ast_node include_impact`, answering with no caller could not tell
+"nobody calls it" from "called through a string key". When the caller list
+shown is empty and the symbol is a function or method, the answer now lists the
+production lines where its name appears in a dynamic-dispatch shape: a
+reflection lookup (`getattr(o, "save")`, `send(:save)`, `getMethod("save")`,
+`dlsym(h, "save")`), an event or channel name (`on("save", …)`, `emit`,
+`invoke`), a string table key (`handlers["save"]`, `{"save": f}`,
+`'save' => …`), a Ruby symbol (`before_action :save`), or the function passed
+or stored as a value (`register(save)`, `.map(Self::save)`, `{ save, load }`,
+`run = save`, `save.bind(this)`). Text output adds a block after the result: up to 5
+`file:line  shape` lines, a count of the rest, and
+`code-graph-mcp grep -w -F <name>` to see every occurrence. `--json` and the
+MCP tools add a `boundaries` object (`total`, `sites`, `note`, `next`). When
+nothing matches and every file that could hold a site was read, the block is
+one line (`(no dynamic-dispatch site names 'x')`) and the field is
+`{"sites":[],"total":0}`. When something was not read, the answer says what:
+a definition in a language with no shape table (bash, where `trap cleanup
+EXIT` dispatches by name), every file over 2 MB (whether or not it holds the
+name), files not UTF-8 that hold the name, files not reached within the scan's
+1-second limit, and Rust paths passing the name as a value through a
+qualifier the scan cannot tie to a definition (below). The block is then
+`(no dynamic-dispatch site names 'x' in the files scanned; not scanned: bash
+files)` followed by the `grep` command (a block with sites gets a
+`not scanned: …` line), and the field gains `not_scanned` (`languages`,
+`skipped_files`, `files_past_time_limit`, `unresolved_paths`) and `next`. No
+edge is added, and a
+non-empty answer is unchanged byte for byte.
+
+The scan reads comments and string contents as blank (a string counts only
+where it is the key), skips test files, and in a file that declares a local,
+parameter or pattern of the name reads that file's bare uses as the local's.
+In Rust, `a.b` not followed by `(` is a field read and never counts (a method
+is passed as `Self::b` / `Type::b`); `Q::b` is a site only when `Q` is where
+a definition of `b` lives (its type, its module's file or directory name, or
+`Self`, `self`, `super`, `crate`), so `Result::ok` and
+`thread::JoinHandle::join` are not a project `ok` / `join`. Any other `Q` can
+still be the name's own (the crate's name, an inline `mod`, a `use … as`
+alias, a trait), and so can `Wrapper::<u8>::b` and `<X as Tr>::b`: such a
+line is not listed as a site, and the answer does not claim none either
+(`not scanned: 1 Rust path with an unrecognized qualifier`). A parameter of a
+generic function binds its name
+(`fn map<T, F>(self, f: F)`), and so does a parameter named like the
+function on the definition's own line (`fn append(&mut self, append: bool)`);
+an attribute's arguments (`#[inline(never)]`) are not values. The scan is
+linear in the file's size: it answered each occurrence's "which bracket
+encloses this" by scanning, which made a nested file quadratic (the review's
+240 KB `[get,[get,…]]` took 22.6 s for an empty `callgraph get`, now 45 ms,
+with the same answer). The shape table is in `src/graph/boundaries/mod.rs`;
+197 corpus rows over 16 language tags (the 14 with a shape table, plus bash
+and markdown look-alikes) pin what counts and what does not. There is
+no block on a `--direction callees` query, on `refs --relation` other than
+`calls` or `references`, or for a symbol that is not a function.
+
+Measured on this repo, 20 interleaved runs each: an empty `callgraph` p50
+3.3 → 7.2 ms (`--direction callers` 17.9 → 21.8 ms), `refs` 2.3 → 6.2 ms,
+`impact` 2.6 → 6.5 ms; a non-empty `callgraph` 7.2 → 7.2 ms (40 runs). Of the
+functions with no caller, 68 of 120 on this repo now show at least one site,
+17 of 55 on express and 23 of 107 on hono.
+
+After the pre-release review's repairs, over every function name of tokio
+(1,786; `callgraph <name> --json`, sites listed per name): 42 names showed a
+site before, 5 of them real dispatch (`clone_waker` in a `RawWakerVTable`,
+`convert_address` in `.and_then(…)`, `callback`, `handler`,
+`globals_init`), the rest field reads (`data: me.data`), parameters
+(`self.0.append(append)`, `Map::new(self, f)`), `#[inline(never)]` and std
+paths (`Result::ok`); now 5 names show a site, those 5. On hono (517 names)
+and express (120) the listed sites are identical; on this repo's `src/` 61 →
+58 names show a site (field reads such as `&ctx.db`, `stats.count` gone).
+
+### An answer can be asked for at a size, and every cut names a command
+
+`map`, `overview`, `callgraph` and `show` take `--budget <tokens>`, and MCP
+`project_map`, `module_overview`, `get_call_graph` and `get_ast_node` take an
+optional `max_tokens` (100-100000; size is bytes/3 of the text or JSON the
+caller receives, the ratio `CHARS_PER_TOKEN` already uses). The answer is
+ranked by caller count (call-edge in-degree; for `map`, a module's incoming
+imports). The lowest-ranked items are shortened first: a module loses its key
+symbols, a symbol its signature, a definition its body, a call-graph node its
+type. Then they are left out, and a call-graph node always goes before its
+parent. An item is printed whole or not at all. In `overview` (CLI and MCP)
+one file gets at most 70% of the budget, also when the path is that one file.
+Text answers end with
+`… budget N tokens: …` and `next: <command>`. MCP answers carry a `budget`
+object (`max_tokens`, `omitted`, what was shortened, `next`). Every section
+counts against the budget, the ones a flag folds in too: `module_overview`'s
+`hot_paths` (the last to go: it repeats the most-called exports),
+`dependencies` and `dead_code` (they lose entries with the inactive names),
+and `project_map`'s `centrality`. A section that lost entries adds its own
+command to `next` (`deps <file> --direction … --depth …`, `dead-code <path>`,
+`centrality --limit N`), several joined by `; `. When even the fixed part
+(headers, summary, notices) is larger than the budget, `budget.over_budget`
+is `true` on these two tools. A path that starts with `-` is written `./-x`
+in a next command, so it is not read as a flag. Without a budget nothing
+changes. With a budget the start is the uncapped answer, so a large
+budget can return more than the default (every dependency in `map`, every
+export in `module_overview`, the flat call graph instead of the rollup).
+`--budget` cannot be combined with `--json` or `--compact`. MCP `compact` has no
+effect beside `max_tokens` and is listed in `ignored_arguments`.
+
+Every existing cut in these four tools now ends with a command that returns
+what it left out. The text of each cut notice is unchanged; the command is
+added after it.
+
+| Cut | Command added |
+|---|---|
+| `map`: `... and N more dependencies` (the text caps them at 30) | `next: code-graph-mcp map --json` |
+| `map --compact`: `... and N more modules` / `hot functions` | `next: code-graph-mcp map` |
+| `map --json --compact`: `hot_functions_truncated` | `"next": "code-graph-mcp map --json"` |
+| MCP `project_map compact`: `hot_functions_truncated` | `"next": "code-graph-mcp map"`, or `map --json` when the threshold tier also cut |
+| MCP `module_overview`: `active_capped`, an inactive group's `more` | `"next": "code-graph-mcp overview <path>"` |
+| MCP `get_call_graph`: `rollup_call_graph` | `"next": "code-graph-mcp callgraph <name> …"` |
+| MCP `get_ast_node`: `compressed_node` | `"next": "code-graph-mcp show <name> --file <file> …"` |
+| MCP threshold tier on these four tools: `_truncated` | the command for the whole answer (it replaces a handler's `next`); for a cut `dead_code` or `centrality` section it does not return those entries (see Not covered) |
+
+Tests execute each suggested command and check that it returns the items that
+were left out, apart from those two threshold-tier sections. Default answers
+were compared with those of the binary built
+before this change: 7 text answers match byte for byte once the added
+`next:` lines are removed, and 10 JSON answers match once `next` is removed
+(`tests/data/budget_base/`).
+
+Measured size with a budget. A ratio is achieved bytes over budget×3, and "whole"
+means the unbudgeted answer was already smaller than the budget:
+
+| corpus | 500 tokens | 1000 tokens | 4000 tokens |
+|---|---|---|---|
+| this repo, `map` | 0.989 | 0.994 | whole (8.6 KB) |
+| this repo, `overview src` | 0.996 | 1.000 | 0.999 |
+| this repo, `callgraph node_text` | 0.993 | 0.999 | 0.999 |
+| this repo, MCP `project_map` | 0.993 | 0.999 | 1.022 |
+| this repo, MCP `module_overview src` | 0.961 | 0.991 | 1.019 |
+| hono, `map` | 0.984 | 1.000 | 1.000 |
+| hono, `overview src` | 0.991 | 0.999 | 1.000 |
+| hono, MCP `project_map` | 0.994 | 0.989 | 1.023 |
+| express, `map` | 1.000 | 1.000 | whole (5.0 KB) |
+| express, MCP `module_overview lib` | 0.998 | 0.998 | whole (4.8 KB) |
+
+With the flags that fold sections in, before the pre-release review's repair
+they were outside the budget; on this repo's `src/` (bytes over budget×3,
+before → after): `module_overview src/mcp/server/mod.rs include_deps
+include_dead` 1.954 → 0.997 at 1000 tokens and 19.5 → 2.70 at 100 (with
+`over_budget`: with every entry left out the answer is 809 bytes), `module_overview src include_dead` 2.794 → 0.964 at 500, and
+`project_map include_centrality` 1.292 → 0.989 at 500.
+
+The MCP answers at 4000 tokens exceed 1.0 by the `freshness` note (about 280
+bytes), which is attached after the budget is applied. One case lands under
+the band: express `show next --refs` at 1000 tokens came to 1,273 bytes (ratio
+0.42). Its body is larger than the budget and is left out whole rather than
+cut.
+
+The four tools' descriptions are unchanged. Each of the four tool schemas gains
+`max_tokens` (+150 bytes each), so `tools/list` goes from 9,120 to 9,720
+bytes. `claude plugin details` does not count MCP tool schemas; it reports the
+same always-on figure before and after.
+
+### Explore and Plan subagents are told the index exists, and a turn that changed a signature lists the callers it left
+
+Two hooks join the six that `install`, `update` and `doctor` register in
+`~/.claude/settings.json`; `uninstall` removes them with the others.
+
+- **SubagentStart** (`subagent-start.js`, matcher `Explore|Plan|general-purpose`,
+  3 s budget). Explore and Plan subagents do not load `CLAUDE.md`, so the
+  adopted block never reached them. The hook runs `health-check` once and
+  returns `additionalContext` stating the file count, the index age, a pending
+  rebuild if there is one, and the `callgraph`, `show` and `overview` commands.
+  Facts only, capped at 400 characters: 321 bytes on this repo, 389 for a file
+  count of up to 9 digits. A longer or fractional count builds a longer text;
+  past 400 characters nothing is injected. Nothing is injected when no index
+  is found
+  up the tree, when no binary resolves, when the index has 0 files, or with
+  `CODE_GRAPH_QUIET_HOOKS=1`. Median 125 ms per subagent spawn (20 runs).
+- **Stop** (`stop-impact.js`, 5 s budget). `pre-edit-guide.js` now appends
+  each Edit (file, the symbol it extracted, and that symbol's definition
+  headers as the file stood just before the Edit) to a per-session log in the
+  plugin's tmp dir. At the end of a turn, for each symbol whose headers now
+  differ from the ones recorded before the turn's first Edit of it, the hook
+  lists its callers (`refs --relation calls --min-confidence inferred`) in
+  files not edited this turn, as `file:line` of the call. The comparison is
+  with the start of the turn, not with `HEAD`: a caller fixed in the turn that
+  changed the signature is not raised again when a later turn edits only the
+  body, and uncommitted changes from before the session are not reported as
+  this turn's. A definition added beside unchanged same-named ones (a new
+  overload, a new `impl From<B>`) is not a change; one whose header changed or
+  that was removed is. A file counts as edited when an Edit to it was logged
+  since the previous Stop or its mtime is at or after the turn's start. Up to 8
+  changed symbols per Stop get a `refs` query, counted after body-only edits
+  are set aside; more are named in one line without callers. Each symbol is
+  reported once per session. File names, symbols and caller names are
+  shell-quoted where they are not plain (`'src/a$(x).rs':5`), including the
+  `code-graph-mcp refs … --file …` command shown past 8 callers. The text goes
+  out as Stop `additionalContext`, not `decision: "block"`. Nothing is injected
+  on `stop_hook_active`, outside a git work tree, without an index or binary,
+  for a body-only change, for a language without an exact header reading
+  (see Not covered), for a file where the symbol's definition pattern matches
+  on a line over 2,000 characters (a minified or generated file), or with
+  `CODE_GRAPH_QUIET_HOOKS=1`. The baseline is read inside `pre-edit-guide.js`,
+  which has a 4 s timeout: on a 1.5 MB one-line bundle, finding the line once
+  per match took it 9.2–9.5 s. The line cap ends that reading at the first
+  match; the test that runs the hook on such a bundle takes 81–84 ms. One
+  caller is 230
+  bytes; 8 symbols × 8 callers is about 3,359 bytes (3,314 measured before the
+  header grew by 45 bytes; the shared 4,000-byte cap applies). A session with
+  no Edit exits in 34 ms median and writes nothing.
+
+The event names, input fields and output shapes were checked against the hooks
+reference (code.claude.com/docs/en/hooks) for Claude Code 2.1.283. A headless
+2.1.283 session confirmed that a SubagentStart `additionalContext` reaches the
+subagent and that Stop `additionalContext` continues the turn, with
+`stop_hook_active: true` on the next Stop.
+
+Not added: a handler-level `"if"` filter on the two Bash hooks. It is supported
+(Claude Code 2.1.85+), and would skip the 34 ms (`pre-grep-guide.js`) and 35 ms
+(`post-grep-inject.js`) median each Bash call pays today, of which about 22 ms
+is node startup. But `if` takes one rule, and the two parsers accept `grep`,
+`rg`, `ag`, `git grep` and `env …` prefixes (plus `sed -n` reads for the
+PreToolUse hook), so each hook would need one handler per verb. In the same
+headless session, two handlers with the same command and different `if` rules
+both ran for one `grep …; sed …` call, which would emit two rewrites or two
+answers for one command.
+
+### The grep hooks answer a grep only where the answer reads the same files, flags and pattern
+
+The rest of the 0.160.0 and 0.161.0 review findings on the grep hooks, each
+reproduced there. Every shape below now runs as typed (the PreToolUse rewrite)
+or gets no answer (the PostToolUse inject); none of them is emulated.
+
+- **`-E`, `-P` and `ag` patterns** went to the answer's rust regex unchecked.
+  On one fixture, GNU grep 3.12, ugrep 7.8 and cg read `\d` (under `-E`),
+  `[\(]`, `a{,2}`, `a+?b`, `(?i)` and a leading `*` differently, and PCRE reads
+  `\<` as the character `<`. A pattern using any of them is no longer
+  answered; one all three read alike (`Foo|Bar`, `\bfoo\b`, `\<foo\>`, `x{2}`,
+  `(a|b)`) still is. A quoted `"-E"` counts as the flag: the
+  shell strips the quotes before grep reads it.
+- **`--include` with `/` or `**`.** GNU grep matches the glob against the base
+  name, so `--include='src/*.js'` finds nothing there; cg's `-g` matches the
+  path.
+- **The files searched.** cg searches git-tracked files plus ripgrep's walk
+  (not hidden, not ignored). `grep -r` also reads untracked hidden and ignored
+  files, `git grep` reads tracked files only, and `rg` and `ag` skip tracked
+  hidden and tracked ignored files. Before a rewrite or an inject goes out, the
+  hook asks `git ls-files` whether the path holds such a file for that verb;
+  when it does, or git cannot tell, the grep runs as typed. Outside a git work
+  tree it looks for hidden entries and ignore files under the path instead.
+  The check runs only for a grep about to be answered; its cost is below.
+- **`grep -c`.** GNU grep and ugrep print `file:0` for every file without a
+  match; cg, `rg -c` and `git grep -c` print only files with matches. `grep -c`
+  is no longer rewritten; `rg -c` and `git grep -c` still are. A rewritten grep
+  now passes `-M 0`: cg cut each line at 512 characters, so a match past that
+  column was missing from the answer.
+- **`show` answers whole names.** `grep -A3 "fn foo"` also matches
+  `fn foobar`, `-i` matches `Foo`, `pub fn foo` misses a private `fn foo`, and
+  `def foo(` misses a Ruby `def foo`. A declaration grep is answered by `show`
+  only when every alternative is a keyword and a name that ends the word
+  (`\b`, `\>`, or `-w`): `grep -A3 "fn foo\b"`. The inject answers the others
+  with a grep answer over the same path, as it did for a file filter.
+- **The inject reads a grep with the rewrite's grammar.** It had no flag list
+  of its own, so a flag it did not know was dropped: `grep -rn Foo src/ "-v"`
+  (grep reads `-v`: the shell strips the quotes), `ag -n` (no recursion),
+  `rg --max-depth 1`, an abbreviated `--inv`, and `grep -n Foo src/*.js` (the
+  shell expands the glob one level deep; cg's `-g` matches every depth) were
+  answered as other searches. The inject now answers only a grep clause the rewrite's per-verb
+  allowlist reads, with the same pattern and path, the call graph included.
+- **A grep that never ran.** After `exit`, `return` or `set -e` the inject
+  answered an empty output the grep never produced. A grep after one of them,
+  `cd x || exit 1; grep …` included, gets no inject.
+
+The pre-release review of these repairs reproduced more files and patterns the
+answer read differently. Each now runs as typed too:
+
+- **Ripgrep's own ignore files.** cg's walk is ripgrep, which reads `.ignore`
+  and `.rgignore` (ag: `.agignore`) inside the searched path and in every
+  directory above it, up to `/`; git reads none of them. A grep whose path
+  holds one, or sits below one, is not answered, and neither is any grep while
+  `RIPGREP_CONFIG_PATH` is set (cg passes ripgrep no `--no-config`).
+- **Symbolic links, submodules and `grep -R`.** `grep -r` and `rg` skip a
+  symbolic link met while recursing; cg named a tracked one on ripgrep's
+  command line, which follows it, and `git grep` searches the link's text.
+  `git grep` does not enter a submodule; cg's walk does. A path holding a
+  symbolic link, a submodule or an untracked nested repository is not
+  answered, and `grep -R`, which follows every link, never is.
+- **`show` reads the index.** Its walk skips hidden files even when tracked,
+  `vendor/`, `node_modules/`, `target/` and `bower_components/`, files of a
+  language it does not parse, files over `CODE_GRAPH_MAX_FILE_SIZE` (1 MiB)
+  and ignored files: `grep -rn -A2 "fn f\b" src/` printed a definition in
+  `src/vendor/` that the answer did not. `show` now answers only when every
+  file the grep reads is one the index holds. The hooks keep a copy of those
+  rules, and a test compares it with the Rust source.
+- **Patterns ugrep reads apart.** Claude Code's `grep` runs ugrep, whose `\W`
+  and `\D` match a line break (`grep -E '\Wfoo\('` also printed the line
+  before a match), and which prints no line for a match of nothing (`d?`,
+  `foo|`, `a*`) where GNU grep and rg print every line. POSIX classes
+  (`[[:alpha:]]`) are ASCII to rust and follow the locale in GNU grep and
+  ugrep; `\d` under `-P` is ASCII to GNU grep and Unicode to rust; a repeated
+  assertion (`\b{2}`, `$+`, `\b*`), a `^` or `$` inside an alternative and a
+  stray `}` read differently as well; and `-E` with `-P` is an error to GNU
+  grep. A pattern using any of them is not answered. On the review's fuzz
+  (1,500 generated patterns per dialect, each run through GNU grep 3.12,
+  ugrep 7.8.4 and rg 15.1 on one file, counting patterns rg finds), the
+  answered patterns that print differently went from 107 to 19 under `-E`,
+  88 to 1 under `-P` and 87 to 16 under basic regex. What is left is a
+  non-breaking space under `\s`, a non-ASCII letter beside `\b`, and a
+  pattern starting with `-`, which the rewrite never takes as a pattern. The
+  fuzz did not cover two more, found by the pre-tag review: a `$` before a
+  CRLF line ending, and an empty alternative (`(a|)b` under `-E`/`-P`). These
+  four are under Not covered.
+
+The file check now runs four `git ls-files` listings for every verb, plus an
+existence check for the three ignore files in each directory from the path up
+to `/`, and, for `show`, a `stat` of each file the grep reads. It runs only
+for a grep about to be answered. On this repo it takes 17–24 ms (median of 9,
+per verb and path, `show` included; 8–19 ms before). On a repository with
+200,000 untracked files under the path it takes 166–175 ms (median of 5;
+172–176 ms before) and now declines: more than 20,000 untracked files are not
+checked one by one.
+
+Replayed through both hooks' processes (a stub binary, one fixture project)
+over 17,739 grep commands from this machine's session logs: the rewrite
+accepts the same 31 commands before and after, each now with `-M 0`; the
+inject accepts 787 instead of 951, and none it did not accept before. Of the
+164 it no longer answers, 107 search a glob path, 35 are `grep -c`, 14 hold
+shell syntax the grammar does not read (`$f`, `\"` inside double quotes), 5
+carry `-a` or `-o`, 1 names a second path, and 2 pass `--include` with a
+directory the fixture lacked (the grammar reads a missing path as a file).
+Declining these inject shapes is not always needed for the answer to be right
+(a `grep -c` of one file has no zero rows); the grammar is one rule for both
+hooks rather than a list of exceptions. The stub prints no `show` output, so
+the replay cannot see a `show` answer; replaying the rewrite's `show`
+decision in-process over the same commands, 1 was answered by `show` before
+(`rg -n "function seedUninstallHome" -A 20 …`, which also matches a longer
+name) and 0 after, and 321 of the 323 inject segments that asked for `show`
+now get a grep answer.
+
+The review repairs were replayed the same way over 17,337 commands (the
+17,099 in this machine's session logs by then, plus 238 adversarial ones from
+the review and the repair), against the previous commit: neither hook answers
+a command it did not answer before, no session-log command lost an answer,
+and the 24 newly declined are adversarial ones (`show` greps of a path
+holding a file the index skips, the patterns above, and `grep -R`).
+
+### Not covered
+
+- A renamed import of a re-export (`import { a as b } from './index'` where
+  `index.js` has `export { a } from './impl'`), a default import
+  (`import b from './x'; b()`), a dynamic `import()`, a nested or defaulted
+  destructuring (`{ a: { c } }`, `{ a: b = f }`), and a call that is not a
+  bare call (`new B()` through `import { A as B }`, `b.call()`, `b` passed as
+  a callback) bind as before. So does an ESM export list
+  (`export { load }`, `export { realLoad as load }`), which records no
+  `exports` edge: the call binds nothing.
+- A renamed-import call whose file lacks the export, or whose relative
+  specifier names no file yet, waits in the pending-call buffer and ages out
+  after 50 runs, like any buffered call; an export or a file added after that
+  binds on a rebuild only. A specifier that starts resolving to a
+  different file (`./x` from `x/index.js` to a new `x.js`) keeps the old edge
+  until the caller's file changes.
+- Two top-level functions on one line, or a function nested on its parent's
+  line, both read as nested: the call binds neither.
+- Two bindings do not shadow a renamed import, so its call still binds the
+  export: a `const` in one `case` of a `switch` seen from another `case`, and
+  a class expression's own name inside its body (`const K = class m { … }`).
+  A `let` alias reassigned later still binds the export.
+- A CommonJS map that publishes one function under several keys
+  (`{ first: a, second: a }`) records one `exports` edge per key, so that
+  function appears once per key in its file's `<module>` context text.
+- An item defined inside a macro body (`cfg_rt! { pub fn spawn(..) }`, most of
+  tokio's runtime) is no node, so a call the `use` sends there binds nothing
+  (it waits in the pending-call buffer). Parsing a `cfg_*! { … }` body as the
+  items it holds was tried and withdrawn: on tokio it made 124 files' hidden
+  code visible, and the oracle judged 273 more edges wrong (83 `extracted`,
+  mostly same-file calls among sealed-trait impls) against 78 fewer, with 26
+  correct pairs lost. When the named module defines only
+  the owner type and the method sits in such a macro, the re-export reading
+  binds a same-named method of another type in the crate: 6 tokio calls of
+  `scheduler::Handle::current()` bound `runtime::Handle::current`, and 3 of
+  `sys::run(f)` (a `use … as run` in an inline module) bound a scheduler `run`.
+- A glob import other than `use super::*` is no proof of anything: a call whose
+  name only a glob can bind resolves by name, as before. So does a path
+  written in the call itself (`crate::sync::Mutex::new`, `io::Error::new` with
+  no `use`), and a bare call of a project item under its own name, which
+  resolves through its import edge as before.
+- A crate whose library is not at `<package>/src/lib.rs` (a `[lib] path`) is
+  not found by its name; such a path resolves as a path written in the call.
+  A dependency rename (`engine = { package = "core-pkg" }`) names core-pkg's
+  library in every crate of the project, not only the one that declares it.
+- An `extern crate x as y` at a crate root is seen only in that file, though
+  Rust puts `y` in every module's extern prelude: `use y::Cfg;` elsewhere binds
+  nothing (the previous release bound a same-named local `Cfg` instead).
+- A bare call of a name that a renamed import also imports under its original
+  name (`use crate::a::helper as a_helper; use crate::b::helper; helper()`)
+  binds both `helper`s, as before: the post pass that binds bare calls through
+  import edges reads the original name. So does
+  `use crate::a::helper; helper()` beside a nested `fn helper` in another
+  function, and a `pub use` re-export binds every same-named item of the
+  crate, not only the one it names (both as before).
+- A typed Rust call bound to its receiver type's one method is still
+  classified by name: with same-named methods elsewhere it is `ambiguous`,
+  hidden at the default confidence floor (tokio: 1,056 of the correct pairs
+  the oracle judges are `ambiguous`).
+- A blanket impl binds a std receiver whether or not its trait is in scope,
+  so a call that rustc sends to std's method of that name binds the
+  project's too: `s.trim()` on a `String` beside a project `impl<T:
+  AsRef<str>> Trimmy for T`. On tokio this adds 16 `ambiguous` edges that
+  0.161.0 did not have: 15 `.id()` calls (a `std::thread::Thread`'s, mostly)
+  bind `impl<T: Wait> Wait for &mut T`'s `id`, and `self.child.kill()` on a `std::process::Child` in
+  `process/windows.rs` binds `&mut T.kill`. The oracle judges 5 of them, all
+  wrong. No correct pair is lost, and the default confidence floor hides
+  them. A trait bound the receiver does not meet is not checked either. An
+  impl on a project type in a file that does not define it (tokio spreads
+  `impl Handle` over several files) still binds a std receiver of that name,
+  and an impl on std's type in a file that also defines a same-named project
+  type binds none.
+- An import (or a `references` edge) bound to the `<external>` sentinel or to
+  a same-named item by name does not follow a type of that name appearing in
+  another file: adding `pub struct Duration;` to tokio's `util/mod.rs` leaves
+  26 `imports` edges of an incremental run different from a rebuild's (32 on
+  9962a87; the review found the same drift on 0.161.0).
+- A Rust receiver whose type only a closure parameter, a pattern or another
+  method's return gives stays untyped (see above). On this repo that leaves 10
+  wrong `as_str` edges (`.map(|n| n.name.as_str())`), 11 wrong `commit` edges
+  (`let tx = conn.unchecked_transaction()?`, rusqlite's) and one `is_empty`
+  (a destructured closure parameter). Typing a method's return needs the
+  callee's signature from another file, as the C++ chain typing records it.
+- A method a project impl defines counts for its type whether or not its
+  trait is imported at the call, and whatever its `self` is: tokio's
+  `read.consume(n)` on a `BufReader` binds the `AsyncBufRead` impl's
+  `consume(self: Pin<&mut Self>, ..)`, where rust-analyzer resolves
+  `AsyncBufReadExt::consume` (2 edges). Types and traits are compared by name:
+  a std receiver keeps every project trait's method of that name
+  (`rd.take(4)` on a `&[u8]` binds `StreamExt::take` beside
+  `AsyncReadExt::take`, 2 edges), mio's `Waker` keeps an impl on std's
+  `Waker` (1; `impl WakerRef for &Waker`, now read as an impl on `Waker`), and `tokio::sync::Semaphore` keeps the mpsc `Semaphore`
+  trait's `add_permits` (2).
+- One correct tokio pair was bound only through a wrong call: in
+  `read_dir_entry_info`, `temp_dir.path()` (a `tempfile::TempDir`) bound
+  `DirEntry::path`, which the untyped `first_entry.path()` of the same
+  function really calls and cannot pick among the project's `path` methods.
+- A typed call that no method answers waits in the pending-call buffer and
+  ages out after 50 runs, like any buffered call. The buffer keeps one row per
+  caller and name: of two waiting calls of one name in one caller
+  (`s.yell(); t.yell()` on a `String` and a `Thread`), one is kept. When a
+  blanket impl appears later, an incremental run binds only that one, and a
+  rebuild binds both; 0.161.0 does the same.
+- A typed call whose type's same-named method takes a different number of
+  arguments (code mid-edit) resolves by name and can bind another type's
+  method (`h.block_on(f)` on a `Handle` whose `block_on` takes 2 arguments
+  binds `Other::block_on`). After the arity is fixed, an incremental run keeps
+  that edge until the caller's file changes; a rebuild binds `Handle`'s.
+- A call whose receiver a glob import leaves untyped loses its blanket-impl
+  edge on an incremental run, not on a rebuild, when an impl on the receiver's
+  own type with a method of that name is added and then removed
+  (`use crate::ext::*; s.yell()`). 0.161.0 loses it too.
+- The dispatch-site scan is lexical. A local named like the function still
+  reads as a function reference where the scan sees no declaration of it (a
+  Java or C typed local `String url = …`, a TypeScript method parameter
+  followed by a return type), and so does a qualified property read outside
+  Rust (`options.executionCtx`, `req.method` for a getter, `request.url`:
+  about 20 of hono's 57 sites; Java, C, Kotlin and PHP field reads were not
+  measured). A Rust `json["key"]` read counts as a string key. A key computed
+  at run time (`obj[name]()`, `getattr(o, f"on_{x}")`) names nothing and is
+  not found; neither is a registration by decorator or annotation
+  (`@app.route`) or an HTML inline handler. A shell `trap` is not scanned
+  (bash has no shape table), which the answer now says. Files over 2 MB are
+  skipped and counted in the answer.
+- Other look-alikes found by the review, not repaired: a JavaScript regex
+  literal holding a backtick or quote is read as a string opening,
+  which can hide a later site or report one from text; a Python keyword
+  argument on its own line of a multi-line call (`f(\n    save=True,\n)`)
+  reads as a binding and hides the file's bare uses; `res.send("save")`,
+  `page.invoke("save")`, an i18n label table (`{ "save": "Save changes" }`),
+  a regex `/x["save"]/` and Ruby `attr_reader :save` are reported as sites.
+- The dispatch block still prints when the caller traversal stopped at its
+  row limit, and it scans the bare name: `callgraph Store::save --file a.rs`
+  lists `save` sites on any object.
+- The MCP threshold tier's `next` does not return a cut `dead_code` or
+  `centrality` section: `module_overview include_dead dead_min_lines:1`, cut
+  from 90 dead-code entries to 15, names `dead-code <path>` without
+  `--min-lines 1` (which lists 50), and `project_map include_centrality
+  centrality_limit:40`, cut to 15, names `map --json`, which has no
+  centrality. With `max_tokens` the budget path names both
+  (`dead-code <path> --min-lines 1`, `centrality --limit N`).
+- A Rust `Q::b` value whose `Q` the dispatch scan cannot tie to a definition
+  of `b` is counted, not listed: the answer says `not scanned: N Rust paths
+  with an unrecognized qualifier` and names no line, so `grep -w -F b` is the
+  way to find it. A std path (`Result::ok`) is counted the same way.
+- A budgeted MCP `module_overview` of a directory can drop signatures
+  (`active_exports_without_signature`) that its `next` command,
+  `overview <dir>`, does not print either: the directory text form has no
+  signatures (`overview <dir> --json` has them).
+- At the smallest budgets the fixed part does not fit and nothing marks it on
+  the CLI (`map --budget 100` is 361 bytes, 1.20×) or on MCP `get_call_graph`
+  and `get_ast_node` (a 100-token answer of 429 and 527 bytes); MCP
+  `project_map` and `module_overview` set `budget.over_budget`.
+- Only `use` paths read a file's crate. `crate::run()` or `super::run()`
+  written in the call itself resolves by name, as the glob item above says,
+  and binds both roots' `run`. A `#[path]` or macro-made `mod` below the top
+  of a root file is not seen, and a `Cargo.toml` added or removed with no
+  source file changing is noticed only by the next run that indexes a file.
+- An edit to a `Cargo.toml` alone (a new dependency, a `package =` rename, a
+  `[lib] name` change) is picked up at the next rebuild, not by an
+  incremental run: no file's calls are resolved again when only a manifest
+  changes. A manifest the scan cannot read, added anywhere in the tree, turns
+  `use <crate>::f; f()` into a call by name on the next rebuild only.
+- The Stop check sees only symbols `pre-edit-guide.js` could name: an Edit
+  whose `old_string` holds no definition header and no identifier it can place
+  in a function is logged as a file edit only, and `Write` is not logged at
+  all (its file still counts as edited by mtime). The header comparison is
+  textual and covers Rust, Python, Go, JavaScript/TypeScript, PHP, C, C++,
+  Java, C#, Kotlin, Scala, Ruby and Lua; for any other language the Stop check
+  says nothing. Within those, a definition is found only in its keyword form
+  (`fn`/`def`/`func`/`function`/`fun`) or, for the C family, as a
+  `Type name(` line: a Kotlin extension (`fun String.f`), a Ruby
+  `def self.f`, a Lua `function M.f`, a C++ out-of-line `Foo::f` and a
+  constructor with no modifier before its name are not found, and nothing is
+  reported for them. A return type after `=>` (TypeScript function types,
+  Scala), a C# `where` clause and a Kotlin return type on the next line are
+  not compared. A header that has not ended within 600 characters is not
+  read, and neither is any file where a definition pattern matches on a line
+  longer than 2,000 characters. A signature change made in a macro or a
+  decorator is not seen, and
+  neither is one made by an Edit that `pre-edit-guide.js` attributed to
+  another function (the baseline is then recorded after the change). Callers
+  are the index's; a call through a string key is not one.
+- A symbol whose signature changed while its callers were not checked (more
+  than 8 changed in one turn, no binary, or the 5 s budget spent) is not
+  checked again in a later turn: the next turn's baseline already has the new
+  signature.
+- File names are shell-quoted, not cleaned: a newline or instruction-like text
+  in a file name reaches the Stop text inside the quotes, as it already does
+  in `pre-edit-guide.js`'s caller list.
+- If the plugin's tmp dir becomes read-only mid-session, the Stop state is not
+  saved and the same symbol is reported at every Stop.
+- In a git worktree whose index lives in the main checkout, the edited path
+  does not match the index's paths, and the Stop check says nothing.
+- A matching binary file is reported as `binary file matches` by GNU grep and
+  not printed by ugrep or cg; the grep hooks do not check for one.
+- The grep hooks' file check reads the hook's own environment: a
+  `RIPGREP_CONFIG_PATH` or `CODE_GRAPH_MAX_FILE_SIZE` set only in the shell
+  profile, or a different size limit in the process that built the index, is
+  not seen. Git settings that change a search (`grep.patternType`,
+  `submodule.recurse`) and a shell alias for `grep` are not read either.
+  Outside a git work tree, a directory is read whole before the 20,000-entry
+  limit applies, and the walk has no time limit. `ag` is not installed here,
+  so its file set and dialect were not run.
+- A `show` answer prints definitions; `grep -A3 "fn foo\b"` also prints a
+  comment or string line holding `fn foo`. The answer comes from the index as
+  last built, which also skips a file that is not UTF-8. `"fn  foo\b"` (two
+  spaces) is still answered by `show foo`, although it matches no
+  single-spaced definition.
+- When `show` does not answer a context grep (`-i`, `-F`, or no end of word),
+  the inject answers it with a grep answer without the `-A`/`-B`/`-C` lines.
+- A grep after `false &&`, `true ||`, or `set` with a quoted `"-e"` or
+  `'errexit'` is still answered by the inject when its output is empty (as in
+  0.160.0).
+- A grep the hooks decline for its files or its grammar leaves no record, so
+  the usage funnel cannot count those declines.
+- `\b`, `\w` and a bracket on non-ASCII text can still differ between the
+  dialects (ugrep's `\b` and `\w` are ASCII), under `-E` and `-P` as under
+  basic regex; so can `\s` on a non-breaking space, which GNU grep does not
+  match and ugrep and rust do.
+- A `$` at the end of a pattern is answered for `grep` and `grep -E`, but
+  ugrep (Claude Code's `grep`) also matches it before a `\r`, and rust regex,
+  rg and GNU grep do not: on a file with CRLF line endings the answer lists
+  fewer lines than the grep would.
+- An empty alternative under `-E` or `-P` (`(a|)b`) is answered with rg's
+  matches, where ugrep stops with an error ("empty (sub)expression").
+- Releases before this one do not recognise the two new settings.json
+  entries: after a downgrade, the older `uninstall` leaves them behind. On
+  POSIX each runs only if its script still exists; on Windows a missing script
+  is an error at every subagent spawn and Stop until the entries are removed
+  by hand.
+- The SubagentStart matcher uses Claude Code's exact-name list form, which
+  takes hyphenated names from 2.1.195. On older versions it is read as an
+  unanchored regex, so `Plan` also matches a custom agent named `Planner`.
+  In `claude -p` on 2.1.283 the subagents in our probe ran as type `worker`,
+  which the matcher does not include.
+
+## 0.161.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 87 → 92 because the Rust fixes below change which `calls`
+edges a file produces. Nothing to run. To pin back: `npm i -g
+@sdsrs/code-graph@0.160.0`, or `cargo install code-graph-mcp --version
+0.160.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v92 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning back to get its graph back.
+
+### An incremental run binds a Rust method added later, as a rebuild does
+
+A Rust method call `x.f()` (or `make().f()`) with no method `f` anywhere in
+the project was dropped, not kept for later: when a later edit added the
+method, an incremental run never bound the call, while a rebuild did. The
+call now waits in the pending-call buffer like a bare call, and the run that
+adds the method binds it.
+
+The same drift hit a Rust `use`: `use crate::a::widget` with `widget` only in
+`c.rs` bound `c.rs` by name, and when `a.rs` later gained `widget` the
+incremental run kept the `c.rs` import and calls while a rebuild moved them to
+`a.rs`. A new definition now re-extracts an importer whose `use crate::` /
+`self::` / `super::` path points outside the module file it names. (A
+`use mycrate::a::widget` from another crate of the workspace is not covered.)
+
+### The grep hook answers only the search the grep ran
+
+Shapes where the rewritten answer searched something else now run as typed
+or are answered exactly (four were listed under 0.160.0's Not covered; the
+rest came from this release's review):
+
+- A command naming the project path anywhere but its search path
+  (`grep -rn "/home/me/proj/Foo" src/`) was answered for `Foo`: the hook strips
+  the project path from path operands and could not tell a pattern from one.
+  The path is now accepted only where the rewrite grammar reads the search path
+  operand, once; anything else runs as typed, and the PostToolUse inject skips
+  it.
+- A declaration grep with context (`grep -rn -A3 "fn load" lib/`) was answered
+  by `show load` over the whole project and every kind of definition. The
+  answer is now given only when every definition `show` prints lies inside the
+  grep's path and is one its keyword matches (`fn` is Rust's: a `struct load`
+  or a Python `def load` is no match); otherwise the grep runs as typed. A grep
+  with a file filter (`--include`, `-g`, `-t`) gets no `show` answer, which
+  cannot filter. The PostToolUse inject scopes its `show` the same way and
+  falls back to a grep answer over the same path.
+- `grep -n Foo src/` without `-r` searches no directory under GNU grep, and
+  `grep -n Foo` with no path reads its input; neither is answered with a
+  recursive search (ugrep, which some shells run as `grep`, does descend: the
+  command runs as typed either way).
+- A `^` or `$` in the middle of a basic regex (`getUser\|$user_id`), and a `*`
+  where a pattern or alternative starts (`^*foo`), read differently in GNU
+  grep, ugrep and the answer's regex; such a pattern runs as typed.
+
+### Rust call resolution, measured on tokio
+
+This repo's Rust precision did not carry over to tokio-1.41.1, the first
+outside Rust corpus: the SCIP oracle judged 639 of 2,851 `inferred` edges
+wrong. Five rules, each a fact of the language:
+
+- A bare `f()` or a module path `m::f()` never calls a function of an `impl`
+  or `trait` block, whether it takes `self` or not. 92 bare `spawn(fut)` calls
+  bound `Handle::spawn(me: &Arc<Self>, ..)`, whose first parameter is not
+  `self`. A `fn` nested in a method is still a free function of its body.
+- An integration test, an example, a bench or another package is another
+  crate: it reaches only `pub` items of a library. `mpsc::channel(n)` from
+  `tests/` bound `chan.rs`'s `pub(crate) fn channel(semaphore)`.
+- A turbofish or a qualified self no longer hides the path:
+  `Block::<u8>::new(0)` and `<S as Tr>::go(&s, 1)` were bare calls, and a
+  turbofish call (`f::<T>()`, `m::f::<T>()`, `x.collect::<Vec<_>>()`) was no
+  call at all.
+- `Self::f()` in a trait's default method names the trait.
+- `module::Type::f()` matches the module against the file and the type
+  against the method's owner: `runtime::Builder::new()` bound nothing. A path
+  through `std::`/`core::`/`alloc::`, or opening with a std module name
+  (`io::Error::new`, `sync::Mutex::new`), is left as it was: without reading
+  the file's `use`, it is usually std's. That also leaves a project module
+  named like std's unsplit, even written `crate::sync::Mutex::new` or
+  `mycrate::sync::Mutex::new`.
+
+On tokio (gold 7,908 call pairs): `inferred` precision 2,212/2,851 (77.6%) →
+2,461/2,889 (85.2%), recall at the default floor 3,787 → 4,072, wrong
+`extracted` edges 386 → 366, wrong `ambiguous` 1,758 → 1,626; of the call
+pairs the oracle can judge, 376 correct ones gained and one lost
+(`task::Notified::<T>::from_raw`, through a module named like std's `task`).
+On this repo (a snapshot with gold 7,142): wrong edges unchanged (16
+extracted, 7 inferred), recall at the default floor 6,854 → 6,961.
+
+### A Rust call through a lowercase type reaches the method again
+
+0.160.0 read a lowercase last path segment as a module, which cannot pass
+`self`, so `tokio::spawn(fut)` stopped binding `Command::spawn(&mut self)`.
+A primitive and a `#[allow(non_camel_case_types)]` struct are lowercase types
+too: `u32::encode_to(&v, buf)` and `sqlite3_db::close_db(&mut d)` lost the
+edges 0.159.0 gave them (listed under 0.160.0's Not covered). A lowercase
+segment now names a type when it is the method's own type (`impl Encode for
+u32`); a method a blanket `impl<T> Encode for T` supplies still binds
+nothing, as in every earlier release. On tokio-1.41.1 the SCIP oracle judges the same 7,099 edges the same
+way before and after, so the `tokio::spawn` fix stands.
+
+### Not covered
+
+- A call from another crate (an integration test, an example) to a
+  `pub(crate)` library function binds nothing, as it should; when the function
+  later becomes `pub`, an incremental run still binds nothing until the
+  caller's file changes or the index is rebuilt. A buffering repair was tried
+  in review and withdrawn: it displaced other buffered calls.
+- `use mycrate::a::widget` from another crate of the workspace does not
+  follow `widget` to `a.rs` when `a.rs` gains it later (only `crate::`,
+  `self::` and `super::` paths do).
+- A `fn` nested in a one-line method (`fn f(&self) { fn g() {} g(); }`) is
+  read as a method, so the bare `g()` binds nothing.
+- `show` answers exact names: a grep for `fn foo` also matches `fn foobar`,
+  and `-i` matches case variants, which the `show` rewrite never prints.
+
+## 0.160.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 79 → 87 because the Rust fixes below change which `calls`
+and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
+@sdsrs/code-graph@0.159.0`, or `cargo install code-graph-mcp --version
+0.159.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v87 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning back to get its graph back.
+
+### A Rust call binds only a function its syntax can reach
+
+A bare `f()` never calls a function that takes `self`, and a method call
+`x.f()` only calls one that does. Resolution by name ignored both rules:
+`drop(guard)` bound the project's own `impl Drop for Guard`,
+`out.status.success()` bound `JsonRpcResponse::success(id, result)`, and a
+builder's `.spawn()` bound a test helper `McpClient::spawn(root)`. A method
+call on a field, an index or a literal (`ctx.db.conn()`, `v[0].len()`) was
+resolved as a bare call; it is now a member call, and so is `self.f()` in a
+trait's default method (`Greeter::greet`'s `self.label()` had lost
+`Greeter::label` for another file's free `label()`).
+
+Measured against rust-analyzer on this repo (SCIP oracle, same snapshot, gold
+7,101 call pairs): wrong edges 107 → 44 (extracted 46 → 16, inferred 38 → 18,
+ambiguous 23 → 10), recall at the default floor 6,809 → 6,810. Two edges moved
+from unjudged to wrong at the ambiguous tier: an atomic's `.load(Ordering)`
+now reaches only the one project `load` that takes `self`.
+
+### A Rust `use` binds the item in the module it names
+
+`use crate::storage::queries::helpers::test_db` was resolved by the name
+`test_db` alone, then narrowed to the closest paths: in `graph/routes.rs` it
+bound three `test_db`s in `graph/` and dropped the imported one, and every
+call to `test_db()` followed. A full rebuild also bound `use crate::a::widget`
+to a same-named `c::widget` added later, which an incremental run did not
+(D#45). The import now carries its module path (`crate::`, `self::`,
+`super::`, counted from the inline `mod` blocks around it) and binds the item
+in that module's file. A path whose file has no such item (a `pub use`
+re-export, a macro-made item) resolves by name as before, as do paths rooted
+at a crate name.
+
+On the same oracle snapshot, after the fix above: inferred-tier wrong edges
+18 → 8, recall at the default floor 6,810 → 6,813. JavaScript and Python
+scores are unchanged.
+
+### A Rust call binds only a function taking as many arguments as it passes
+
+Rust has no overloading, default or variadic parameters, so a call passing two
+arguments cannot run a function taking three. Resolution by name did not
+check: an atomic's `.load(Ordering::Acquire)` bound the project's
+`ProjectClassNames::load(&mut self, db, candidates)` from ten callers, and
+`super::resolve::member_call_candidates(meta, ids, db)` also bound the
+same-named method, which takes `self` besides those three. A method call or a
+path call (`T::f()`, `self.f()`, `x.f()`, `a.b().f()`) now carries its
+argument count and binds only a function taking that many, less `self` for a
+method call; a path call `T::f(x, a)` passes `self` itself. A bare `f(a)` is
+not checked, and neither is a function whose parameter count its signature
+does not fix (a `#[cfg]`'d parameter, C variadics, a comment in the list). A
+path through a crate or module (`tokio::spawn(fut)`) names no type, so it
+never reaches a function taking `self`: only `Type::f(x)` passes `self` that
+way.
+
+On the oracle snapshot of the commit before this one (gold 7,126 call pairs):
+wrong edges 35 → 24 (ambiguous 11 → 1, inferred 7 → 6), correct edges 6,844
+before and after, no edge added.
+
+### Measured on outside projects
+
+Against 0.159.0, both built without embedding, 3 full-index runs each
+(ms, 0.159.0 → 0.160.0): django 9,572/9,554/9,517 → 9,639/9,564/9,646; hono
+588/568/563 → 556/583/571; tokio 2,808/2,635/2,628 → 2,683/2,497/2,544;
+leveldb 461/444/444 → 444/457/431. Re-indexing one edited file then matches
+a rebuild edge for edge on all four, with either binary.
+
+tokio is the first outside Rust project the Rust fixes above were scored on
+(rust-analyzer SCIP, gold 7,908 call pairs): precision at the extracted tier
+71.4% → 80.3% and at the inferred tier 48.3% → 77.6% (wrong edges 2,242 →
+639); recall at the default floor 3,660 → 3,787. On this repo (gold 7,140):
+wrong edges 107 → 24 over all tiers, recall at the default floor 6,848 →
+6,852. tokio's inferred-tier precision is still far below this repo's 99.8%:
+see Not covered.
+
+### The grep rewrite runs the search the grep asked for
+
+The PreToolUse hook replaces an answerable `grep` with `code-graph-mcp grep`
+and reports it as a success. Four shapes were rewritten to a different
+search:
+
+- **A flag inside a quoted pattern.** `grep -rn "FooBar -l x" src/` was
+  rewritten with `-l` and answered with a file list: flags were read from a
+  whitespace split. Words are now split the way the shell splits them. In this
+  machine's session logs, 10 of 1,829 commands the PostToolUse inject folds
+  carried such a phantom flag (`"…running as root"` read as `-i`).
+- **Bare `( ) { } + ? |` in a basic regex.** grep reads them as literals and
+  rust regex as operators, so `grep "tombstoneActive()"` matched every
+  `tombstoneActive`. They are now escaped. A bracket expression the two
+  dialects read differently (`[\(]`, `[a&&b]`) is not rewritten.
+- **`--include` with a file operand.** GNU grep filters a named file by the
+  glob; cg searches it anyway. Rewritten only for a directory now.
+- **A relative path from a subdirectory shell that the rebase left alone.**
+  From `xtask/`, `grep -rn X src/` was rewritten to search the root's `src/`.
+  The rewrite now requires the operand to name the same directory from the
+  shell as its root-relative form names from the root.
+
+Each shape now runs as typed. Over 16,352 grep commands from this machine's
+session logs, the old and new hook rewrite the same 42 commands; 9 of those
+now search a literal paren or brace.
+
+### The grep inject answers the grep that ran, where it ran
+
+The PostToolUse hook adds a structural answer after a compound command's grep
+found nothing. It now reads that command closer to the way the shell does:
+
+- **Heredoc bodies are data.** A `grep` line inside a `python3 - <<'PY'` body
+  was answered as if the shell had run it, and a `\'` in the body flipped the
+  quote parity so a real grep after the body was missed.
+- **The directory the grep ran in.** The answer searched the root-relative
+  path from the project root, even after `cd backend &&` or from a
+  subdirectory shell. It now follows commands that cannot move the shell and
+  a `cd` to a literal path that must have run for the grep to run (not
+  `false && cd x;`, not `true || cd x &&`, not `cd x | cat`), and answers
+  only when the grep's
+  operand names the same directory from there. After any other command
+  (`cd "$D"`, a function, `source`) it stays silent.
+- **Comments, here-strings and shifts.** A `#` comment ends at its line, and
+  `<<<` or a `<<` inside `((…))` starts no heredoc.
+- **The pattern as the shell passes it.** `"Foo"'Bar'` is one pattern
+  `FooBar`; a quoted pattern the shell expands (`"$MAX"`, `` "`date`" ``) or an
+  unterminated quote has no readable pattern; words inside a quoted pattern are
+  no longer rebased as paths from a subdirectory.
+
+On the same 16,352 commands, measured before the `||` repair above, the
+inject folds 1,734 commands instead of 1,807:
+32 real greps after a heredoc are now found, 7 heredoc-body greps and 23
+greps after a `cd` elsewhere are no longer answered, and 75 follow a command
+whose directory the hook cannot name. The PreToolUse rewrite decisions are
+unchanged.
+
+The basic-regex bridge also declines what it cannot translate faithfully: an
+escape other than `\( \) \{ \} \+ \? \|`, `\w \s \b` (and their capitals)
+or an escaped metacharacter; an empty group; an unknown `[:class:]`; a
+bracket starting with `]`. An `--include` glob with `{a,b}` is not rewritten
+(GNU grep does not expand it), and `-E` inside a quoted pattern no longer
+counts as the flag.
+
+### Not covered
+
+- 22 of the 24 Rust wrong edges left on that snapshot need the receiver's
+  type, which the source does not write down: `n.name.as_str()` on a closure
+  parameter binds a project enum's `as_str`, and `tx.commit()` on a
+  `rusqlite` transaction binds the project's savepoint `commit`. The other
+  two are a `#[cfg]` twin and a caller whose stored body is truncated.
+- On tokio, 639 inferred-tier Rust edges are still wrong. The largest groups:
+  `Semaphore::new()` binding a same-named type in another module (a `use`
+  rooted at the crate's own name, `use tokio::sync::Semaphore`, is not
+  anchored), and a bare `spawn()` binding the associated function
+  `Handle::spawn(me, future, id)`, which no bare call can reach.
+- A Rust `x.f()` that finds no function when its file is indexed does not bind
+  one a later incremental run adds; a rebuild binds it. Adding `widget` to
+  `a.rs` after `use crate::a::widget` bound another file's `widget` also keeps
+  the old edge until a rebuild. `<S as Tr>::go(s)` binds nothing.
+- A call through a renamed JavaScript import (`import { a as b }`,
+  `const { a: b } = require()`) still resolves by its local name, as in
+  0.159.0: to nothing, or to another file's function named `b`.
+- The module-path rule reads a lowercase last segment as a module, so a call
+  through a lowercase type that passes `self` itself loses its edge:
+  `u32::encode_to(&v, buf)` for a project trait implemented on `u32`, or
+  `sqlite3_db::close_db(&mut d)` for a `#[allow(non_camel_case_types)]` struct.
+- A grep that may not have run (`true || grep …`) is still answered by the
+  inject when its output is empty, and a `cd` inside a loop body
+  (`for d in "$@"; do cd x; done; grep …`) is followed although the body may
+  not have run.
+- The inject does not apply the `--include`-with-a-file rule, and forwards no
+  `-x`; the rewrite declines both.
+- `\b` and `[[:alpha:]]` on non-ASCII text can differ between the dialects.
+- Older rewrite gaps found by this release's review, not yet fixed: a quoted
+  pattern holding the project root path is rewritten without it; a grep
+  answered by `show` ignores its path and context flags; a grep without `-r`
+  on a directory is rewritten as recursive; a `$` inside a basic-regex
+  alternation (`getUser\|$user_id`) is copied as an anchor.
+
+## 0.159.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 74 → 79 because the fixes below change which `calls` and
+`inherits` edges a file produces, and an existing index keeps the wrong ones
+until each file's content changes. Nothing to run; the rebuild itself is faster
+than 0.158.0's full index (below). To pin back: `npm i -g
+@sdsrs/code-graph@0.158.0`, or `cargo install code-graph-mcp --version 0.158.0`;
+plugin users can set the version in the marketplace entry. An older binary
+leaves a v79 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning to get its graph back.
+
+### A full index is faster than 0.157.0 again
+
+0.158.0 and the typing fixes below made a full index slower than 0.157.0: by
+6% on django, 16% on hono and 25% on leveldb (the table below). Timers on each
+phase put most of the time in reading each file's calls and imports from its syntax tree: 3.6 s of
+django's 12.5 s, 400 of hono's 905 ms and 220 of leveldb's 640 ms. That step
+ran one file at a time, after the file's symbols were stored. It now runs on
+the parser's worker threads beside symbol extraction. The worker threads get
+the same 8 MiB stack as the index thread, because this step recurses once per
+syntax level.
+
+Full index, median of interleaved runs (3 for django, 5 otherwise), against
+0.157.0:
+
+| | 0.157.0 | before this change | now |
+|---|---|---|---|
+| django (3,290 files) | 11.9 s | 12.6 s | 9.4 s |
+| hono | 792 ms | 919 ms | 558 ms |
+| leveldb | 508 ms | 636 ms | 447 ms |
+
+Peak memory drops too: django from 471 to 457 MiB, hono from 107 to 76 MiB,
+leveldb from 61 to 51 MiB, because each syntax tree is freed once its file is
+read instead of being held until its batch is resolved. The graph is identical.
+Every edge, buffered call, recorded field, symbol and context string matches
+on django, hono, express, flask, leveldb and this repository. A one-file edit
+on django takes the same time: 498 → 504 ms median of 9, within both runs'
+spread; a no-op run takes 95 → 94 ms.
+
+### A C++ call through a chain of fields and calls is typed
+
+`r->index_block.Add()`, `versions_->current()->Ref()` and
+`env_.target()->GetChildren()` call a method on the result of a member
+access or another call. Each such call was untyped and bound every `Add`,
+`Ref` or `GetChildren` in reach. The chain is now typed one step at a time,
+through the recorded field types and the methods' declared return types,
+following base classes where a class inherits the member. The call is typed
+only when the chain ends in a class the project defines. A subscript, a free
+function's result, a primitive or `std::` type, or a method returning its
+template's parameter (`template <class Iterator> … Iterator* inner()`) leaves
+it untyped, as before. Editing the header that declares a field or a return
+type on the chain re-resolves the callers in other files, and so does renaming
+a class to the type an untyped chain ends in. Not covered: a library type is
+matched by its last name, so `absl::Status st_; st_.ok()` binds a project
+`Status::ok`, the rule locals already follow. A chain call that stays untyped
+records the type it ends in, so two chains to one method ending in different
+library types (`std::string`, `std::vector`) keep one edge each.
+
+On leveldb, scored against SCIP, the `inferred` tier goes from 2513/2550 to
+2605/2642 (98.6%). Recall rises from 2738 to 2789 of 3470. Same-file precision
+goes from 1497/1534 to 1497/1529.
+
+Typing a call through a field declared in a base class, or through a chain step
+a class inherits, read the class hierarchy before a full index had resolved
+its cross-file `inherits` edges. A rebuild typed fewer of these calls than an
+incremental run did. Both now read it after.
+
+### A typed call on a class without the method binds what that class runs
+
+`db->Get()` on a `DB*` whose `Get` is pure virtual, or `self.helper()` in a
+class that inherits `helper`, names a class that does not define the method
+itself. Such a call used to resolve as an untyped member call. It bound every
+`Get` or `helper` in reach, preferring the caller's own file, so leveldb's
+`db->Get()` inside `DBTest` bound `DBTest::Get`. It now binds the
+definition the class inherits from its nearest ancestor that has one. Called
+through an object that may be a subclass, it also binds that class's
+subclasses' overrides, the same rule a class that defines the method already
+followed. A call stays untyped only when the class hierarchy has no
+definition, such as a method from a library base class.
+
+Two errors in `inherits` edges fed this and are fixed with it:
+
+- An `inherits` edge could point at a function or method named like the base:
+  a C++ class's own constructor, or, for `class DBTest : public
+  testing::Test`, a project method called `Test`. leveldb had 93 such edges,
+  which made unrelated classes subclasses of each other. A supertype is now
+  always a type, both when the subclass's file is indexed and when the base's
+  file is edited. Not covered: a JavaScript `class Sub extends Base` whose
+  `Base` is an ES5 constructor function (`function Base() {}`) gets no
+  `inherits` edge. Exempting functions there made classes extend unrelated
+  same-named functions instead.
+- A C++ base written `log::Reader::Reporter` or `ns::Tmpl<int>` was recorded as
+  `Reader::Reporter` or `Tmpl<int>`, names no node has, so those subclasses
+  had no base. The last segment is recorded now.
+
+On leveldb, scored against SCIP, the `inferred` tier goes from 1528/1565 to
+2513/2550 (97.6% → 98.5%), and recall from 2730 to 2738 of 3470. Most of the
+gain is edges that were `ambiguous` guesses and are now decided. hono gains 2
+correct `inferred` edges and no wrong ones; express and this repository's own
+Rust and JavaScript are unchanged. flask gains 1 correct and 2 wrong: a
+session interface's `self.get_cookie_name()` now also reaches a test
+subclass's override. That is the dispatch rule above, and the oracle cannot
+credit it because scip-python records no overrides. A full index of django takes
+as long as before (12.5 s, three runs each).
+
+A class that inherits the method depends on its bases, so an incremental run
+that changes a base re-resolves the typed calls of every class below it. That
+covers a base gaining or losing the method, a class changing its bases, and a
+base being renamed out from under a subclass in another file. In each case the
+incremental graph equals a rebuild's. Not covered: the reverse, a class
+renamed to the base name an untouched subclass already writes (`class Basex`
+→ `class Base` under `class Sub(Base)`). As in 0.158.0, only `rebuild-index`
+adds that `inherits` edge, and until then the subclass's typed calls resolve
+without the base.
+
+### A C++ call through a field declared in another file is typed
+
+`snapshots_.Delete()` in `DBImpl::ReleaseSnapshot` (db_impl.cc) calls through a
+field declared in db_impl.h, and `db_->Put()` in a gtest `TEST_F(DBTest, …)`
+body calls through a field of the fixture. The caller's file declares neither,
+so each was an untyped member call that bound every `Delete` or `Put` in reach,
+including `DBImpl::Delete` itself. Class bodies now record the type of each field. Such a call is typed from its
+class's fields, or its base classes' when the class does not declare it, and
+binds that type's method. A `std::` type such as `std::string saved_key_`
+binds nothing, where `saved_key_.clear()` used to reach a project `clear`. A
+name that is no field of the class, such as a global, resolves as before.
+
+A field followed by a Clang thread-safety annotation
+(`SnapshotList snapshots_ GUARDED_BY(mutex_);`, `void F()
+EXCLUSIVE_LOCKS_REQUIRED(mutex_);`) did not parse: tree-sitter read the
+annotation as a function and lost the field's name. These annotations are now
+blanked before parsing, as class export macros already were, when they follow
+a declarator, a lambda's parameters or an `operator` (other than `new`,
+`delete` and `,`). A function whose own name only ends like one is left alone
+when it returns a built-in type (`static void OBJ_RELEASE(void* p)`), and so
+is such a call after `if (…)`, `while (…)` or a cast
+(`FT_ATOMIC_LOAD_PTR_ACQUIRE(x)`). Not covered: such a function returning a
+project type (`static Status DO_RELEASE(…)`) is still blanked, and an
+annotation after a built-in trailing return type (`auto f() -> int
+REQUIRES(mu);`) is not; none of leveldb, abseil, grpc, rocksdb or cpython has
+either.
+
+On leveldb, scored against SCIP, same-file precision goes from 1484/1559 to
+1500/1548 (95.2% → 96.9%) and the `inferred` tier from 1361/1401 to 1528/1565
+(97.1% → 97.6%), with recall 2730 of 3470 (the denominator grows because
+annotated member functions now parse). Editing the header re-resolves the
+callers in other files. Dropping or retyping a field, or deleting a header,
+leaves the incremental graph equal to a rebuild's.
+
+### Changing a class re-resolves typed calls in files the edit did not touch
+
+A typed call (`f = Field(); f.clean()`, `it->Next()` on an `Iterator*`) binds
+by the whole project's classes: whether a class of that name exists, whether
+the name is unique and top-level, which classes subclass it, and which of them
+define the method. An edit that changed any of that left callers in other files
+as they were until `rebuild-index`. Deleting django's `forms/fields.py` left 19
+edges a rebuild has. Deleting leveldb's `iterator.h` left 861 edges missing and
+457 stale. Renaming django's `forms.CharField` left 5 missing edges. The
+incremental run now compares its files' classes, base classes and methods
+before and after. It re-indexes the files holding a typed call that the change
+can move, along with the callers a new same-named definition reaches. In all
+five cases measured (those three, plus deleting leveldb's `skiplist.h` and
+adding a `Field` override in django), the incremental graph now equals a
+rebuild's.
+
+The price is paid only by edits that change a class. Adding or removing one,
+renaming it, changing its bases, or adding or removing a method all qualify.
+Deleting `forms/fields.py` took 6.9 s instead of 4.6 s, renaming `CharField`
+3.2 s instead of 1.0 s, and deleting `iterator.h` 392 ms instead of 20 ms. A
+one-file edit that leaves classes alone is unchanged on django: 1,209 → 1,246
+ms median of 9, within both runs' spread; a no-op run takes 102 ms in both.
+
+A typed call that binds nothing is kept as a buffered row, so the class or
+method that answers it later still finds it. This covers a call on a class the
+project does not define, and a call on a class without the method whose name
+is too common to guess at (`x.build()`, `x.run()`). The second kind used to be
+dropped with no trace, and it adds 42 buffered rows on django's 29,075. Not
+covered: once a row has aged out (50 index runs that parsed something), only
+`rebuild-index` binds the call.
+
+### A buffered typed call from a free function binds like a rebuild
+
+A typed call whose class lacks the method (`def f(): a = A(); a.f()`, with
+`A` defining no `f`) resolves as an untyped member call. When such a call waited
+in the pending buffer and its caller was a free function named like the
+method, the incremental sweep counted the caller as a same-file candidate and
+bound nothing, while a rebuild binds the method in the other file.
+
+### A C++ local constructed with arguments is typed
+
+`ModelDB model(CurrentOptions());` and `Block block(contents);` parse as
+function declarations, a C++ ambiguity known as the most vexing parse, so
+`model.Put()` was an untyped member call and bound every `Put` in the file. Inside a
+function body such a line declares a variable, and the call now binds that
+class's method. On leveldb, scored against SCIP, same-file precision goes
+from 1484/1563 to 1484/1559 and the `inferred` tier from 1355/1395 to 1361/1401
+(recall 2620 → 2626 of 3431). `T f(args);` in a class body is still a method
+declaration.
+
+### Two read-fanout hints in one Bash call reach the model
+
+A compound command whose `sed -n` range reads pushed two directories past the
+read-fanout threshold (`sed -n 1,10p lib/a.js; sed -n 1,6p tests/a.test.js`)
+wrote two JSON envelopes to the Bash hook's stdout. Claude Code parses a hook's
+output as one JSON value, rejected the pair ("Unexpected non-whitespace
+character after JSON ... line 2 column 1"), and the model saw neither hint —
+while the tracker recorded both as delivered, so neither fired again for five
+minutes. Seen 4 times between September 6 and 26 in claude-mem-lite sessions.
+The hints now share one envelope. Each directory first reserves room for its
+own lines, sized by its name, and the overview answers split what is left of
+the 4000-byte context cap, so a large first answer cannot cut a later
+directory out. When the split leaves less than 400 bytes per answer (from
+seven short-named directories at once), every directory gets the one-line
+advice instead of an overview. Past what those lines fit, one closing line
+names the remaining directories, so every directory marked as hinted is
+named in the envelope, unless the names themselves overflow the cap (several
+directories named with 150 or more CJK characters).
+
+That envelope also no longer carries `permissionDecision: "allow"`. It was the
+Read hook's envelope, written from inside the tracker the Bash hook shares, and
+on a Bash call it skipped the user's permission prompt for the whole command —
+including anything after the `sed`. The hint still arrives as
+`additionalContext`; the command goes through the normal permission flow.
+
+## 0.158.0
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 72 → 74 because the call-graph errors below change which
+nodes and `calls` edges a file produces, and an existing index keeps the wrong
+ones until each file's content changes. Nothing to run. To pin back:
+`npm i -g @sdsrs/code-graph@0.157.0`, or `cargo install code-graph-mcp --version
+0.157.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v74 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning to get its graph back.
+
+### Call edges measured against the compiler on four outside projects
+
+The call graph was scored against SCIP indexes (the compilers' own name
+resolution) on pinned open-source corpora, one per language this repository
+has little or none of: hono (TypeScript), express (JavaScript), flask (Python)
+and leveldb (C++). `scripts/scip_oracle/corpora.sh DIR` clones, indexes and
+scores them. Every error below was found that way and is fixed. Before and
+after, precision and recall at the `inferred` confidence floor that
+`callgraph` and `impact` use, 0.157.0 against this release on the same SCIP
+indexes:
+
+| corpus | precision | recall |
+|---|---|---|
+| flask | 69/237 = 29.1% → 73/89 = 82.0% | 233/273 → 236/273 |
+| hono | 471/571 = 82.5% → 490/520 = 94.2% | 780/896 → 799/896 |
+| express | 5/9 → 5/5 | 63/68, unchanged |
+| leveldb | 641/682 = 94.0% → 1355/1395 = 97.1% | 1364/3393 = 40.2% → 2620/3431 = 76.4% |
+| this repo, JS | 495/516 → 495/495 | 1284/1289, unchanged |
+| this repo, Rust | 3125/3162 → 3125/3161 | 6549/6832, unchanged |
+
+leveldb's extracted tier (same-file edges) went from 828/972 = 85.2% to
+1484/1563 = 94.9%. The recall denominators move because SCIP's gold pairs are
+counted only where code-graph has a caller node, and 0.157.0 was missing
+leveldb's test cases and exported classes.
+
+- **A member call bound every same-named method.** `x.f()` names only `f`, so
+  `snapshots_.Delete()` inside `DBImpl` bound `DBImpl::Delete`, and
+  `this.getCookies()` bound three sibling classes' `getCookies`. When the
+  source writes the receiver's class down, the call now binds that class's
+  method. That covers `this`/`self`, Python `super()` (its first base), a
+  Python local assigned from a constructor, a C++ local, parameter or in-class
+  field's declared type (`Slice s`, `DB* db`, `std::unique_ptr<T> p` for `->`),
+  JS `const q = new Q()`, and a TypeScript `: T`. Overrides in subclasses
+  are bound too, since the object may be one; `super()` is exempt, since it
+  names one implementation. A class the project does not define
+  (`std::string`, `AbortController`, an imported library class) binds nothing.
+  A project class without the method (inherited) resolves as an untyped member
+  call. Same-named classes are told apart: a caller's own file's class wins,
+  and a class nested in another (leveldb's `SkipList::Iterator`) is not the
+  top-level one of that name (`leveldb::Iterator`).
+- **A call through a library module bound a project function.** flask's
+  `click.echo()` bound flask's own `echo` (16 edges). A Python call through
+  an import of a module the project does not have now binds nothing;
+  `helpers.run()` on a project module is unchanged.
+- **A member call on an object bound free functions.** `words.push(x)`,
+  `JSON.stringify(v)`, `s.clear()` or `ctx.get(None)` could bind a project
+  function of that name, such as a nested `const push = () => …`, a
+  module-private `function stringify` or a free `void clear()`. An object's
+  member is never a free function, so in C++, Python, JavaScript and TypeScript
+  such a call no longer reaches one. The exception is a nested function that its
+  factory returns in an object literal (`return { attemptUpgrade }`). It is a
+  member of the returned object and is now qualified `makeStub.attemptUpgrade`.
+  A call through a module (`helpers.run()`, `require('./x').f()`, `m.f()` for
+  an imported `m`) is unchanged.
+- **Same-named functions in one file shared their calls.** A call's caller was
+  found by name, so every same-named definition in the file got it. flask's
+  test file has 37 nested `def index()` route handlers, and each carried the
+  `url_for` / `flash` / `abort` calls of all the others (125 of flask's 168
+  wrong inferred edges). The same happened to Rust `#[cfg]` twins and Python
+  `@overload` stubs. The caller is now the definition that contains the call.
+- **gtest bodies had no calls.** `TEST_F(DBTest, Get) {…}` is the node
+  `DBTest.Get`, but its calls were recorded as coming from `TEST_F`, so 228 of
+  leveldb's 229 test cases showed no callees and their helpers no test callers.
+  Now 226 of 229 have their calls. A bare `Put()` in a test body, like one in
+  any member function, binds the class's own `DBTest::Put` when the file
+  defines it, instead of every `Put` in the file. `ModelDB::Put()` and a
+  `Status(...)` constructor call inside a `Status` member are not affected.
+- **`class LEVELDB_EXPORT Slice {` was not a class.** An export or annotation
+  macro between `class`/`struct` and the name made the parser read the line as
+  a function `Slice` returning `class LEVELDB_EXPORT`. Each such class became a
+  one-line node named after the macro, and its members became free functions.
+  The macro is now blanked before parsing.
+- **A `class` or `struct` without a body made a node.** A forward declaration
+  (`class Cache;`, `class LEVELDB_EXPORT Cache;`) and every C type use
+  (`struct stat *st`, `static struct node *g(...)`) produced a class/struct
+  node of that name beside the real definition, or in place of a system type.
+  Only a definition makes one now.
+- **TypeScript `abstract class` was not a class.** It had no node, its methods
+  were unqualified, and its `extends`/`implements` made no edge.
+- **Editing a file re-bound calls into it by name.** When a file is
+  re-indexed, calls from unchanged files into it are restored. A call the
+  resolver had bound through its receiver's class, a `super()` or a member
+  call's candidates was restored to every same-named method in the file,
+  and it stayed that way until the caller's file changed. On 0.157.0,
+  editing one django file left 66 or 179 such extra edges that a rebuild
+  does not have. Each is now restored to the method with the same qualified
+  name. After appending a line to any of 11 files across django, leveldb,
+  hono and flask, the incremental graph equals a rebuild's. When the edit
+  renames or deletes the class a typed call was bound to, the call is
+  re-resolved as the typed call it is.
+
+Indexing does more work per call. A full index took 7% longer on django
+(11.9 s → 12.8 s, 3,290 files), 11% on hono and 21% on leveldb (537 → 648 ms,
+most of it from the earlier INDEX_VERSION 73 fixes). A one-file edit on django
+takes 1–5% longer than on 0.157.0 (0.8–1.4 s per file here).
+
+The JS/TS oracle's tsconfig now uses `"module": "preserve"`, which resolves
+extensionless ESM imports as well as `require()`. The oracle also gained C++
+(scip-clang), virtual dispatch through SCIP's override relationships,
+constructor calls and a `--repo DIR` option.
+
+### Not covered
+
+- **A receiver the source does not type stays an untyped member call.** That
+  covers a C++ field used by a member function defined outside its class body
+  (`snapshots_.Delete()` in `db_impl.cc`, the field declared in `db_impl.h`),
+  a chain (`c.req.text()`), a call's result, and a Python name imported from
+  another module (`_cv_app.get()`). Such a call still binds every same-named
+  method: 48 of leveldb's 79 remaining wrong same-file edges are these.
+- **Overrides are found through `inherits` edges, which are bound by name.**
+  When two classes share a name, a subclass may be bound to the wrong one, so
+  such a class contributes no overrides.
+- **A Python local constructed from an imported library class** that shares a
+  project class's name (`from requests import Session; s = Session()`) is
+  typed as the project's class, as it was before this release. The same
+  now happens to a C++ type brought in by `using std::mutex;`, a TypeScript
+  type aliased from a namespace import, and a browser global such as
+  `Response`, when a project class has that name. A TypeScript
+  class imported by name from a package stays untyped, and a `std::` type
+  binds nothing. A path alias or workspace package (`'@/models'`) counts as a
+  package, so its classes stay untyped too.
+- **Renaming or deleting a class does not re-resolve unchanged callers.** A
+  typed call binds by the whole project's set of classes: whether its class
+  is known, and whether its name is unique enough to follow overrides. When
+  an edit changes that set, a rebuild can bind calls in files the edit never
+  touched differently. After deleting django's `forms/fields.py`, a rebuild
+  had 19 edges an incremental run did not, all of them overrides it could
+  now follow. `rebuild-index` catches up.
+- **A later file does not re-bind an earlier typed call.** A class added after
+  its caller was indexed gets the call only while the call is still buffered
+  (a bounded number of runs). A subclass override added later gets no
+  existing callers until those callers' files change. `rebuild-index` binds
+  both.
+- C member calls are not restricted: a struct field commonly holds a free
+  function of the same name (`ops->read` → `read`).
+
+### The grep hook now answers `grep -rn X src` the way it answers `src/`
+
+The grep hook only recognized a source directory written with a trailing slash.
+`grep -rn "Foo" src`, `rg Foo tests` and `git grep Foo src` ran unhooked,
+while the same command with `src/` was rewritten to `code-graph-mcp grep`.
+Models write the bare form often, for example when a prompt says a project
+lives "under src/". A bare source directory, or one written `./src`, now counts
+when the hook's rewrite grammar can prove it is the command's path argument.
+Such a command gets the treatment its `src/` spelling gets. To check that, we
+took 873 grep commands from real sessions and generated two spellings of each,
+with the first source path written `dir/` and written bare `dir`. The `dir/`
+spelling is rewritten in 38 of them, and in all 38 the bare spelling is
+rewritten to the same directory. Over 1,766 distinct grep commands from real
+sessions, 8 change. In 6 of them an extra answer is now injected after a
+compound command ran (`grep -rn X tests | head`); the other 2 change only an
+internal decision that prints nothing. None of the 1,766 loses a rewrite or
+inject it had. The commands that do lose one are generated shapes where the old
+inject searched a fragment of the pattern instead of a path
+(`grep -rn "src/Foo" tests 2>/dev/null` searched `src/Foo`).
+
+A bare word the grammar cannot place is left alone: the pattern itself
+(`grep -n tasks "task_queue.py"`), a flag's value (`ag --ignore tests`), one of
+two paths, anything inside `$(…)`, and an English word inside a quoted pattern.
+A bare `src` means `src` under wherever the shell is, so it is answered only
+from the project root and only when the grep is the first command in the line:
+after `cd x &&`, `if cd x;`, `{ cd x; …` or even `echo; grep …` it runs as
+typed with no extra answer. `grep -rn X .` and a bare `rg X` are unchanged, because they
+search non-source files and `grep -r` ignores `.gitignore` where the rewrite
+does not. To turn the rewrite off: `CODE_GRAPH_NO_BLOCK_GREP=1`; all grep hints:
+`CODE_GRAPH_QUIET_HOOKS=1`.
+
+## 0.157.0
+
+**Upgrading: nothing to do; an index damaged by an older server repairs itself.**
+`INDEX_VERSION` (72) and the schema (v10) are unchanged, so nothing re-indexes.
+Two behaviors change. When a code-graph server finds the index was built by a
+newer code-graph, it stops writing to it: tools keep answering from the index
+as it stands, and CLI `incremental-index` exits 1 with a message telling you to
+restart. The first incremental run after upgrading re-parses any file that
+`health-check` lists as a damaged parse and that this version has not parsed
+itself, once each. If `health-check` still
+shows files you believe are fine, `code-graph-mcp rebuild-index --confirm`
+rebuilds from scratch. To pin back: `npm i -g @sdsrs/code-graph@0.156.0`, or
+`cargo install code-graph-mcp --version 0.156.0`; plugin users can set the
+version in the marketplace entry.
+
+### A server left running from before an upgrade no longer rewrites the index
+
+A Claude Code session opened before an upgrade keeps its code-graph server
+running on the old binary. Once the upgraded binary rebuilt the index, that old
+server refused to wipe it, as it should, but it went on indexing into it: every
+file it re-indexed was stored as the OLD grammar's parse under the NEW version
+stamp. The newer binary never re-parses a file whose content did not change, so
+the damage stayed until you edited the file or rebuilt by hand. Reproduced with
+a 0.153.0 server against a 0.156.0 index: the function after a
+`for r in &raw {}` loop disappeared from the index, and running 0.156.0 again
+did not bring it back. On this repository, 9 Rust files sat in `health-check`'s
+`Parse:` line after the 0.155.0 upgrade, and `cmd_affected` was missing.
+
+From this release, a code-graph that finds the index was built by a newer
+`INDEX_VERSION` stops writing parse results into it. It checks the index as it
+is when each indexing run starts, not as it was when the server started,
+because the usual order is the reverse: the server is already running when the
+newer binary rebuilds under it. The server keeps answering from the index as it
+stands, including tools given a `file_path` whose file has changed (they skip
+the refresh rather than fail). On the primary instance, the tools that refresh
+the files their results name (call graph, references, searches and the like)
+add a `freshness` note saying the index belongs to a newer code-graph and that
+restarting the session is the remedy. A secondary instance does not promote itself to
+primary over such an index; and the startup context-string repair does not
+run. CLI `incremental-index` exits 1 and says why. This protects future
+upgrades; servers from 0.156.0 and earlier that are already running cannot be
+changed, which is what the second part is for.
+
+A file listed as a damaged parse is now re-parsed by the next incremental run
+unless this version recorded that verdict itself, for the content the index
+now holds. The record is kept per `INDEX_VERSION` and per file content, so a
+verdict another version wrote, or one about content that has since changed,
+does not count. A file that really does fail to parse is re-parsed
+once and then left alone. Indexes already damaged by an older server therefore
+repair themselves on first use, as far as the damage is on record: the damaged
+list exists since 0.151.0, so a server older than that leaves nothing to find,
+and `rebuild-index --confirm` is the remedy there.
+
+### Not covered
+
+- Background embedding still writes vectors into a newer index. Vectors are
+  computed from the newer binary's own context strings and never change what
+  was extracted.
+- A file listed as damaged that cannot be READ is re-queued on every
+  incremental run until it is readable again, because a failed read does not
+  count as having examined it. Each otherwise empty incremental then runs a
+  small index pass, including the post-index phases.
+- Opening an index whose vector table has a different embedding dimension
+  still drops that table, before any version check. No release has changed the
+  dimension; this matters only if one does.
+- An indexing run already under way when the newer binary stamps the index
+  finishes writing; the check is made when a run starts.
+- CLI read commands over a newer index still suggest
+  `code-graph-mcp incremental-index` when files changed, and `health-check`
+  suggests `reindex`; both now exit 1 there. Restarting the session is the
+  remedy.
+- The verified record takes each file's hash from the index when the run
+  finishes. If another binary re-indexes that file in the same moment, the
+  record can vouch for content this run did not parse.
+
 ## 0.156.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (72) and

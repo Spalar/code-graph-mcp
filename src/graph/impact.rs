@@ -45,8 +45,9 @@ pub struct ImpactClassification<'a> {
     /// Risk level from [`domain::compute_risk_level`], or `"UNKNOWN"` when the
     /// target is a non-function with zero production callers — its real usage
     /// (imports / field access / instantiation / type annotations) is broader than
-    /// the call graph, so a `LOW` would mislead. [`Self::type_warning`] carries the
-    /// matching explanation in that case.
+    /// the call graph, so a `LOW` would mislead — or a function with no caller at
+    /// all, production or test, which the graph cannot tell from one whose callers
+    /// went unresolved. [`Self::type_warning`] carries the matching explanation.
     pub risk_level: &'static str,
     /// `Some(explanation)` exactly when `risk_level == "UNKNOWN"`; `None` otherwise.
     pub type_warning: Option<&'static str>,
@@ -57,8 +58,8 @@ pub struct ImpactClassification<'a> {
 ///
 /// `callers` is the raw list from `get_callers_with_route_info`; the queried
 /// symbol itself (depth 0) is filtered out here. `is_function_like` reports
-/// whether the target symbol is a function/method (drives the `UNKNOWN`-risk path
-/// for types and other non-function symbols).
+/// whether the target symbol is a function/method (selects which `UNKNOWN`-risk
+/// warning applies: the non-function one, or the no-callers-at-all one).
 pub fn classify_impact<'a>(
     callers: &'a [CallerWithRouteInfo],
     change_type: &str,
@@ -119,8 +120,26 @@ pub fn classify_impact<'a>(
         .copied()
         .collect();
 
-    let type_warning = if prod_callers.is_empty() && !is_function_like {
+    let caller_risk = domain::compute_risk_level(
+        prod_callers.len(),
+        route_callers.len(),
+        // Both `remove` and `signature` are *breaking* changes: every call
+        // site must change or it won't compile/run. `behavior` keeps callers
+        // compiling, so only it scales risk by caller count. Treating
+        // `signature` like `behavior` (its prior behaviour) made the option a
+        // silent no-op.
+        matches!(change_type, "remove" | "signature"),
+    );
+    // A type's users are type positions, implementers and imports, which the
+    // call graph does not count: a few calls make no LOW (hono's `Router`
+    // interface read LOW on one caller, B4 in the 2026-09-28 usage
+    // evaluation). MEDIUM or HIGH from calls alone is a lower bound and stays.
+    let type_warning = if !is_function_like && (prod_callers.is_empty() || caller_risk == "LOW") {
         Some(domain::NON_FUNCTION_IMPACT_WARNING)
+    } else if prod_callers.is_empty() && test_callers.is_empty() {
+        // Nothing resolved calls it, test code included: the graph has no
+        // evidence either way, and `LOW` would read as an endorsement.
+        Some(domain::NO_CALLERS_IMPACT_WARNING)
     } else {
         None
     };
@@ -128,16 +147,7 @@ pub fn classify_impact<'a>(
     let risk_level = if type_warning.is_some() {
         "UNKNOWN"
     } else {
-        domain::compute_risk_level(
-            prod_callers.len(),
-            route_callers.len(),
-            // Both `remove` and `signature` are *breaking* changes: every call
-            // site must change or it won't compile/run. `behavior` keeps callers
-            // compiling, so only it scales risk by caller count. Treating
-            // `signature` like `behavior` (its prior behaviour) made the option a
-            // silent no-op.
-            matches!(change_type, "remove" | "signature"),
-        )
+        caller_risk
     };
 
     ImpactClassification {
@@ -278,9 +288,56 @@ mod tests {
         assert!(c.type_warning.is_some());
     }
 
+    /// B4 (2026-09-28 usage evaluation): a type's users are type positions,
+    /// implementers and imports, which the call graph does not see, so a few
+    /// calls cannot make it LOW. hono's `Router` interface (five routers
+    /// implement it, 27 references) read `Risk: LOW` on one caller — itself a
+    /// `new Router()` of another package's class. A count high enough for
+    /// MEDIUM or HIGH stays: it is a lower bound.
     #[test]
-    fn function_zero_callers_is_low_not_unknown() {
+    fn non_function_with_few_callers_is_unknown_not_low() {
+        let callers = vec![
+            caller("Router", "src/router.ts", 0, None),
+            caller("main", "src/b.ts", 1, None),
+        ];
+        let c = classify_impact(&callers, "behavior", false);
+        assert_eq!(c.risk_level, "UNKNOWN");
+        assert_eq!(c.type_warning, Some(domain::NON_FUNCTION_IMPACT_WARNING));
+        assert_eq!(
+            classify_impact(&callers, "behavior", true).risk_level,
+            "LOW"
+        );
+
+        let many: Vec<_> = std::iter::once(caller("Context", "src/context.ts", 0, None))
+            .chain((0..12).map(|i| caller(&format!("f{i}"), &format!("src/f{i}.ts"), 1, None)))
+            .collect();
+        let c = classify_impact(&many, "behavior", false);
+        assert_eq!(c.risk_level, "HIGH");
+        assert!(c.type_warning.is_none());
+    }
+
+    /// Zero callers in the graph is not evidence of zero callers: an exported
+    /// entry point reached through an unresolved import, a dynamic call or code
+    /// outside the index looks the same. express's `createApplication` (called
+    /// by every test through `require('..')`) was reported `Risk: LOW, 0
+    /// callers` and that line was injected into a rename request (2026-09-28
+    /// usage evaluation). With nothing to count, the risk is UNKNOWN.
+    #[test]
+    fn function_with_no_callers_at_all_is_unknown() {
         let callers = vec![caller("orphanFn", "src/a.rs", 0, None)];
+        let c = classify_impact(&callers, "behavior", true);
+        assert_eq!(c.risk_level, "UNKNOWN");
+        assert_eq!(c.type_warning, Some(domain::NO_CALLERS_IMPACT_WARNING));
+    }
+
+    /// A test caller is a caller the graph DID resolve: the symbol is reachable
+    /// and the count means something, so the computed risk stands.
+    #[test]
+    fn function_with_only_test_callers_keeps_its_computed_risk() {
+        let callers = vec![
+            caller("helper", "src/a.rs", 0, None),
+            caller("test_helper", "tests/a_test.rs", 1, None),
+        ];
         let c = classify_impact(&callers, "behavior", true);
         assert_eq!(c.risk_level, "LOW");
         assert!(c.type_warning.is_none());

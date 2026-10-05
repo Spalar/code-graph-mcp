@@ -593,6 +593,38 @@ fn test_aggregate_recommendations_counts_live_impact_separately() {
 }
 
 #[test]
+fn test_aggregate_recommendations_counts_stop_and_subagent_lines_outside_the_funnel() {
+    // D#163: the Stop check's reports and follow-ups, and the SubagentStart
+    // deliveries, are counted on their own. None is a recommendation, and none
+    // is a search event, so the re-search funnel must read exactly as it would
+    // without them: t2's answered deny is followed, for the funnel, by t5.
+    let content = "\
+{\"ts\":\"t1\",\"hook\":\"subagent\",\"action\":\"subagent_context\",\"agent\":\"Explore\"}
+{\"ts\":\"t2\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"foo\"}
+{\"ts\":\"t3\",\"hook\":\"stop\",\"action\":\"stop_check\",\"symbols\":1,\"callers\":2}
+{\"ts\":\"t4\",\"hook\":\"stop\",\"action\":\"stop_followup\",\"adopted\":true,\"listed\":2,\"edited\":1}
+{\"ts\":\"t5\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":false,\"pattern\":\"bar\"}
+{\"ts\":\"t6\",\"hook\":\"stop\",\"action\":\"stop_check\",\"symbols\":2,\"callers\":3}
+{\"ts\":\"t7\",\"hook\":\"stop\",\"action\":\"stop_followup\",\"adopted\":false,\"listed\":3,\"edited\":0}
+{\"ts\":\"t8\",\"hook\":\"subagent\",\"action\":\"subagent_context\"}
+";
+    let s = aggregate_recommendations_jsonl(content);
+    assert_eq!(s.stop_checks, 2);
+    assert_eq!(s.stop_followups, 2);
+    assert_eq!(s.stop_adopted, 1);
+    assert_eq!(s.subagent_contexts, 2);
+    assert_eq!(s.total, 2, "only the two denies are recommendation events");
+    assert_eq!(s.by_hook.get("stop"), None);
+    assert_eq!(s.by_hook.get("subagent"), None);
+    assert_eq!(s.by_action.get("stop_check"), None);
+    assert_eq!(
+        (s.researched_after_answer, s.fallthrough_after_answer),
+        (1, 1),
+        "the lines between an answered deny and the next search leave the funnel as it was"
+    );
+}
+
+#[test]
 fn resolve_project_root_prefers_existing_index_at_cwd() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();

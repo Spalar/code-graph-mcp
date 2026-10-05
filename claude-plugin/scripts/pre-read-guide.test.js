@@ -37,9 +37,9 @@ test.after(() => {
 
 const {
   isSourceFile, dirOf, recordRead, shouldHint, markHint,
-  buildHint, buildHintWithAnswer, isSilenced, isAnswerDisabled,
+  buildHintWithAnswer, isSilenced, isAnswerDisabled,
   trackReadAndMaybeHint,
-  FANOUT_THRESHOLD, COOLDOWN_MS, STATE_TTL_MS,
+  FANOUT_THRESHOLD, STATE_TTL_MS,
   loadState, saveState, statePath,
 } = require('./pre-read-guide');
 
@@ -144,14 +144,27 @@ test('shouldHint: cooldown suppresses re-fire', () => {
   assert.equal(shouldHint(s, 'src/foo', 1005 + 1000), false);
 });
 
-test('shouldHint: past cooldown re-fires', () => {
+test('shouldHint: a dir that fired stays quiet for as long as its state entry lives', () => {
+  // Real sessions (2026-09-05..28): 31.7% of fanout hints repeated a text the
+  // same session had already received — the 5-minute cooldown re-sent the same
+  // overview of the same dir. One delivery per dir; the entry expires after
+  // STATE_TTL_MS without a read.
   const s = { by_dir: {} };
   for (let i = 0; i < 5; i++) recordRead(s, 'src/foo', 1000 + i);
   markHint(s, 'src/foo', 1005);
-  // COOLDOWN_MS + 1 later, plus one more read
-  const after = 1005 + COOLDOWN_MS + 1;
+  const after = 1005 + 5 * 60 * 1000 + 1;  // past the old 5-minute re-fire
   recordRead(s, 'src/foo', after);
-  assert.equal(shouldHint(s, 'src/foo', after), true);
+  assert.equal(shouldHint(s, 'src/foo', after), false);
+});
+
+test('recordRead: re-reading one file counts once — fanout is about distinct files', () => {
+  // Reading one file in five chunks is not a fanout; it fired a 3.8 KB overview
+  // of the whole parent dir in the 2026-09-28 hook audit.
+  const s = { by_dir: {} };
+  for (let i = 0; i < 5; i++) recordRead(s, 'src/foo', 1000 + i, 'src/foo/big.rs');
+  assert.equal(shouldHint(s, 'src/foo', 1005), false);
+  for (let i = 0; i < 4; i++) recordRead(s, 'src/foo', 2000 + i, `src/foo/f${i}.rs`);
+  assert.equal(shouldHint(s, 'src/foo', 2004), true, 'the fifth DISTINCT file fires');
 });
 
 test('shouldHint: different dirs tracked independently', () => {
@@ -170,29 +183,6 @@ test('shouldHint: unknown dir returns false', () => {
 test('shouldHint: empty dir returns false', () => {
   const s = { by_dir: {} };
   assert.equal(shouldHint(s, '', 1000), false);
-});
-
-// ── buildHint ───────────────────────────────────────────────────────
-
-test('buildHint: contains the directory + module_overview tool', () => {
-  const out = buildHint('src/storage');
-  assert.match(out, /src\/storage/);
-  assert.match(out, /module_overview|overview/);
-});
-
-test('buildHint: stays under 300 bytes (single-line budget)', () => {
-  assert.ok(buildHint('src/storage').length < 300,
-    `hint length ${buildHint('src/storage').length} exceeds budget`);
-});
-
-test('buildHint: starts with [code-graph]', () => {
-  assert.match(buildHint('any/dir'), /^\[code-graph\]/);
-});
-
-test('buildHint: single line (no embedded newlines)', () => {
-  const out = buildHint('src/foo');
-  // Trailing newline is added by the caller; the function itself should not embed any.
-  assert.equal(out.indexOf('\n'), -1, `hint contains newline: ${JSON.stringify(out)}`);
 });
 
 // ── isSilenced ──────────────────────────────────────────────────────
@@ -303,20 +293,16 @@ test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', ()
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk) => { written.push(String(chunk)); return true; };
   try {
-    let fired = false;
+    let hint = null;
     for (let i = 0; i < 5; i++) {
-      fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
+      hint = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
     }
-    assert.equal(fired, true, '5th same-dir read must fire');
-    // Compound-grep sibling sweep: the fanout hint is now emitted as a
-    // PreToolUse allow+additionalContext envelope (was bare stdout, which CC
-    // routes to the debug log only and never shows the model). The overview
-    // answer must ride inside additionalContext.
-    const emitted = JSON.parse(written.join(''));
-    assert.equal(emitted.hookSpecificOutput.hookEventName, 'PreToolUse');
-    assert.equal(emitted.hookSpecificOutput.permissionDecision, 'allow');
-    assert.match(emitted.hookSpecificOutput.additionalContext, /Module overview stub/,
-      'hint must EMBED the overview answer in additionalContext');
+    assert.equal(typeof hint, 'string', '5th same-dir read must fire');
+    assert.match(hint, /Module overview stub/, 'hint must EMBED the overview answer');
+    // The tracker returns the hint; only the hook entry point writes, once. The
+    // pre-grep sed path calls this per target, and two writes in one hook run
+    // are rejected by Claude Code as invalid JSON.
+    assert.deepEqual(written, [], 'the shared tracker must not write to stdout');
     const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
     assert.match(recs, /"hook":"read"/);
     assert.match(recs, /"answered":true/);
@@ -324,6 +310,63 @@ test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', ()
     process.stdout.write = origWrite;
     if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
     else process.env._CG_ANSWER_BINARY = oldEnv;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('D5: no fan-out hint while the startup index is being written, and the dir stays eligible', () => {
+  // A partial index's overview lists some of the dir's files as if it were the
+  // module. Marking the hint delivered anyway would spend the dir's one hint.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-building-'));
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: 3 symbols\\n");');
+  fs.chmodSync(stub, 0o755);
+  const oldEnv = process.env._CG_ANSWER_BINARY;
+  process.env._CG_ANSWER_BINARY = stub;
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  const status = path.join(root, '.code-graph', 'indexing-status.json');
+  fs.writeFileSync(status, JSON.stringify({ s: 'indexing', d: 3, t: 50 }));
+  try {
+    for (let i = 0; i < 6; i++) {
+      assert.equal(trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs'), null, `read ${i + 1}`);
+    }
+    fs.rmSync(status);
+    const hint = trackReadAndMaybeHint(root, 'src/storage/file6.rs');
+    assert.match(String(hint), /Module overview stub/, 'the first read after the build gets the hint');
+  } finally {
+    if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
+    else process.env._CG_ANSWER_BINARY = oldEnv;
+    fs.rmSync(statePath(root), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('hook entry: the 5th Read emits one allow+additionalContext envelope', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-main-'));
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.code-graph', 'index.db'), '');
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: 3 symbols\\n");');
+  fs.chmodSync(stub, 0o755);
+  try {
+    const state = loadState(root);
+    for (let i = 0; i < FANOUT_THRESHOLD; i++) recordRead(state, 'src/storage');
+    saveState(root, state);
+    const res = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'pre-read-guide.js')], {
+      cwd: root,
+      input: JSON.stringify({ tool_input: { file_path: path.join(root, 'src', 'storage', 'db.rs') } }),
+      encoding: 'utf8',
+      env: { ...process.env, _CG_ANSWER_BINARY: stub, CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_NO_ANSWER_IN_DENY: '0' },
+    });
+    assert.equal(res.status, 0, res.stderr);
+    // Compound-grep sibling sweep: the fanout hint is emitted as a PreToolUse
+    // allow+additionalContext envelope (was bare stdout, which CC routes to the
+    // debug log only and never shows the model).
+    const out = JSON.parse(res.stdout).hookSpecificOutput;
+    assert.equal(out.hookEventName, 'PreToolUse');
+    assert.equal(out.permissionDecision, 'allow');
+    assert.match(out.additionalContext, /5\+ Reads into src\/storage\/[\s\S]*Module overview stub/);
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -343,11 +386,12 @@ test('trackReadAndMaybeHint: missing binary → hint records reason:no-binary (d
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = () => true;
   try {
-    let fired = false;
+    let fired = null;
     for (let i = 0; i < 5; i++) {
       fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
     }
-    assert.equal(fired, true, '5th same-dir read must still fire the hint');
+    assert.equal(fired, null,
+      'no overview, no hint: the advice-only line measured 18/672 follow-through against a 2.76% baseline');
     const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
     const last = JSON.parse(recs.trim().split('\n').pop());
     assert.equal(last.action, 'hint');
@@ -363,6 +407,17 @@ test('trackReadAndMaybeHint: missing binary → hint records reason:no-binary (d
   }
 });
 
+test('trackReadAndMaybeHint: five chunked reads of ONE file never fire', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-chunks-'));
+  try {
+    let fired = null;
+    for (let i = 0; i < 5; i++) fired = trackReadAndMaybeHint(root, 'src/storage/db.rs') || fired;
+    assert.equal(fired, null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('trackReadAndMaybeHint: non-fanout source read records an observe event', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-observe-'));
   fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
@@ -370,7 +425,7 @@ test('trackReadAndMaybeHint: non-fanout source read records an observe event', (
     // A single subdir source read is below the fanout threshold → no hint, but
     // it must still record an `observe` event for the search-decay metric.
     const fired = trackReadAndMaybeHint(root, 'src/storage/db.rs');
-    assert.equal(fired, false, 'single read must not fire the fanout hint');
+    assert.equal(fired, null, 'single read must not fire the fanout hint');
     const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
     const last = JSON.parse(recs.trim().split('\n').pop());
     assert.equal(last.hook, 'read');
@@ -383,9 +438,9 @@ test('trackReadAndMaybeHint: non-fanout source read records an observe event', (
 test('trackReadAndMaybeHint: top-level and outside-root paths never fire', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-skip-'));
   try {
-    assert.equal(trackReadAndMaybeHint(root, 'main.rs'), false);
-    assert.equal(trackReadAndMaybeHint(root, '../other/file.rs'), false);
-    assert.equal(trackReadAndMaybeHint(root, '/abs/file.rs'), false);
+    assert.equal(trackReadAndMaybeHint(root, 'main.rs'), null);
+    assert.equal(trackReadAndMaybeHint(root, '../other/file.rs'), null);
+    assert.equal(trackReadAndMaybeHint(root, '/abs/file.rs'), null);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -410,11 +465,11 @@ test('trackReadAndMaybeHint: a spent budget records fallthrough_reason:budget be
   process.stdout.write = () => true;
   resetHookDeadline(Date.now() - 1);
   try {
-    let fired = false;
+    let fired = null;
     for (let i = 0; i < 5; i++) {
       fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
     }
-    assert.equal(fired, true, '5th same-dir read must still fire the hint');
+    assert.equal(fired, null, 'a spent budget delivers no overview, so nothing is emitted');
     const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
     const last = JSON.parse(recs.trim().split('\n').pop());
     assert.equal(last.answered, false);
